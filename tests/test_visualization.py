@@ -157,6 +157,24 @@ def test_lab_ab_samples_from_bbox_returns_ab_pairs_and_colors():
     assert bgr_samples.shape == (50, 3)
 
 
+def test_lab_ab_samples_from_bbox_can_sample_inside_mask_only():
+    frame = np.zeros((20, 30, 3), dtype=np.uint8)
+    frame[:, :15] = [0, 0, 220]
+    frame[:, 15:] = [220, 0, 0]
+    sample_mask = np.zeros((20, 30), dtype=np.uint8)
+    sample_mask[:, :15] = 255
+
+    ab_samples, bgr_samples = lab_ab_samples_from_bbox(
+        frame,
+        (0, 0, 30, 20),
+        sample_mask=sample_mask,
+        max_samples=1000,
+    )
+
+    assert len(ab_samples) == 300
+    assert (bgr_samples[:, 2] > bgr_samples[:, 0]).all()
+
+
 def test_save_lab_ab_plot_writes_png(tmp_path):
     frame = np.zeros((20, 30, 3), dtype=np.uint8)
     frame[:, :10] = [0, 0, 220]

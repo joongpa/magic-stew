@@ -21,12 +21,22 @@ import json
 import math
 from pathlib import Path
 import random
+import struct
 import sys
 import tempfile
 import urllib.request
+import zlib
 
 import bpy
 from mathutils import Quaternion, Vector
+
+import site
+from pathlib import Path
+
+PROJECT = Path("/Users/jeffpark/Documents/LiveRecognition")
+VENV = PROJECT / ".venv"
+site_packages = next((VENV / "lib").glob("python*/site-packages"))
+site.addsitedir(str(site_packages))
 
 
 # Common Blender convention: X right, Z up, and negative Y faces the camera/front.
@@ -44,7 +54,6 @@ LIGHT_DISTANCE_RANGE = (3.0, 6.0)
 LIGHT_ELEVATION_DEGREES = (20.0, 70.0)
 BACKGROUND_NAME = "SyntheticDataBackground"
 BACKGROUND_MATERIAL_NAME = "SyntheticDataBackgroundMaterial"
-MASK_MATERIAL_PREFIX = "SyntheticDataMaskValue"
 BACKGROUND_DISTANCE = 4.0
 BACKGROUND_SIZE = 12.0
 BACKGROUND_IMAGE_URL = "https://picsum.photos/256/256"
@@ -54,6 +63,18 @@ SOLVED_LOCATION_PROP = "synthetic_solved_location"
 SOLVED_ROTATION_PROP = "synthetic_solved_rotation"
 DEFAULT_OUTPUT_DIR = "synthetic_cube_dataset"
 DEFAULT_IMAGE_SIZE = 512
+CLASS_NAMES = ["center", "edge", "corner"]
+INSTANCE_VALUES = {
+    "center": [20, 40, 60, 80, 100, 120],
+    "edge": [130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240],
+    "corner": [248, 249, 250, 251, 252, 253, 254, 255],
+}
+MASK_VALUE_TO_CLASS = {
+    value: class_id
+    for class_id, class_name in enumerate(CLASS_NAMES)
+    for value in INSTANCE_VALUES[class_name]
+}
+MIN_SEGMENT_PIXELS = 8
 
 
 def parse_axis(axis_name: str) -> Vector:
@@ -290,100 +311,126 @@ def render_png(path: Path) -> None:
     bpy.ops.render.render(write_still=True)
 
 
-def mask_material(label: int) -> bpy.types.Material:
-    material_name = f"{MASK_MATERIAL_PREFIX}_{label:03d}"
-    material = bpy.data.materials.get(material_name)
-    if material is None:
-        material = bpy.data.materials.new(material_name)
-        material.use_nodes = True
+def write_grayscale_png(path: Path, pixels: bytearray, width: int, height: int) -> None:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
 
-        nodes = material.node_tree.nodes
-        nodes.clear()
-        output = nodes.new("ShaderNodeOutputMaterial")
-        emission = nodes.new("ShaderNodeEmission")
-        material.node_tree.links.new(emission.outputs[0], output.inputs["Surface"])
+    raw_rows = bytearray()
+    row_stride = width
+    for y in range(height):
+        raw_rows.append(0)
+        start = y * row_stride
+        raw_rows.extend(pixels[start : start + row_stride])
 
-    emission = material.node_tree.nodes.get("Emission")
-    if emission is not None:
-        value = max(0, min(label, 255)) / 255.0
-        emission.inputs["Color"].default_value = (value, value, value, 1.0)
-        emission.inputs["Strength"].default_value = 1.0
-
-    return material
-
-
-def use_object_material(obj: bpy.types.Object, material: bpy.types.Material) -> None:
-    if not obj.material_slots:
-        obj.data.materials.append(material)
-
-    for slot in obj.material_slots:
-        slot.link = "OBJECT"
-        slot.material = material
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk("IHDR".encode(), struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0))
+    png += chunk("IDAT".encode(), zlib.compress(bytes(raw_rows), level=6))
+    png += chunk("IEND".encode(), b"")
+    path.write_bytes(png)
 
 
-def render_mask(path: Path, objects: list[bpy.types.Object]) -> None:
+def camera_frame_bounds(camera: bpy.types.Object, scene: bpy.types.Scene) -> tuple[float, float, float, float, float]:
+    frame = camera.data.view_frame(scene=scene)
+    xs = [corner.x for corner in frame]
+    ys = [corner.y for corner in frame]
+    zs = [corner.z for corner in frame]
+    return min(xs), max(xs), min(ys), max(ys), sum(zs) / len(zs)
+
+
+def camera_ray(camera: bpy.types.Object, scene: bpy.types.Scene, x: int, y: int) -> tuple[Vector, Vector]:
+    width = scene.render.resolution_x
+    height = scene.render.resolution_y
+    left, right, bottom, top, frame_z = camera_frame_bounds(camera, scene)
+    u = (x + 0.5) / width
+    v = 1.0 - ((y + 0.5) / height)
+    frame_x = left + u * (right - left)
+    frame_y = bottom + v * (top - bottom)
+    camera_matrix = camera.matrix_world
+
+    if camera.data.type == "ORTHO":
+        origin = camera_matrix @ Vector((frame_x, frame_y, 0.0))
+        direction = (camera_matrix.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
+        return origin, direction
+
+    origin = camera_matrix.translation
+    direction = (camera_matrix.to_3x3() @ Vector((frame_x, frame_y, frame_z))).normalized()
+    return origin, direction
+
+
+def render_mask(path: Path, objects: list[bpy.types.Object]) -> bytearray:
     scene = bpy.context.scene
-    world = scene.world
-    background = bpy.data.objects.get(BACKGROUND_NAME)
-    original_world_color = tuple(world.color) if world is not None else None
-    original_film_transparent = scene.render.film_transparent
-    original_color_mode = scene.render.image_settings.color_mode
-    original_view_transform = scene.view_settings.view_transform
-    original_look = scene.view_settings.look
-    original_exposure = scene.view_settings.exposure
-    original_gamma = scene.view_settings.gamma
-    mask_objects = objects + ([background] if background is not None else [])
-    original_materials = {
-        obj.name: [
-            {
-                "material": slot.material,
-                "link": slot.link,
-            }
-            for slot in obj.material_slots
-        ]
-        for obj in mask_objects
-    }
-    background_was_hidden = background.hide_render if background is not None else None
+    camera = get_camera()
+    width = scene.render.resolution_x
+    height = scene.render.resolution_y
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    cubie_names = {obj.name for obj in objects}
+    pixels = bytearray(width * height)
 
+    bpy.context.view_layer.update()
+    for y in range(height):
+        for x in range(width):
+            origin, direction = camera_ray(camera, scene, x, y)
+            hit, _location, _normal, _index, hit_object, _matrix = scene.ray_cast(
+                depsgraph,
+                origin,
+                direction,
+            )
+            if hit and hit_object is not None and hit_object.name in cubie_names:
+                pixels[y * width + x] = max(0, min(hit_object.pass_index, 255))
+
+    write_grayscale_png(path, pixels, width, height)
+    return pixels
+
+
+def normalize_point(x: float, y: float, width: int, height: int) -> tuple[float, float]:
+    return (
+        max(0.0, min(x / width, 1.0)),
+        max(0.0, min(y / height, 1.0)),
+    )
+
+
+def yolo_segments_with_cv2(pixels: bytearray, width: int, height: int) -> list[str]:
     try:
-        if world is not None:
-            world.color = (0.0, 0.0, 0.0)
-        scene.render.film_transparent = False
-        scene.render.image_settings.color_mode = "RGB"
-        scene.view_settings.view_transform = "Standard"
-        scene.view_settings.look = "None"
-        scene.view_settings.exposure = 0.0
-        scene.view_settings.gamma = 1.0
-        if background is not None:
-            background.hide_render = False
-            use_object_material(background, mask_material(0))
+        import cv2
+        import numpy as np
+    except ImportError:
+        raise RuntimeError(
+            "OpenCV is required to write non-rectangular YOLO segmentation labels. "
+            "Install cv2 in Blender's Python environment before generating training data."
+        ) from None
 
-        for obj in objects:
-            use_object_material(obj, mask_material(obj.pass_index))
-
-        render_png(path)
-    finally:
-        for obj in mask_objects:
-            if not original_materials[obj.name]:
-                for slot in obj.material_slots:
-                    slot.material = None
+    mask = np.frombuffer(bytes(pixels), dtype=np.uint8).reshape((height, width))
+    lines = []
+    for label in sorted(int(value) for value in np.unique(mask) if int(value) in MASK_VALUE_TO_CLASS):
+        binary = (mask == label).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            if cv2.contourArea(contour) < MIN_SEGMENT_PIXELS:
                 continue
 
-            for slot, saved_slot in zip(obj.material_slots, original_materials[obj.name]):
-                slot.material = saved_slot["material"]
-                slot.link = saved_slot["link"]
+            epsilon = 0.0008 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
+            if len(approx) < 3:
+                continue
 
-        if background is not None and background_was_hidden is not None:
-            background.hide_render = background_was_hidden
-        if world is not None and original_world_color is not None:
-            world.color = original_world_color
-        scene.render.film_transparent = original_film_transparent
-        scene.render.image_settings.color_mode = original_color_mode
-        scene.view_settings.view_transform = original_view_transform
-        scene.view_settings.look = original_look
-        scene.view_settings.exposure = original_exposure
-        scene.view_settings.gamma = original_gamma
-        bpy.context.view_layer.update()
+            values = [str(MASK_VALUE_TO_CLASS[label])]
+            for x, y in approx:
+                nx, ny = normalize_point(float(x), float(y), width, height)
+                values.append(f"{nx:.6f}")
+                values.append(f"{ny:.6f}")
+            lines.append(" ".join(values))
+    return lines
+
+
+def write_yolo_segments(path: Path, pixels: bytearray, width: int, height: int) -> list[str]:
+    lines = yolo_segments_with_cv2(pixels, width, height)
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return lines
 
 
 def generate_dataset(
@@ -395,8 +442,10 @@ def generate_dataset(
 ) -> None:
     images_dir = output_dir / "images"
     masks_dir = output_dir / "masks"
+    labels_dir = output_dir / "labels"
     images_dir.mkdir(parents=True, exist_ok=True)
     masks_dir.mkdir(parents=True, exist_ok=True)
+    labels_dir.mkdir(parents=True, exist_ok=True)
 
     configure_render(width, height)
 
@@ -405,23 +454,36 @@ def generate_dataset(
         moves = randomize_scene(scramble_length)
         objects = cube_objects()
 
-        stem = f"{(840 + index):06d}"
+        stem = f"{(index + 800):06d}"
         image_path = images_dir / f"{stem}.png"
         mask_path = masks_dir / f"{stem}.png"
+        label_path = labels_dir / f"{stem}.txt"
 
         render_png(image_path)
-        render_mask(mask_path, objects)
+        mask_pixels = render_mask(mask_path, objects)
+        yolo_lines = write_yolo_segments(label_path, mask_pixels, width, height)
 
         metadata.append({
             "image": str(image_path),
             "mask": str(mask_path),
+            "label": str(label_path),
             "moves": moves,
             "labels": {obj.name: obj.pass_index for obj in objects},
+            "segments": len(yolo_lines),
         })
-        print(f"Wrote {image_path} and {mask_path}")
+        print(f"Wrote {image_path}, {mask_path}, and {label_path}")
 
     metadata_path = output_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    data_yaml = output_dir / "data.yaml"
+    data_yaml.write_text(
+        "path: " + str(output_dir.resolve()) + "\n"
+        "train: images\n"
+        "val: images\n"
+        "names:\n"
+        + "".join(f"  {index}: {name}\n" for index, name in enumerate(CLASS_NAMES)),
+        encoding="utf-8",
+    )
 
 
 def cli_args() -> argparse.Namespace:

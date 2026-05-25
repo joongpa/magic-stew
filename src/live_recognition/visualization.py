@@ -103,6 +103,7 @@ def lab_ab_samples_from_bbox(
     frame_bgr: NDArray[np.uint8],
     bbox_xyxy: tuple[int, int, int, int],
     *,
+    sample_mask: NDArray[np.uint8] | None = None,
     max_samples: int = 6000,
 ) -> tuple[NDArray[np.float32], NDArray[np.uint8]]:
     x1, y1, x2, y2 = _clip_bbox(bbox_xyxy, frame_bgr.shape[1], frame_bgr.shape[0])
@@ -110,9 +111,21 @@ def lab_ab_samples_from_bbox(
         return np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
 
     crop = frame_bgr[y1:y2, x1:x2]
+    crop_sample_mask = _crop_sample_mask(sample_mask, (x1, y1, x2, y2), crop.shape[:2])
+    if crop_sample_mask is not None and not bool(crop_sample_mask.any()):
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+
     reliable_mask = _reliable_color_mask(crop)
+    if crop_sample_mask is not None:
+        reliable_mask = reliable_mask & crop_sample_mask
     if int(reliable_mask.sum()) < 10:
-        reliable_mask = np.ones(crop.shape[:2], dtype=bool)
+        reliable_mask = (
+            crop_sample_mask.copy()
+            if crop_sample_mask is not None
+            else np.ones(crop.shape[:2], dtype=bool)
+        )
+    if not bool(reliable_mask.any()):
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
 
     balanced = _gray_world_white_balance(crop, reliable_mask)
     lab = cv2.cvtColor(balanced, cv2.COLOR_BGR2LAB)
@@ -161,12 +174,63 @@ def save_lab_ab_samples_plot(
     plt.close(figure)
 
 
+def save_rgb_samples_plot(
+    bgr_samples: NDArray[np.uint8],
+    output_path: str,
+    *,
+    title: str = "Reliable pixels in RGB",
+) -> None:
+    if len(bgr_samples) == 0:
+        raise ValueError("No RGB samples available for plotting")
+
+    cache_dir = Path(".matplotlib-cache")
+    cache_dir.mkdir(exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(cache_dir))
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rgb_samples = cv2.cvtColor(bgr_samples.reshape(-1, 1, 3), cv2.COLOR_BGR2RGB).reshape(-1, 3)
+    colors = rgb_samples.astype(np.float32) / 255.0
+    figure = plt.figure(figsize=(8, 7), dpi=140)
+    axes = figure.add_subplot(111, projection="3d")
+    axes.scatter(
+        rgb_samples[:, 0],
+        rgb_samples[:, 1],
+        rgb_samples[:, 2],
+        c=colors,
+        s=4,
+        alpha=0.35,
+        linewidths=0,
+        depthshade=False,
+    )
+    axes.set_xlim(0, 255)
+    axes.set_ylim(0, 255)
+    axes.set_zlim(0, 255)
+    axes.set_xlabel("R")
+    axes.set_ylabel("G")
+    axes.set_zlabel("B")
+    axes.set_title(title)
+    axes.view_init(elev=22, azim=38)
+    figure.tight_layout()
+    figure.savefig(output_path)
+    plt.close(figure)
+
+
 def save_lab_ab_plot(
     frame_bgr: NDArray[np.uint8],
     bbox_xyxy: tuple[int, int, int, int],
     output_path: str,
+    *,
+    sample_mask: NDArray[np.uint8] | None = None,
 ) -> None:
-    ab_samples, bgr_samples = lab_ab_samples_from_bbox(frame_bgr, bbox_xyxy)
+    ab_samples, bgr_samples = lab_ab_samples_from_bbox(
+        frame_bgr,
+        bbox_xyxy,
+        sample_mask=sample_mask,
+    )
     save_lab_ab_samples_plot(ab_samples, bgr_samples, output_path)
 
 
@@ -216,3 +280,23 @@ def _clip_bbox(
         max(0, min(width, x2)),
         max(0, min(height, y2)),
     )
+
+
+def _crop_sample_mask(
+    sample_mask: NDArray[np.uint8] | None,
+    bbox_xyxy: tuple[int, int, int, int],
+    crop_shape: tuple[int, int],
+) -> NDArray[np.bool_] | None:
+    if sample_mask is None:
+        return None
+
+    x1, y1, x2, y2 = bbox_xyxy
+    mask_crop = sample_mask[y1:y2, x1:x2]
+    crop_height, crop_width = crop_shape
+    if mask_crop.shape[:2] != (crop_height, crop_width):
+        mask_crop = cv2.resize(
+            mask_crop.astype(np.uint8),
+            (crop_width, crop_height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    return mask_crop > 0
