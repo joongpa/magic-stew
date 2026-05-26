@@ -25,8 +25,11 @@ if str(SRC) not in sys.path:
 
 from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
 from live_recognition.visualization import (  # noqa: E402
-    lab_ab_samples_from_bbox,
+    _gray_world_white_balance,
+    _reliable_color_mask,
+    rgb_origin_regression_rays,
     save_lab_ab_samples_plot,
+    save_rgb_samples_interactive_plot,
     save_rgb_samples_plot,
 )
 
@@ -41,6 +44,73 @@ CLASS_COLORS = {
     1: (80, 255, 120),   # edge
     2: (255, 120, 80),   # corner
 }
+CENTER_CLASS_ID = 0
+
+
+class ColorRayClassifier:
+    def __init__(
+        self,
+        *,
+        required_frames: int = 30,
+        cluster_count: int = 6,
+        min_brightness: float = 40.0,
+    ) -> None:
+        self.required_frames = max(1, required_frames)
+        self.cluster_count = max(1, cluster_count)
+        self.min_brightness = min_brightness
+        self.detected_frames = 0
+        self._rgb_samples: list[np.ndarray] = []
+        self.directions = np.empty((0, 3), dtype=np.float32)
+        self.centroids = np.empty((0, 3), dtype=np.float32)
+
+    @property
+    def ready(self) -> bool:
+        return len(self.directions) > 0
+
+    def observe_frame(self, bgr_samples: np.ndarray) -> None:
+        if self.ready or len(bgr_samples) == 0:
+            return
+
+        bgr_samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
+        rgb_samples = bgr_samples[:, ::-1]
+        self._rgb_samples.extend(rgb_samples)
+        self.detected_frames += 1
+        if self.detected_frames < self.required_frames:
+            return
+
+        samples = np.asarray(self._rgb_samples, dtype=np.uint8)
+        self.directions, self.centroids = rgb_origin_regression_rays(
+            samples,
+            cluster_count=self.cluster_count,
+            min_brightness=self.min_brightness,
+        )
+
+    def classify_bgr(self, bgr_sample: np.ndarray) -> int | None:
+        if not self.ready:
+            return None
+
+        rgb = np.asarray(bgr_sample, dtype=np.float32).reshape(3)[::-1]
+        if float(np.linalg.norm(rgb)) < self.min_brightness:
+            return None
+
+        distances = distance_to_origin_rays(rgb, self.directions)
+        if len(distances) == 0:
+            return None
+
+        return int(distances.argmin())
+
+
+def distance_to_origin_rays(
+    rgb_sample: np.ndarray,
+    directions: np.ndarray,
+) -> np.ndarray:
+    point = np.asarray(rgb_sample, dtype=np.float32).reshape(3)
+    if len(directions) == 0:
+        return np.empty((0,), dtype=np.float32)
+
+    projections = np.maximum(directions @ point, 0.0)
+    closest_points = directions * projections[:, None]
+    return np.linalg.norm(point[None, :] - closest_points, axis=1)
 
 
 def parse_source(source: str) -> int | str:
@@ -85,13 +155,81 @@ def apply_mask_padding(mask: np.ndarray, padding_px: int) -> np.ndarray:
     return padded > 0
 
 
+def piece_mask_bool(result, index: int, roi_width: int, roi_height: int) -> np.ndarray:
+    mask_data = result.masks.data.detach().cpu().numpy()
+    mask = cv2.resize(
+        mask_data[index].astype(np.float32),
+        (roi_width, roi_height),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    return mask > 0.5
+
+
+def lab_ab_samples_from_piece(
+    frame: np.ndarray,
+    roi_xyxy: tuple[int, int, int, int],
+    piece_mask: np.ndarray,
+    max_samples: int,
+    average_color: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    x1, y1, x2, y2 = roi_xyxy
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0 or not bool(piece_mask.any()):
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+
+    reliable_mask = _reliable_color_mask(crop) & piece_mask
+    if int(reliable_mask.sum()) < 10:
+        reliable_mask = piece_mask.copy()
+    if not bool(reliable_mask.any()):
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+
+    balanced = _gray_world_white_balance(crop, reliable_mask)
+    lab = cv2.cvtColor(balanced, cv2.COLOR_BGR2LAB)
+    ab_samples = lab[:, :, 1:3][reliable_mask].astype(np.float32)
+    bgr_samples = crop[reliable_mask]
+    if average_color:
+        mean_bgr_sample = (
+            bgr_samples.astype(np.float32)
+            .mean(axis=0, keepdims=True)
+            .clip(0, 255)
+            .astype(np.uint8)
+        )
+        return (
+            ab_samples.mean(axis=0, keepdims=True).astype(np.float32),
+            mean_bgr_sample,
+        )
+    if len(ab_samples) > max_samples:
+        indexes = np.linspace(0, len(ab_samples) - 1, max_samples, dtype=np.int32)
+        ab_samples = ab_samples[indexes]
+        bgr_samples = bgr_samples[indexes]
+    return ab_samples, bgr_samples
+
+
+def concatenate_samples(
+    ab_batches: list[np.ndarray],
+    bgr_batches: list[np.ndarray],
+    max_samples: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not ab_batches:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+
+    ab_samples = np.concatenate(ab_batches, axis=0)
+    bgr_samples = np.concatenate(bgr_batches, axis=0)
+    if len(ab_samples) > max_samples:
+        indexes = np.linspace(0, len(ab_samples) - 1, max_samples, dtype=np.int32)
+        ab_samples = ab_samples[indexes]
+        bgr_samples = bgr_samples[indexes]
+    return ab_samples, bgr_samples
+
+
 def draw_piece_segments(
     frame: np.ndarray,
     roi: np.ndarray,
     piece_model,
     roi_xyxy,
     args,
-) -> tuple[int, np.ndarray]:
+    color_classifier: ColorRayClassifier | None = None,
+) -> tuple[int, np.ndarray, np.ndarray]:
     x1, y1, x2, y2 = roi_xyxy
     results = piece_model.predict(
         source=roi,
@@ -99,44 +237,44 @@ def draw_piece_segments(
         imgsz=args.piece_imgsz,
         verbose=False,
     )
-    sample_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    ab_batches = []
+    bgr_batches = []
     if not results:
-        return 0, sample_mask
+        return 0, np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
 
     result = results[0]
     masks = result.masks
     boxes = result.boxes
     if masks is None or boxes is None:
-        return 0, sample_mask
+        return 0, np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
 
     overlay = frame.copy()
     roi_height = y2 - y1
     roi_width = x2 - x1
     count = 0
     confidence_labels = []
-    mask_data = masks.data.detach().cpu().numpy()
-    sample_roi_mask = sample_mask[y1:y2, x1:x2]
-    for index, mask in enumerate(mask_data):
+    center_color_numbers = []
+    classifier_bgr_batches = []
+    for index in range(len(boxes)):
         class_id = int(boxes.cls[index].item())
         color = CLASS_COLORS.get(class_id, (255, 255, 255))
 
-        mask = cv2.resize(
-            mask.astype(np.float32),
-            (roi_width, roi_height),
-            interpolation=cv2.INTER_LINEAR,
-        )
-        mask_bool = mask > 0.5
+        mask_bool = piece_mask_bool(result, index, roi_width, roi_height)
         if not mask_bool.any():
             continue
 
-        ys, xs = np.nonzero(mask_bool)
+        draw_mask = apply_mask_padding(mask_bool, args.segmentation_padding_px)
+        if not draw_mask.any():
+            continue
+
+        ys, xs = np.nonzero(draw_mask)
         label_at = (int(xs.mean()) + x1, int(ys.mean()) + y1)
         confidence = float(boxes.conf[index].item())
         confidence_labels.append((label_at, confidence))
 
         if args.debug_overlay:
             contours, _ = cv2.findContours(
-                mask_bool.astype(np.uint8) * 255,
+                draw_mask.astype(np.uint8) * 255,
                 cv2.RETR_EXTERNAL,
                 cv2.CHAIN_APPROX_SIMPLE,
             )
@@ -151,11 +289,55 @@ def draw_piece_segments(
                     continue
                 cv2.polylines(frame, [points], isClosed=True, color=color, thickness=2)
 
+        _, center_bgr_samples = (
+            lab_ab_samples_from_piece(
+                frame,
+                roi_xyxy,
+                draw_mask,
+                max_samples=1,
+                average_color=True,
+            )
+            if color_classifier is not None and class_id == CENTER_CLASS_ID
+            else (np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8))
+        )
+        if (
+            color_classifier is not None
+            and color_classifier.ready
+            and getattr(args, "show_center_color_classification", True)
+            and class_id == CENTER_CLASS_ID
+            and len(center_bgr_samples) > 0
+        ):
+            cluster_index = color_classifier.classify_bgr(center_bgr_samples[0])
+            if cluster_index is not None and cluster_index < len(color_classifier.centroids):
+                centroid_rgb = color_classifier.centroids[cluster_index]
+                color = tuple(int(value) for value in centroid_rgb[::-1])
+                center_color_numbers.append((label_at, cluster_index + 1))
+
         roi_overlay = overlay[y1:y2, x1:x2]
-        roi_overlay[mask_bool] = color
-        sample_area = apply_mask_padding(mask_bool, args.segmentation_padding_px)
-        if sample_area.any():
-            sample_roi_mask[sample_area] = 255
+        roi_overlay[draw_mask] = color
+        ab_samples, bgr_samples = lab_ab_samples_from_piece(
+            frame,
+            roi_xyxy,
+            draw_mask,
+            args.color_plot_samples_per_frame,
+            args.average_mask_color,
+        )
+        if len(ab_samples) > 0:
+            ab_batches.append(ab_samples)
+            bgr_batches.append(bgr_samples)
+        if color_classifier is not None:
+            if args.average_mask_color:
+                _, classifier_bgr_samples = lab_ab_samples_from_piece(
+                    frame,
+                    roi_xyxy,
+                    draw_mask,
+                    args.color_plot_samples_per_frame,
+                    average_color=False,
+                )
+            else:
+                classifier_bgr_samples = bgr_samples
+            if len(classifier_bgr_samples) > 0:
+                classifier_bgr_batches.append(classifier_bgr_samples)
         count += 1
 
     mask = cv2.addWeighted(frame, 1.0 - args.mask_opacity, overlay, args.mask_opacity, 0)
@@ -182,7 +364,49 @@ def draw_piece_segments(
                 1,
                 cv2.LINE_AA,
             )
-    return count, sample_mask
+    draw_center_color_numbers(frame, center_color_numbers)
+    ab_samples, bgr_samples = concatenate_samples(
+        ab_batches,
+        bgr_batches,
+        args.color_plot_samples_per_frame,
+    )
+    if color_classifier is not None:
+        classifier_bgr_samples = (
+            np.concatenate(classifier_bgr_batches, axis=0)
+            if classifier_bgr_batches
+            else np.empty((0, 3), dtype=np.uint8)
+        )
+        color_classifier.observe_frame(classifier_bgr_samples)
+    return count, ab_samples, bgr_samples
+
+
+def draw_center_color_numbers(
+    frame: np.ndarray,
+    center_color_numbers: list[tuple[tuple[int, int], int]],
+) -> None:
+    for label_at, color_number in center_color_numbers:
+        text = str(color_number)
+        origin = (label_at[0] - 8, label_at[1] + 8)
+        cv2.putText(
+            frame,
+            text,
+            origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (0, 0, 0),
+            4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            text,
+            origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
 
 def process_frame(
@@ -190,17 +414,25 @@ def process_frame(
     bbox_detector,
     piece_model,
     args,
-) -> tuple[np.ndarray, np.ndarray | None, tuple[int, int, int, int] | None]:
+    color_classifier: ColorRayClassifier | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     output = frame.copy()
     candidate = bbox_detector.detect(frame)
     if candidate is None:
-        return output, None, None
+        return output, np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
 
     height, width = frame.shape[:2]
     roi_xyxy = clipped_square_roi(candidate.bbox_xyxy, width, height, args.roi_padding)
     x1, y1, x2, y2 = roi_xyxy
     roi = frame[y1:y2, x1:x2]
-    segment_count, sample_mask = draw_piece_segments(output, roi, piece_model, roi_xyxy, args)
+    segment_count, ab_samples, bgr_samples = draw_piece_segments(
+        output,
+        roi,
+        piece_model,
+        roi_xyxy,
+        args,
+        color_classifier,
+    )
 
     if args.show_bbox or args.debug_overlay:
         cv2.rectangle(output, (x1, y1), (x2, y2), (40, 220, 40), 2)
@@ -215,7 +447,7 @@ def process_frame(
             2,
             cv2.LINE_AA,
         )
-    return output, sample_mask, roi_xyxy
+    return output, ab_samples, bgr_samples
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -237,8 +469,60 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mask-opacity", type=float, default=1.0)
     parser.add_argument("--color-plot", type=Path, help="Output PNG path for LAB a/b samples")
     parser.add_argument("--rgb-color-plot", type=Path, help="Output PNG path for 3D RGB samples")
+    parser.add_argument(
+        "--rgb-html-plot",
+        type=Path,
+        help="Output HTML path for interactive 3D RGB samples",
+    )
+    parser.add_argument(
+        "--normalize-rgb-plot",
+        action="store_true",
+        help="Plot RGB coordinates as R,G,B divided by R+G+B",
+    )
+    parser.add_argument(
+        "--hide-rgb-regressions",
+        dest="show_rgb_regressions",
+        action="store_false",
+        help="Do not draw k-means origin-ray regressions on the interactive RGB plot",
+    )
+    parser.add_argument(
+        "--rgb-regression-clusters",
+        type=int,
+        default=6,
+        help="Number of RGB origin-ray regressions to fit for the interactive plot",
+    )
+    parser.add_argument(
+        "--rgb-regression-min-brightness",
+        type=float,
+        default=40.0,
+        help="Minimum raw RGB vector length used while fitting RGB regressions",
+    )
+    parser.add_argument(
+        "--average-mask-color",
+        action="store_true",
+        help="Plot one average color per segmented piece mask instead of pixel samples",
+    )
+    parser.add_argument(
+        "--hide-center-color-classification",
+        dest="show_center_color_classification",
+        action="store_false",
+        help="Do not recolor center masks using the learned color rays",
+    )
+    parser.add_argument(
+        "--center-color-frames",
+        type=int,
+        default=30,
+        help="Detected frames of all-mask color samples to collect before recoloring centers",
+    )
+    parser.add_argument(
+        "--center-color-min-brightness",
+        type=float,
+        default=40.0,
+        help="Minimum raw RGB vector length used while fitting color rays",
+    )
     parser.add_argument("--color-plot-frames", type=int, default=90)
     parser.add_argument("--color-plot-samples-per-frame", type=int, default=800)
+    parser.add_argument("--average-plot-point-size", type=float, default=36.0)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--save", type=Path)
     parser.add_argument("--display", action="store_true")
@@ -249,12 +533,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Draw ROI box, polygon outlines, labels, and FPS",
     )
-    parser.set_defaults(show_bbox=True, show_confidence=True)
+    parser.set_defaults(
+        show_bbox=True,
+        show_confidence=True,
+        show_rgb_regressions=True,
+        show_center_color_classification=True,
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+
     from ultralytics import YOLO
 
     bbox_detector = YOLOCubeDetector(
@@ -264,6 +554,12 @@ def main() -> int:
     )
     piece_model = YOLO(str(args.piece_model))
     source = parse_source(args.source)
+    plot_point_size = args.average_plot_point_size if args.average_mask_color else 4
+    color_classifier = ColorRayClassifier(
+        required_frames=args.center_color_frames,
+        cluster_count=args.rgb_regression_clusters,
+        min_brightness=args.center_color_min_brightness,
+    )
     color_plot_ab_batches = []
     color_plot_bgr_batches = []
     color_plot_detected_frames = 0
@@ -277,30 +573,44 @@ def main() -> int:
         frame = cv2.imread(source)
         if frame is None:
             raise SystemExit(f"Could not read image: {source}")
-        output, sample_mask, roi_xyxy = process_frame(frame, bbox_detector, piece_model, args)
-        if args.color_plot or args.rgb_color_plot:
-            if sample_mask is None or roi_xyxy is None:
+        output, ab_samples, bgr_samples = process_frame(
+            frame,
+            bbox_detector,
+            piece_model,
+            args,
+            color_classifier,
+        )
+        if args.color_plot or args.rgb_color_plot or args.rgb_html_plot:
+            if len(ab_samples) == 0:
                 raise SystemExit(
                     "Could not collect color plot samples because no pieces were segmented"
                 )
-            ab_samples, bgr_samples = lab_ab_samples_from_bbox(
-                frame,
-                roi_xyxy,
-                sample_mask=sample_mask,
-                max_samples=args.color_plot_samples_per_frame,
-            )
             if args.color_plot:
                 save_lab_ab_samples_plot(
                     ab_samples,
                     bgr_samples,
                     str(args.color_plot),
                     title="Piece segmentation reliable pixels in LAB a/b",
+                    point_size=plot_point_size,
                 )
             if args.rgb_color_plot:
                 save_rgb_samples_plot(
                     bgr_samples,
                     str(args.rgb_color_plot),
                     title="Piece segmentation reliable pixels in RGB",
+                    point_size=plot_point_size,
+                    normalize_rgb=args.normalize_rgb_plot,
+                )
+            if args.rgb_html_plot:
+                save_rgb_samples_interactive_plot(
+                    bgr_samples,
+                    str(args.rgb_html_plot),
+                    title="Piece segmentation reliable pixels in RGB",
+                    normalize_rgb=args.normalize_rgb_plot,
+                    point_size=plot_point_size,
+                    draw_regression_lines=args.show_rgb_regressions,
+                    regression_cluster_count=args.rgb_regression_clusters,
+                    regression_min_brightness=args.rgb_regression_min_brightness,
                 )
         if args.save:
             cv2.imwrite(str(args.save), output)
@@ -319,7 +629,13 @@ def main() -> int:
         ok, frame = capture.read()
         if not ok:
             break
-        output, sample_mask, roi_xyxy = process_frame(frame, bbox_detector, piece_model, args)
+        output, ab_samples, bgr_samples = process_frame(
+            frame,
+            bbox_detector,
+            piece_model,
+            args,
+            color_classifier,
+        )
         now = perf_counter()
         fps = 1.0 / max(now - previous, 1e-6)
         previous = now
@@ -345,24 +661,13 @@ def main() -> int:
 
         if args.save and args.once:
             cv2.imwrite(str(args.save), output)
-        if args.color_plot or args.rgb_color_plot:
-            if sample_mask is not None and roi_xyxy is not None:
-                if color_plot_detected_frames < args.color_plot_frames:
-                    ab_samples, bgr_samples = lab_ab_samples_from_bbox(
-                        frame,
-                        roi_xyxy,
-                        sample_mask=sample_mask,
-                        max_samples=args.color_plot_samples_per_frame,
-                    )
-                    if len(ab_samples) > 0:
-                        color_plot_ab_batches.append(ab_samples)
-                        color_plot_bgr_batches.append(bgr_samples)
-                        color_plot_detected_frames += 1
-                        if (
-                            color_plot_detected_frames >= args.color_plot_frames
-                            and not args.display
-                        ):
-                            break
+        if args.color_plot or args.rgb_color_plot or args.rgb_html_plot:
+            if color_plot_detected_frames < args.color_plot_frames and len(ab_samples) > 0:
+                color_plot_ab_batches.append(ab_samples)
+                color_plot_bgr_batches.append(bgr_samples)
+                color_plot_detected_frames += 1
+                if color_plot_detected_frames >= args.color_plot_frames and not args.display:
+                    break
         if args.display:
             cv2.imshow("cube piece segmentation", output)
             key = cv2.waitKey(0 if args.once else 1) & 0xFF
@@ -374,7 +679,7 @@ def main() -> int:
     capture.release()
     if args.display:
         cv2.destroyAllWindows()
-    if args.color_plot or args.rgb_color_plot:
+    if args.color_plot or args.rgb_color_plot or args.rgb_html_plot:
         if not color_plot_ab_batches:
             raise SystemExit("Could not collect color plot samples from any segmented frames")
         ab_samples = np.concatenate(color_plot_ab_batches, axis=0)
@@ -388,12 +693,26 @@ def main() -> int:
                     "Piece segmentation reliable pixels "
                     f"across {color_plot_detected_frames} frames"
                 ),
+                point_size=plot_point_size,
             )
         if args.rgb_color_plot:
             save_rgb_samples_plot(
                 bgr_samples,
                 str(args.rgb_color_plot),
                 title=f"Piece segmentation RGB samples across {color_plot_detected_frames} frames",
+                point_size=plot_point_size,
+                normalize_rgb=args.normalize_rgb_plot,
+            )
+        if args.rgb_html_plot:
+            save_rgb_samples_interactive_plot(
+                bgr_samples,
+                str(args.rgb_html_plot),
+                title=f"Piece segmentation RGB samples across {color_plot_detected_frames} frames",
+                normalize_rgb=args.normalize_rgb_plot,
+                point_size=plot_point_size,
+                draw_regression_lines=args.show_rgb_regressions,
+                regression_cluster_count=args.rgb_regression_clusters,
+                regression_min_brightness=args.rgb_regression_min_brightness,
             )
     return 0
 

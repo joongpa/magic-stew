@@ -144,6 +144,7 @@ def save_lab_ab_samples_plot(
     output_path: str,
     *,
     title: str = "Cube bbox reliable pixels in LAB a/b",
+    point_size: float = 4,
 ) -> None:
     if len(ab_samples) == 0:
         raise ValueError("No LAB a/b samples available for plotting")
@@ -160,7 +161,14 @@ def save_lab_ab_samples_plot(
     rgb_samples = cv2.cvtColor(bgr_samples.reshape(-1, 1, 3), cv2.COLOR_BGR2RGB).reshape(-1, 3)
     colors = rgb_samples.astype(np.float32) / 255.0
     figure, axes = plt.subplots(figsize=(7, 7), dpi=140)
-    axes.scatter(ab_samples[:, 0], ab_samples[:, 1], c=colors, s=4, alpha=0.35, linewidths=0)
+    axes.scatter(
+        ab_samples[:, 0],
+        ab_samples[:, 1],
+        c=colors,
+        s=point_size,
+        alpha=0.35,
+        linewidths=0,
+    )
     axes.axvline(128, color="0.75", linewidth=1)
     axes.axhline(128, color="0.75", linewidth=1)
     axes.set_xlim(0, 255)
@@ -179,7 +187,9 @@ def save_rgb_samples_plot(
     output_path: str,
     *,
     title: str = "Reliable pixels in RGB",
-) -> None:
+    point_size: float = 4,
+    normalize_rgb: bool = False,
+) -> list[str]:
     if len(bgr_samples) == 0:
         raise ValueError("No RGB samples available for plotting")
 
@@ -194,29 +204,269 @@ def save_rgb_samples_plot(
 
     rgb_samples = cv2.cvtColor(bgr_samples.reshape(-1, 1, 3), cv2.COLOR_BGR2RGB).reshape(-1, 3)
     colors = rgb_samples.astype(np.float32) / 255.0
-    figure = plt.figure(figsize=(8, 7), dpi=140)
-    axes = figure.add_subplot(111, projection="3d")
-    axes.scatter(
-        rgb_samples[:, 0],
-        rgb_samples[:, 1],
-        rgb_samples[:, 2],
-        c=colors,
-        s=4,
-        alpha=0.35,
-        linewidths=0,
-        depthshade=False,
+    plot_samples = rgb_samples.astype(np.float32)
+    axis_limit = 255
+    axis_label_prefix = ""
+    if normalize_rgb:
+        channel_sum = np.maximum(plot_samples.sum(axis=1, keepdims=True), 1.0)
+        plot_samples = plot_samples / channel_sum
+        axis_limit = 1.0
+        axis_label_prefix = "normalized "
+
+    output_paths = _rgb_plot_output_paths(output_path)
+    views = [
+        ("rg", 18, -90),
+        ("rb", 18, 0),
+        ("gb", 18, 90),
+    ]
+    saved_paths = []
+    for output_path_for_view, (view_name, elev, azim) in zip(output_paths, views):
+        figure = plt.figure(figsize=(8, 7), dpi=140)
+        axes = figure.add_subplot(111, projection="3d")
+        axes.scatter(
+            plot_samples[:, 0],
+            plot_samples[:, 1],
+            plot_samples[:, 2],
+            c=colors,
+            s=point_size,
+            alpha=0.35,
+            linewidths=0,
+            depthshade=False,
+        )
+        axes.set_xlim(0, axis_limit)
+        axes.set_ylim(0, axis_limit)
+        axes.set_zlim(0, axis_limit)
+        axes.set_xlabel(f"{axis_label_prefix}R")
+        axes.set_ylabel(f"{axis_label_prefix}G")
+        axes.set_zlabel(f"{axis_label_prefix}B")
+        axes.set_title(f"{title} ({view_name.upper()} view)")
+        axes.view_init(elev=elev, azim=azim)
+        figure.tight_layout()
+        figure.savefig(output_path_for_view)
+        plt.close(figure)
+        saved_paths.append(str(output_path_for_view))
+    return saved_paths
+
+
+def save_rgb_samples_interactive_plot(
+    bgr_samples: NDArray[np.uint8],
+    output_path: str,
+    *,
+    title: str = "Reliable pixels in RGB",
+    normalize_rgb: bool = False,
+    point_size: float = 4,
+    draw_regression_lines: bool = True,
+    regression_cluster_count: int = 6,
+    regression_min_brightness: float = 40.0,
+) -> str:
+    if len(bgr_samples) == 0:
+        raise ValueError("No RGB samples available for plotting")
+
+    try:
+        import plotly.graph_objects as go
+    except ImportError as exc:
+        raise RuntimeError(
+            "Plotly is required for --rgb-html-plot. Install it in the Python "
+            "environment used to run this script."
+        ) from exc
+
+    rgb_samples = cv2.cvtColor(bgr_samples.reshape(-1, 1, 3), cv2.COLOR_BGR2RGB).reshape(-1, 3)
+    plot_samples = rgb_samples.astype(np.float32)
+    axis_range = [0, 255]
+    axis_prefix = ""
+    if normalize_rgb:
+        channel_sum = np.maximum(plot_samples.sum(axis=1, keepdims=True), 1.0)
+        plot_samples = plot_samples / channel_sum
+        axis_range = [0, 1]
+        axis_prefix = "normalized "
+
+    hex_colors = [
+        f"rgb({int(rgb[0])},{int(rgb[1])},{int(rgb[2])})"
+        for rgb in rgb_samples
+    ]
+    traces = [
+        go.Scatter3d(
+            x=plot_samples[:, 0],
+            y=plot_samples[:, 1],
+            z=plot_samples[:, 2],
+            mode="markers",
+            marker={
+                "size": point_size,
+                "color": hex_colors,
+                "opacity": 0.75,
+            },
+            customdata=rgb_samples,
+            hovertemplate=(
+                f"{axis_prefix}R=%{{x:.3f}}<br>"
+                f"{axis_prefix}G=%{{y:.3f}}<br>"
+                f"{axis_prefix}B=%{{z:.3f}}<br>"
+                "raw RGB=%{customdata}<extra></extra>"
+            ),
+            name="samples",
+        )
+    ]
+    if draw_regression_lines and not normalize_rgb:
+        traces.extend(
+            _rgb_origin_regression_line_traces(
+                go,
+                rgb_samples,
+                cluster_count=regression_cluster_count,
+                min_brightness=regression_min_brightness,
+            )
+        )
+
+    figure = go.Figure(data=traces)
+    figure.update_layout(
+        title=title,
+        scene={
+            "xaxis": {"title": f"{axis_prefix}R", "range": axis_range},
+            "yaxis": {"title": f"{axis_prefix}G", "range": axis_range},
+            "zaxis": {"title": f"{axis_prefix}B", "range": axis_range},
+            "aspectmode": "cube",
+        },
+        margin={"l": 0, "r": 0, "b": 0, "t": 48},
     )
-    axes.set_xlim(0, 255)
-    axes.set_ylim(0, 255)
-    axes.set_zlim(0, 255)
-    axes.set_xlabel("R")
-    axes.set_ylabel("G")
-    axes.set_zlabel("B")
-    axes.set_title(title)
-    axes.view_init(elev=22, azim=38)
-    figure.tight_layout()
-    figure.savefig(output_path)
-    plt.close(figure)
+    figure.write_html(output_path, include_plotlyjs="cdn", full_html=True)
+    return output_path
+
+
+def _rgb_origin_regression_line_traces(
+    go,
+    rgb_samples: NDArray[np.uint8],
+    *,
+    cluster_count: int,
+    min_brightness: float,
+) -> list:
+    directions, centroids = rgb_origin_regression_rays(
+        rgb_samples,
+        cluster_count=cluster_count,
+        min_brightness=min_brightness,
+    )
+    traces = []
+    axis_max = 255.0
+    for index, (direction, centroid) in enumerate(zip(directions, centroids)):
+        endpoint_scale = axis_max / max(float(direction.max()), 1e-6)
+        endpoint = direction * endpoint_scale
+        color = f"rgb({int(centroid[0])},{int(centroid[1])},{int(centroid[2])})"
+        traces.append(
+            go.Scatter3d(
+                x=[0, endpoint[0]],
+                y=[0, endpoint[1]],
+                z=[0, endpoint[2]],
+                mode="lines",
+                line={"color": color, "width": 7},
+                name=f"RGB ray {index + 1}",
+                hovertemplate=(
+                    "origin ray<br>"
+                    f"centroid RGB=({centroid[0]:.1f}, {centroid[1]:.1f}, {centroid[2]:.1f})"
+                    "<extra></extra>"
+                ),
+            )
+        )
+    return traces
+
+
+def rgb_origin_regression_rays(
+    rgb_samples: NDArray[np.uint8] | NDArray[np.float32],
+    *,
+    cluster_count: int = 6,
+    min_brightness: float = 40.0,
+    max_iterations: int = 50,
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    """Fit origin rays by clustering RGB directions and using raw RGB centroids."""
+    samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
+    if len(samples) == 0 or cluster_count <= 0:
+        return (
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0, 3), dtype=np.float32),
+        )
+
+    brightness = np.linalg.norm(samples, axis=1)
+    usable = samples[brightness >= min_brightness]
+    if len(usable) == 0:
+        usable = samples[brightness > 0]
+    if len(usable) == 0:
+        return (
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0, 3), dtype=np.float32),
+        )
+
+    usable_brightness = np.maximum(np.linalg.norm(usable, axis=1, keepdims=True), 1e-6)
+    unit_samples = usable / usable_brightness
+    k = min(cluster_count, len(unit_samples))
+    centers = _initialize_direction_centers(unit_samples, k)
+
+    labels = np.zeros(len(unit_samples), dtype=np.int32)
+    for _ in range(max_iterations):
+        distances = np.linalg.norm(unit_samples[:, None, :] - centers[None, :, :], axis=2)
+        next_labels = distances.argmin(axis=1)
+        next_centers = centers.copy()
+        for cluster_index in range(k):
+            members = unit_samples[next_labels == cluster_index]
+            if len(members) > 0:
+                center = members.mean(axis=0)
+                next_centers[cluster_index] = center / max(float(np.linalg.norm(center)), 1e-6)
+        if np.array_equal(labels, next_labels) and np.allclose(centers, next_centers):
+            centers = next_centers
+            labels = next_labels
+            break
+        centers = next_centers
+        labels = next_labels
+
+    centroids = []
+    directions = []
+    for cluster_index in range(k):
+        members = usable[labels == cluster_index]
+        if len(members) == 0:
+            continue
+        centroid = members.mean(axis=0)
+        norm = float(np.linalg.norm(centroid))
+        if norm <= 1e-6:
+            continue
+        centroids.append(centroid)
+        directions.append(centroid / norm)
+
+    if not centroids:
+        return (
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0, 3), dtype=np.float32),
+        )
+
+    order = np.argsort([_rgb_hue_sort_key(centroid) for centroid in centroids])
+    return (
+        np.asarray(directions, dtype=np.float32)[order],
+        np.asarray(centroids, dtype=np.float32)[order],
+    )
+
+
+def _initialize_direction_centers(
+    unit_samples: NDArray[np.float32],
+    cluster_count: int,
+) -> NDArray[np.float32]:
+    first_index = int(np.argmax(np.linalg.norm(unit_samples, axis=1)))
+    centers = [unit_samples[first_index]]
+    while len(centers) < cluster_count:
+        distances = np.min(
+            np.linalg.norm(unit_samples[:, None, :] - np.asarray(centers)[None, :, :], axis=2),
+            axis=1,
+        )
+        centers.append(unit_samples[int(np.argmax(distances))])
+    return np.asarray(centers, dtype=np.float32)
+
+
+def _rgb_hue_sort_key(rgb: NDArray[np.float32]) -> float:
+    rgb_u8 = np.clip(np.asarray(rgb).reshape(1, 1, 3), 0, 255).astype(np.uint8)
+    hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2HSV)
+    return float(hsv[0, 0, 0])
+
+
+def _rgb_plot_output_paths(output_path: str) -> list[Path]:
+    path = Path(output_path)
+    suffix = path.suffix or ".png"
+    return [
+        path.with_name(f"{path.stem}_{view}{suffix}")
+        for view in ("rg", "rb", "gb")
+    ]
 
 
 def save_lab_ab_plot(

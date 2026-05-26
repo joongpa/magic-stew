@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from live_recognition.types import CubeCandidate, FrameResult
 from live_recognition.visualization import (
@@ -7,7 +8,10 @@ from live_recognition.visualization import (
     build_luminance_debug_view,
     draw_result,
     lab_ab_samples_from_bbox,
+    rgb_origin_regression_rays,
     save_lab_ab_plot,
+    save_rgb_samples_interactive_plot,
+    save_rgb_samples_plot,
 )
 
 
@@ -186,3 +190,104 @@ def test_save_lab_ab_plot_writes_png(tmp_path):
 
     assert output_path.exists()
     assert output_path.stat().st_size > 0
+
+
+def test_save_rgb_samples_plot_writes_three_angles(tmp_path):
+    bgr_samples = np.array(
+        [
+            [0, 0, 220],
+            [0, 220, 0],
+            [220, 0, 0],
+            [0, 220, 220],
+        ],
+        dtype=np.uint8,
+    )
+    output_path = tmp_path / "rgb.png"
+
+    saved_paths = save_rgb_samples_plot(bgr_samples, str(output_path))
+
+    assert len(saved_paths) == 3
+    for suffix in ("rg", "rb", "gb"):
+        angle_path = tmp_path / f"rgb_{suffix}.png"
+        assert str(angle_path) in saved_paths
+        assert angle_path.exists()
+        assert angle_path.stat().st_size > 0
+
+
+def test_save_rgb_samples_plot_can_normalize_rgb_coordinates(tmp_path):
+    bgr_samples = np.array(
+        [
+            [0, 0, 220],
+            [0, 220, 0],
+            [220, 0, 0],
+            [40, 80, 160],
+        ],
+        dtype=np.uint8,
+    )
+    output_path = tmp_path / "rgb_normalized.png"
+
+    saved_paths = save_rgb_samples_plot(bgr_samples, str(output_path), normalize_rgb=True)
+
+    assert len(saved_paths) == 3
+    for suffix in ("rg", "rb", "gb"):
+        angle_path = tmp_path / f"rgb_normalized_{suffix}.png"
+        assert str(angle_path) in saved_paths
+        assert angle_path.exists()
+        assert angle_path.stat().st_size > 0
+
+
+def test_rgb_origin_regression_rays_finds_six_directions():
+    base_colors = np.array(
+        [
+            [220, 20, 20],
+            [230, 120, 20],
+            [220, 220, 30],
+            [30, 180, 40],
+            [30, 70, 220],
+            [220, 220, 220],
+        ],
+        dtype=np.float32,
+    )
+    samples = []
+    for color in base_colors:
+        for scale in (0.35, 0.55, 0.8, 1.0):
+            samples.append(np.clip(color * scale, 0, 255))
+
+    directions, centroids = rgb_origin_regression_rays(
+        np.asarray(samples, dtype=np.uint8),
+        cluster_count=6,
+        min_brightness=20,
+    )
+
+    assert directions.shape == (6, 3)
+    assert centroids.shape == (6, 3)
+    assert np.allclose(np.linalg.norm(directions, axis=1), 1.0)
+
+
+def test_save_rgb_samples_interactive_plot_can_draw_regression_lines(tmp_path):
+    pytest.importorskip("plotly")
+    rgb_samples = np.array(
+        [
+            [220, 20, 20],
+            [120, 10, 10],
+            [20, 220, 20],
+            [10, 120, 10],
+            [20, 20, 220],
+            [10, 10, 120],
+        ],
+        dtype=np.uint8,
+    )
+    bgr_samples = rgb_samples[:, ::-1]
+    output_path = tmp_path / "rgb.html"
+
+    save_rgb_samples_interactive_plot(
+        bgr_samples,
+        str(output_path),
+        regression_cluster_count=3,
+        regression_min_brightness=20,
+    )
+
+    html = output_path.read_text()
+    assert "RGB ray 1" in html
+    assert "RGB ray 2" in html
+    assert "RGB ray 3" in html
