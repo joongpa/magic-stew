@@ -29,6 +29,7 @@ from live_recognition.visualization import (  # noqa: E402
     _reliable_color_mask,
     rgb_origin_regression_rays,
     save_lab_ab_samples_plot,
+    save_hsv_samples_interactive_plot,
     save_rgb_samples_interactive_plot,
     save_rgb_samples_plot,
 )
@@ -37,7 +38,7 @@ from live_recognition.visualization import (  # noqa: E402
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 DEFAULT_PIECE_MODEL = (
     ROOT
-    / "runs/segment/runs/cube_piece_seg_local/runs/cube_piece_yolo11n_seg/weights/best.pt"
+    / "runs/cube_piece_seg_local/runs/cube_piece_yolo11n_seg-3/weights/best.pt"
 )
 CLASS_COLORS = {
     0: (80, 220, 255),   # center
@@ -54,10 +55,14 @@ class ColorRayClassifier:
         required_frames: int = 30,
         cluster_count: int = 6,
         min_brightness: float = 40.0,
+        raw_density_filter_radius: float = 0.0,
+        raw_density_filter_min_neighbors: int = 0,
     ) -> None:
         self.required_frames = max(1, required_frames)
         self.cluster_count = max(1, cluster_count)
         self.min_brightness = min_brightness
+        self.raw_density_filter_radius = raw_density_filter_radius
+        self.raw_density_filter_min_neighbors = raw_density_filter_min_neighbors
         self.detected_frames = 0
         self._rgb_samples: list[np.ndarray] = []
         self.directions = np.empty((0, 3), dtype=np.float32)
@@ -83,6 +88,8 @@ class ColorRayClassifier:
             samples,
             cluster_count=self.cluster_count,
             min_brightness=self.min_brightness,
+            raw_density_filter_radius=self.raw_density_filter_radius,
+            raw_density_filter_min_neighbors=self.raw_density_filter_min_neighbors,
         )
 
     def classify_bgr(self, bgr_sample: np.ndarray) -> int | None:
@@ -475,6 +482,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output HTML path for interactive 3D RGB samples",
     )
     parser.add_argument(
+        "--hsv-html-plot",
+        type=Path,
+        help="Output HTML path for interactive 3D HSV samples",
+    )
+    parser.add_argument(
         "--normalize-rgb-plot",
         action="store_true",
         help="Plot RGB coordinates as R,G,B divided by R+G+B",
@@ -496,6 +508,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=40.0,
         help="Minimum raw RGB vector length used while fitting RGB regressions",
+    )
+    parser.add_argument(
+        "--rgb-regression-raw-density-filter-radius",
+        type=float,
+        default=0.0,
+        help="Reject RGB samples with too few raw-space neighbors inside this radius; 0 disables",
+    )
+    parser.add_argument(
+        "--rgb-regression-raw-density-filter-min-neighbors",
+        type=int,
+        default=0,
+        help="Minimum other samples required inside the raw-density filter radius; 0 disables",
     )
     parser.add_argument(
         "--average-mask-color",
@@ -523,6 +547,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--color-plot-frames", type=int, default=90)
     parser.add_argument("--color-plot-samples-per-frame", type=int, default=800)
     parser.add_argument("--average-plot-point-size", type=float, default=36.0)
+    parser.add_argument(
+        "--plotly-point-size",
+        type=float,
+        default=1.0,
+        help="Marker size for interactive Plotly RGB/HSV plots",
+    )
+    parser.add_argument(
+        "--plotly-regression-line-width",
+        type=float,
+        default=4.0,
+        help="Line width for RGB regression rays in the interactive Plotly plot",
+    )
+    parser.add_argument(
+        "--plotly-color-by-cluster",
+        action="store_true",
+        help="Color interactive Plotly points by learned RGB cluster instead of raw color",
+    )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--save", type=Path)
     parser.add_argument("--display", action="store_true")
@@ -559,6 +600,8 @@ def main() -> int:
         required_frames=args.center_color_frames,
         cluster_count=args.rgb_regression_clusters,
         min_brightness=args.center_color_min_brightness,
+        raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
+        raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
     )
     color_plot_ab_batches = []
     color_plot_bgr_batches = []
@@ -580,7 +623,7 @@ def main() -> int:
             args,
             color_classifier,
         )
-        if args.color_plot or args.rgb_color_plot or args.rgb_html_plot:
+        if args.color_plot or args.rgb_color_plot or args.rgb_html_plot or args.hsv_html_plot:
             if len(ab_samples) == 0:
                 raise SystemExit(
                     "Could not collect color plot samples because no pieces were segmented"
@@ -600,6 +643,11 @@ def main() -> int:
                     title="Piece segmentation reliable pixels in RGB",
                     point_size=plot_point_size,
                     normalize_rgb=args.normalize_rgb_plot,
+                    color_by_cluster=args.plotly_color_by_cluster,
+                    cluster_count=args.rgb_regression_clusters,
+                    cluster_min_brightness=args.rgb_regression_min_brightness,
+                    raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
+                    raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
                 )
             if args.rgb_html_plot:
                 save_rgb_samples_interactive_plot(
@@ -607,10 +655,26 @@ def main() -> int:
                     str(args.rgb_html_plot),
                     title="Piece segmentation reliable pixels in RGB",
                     normalize_rgb=args.normalize_rgb_plot,
-                    point_size=plot_point_size,
+                    point_size=args.plotly_point_size,
                     draw_regression_lines=args.show_rgb_regressions,
                     regression_cluster_count=args.rgb_regression_clusters,
                     regression_min_brightness=args.rgb_regression_min_brightness,
+                    regression_line_width=args.plotly_regression_line_width,
+                    color_by_cluster=args.plotly_color_by_cluster,
+                    raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
+                    raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
+                )
+            if args.hsv_html_plot:
+                save_hsv_samples_interactive_plot(
+                    bgr_samples,
+                    str(args.hsv_html_plot),
+                    title="Piece segmentation reliable pixels in HSV",
+                    point_size=args.plotly_point_size,
+                    color_by_cluster=args.plotly_color_by_cluster,
+                    cluster_count=args.rgb_regression_clusters,
+                    cluster_min_brightness=args.rgb_regression_min_brightness,
+                    raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
+                    raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
                 )
         if args.save:
             cv2.imwrite(str(args.save), output)
@@ -661,7 +725,7 @@ def main() -> int:
 
         if args.save and args.once:
             cv2.imwrite(str(args.save), output)
-        if args.color_plot or args.rgb_color_plot or args.rgb_html_plot:
+        if args.color_plot or args.rgb_color_plot or args.rgb_html_plot or args.hsv_html_plot:
             if color_plot_detected_frames < args.color_plot_frames and len(ab_samples) > 0:
                 color_plot_ab_batches.append(ab_samples)
                 color_plot_bgr_batches.append(bgr_samples)
@@ -679,7 +743,7 @@ def main() -> int:
     capture.release()
     if args.display:
         cv2.destroyAllWindows()
-    if args.color_plot or args.rgb_color_plot or args.rgb_html_plot:
+    if args.color_plot or args.rgb_color_plot or args.rgb_html_plot or args.hsv_html_plot:
         if not color_plot_ab_batches:
             raise SystemExit("Could not collect color plot samples from any segmented frames")
         ab_samples = np.concatenate(color_plot_ab_batches, axis=0)
@@ -702,6 +766,11 @@ def main() -> int:
                 title=f"Piece segmentation RGB samples across {color_plot_detected_frames} frames",
                 point_size=plot_point_size,
                 normalize_rgb=args.normalize_rgb_plot,
+                color_by_cluster=args.plotly_color_by_cluster,
+                cluster_count=args.rgb_regression_clusters,
+                cluster_min_brightness=args.rgb_regression_min_brightness,
+                raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
+                raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
             )
         if args.rgb_html_plot:
             save_rgb_samples_interactive_plot(
@@ -709,10 +778,26 @@ def main() -> int:
                 str(args.rgb_html_plot),
                 title=f"Piece segmentation RGB samples across {color_plot_detected_frames} frames",
                 normalize_rgb=args.normalize_rgb_plot,
-                point_size=plot_point_size,
+                point_size=args.plotly_point_size,
                 draw_regression_lines=args.show_rgb_regressions,
                 regression_cluster_count=args.rgb_regression_clusters,
                 regression_min_brightness=args.rgb_regression_min_brightness,
+                regression_line_width=args.plotly_regression_line_width,
+                color_by_cluster=args.plotly_color_by_cluster,
+                raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
+                raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
+            )
+        if args.hsv_html_plot:
+            save_hsv_samples_interactive_plot(
+                bgr_samples,
+                str(args.hsv_html_plot),
+                title=f"Piece segmentation HSV samples across {color_plot_detected_frames} frames",
+                point_size=args.plotly_point_size,
+                color_by_cluster=args.plotly_color_by_cluster,
+                cluster_count=args.rgb_regression_clusters,
+                cluster_min_brightness=args.rgb_regression_min_brightness,
+                raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
+                raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
             )
     return 0
 

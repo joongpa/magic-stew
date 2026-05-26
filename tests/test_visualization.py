@@ -8,8 +8,10 @@ from live_recognition.visualization import (
     build_luminance_debug_view,
     draw_result,
     lab_ab_samples_from_bbox,
+    rgb_regression_fit_sample_mask,
     rgb_origin_regression_rays,
     save_lab_ab_plot,
+    save_hsv_samples_interactive_plot,
     save_rgb_samples_interactive_plot,
     save_rgb_samples_plot,
 )
@@ -236,6 +238,39 @@ def test_save_rgb_samples_plot_can_normalize_rgb_coordinates(tmp_path):
         assert angle_path.stat().st_size > 0
 
 
+def test_save_rgb_samples_plot_can_color_by_cluster(tmp_path):
+    bgr_samples = np.array(
+        [
+            [20, 20, 220],
+            [18, 18, 210],
+            [16, 16, 200],
+            [14, 14, 190],
+            [20, 220, 20],
+            [18, 210, 18],
+            [16, 200, 16],
+            [14, 190, 14],
+            [220, 40, 40],
+        ],
+        dtype=np.uint8,
+    )
+    output_path = tmp_path / "rgb_cluster.png"
+
+    saved_paths = save_rgb_samples_plot(
+        bgr_samples,
+        str(output_path),
+        color_by_cluster=True,
+        cluster_count=2,
+        cluster_min_brightness=20,
+    )
+
+    assert len(saved_paths) == 3
+    for suffix in ("rg", "rb", "gb"):
+        angle_path = tmp_path / f"rgb_cluster_{suffix}.png"
+        assert str(angle_path) in saved_paths
+        assert angle_path.exists()
+        assert angle_path.stat().st_size > 0
+
+
 def test_rgb_origin_regression_rays_finds_six_directions():
     base_colors = np.array(
         [
@@ -262,6 +297,36 @@ def test_rgb_origin_regression_rays_finds_six_directions():
     assert directions.shape == (6, 3)
     assert centroids.shape == (6, 3)
     assert np.allclose(np.linalg.norm(directions, axis=1), 1.0)
+
+
+def test_rgb_regression_fit_sample_mask_rejects_sparse_raw_rgb_samples():
+    dense_red = np.array(
+        [
+            [180, 20, 20],
+            [182, 21, 20],
+            [178, 19, 21],
+            [181, 20, 22],
+        ],
+        dtype=np.uint8,
+    )
+    sparse_tail = np.array(
+        [
+            [95, 14, 14],
+            [60, 9, 9],
+        ],
+        dtype=np.uint8,
+    )
+    samples = np.concatenate([dense_red, sparse_tail], axis=0)
+
+    fit_mask = rgb_regression_fit_sample_mask(
+        samples,
+        cluster_count=1,
+        min_brightness=20,
+        raw_density_filter_radius=6,
+        raw_density_filter_min_neighbors=2,
+    )
+
+    assert fit_mask.tolist() == [True, True, True, True, False, False]
 
 
 def test_save_rgb_samples_interactive_plot_can_draw_regression_lines(tmp_path):
@@ -291,3 +356,137 @@ def test_save_rgb_samples_interactive_plot_can_draw_regression_lines(tmp_path):
     assert "RGB ray 1" in html
     assert "RGB ray 2" in html
     assert "RGB ray 3" in html
+
+
+def test_save_hsv_samples_interactive_plot_writes_html(tmp_path):
+    pytest.importorskip("plotly")
+    bgr_samples = np.array(
+        [
+            [0, 0, 220],
+            [0, 220, 0],
+            [220, 0, 0],
+            [0, 220, 220],
+        ],
+        dtype=np.uint8,
+    )
+    output_path = tmp_path / "hsv.html"
+
+    save_hsv_samples_interactive_plot(bgr_samples, str(output_path))
+
+    html = output_path.read_text()
+    assert "Reliable pixels in HSV" in html
+    assert "raw RGB" in html
+
+
+def test_interactive_plots_can_color_by_rgb_cluster(tmp_path):
+    pytest.importorskip("plotly")
+    rgb_samples = np.array(
+        [
+            [220, 20, 20],
+            [120, 10, 10],
+            [20, 220, 20],
+            [10, 120, 10],
+            [20, 20, 220],
+            [10, 10, 120],
+        ],
+        dtype=np.uint8,
+    )
+    bgr_samples = rgb_samples[:, ::-1]
+    rgb_output_path = tmp_path / "rgb_cluster.html"
+    hsv_output_path = tmp_path / "hsv_cluster.html"
+
+    save_rgb_samples_interactive_plot(
+        bgr_samples,
+        str(rgb_output_path),
+        regression_cluster_count=3,
+        regression_min_brightness=20,
+        color_by_cluster=True,
+    )
+    save_hsv_samples_interactive_plot(
+        bgr_samples,
+        str(hsv_output_path),
+        cluster_count=3,
+        cluster_min_brightness=20,
+        color_by_cluster=True,
+    )
+
+    rgb_html = rgb_output_path.read_text()
+    hsv_html = hsv_output_path.read_text()
+    assert "cluster 1" in rgb_html
+    assert "cluster 2" in rgb_html
+    assert "cluster 3" in rgb_html
+    assert "cluster=%{customdata[3]}" in rgb_html
+    assert "cluster 1" in hsv_html
+    assert "cluster 2" in hsv_html
+    assert "cluster 3" in hsv_html
+    assert "cluster=%{customdata[3]}" in hsv_html
+
+
+def test_cluster_colored_plot_shows_low_brightness_samples_as_unknown(tmp_path):
+    pytest.importorskip("plotly")
+    rgb_samples = np.array(
+        [
+            [220, 20, 20],
+            [210, 18, 18],
+            [200, 16, 16],
+            [190, 14, 14],
+            [20, 220, 20],
+            [18, 210, 18],
+            [16, 200, 16],
+            [14, 190, 14],
+            [1, 1, 1],
+        ],
+        dtype=np.uint8,
+    )
+    output_path = tmp_path / "rgb_cluster_unknown.html"
+
+    save_rgb_samples_interactive_plot(
+        rgb_samples[:, ::-1],
+        str(output_path),
+        regression_cluster_count=2,
+        regression_min_brightness=20,
+        color_by_cluster=True,
+    )
+
+    html = output_path.read_text()
+    assert "cluster unknown" in html
+
+
+def test_raw_color_plot_shows_low_brightness_samples_as_unknown(tmp_path):
+    pytest.importorskip("plotly")
+    rgb_samples = np.array(
+        [
+            [220, 20, 20],
+            [210, 18, 18],
+            [200, 16, 16],
+            [190, 14, 14],
+            [20, 220, 20],
+            [18, 210, 18],
+            [16, 200, 16],
+            [14, 190, 14],
+            [1, 1, 1],
+        ],
+        dtype=np.uint8,
+    )
+    rgb_output_path = tmp_path / "rgb_raw_unknown.html"
+    hsv_output_path = tmp_path / "hsv_raw_unknown.html"
+
+    save_rgb_samples_interactive_plot(
+        rgb_samples[:, ::-1],
+        str(rgb_output_path),
+        regression_cluster_count=2,
+        regression_min_brightness=20,
+    )
+    save_hsv_samples_interactive_plot(
+        rgb_samples[:, ::-1],
+        str(hsv_output_path),
+        cluster_count=2,
+        cluster_min_brightness=20,
+    )
+
+    rgb_html = rgb_output_path.read_text()
+    hsv_html = hsv_output_path.read_text()
+    assert "samples (raw color)" in rgb_html
+    assert "cluster unknown" in rgb_html
+    assert "samples (raw color)" in hsv_html
+    assert "cluster unknown" in hsv_html
