@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from pathlib import Path
 from typing import Protocol
 
 import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from live_recognition.model_utils import (
+    ensure_yolo_config_dir,
+    resolve_model_path,
+    resolve_sam3_model_path,
+)
 from live_recognition.types import CubeCandidate
 
 
@@ -25,25 +29,6 @@ def _best_confident_box_index(confidences, threshold: float) -> int | None:
     candidate_indexes = above_threshold.nonzero().flatten()
     best_local_index = int(confidences[candidate_indexes].argmax().item())
     return int(candidate_indexes[best_local_index].item())
-
-
-def _resolve_sam3_model_path(model_name: str) -> str:
-    model_path = Path(model_name)
-    if model_path.exists():
-        return str(model_path)
-
-    raise FileNotFoundError(
-        f"SAM 3 weights not found: {model_name}. "
-        "Download sam3.pt from the gated Meta SAM 3 Hugging Face page after access is approved, "
-        "place it in this project directory, or pass its path with --model /path/to/sam3.pt."
-    )
-
-
-def _resolve_model_path(model_name: str, description: str) -> str:
-    model_path = Path(model_name)
-    if model_path.exists():
-        return str(model_path)
-    raise FileNotFoundError(f"{description} weights not found: {model_name}")
 
 
 def _bbox_from_mask(mask: NDArray[np.uint8]) -> tuple[int, int, int, int] | None:
@@ -87,6 +72,7 @@ class SAM3CubeDetector:
     return_mask: bool = False
 
     def __post_init__(self) -> None:
+        ensure_yolo_config_dir()
         os.environ.setdefault("YOLO_CONFIG_DIR", ".ultralytics")
 
         from ultralytics.models.sam import SAM3SemanticPredictor
@@ -132,7 +118,7 @@ class SAM3CubeDetector:
                     results.append(Results(orig_img, path=img_path, names=names, masks=None, boxes=boxes))
                 return results
 
-        model_path = _resolve_sam3_model_path(self.model_name)
+        model_path = resolve_sam3_model_path(self.model_name)
 
         overrides = {
             "conf": self.confidence_threshold,
@@ -198,10 +184,11 @@ class YOLOCubeDetector:
     image_size: int = 640
 
     def __post_init__(self) -> None:
+        ensure_yolo_config_dir()
         os.environ.setdefault("YOLO_CONFIG_DIR", ".ultralytics")
         from ultralytics import YOLO
 
-        self.model = YOLO(_resolve_model_path(self.model_name, "YOLO"))
+        self.model = YOLO(resolve_model_path(self.model_name, "YOLO"))
 
     def detect_all(self, frame_bgr: NDArray[np.uint8]) -> list[CubeCandidate]:
         results = self.model.predict(

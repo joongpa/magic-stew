@@ -24,6 +24,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
+from live_recognition.piece_graph import PieceMask, build_piece_graph, draw_piece_graph  # noqa: E402
 from live_recognition.visualization import (  # noqa: E402
     _gray_world_white_balance,
     _reliable_color_mask,
@@ -44,6 +45,11 @@ CLASS_COLORS = {
     0: (80, 220, 255),   # center
     1: (80, 255, 120),   # edge
     2: (255, 120, 80),   # corner
+}
+PIECE_TYPE_BY_CLASS_ID = {
+    0: "center",
+    1: "edge",
+    2: "corner",
 }
 CENTER_CLASS_ID = 0
 STICKER_COUNTS_BY_CLASS = {
@@ -251,6 +257,7 @@ def sticker_segments_from_piece(
     *,
     spatial_weight: float = 1.0,
     max_iterations: int = 30,
+    min_segment_ratio: float = 0.25,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     x1, y1, x2, y2 = roi_xyxy
     crop = frame[y1:y2, x1:x2]
@@ -277,9 +284,10 @@ def sticker_segments_from_piece(
         cluster_count=sticker_count,
         spatial_weight=spatial_weight,
         max_iterations=max_iterations,
+        min_segment_ratio=min_segment_ratio,
     )
     stickers = []
-    for cluster_index in range(sticker_count):
+    for cluster_index in sorted(int(label) for label in np.unique(labels[labels >= 0])):
         sticker_mask = piece_mask & (labels == cluster_index)
         if not bool(sticker_mask.any()):
             continue
@@ -303,6 +311,7 @@ def rgbxy_kmeans_labels(
     cluster_count: int,
     spatial_weight: float = 1.0,
     max_iterations: int = 30,
+    min_segment_ratio: float = 0.25,
 ) -> np.ndarray:
     ys, xs = np.nonzero(mask)
     labels_image = np.full(mask.shape, -1, dtype=np.int32)
@@ -336,7 +345,12 @@ def rgbxy_kmeans_labels(
         centers = next_centers
         labels = next_labels
 
-    labels = collapse_similar_sticker_labels(labels, rgb, k)
+    labels = merge_small_sticker_labels(
+        labels,
+        features,
+        k,
+        min_segment_ratio=min_segment_ratio,
+    )
     labels = reorder_sticker_labels(labels, features, int(labels.max()) + 1)
     labels_image[ys, xs] = labels
     return labels_image
@@ -371,38 +385,106 @@ def reorder_sticker_labels(
     return np.asarray([remap[int(label)] for label in labels], dtype=np.int32)
 
 
-def collapse_similar_sticker_labels(
+def merge_small_sticker_labels(
     labels: np.ndarray,
-    rgb: np.ndarray,
+    features: np.ndarray,
     cluster_count: int,
     *,
-    color_distance_threshold: float = 28.0,
+    min_segment_ratio: float,
 ) -> np.ndarray:
-    remap = {cluster_index: cluster_index for cluster_index in range(cluster_count)}
-    means = []
-    for cluster_index in range(cluster_count):
-        members = rgb[labels == cluster_index]
-        means.append(members.mean(axis=0) if len(members) > 0 else None)
+    if min_segment_ratio <= 0 or cluster_count <= 1:
+        return labels
 
+    sizes = np.bincount(labels, minlength=cluster_count)
+    if len(sizes) == 0:
+        return labels
+
+    largest_size = int(sizes.max())
+    if largest_size <= 0:
+        return labels
+
+    min_size = largest_size * float(min_segment_ratio)
+    keep_indexes = np.flatnonzero(sizes >= min_size)
+    if len(keep_indexes) == 0:
+        keep_indexes = np.array([int(sizes.argmax())], dtype=np.int32)
+
+    centers = []
     for cluster_index in range(cluster_count):
-        if means[cluster_index] is None:
+        members = features[labels == cluster_index]
+        if len(members) == 0:
+            centers.append(np.full(features.shape[1], np.inf, dtype=np.float32))
+        else:
+            centers.append(members.mean(axis=0))
+    centers_array = np.asarray(centers, dtype=np.float32)
+    kept_centers = centers_array[keep_indexes]
+    kept_index_set = set(int(index) for index in keep_indexes)
+
+    next_labels = labels.copy()
+    for cluster_index in range(cluster_count):
+        if cluster_index in kept_index_set:
             continue
-        for previous_index in range(cluster_index):
-            if means[previous_index] is None:
-                continue
-            distance = float(np.linalg.norm(means[cluster_index] - means[previous_index]))
-            if distance <= color_distance_threshold:
-                remap[cluster_index] = remap[previous_index]
-                break
+        member_mask = labels == cluster_index
+        if not bool(member_mask.any()):
+            continue
+        distances = np.linalg.norm(
+            features[member_mask, None, :] - kept_centers[None, :, :],
+            axis=2,
+        )
+        nearest_kept = keep_indexes[distances.argmin(axis=1)]
+        next_labels[member_mask] = nearest_kept
 
     compact_indexes = {
-        old_index: new_index
-        for new_index, old_index in enumerate(sorted(set(remap.values())))
+        old_index: new_index for new_index, old_index in enumerate(sorted(set(next_labels)))
     }
     return np.asarray(
-        [compact_indexes[remap[int(label)]] for label in labels],
+        [compact_indexes[int(label)] for label in next_labels],
         dtype=np.int32,
     )
+
+
+def stickers_for_ready_color_classifier(
+    frame: np.ndarray,
+    roi_xyxy: tuple[int, int, int, int],
+    stickers: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    color_classifier: ColorRayClassifier | None,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, int | None]]:
+    classified_stickers = []
+    if color_classifier is None or not color_classifier.ready:
+        return [(mask, bgr, ab, None) for mask, bgr, ab in stickers]
+
+    grouped_masks: dict[tuple[str, int], list[np.ndarray]] = {}
+    group_order = []
+    for sticker_index, (sticker_mask, sticker_bgr, _,) in enumerate(stickers):
+        cluster_index = (
+            color_classifier.classify_bgr(sticker_bgr)
+            if len(sticker_bgr) == 3
+            else None
+        )
+        if cluster_index is not None and cluster_index < len(color_classifier.centroids):
+            key = ("cluster", int(cluster_index))
+        else:
+            key = ("raw", sticker_index)
+        if key not in grouped_masks:
+            grouped_masks[key] = []
+            group_order.append(key)
+        grouped_masks[key].append(sticker_mask)
+
+    for key in group_order:
+        merged_mask = np.zeros_like(grouped_masks[key][0], dtype=bool)
+        for sticker_mask in grouped_masks[key]:
+            merged_mask |= sticker_mask
+        mean_ab, mean_bgr = lab_ab_samples_from_piece(
+            frame,
+            roi_xyxy,
+            merged_mask,
+            max_samples=1,
+            average_color=True,
+        )
+        if len(mean_bgr) == 0:
+            continue
+        cluster_index = key[1] if key[0] == "cluster" else None
+        classified_stickers.append((merged_mask, mean_bgr[0], mean_ab[0], cluster_index))
+    return classified_stickers
 
 
 def concatenate_samples(
@@ -448,6 +530,7 @@ def draw_piece_segments(
     if masks is None or boxes is None:
         return 0, np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
 
+    source_frame = frame.copy()
     overlay = frame.copy()
     roi_height = y2 - y1
     roi_width = x2 - x1
@@ -455,6 +538,7 @@ def draw_piece_segments(
     confidence_labels = []
     sticker_color_numbers = []
     classifier_bgr_batches = []
+    piece_masks = []
     for index in range(len(boxes)):
         class_id = int(boxes.cls[index].item())
         color = CLASS_COLORS.get(class_id, (255, 255, 255))
@@ -471,6 +555,19 @@ def draw_piece_segments(
         label_at = (int(xs.mean()) + x1, int(ys.mean()) + y1)
         confidence = float(boxes.conf[index].item())
         confidence_labels.append((label_at, confidence))
+        full_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        full_mask[y1:y2, x1:x2] = draw_mask.astype(np.uint8) * 255
+        piece_masks.append(
+            PieceMask(
+                piece_id=len(piece_masks),
+                class_id=class_id,
+                piece_type=PIECE_TYPE_BY_CLASS_ID.get(class_id, str(class_id)),
+                confidence=confidence,
+                mask=full_mask,
+                roi_mask=draw_mask,
+                roi_xyxy=roi_xyxy,
+            )
+        )
 
         if args.debug_overlay:
             contours, _ = cv2.findContours(
@@ -489,19 +586,26 @@ def draw_piece_segments(
                     continue
                 cv2.polylines(frame, [points], isClosed=True, color=color, thickness=2)
 
-        stickers = sticker_segments_from_piece(
+        raw_stickers = sticker_segments_from_piece(
             frame,
             roi_xyxy,
             draw_mask,
             class_id,
+            min_segment_ratio=args.min_sticker_segment_ratio,
         )
-        if not stickers:
-            stickers = [
+        if not raw_stickers:
+            raw_stickers = [
                 (draw_mask, np.empty((0,), dtype=np.uint8), np.empty((0,), dtype=np.float32))
             ]
+        display_stickers = stickers_for_ready_color_classifier(
+            frame,
+            roi_xyxy,
+            raw_stickers,
+            color_classifier,
+        )
 
         roi_overlay = overlay[y1:y2, x1:x2]
-        for sticker_mask, sticker_bgr, _ in stickers:
+        for sticker_mask, sticker_bgr, _, cluster_index in display_stickers:
             sticker_color = color
             if (
                 color_classifier is not None
@@ -509,7 +613,6 @@ def draw_piece_segments(
                 and getattr(args, "show_center_color_classification", True)
                 and len(sticker_bgr) == 3
             ):
-                cluster_index = color_classifier.classify_bgr(sticker_bgr)
                 if cluster_index is not None and cluster_index < len(color_classifier.centroids):
                     centroid_rgb = color_classifier.centroids[cluster_index]
                     sticker_color = tuple(int(value) for value in centroid_rgb[::-1])
@@ -521,19 +624,30 @@ def draw_piece_segments(
                     sticker_color_numbers.append((sticker_label_at, cluster_index + 1))
             roi_overlay[sticker_mask] = sticker_color
 
-        ab_samples, bgr_samples = lab_ab_samples_from_piece(
-            frame,
-            roi_xyxy,
-            draw_mask,
+        sticker_ab_batches = []
+        sticker_bgr_batches = []
+        for sticker_mask, _, _, _ in display_stickers:
+            sticker_ab_samples, sticker_bgr_samples = lab_ab_samples_from_piece(
+                frame,
+                roi_xyxy,
+                sticker_mask,
+                args.color_plot_samples_per_frame,
+                args.average_mask_color,
+            )
+            if len(sticker_ab_samples) > 0:
+                sticker_ab_batches.append(sticker_ab_samples)
+                sticker_bgr_batches.append(sticker_bgr_samples)
+        ab_samples, bgr_samples = concatenate_samples(
+            sticker_ab_batches,
+            sticker_bgr_batches,
             args.color_plot_samples_per_frame,
-            args.average_mask_color,
         )
         if len(ab_samples) > 0:
             ab_batches.append(ab_samples)
             bgr_batches.append(bgr_samples)
         if color_classifier is not None:
             classifier_bgr_samples = np.asarray(
-                [sticker_bgr for _, sticker_bgr, _ in stickers if len(sticker_bgr) == 3],
+                [sticker_bgr for _, sticker_bgr, _ in raw_stickers if len(sticker_bgr) == 3],
                 dtype=np.uint8,
             ).reshape(-1, 3)
             if len(classifier_bgr_samples) > 0:
@@ -542,6 +656,20 @@ def draw_piece_segments(
 
     mask = cv2.addWeighted(frame, 1.0 - args.mask_opacity, overlay, args.mask_opacity, 0)
     frame[:] = mask
+    if args.draw_piece_graph and piece_masks:
+        graph = build_piece_graph(
+            source_frame,
+            piece_masks,
+            adjacency_radius_px=args.graph_adjacency_radius,
+            min_component_area_px=args.graph_min_sticker_area,
+            min_sticker_segment_ratio=args.min_sticker_segment_ratio,
+        )
+        frame[:] = draw_piece_graph(
+            frame,
+            graph,
+            roi_xyxy=roi_xyxy,
+            draw_masks=False,
+        )
     if args.show_confidence or args.debug_overlay:
         for label_at, confidence in confidence_labels:
             cv2.putText(
@@ -666,6 +794,34 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=-2,
         help="Pixel padding applied to each piece mask before sampling; negative values erode",
+    )
+    parser.add_argument(
+        "--min-sticker-segment-ratio",
+        type=float,
+        default=0.25,
+        help=(
+            "Merge RGBXY sticker segments smaller than this fraction of the largest "
+            "segment before recognition and color plotting; 0 disables"
+        ),
+    )
+    parser.add_argument(
+        "--draw-piece-graph",
+        action="store_true",
+        help="Draw piece graph nodes and edges on top of the segmentation overlay",
+    )
+    parser.add_argument(
+        "--adjacency-radius",
+        "--graph-adjacency-radius",
+        dest="graph_adjacency_radius",
+        type=int,
+        default=6,
+        help="Pixel distance threshold used when connecting nearby graph nodes",
+    )
+    parser.add_argument(
+        "--graph-min-sticker-area",
+        type=int,
+        default=12,
+        help="Minimum sticker area kept as a graph node",
     )
     parser.add_argument("--mask-opacity", type=float, default=1.0)
     parser.add_argument("--color-plot", type=Path, help="Output PNG path for LAB a/b samples")

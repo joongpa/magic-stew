@@ -53,6 +53,16 @@ Single image:
 cube-orient --source /path/to/frame.jpg --once --save runs/frame_bbox.jpg
 ```
 
+Piece graph overlay:
+
+```bash
+cube-piece-graph --source /path/to/frame.jpg --display
+```
+
+`cube-piece-graph` runs the cube bounding-box model first, runs the center/edge/corner
+piece segmentation model, clips piece masks to the detected cube, and draws legal graph
+edges between adjacent sticker centroids. Legal edges are center-edge and edge-corner.
+
 Add `--display` if you want an OpenCV preview window. Press `q` to exit the video window.
 
 ```bash

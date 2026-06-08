@@ -75,6 +75,10 @@ def default_args(**overrides):
         "color_plot_samples_per_frame": 800,
         "average_mask_color": False,
         "show_center_color_classification": True,
+        "min_sticker_segment_ratio": 0.25,
+        "draw_piece_graph": False,
+        "graph_adjacency_radius": 6,
+        "graph_min_sticker_area": 12,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -159,6 +163,22 @@ def test_average_mask_color_returns_one_sample_per_piece():
     assert bgr_samples[0, 2] > bgr_samples[0, 0]
 
 
+def test_process_frame_can_draw_piece_graph_overlay():
+    frame = np.zeros((40, 40, 3), dtype=np.uint8)
+    frame[:, :] = [40, 40, 40]
+    frame[10:20, 10:20] = [0, 0, 220]
+    args = default_args(draw_piece_graph=True, graph_min_sticker_area=10_000)
+
+    output, _, _ = piece_seg_script.process_frame(
+        frame,
+        StubBboxDetector(),
+        StubPieceModel(),
+        args,
+    )
+
+    assert np.array_equal(output[15, 15], piece_seg_script.CLASS_COLORS[0])
+
+
 def test_rgbxy_sticker_segmentation_splits_edge_into_two_color_regions():
     frame = np.zeros((30, 30, 3), dtype=np.uint8)
     frame[:, :] = [40, 40, 40]
@@ -180,10 +200,11 @@ def test_rgbxy_sticker_segmentation_splits_edge_into_two_color_regions():
     assert (sticker_bgrs[:, 0] > sticker_bgrs[:, 2]).any()
 
 
-def test_rgbxy_sticker_segmentation_collapses_same_color_edge_region():
+def test_rgbxy_sticker_segmentation_merges_tiny_edge_segment():
     frame = np.zeros((30, 30, 3), dtype=np.uint8)
     frame[:, :] = [40, 40, 40]
     frame[5:20, 5:20] = [220, 0, 0]
+    frame[5:7, 18:20] = [0, 0, 220]
     piece_mask = np.zeros((30, 30), dtype=bool)
     piece_mask[5:20, 5:20] = True
 
@@ -195,7 +216,26 @@ def test_rgbxy_sticker_segmentation_collapses_same_color_edge_region():
     )
 
     assert len(stickers) == 1
-    assert np.array_equal(stickers[0][1], [220, 0, 0])
+    assert stickers[0][1][0] > stickers[0][1][2]
+
+
+def test_rgbxy_sticker_segmentation_can_disable_tiny_segment_merge():
+    frame = np.zeros((30, 30, 3), dtype=np.uint8)
+    frame[:, :] = [40, 40, 40]
+    frame[5:20, 5:20] = [220, 0, 0]
+    frame[5:7, 18:20] = [0, 0, 220]
+    piece_mask = np.zeros((30, 30), dtype=bool)
+    piece_mask[5:20, 5:20] = True
+
+    stickers = piece_seg_script.sticker_segments_from_piece(
+        frame,
+        (0, 0, 30, 30),
+        piece_mask,
+        class_id=1,
+        min_segment_ratio=0.0,
+    )
+
+    assert len(stickers) == 2
 
 
 def test_color_classifier_collects_mean_samples_from_sticker_segments():
@@ -219,9 +259,42 @@ def test_color_classifier_collects_mean_samples_from_sticker_segments():
 
     observed = np.asarray(classifier._rgb_samples)
     assert classifier.detected_frames == 1
-    assert len(observed) == 2
+    assert len(observed) == 3
     assert (observed[:, 0] > observed[:, 2]).any()
     assert (observed[:, 2] > observed[:, 0]).any()
+
+
+def test_ready_color_classifier_merges_same_color_sticker_segments():
+    frame = np.zeros((30, 30, 3), dtype=np.uint8)
+    frame[:, :] = [40, 40, 40]
+    frame[5:20, 5:12] = [0, 0, 220]
+    frame[5:20, 12:20] = [0, 0, 180]
+    left_mask = np.zeros((30, 30), dtype=bool)
+    left_mask[5:20, 5:12] = True
+    right_mask = np.zeros((30, 30), dtype=bool)
+    right_mask[5:20, 12:20] = True
+    classifier = piece_seg_script.ColorRayClassifier(
+        required_frames=1,
+        cluster_count=1,
+        min_brightness=20,
+    )
+    classifier.centroids = np.array([[220.0, 0.0, 0.0]], dtype=np.float32)
+    classifier.cluster_samples = [np.array([[220.0, 0.0, 0.0]], dtype=np.float32)]
+    stickers = [
+        (left_mask, np.array([0, 0, 220], dtype=np.uint8), np.array([0, 0], dtype=np.float32)),
+        (right_mask, np.array([0, 0, 180], dtype=np.uint8), np.array([0, 0], dtype=np.float32)),
+    ]
+
+    merged = piece_seg_script.stickers_for_ready_color_classifier(
+        frame,
+        (0, 0, 30, 30),
+        stickers,
+        classifier,
+    )
+
+    assert len(merged) == 1
+    assert merged[0][3] == 0
+    assert int(merged[0][0].sum()) == int(left_mask.sum() + right_mask.sum())
 
 
 def test_learned_color_recolors_each_sticker_after_classifier_ready():
@@ -377,3 +450,25 @@ def test_parser_exposes_color_classifier_mode():
     )
 
     assert args.color_classifier_mode == "linear-regression"
+
+
+def test_parser_exposes_min_sticker_segment_ratio():
+    args = piece_seg_script.build_parser().parse_args(["--min-sticker-segment-ratio", "0.4"])
+
+    assert args.min_sticker_segment_ratio == 0.4
+
+
+def test_parser_exposes_piece_graph_options():
+    args = piece_seg_script.build_parser().parse_args(
+        [
+            "--draw-piece-graph",
+            "--adjacency-radius",
+            "9",
+            "--graph-min-sticker-area",
+            "5",
+        ]
+    )
+
+    assert args.draw_piece_graph is True
+    assert args.graph_adjacency_radius == 9
+    assert args.graph_min_sticker_area == 5
