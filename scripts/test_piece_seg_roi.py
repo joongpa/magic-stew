@@ -27,7 +27,7 @@ from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
 from live_recognition.visualization import (  # noqa: E402
     _gray_world_white_balance,
     _reliable_color_mask,
-    rgb_origin_regression_rays,
+    rgb_origin_regression_clusters,
     save_lab_ab_samples_plot,
     save_hsv_samples_interactive_plot,
     save_rgb_samples_interactive_plot,
@@ -46,6 +46,12 @@ CLASS_COLORS = {
     2: (255, 120, 80),   # corner
 }
 CENTER_CLASS_ID = 0
+STICKER_COUNTS_BY_CLASS = {
+    0: 1,  # center
+    1: 2,  # edge
+    2: 3,  # corner
+}
+COLOR_CLASSIFIER_MODES = ("closest-cluster-point", "linear-regression")
 
 
 class ColorRayClassifier:
@@ -57,20 +63,25 @@ class ColorRayClassifier:
         min_brightness: float = 40.0,
         raw_density_filter_radius: float = 0.0,
         raw_density_filter_min_neighbors: int = 0,
+        mode: str = "closest-cluster-point",
     ) -> None:
+        if mode not in COLOR_CLASSIFIER_MODES:
+            raise ValueError(f"Unsupported color classifier mode: {mode}")
         self.required_frames = max(1, required_frames)
         self.cluster_count = max(1, cluster_count)
         self.min_brightness = min_brightness
         self.raw_density_filter_radius = raw_density_filter_radius
         self.raw_density_filter_min_neighbors = raw_density_filter_min_neighbors
+        self.mode = mode
         self.detected_frames = 0
         self._rgb_samples: list[np.ndarray] = []
         self.directions = np.empty((0, 3), dtype=np.float32)
         self.centroids = np.empty((0, 3), dtype=np.float32)
+        self.cluster_samples: list[np.ndarray] = []
 
     @property
     def ready(self) -> bool:
-        return len(self.directions) > 0
+        return len(self.directions) > 0 or len(self.cluster_samples) > 0
 
     def observe_frame(self, bgr_samples: np.ndarray) -> None:
         if self.ready or len(bgr_samples) == 0:
@@ -84,7 +95,7 @@ class ColorRayClassifier:
             return
 
         samples = np.asarray(self._rgb_samples, dtype=np.uint8)
-        self.directions, self.centroids = rgb_origin_regression_rays(
+        self.directions, self.centroids, self.cluster_samples = rgb_origin_regression_clusters(
             samples,
             cluster_count=self.cluster_count,
             min_brightness=self.min_brightness,
@@ -100,11 +111,31 @@ class ColorRayClassifier:
         if float(np.linalg.norm(rgb)) < self.min_brightness:
             return None
 
-        distances = distance_to_origin_rays(rgb, self.directions)
+        if self.mode == "linear-regression":
+            distances = distance_to_origin_rays(rgb, self.directions)
+        else:
+            distances = distance_to_rgb_clusters(rgb, self.cluster_samples)
+            if len(distances) == 0:
+                distances = distance_to_origin_rays(rgb, self.directions)
         if len(distances) == 0:
             return None
 
         return int(distances.argmin())
+
+
+def distance_to_rgb_clusters(
+    rgb_sample: np.ndarray,
+    cluster_samples: list[np.ndarray],
+) -> np.ndarray:
+    point = np.asarray(rgb_sample, dtype=np.float32).reshape(3)
+    distances = []
+    for samples in cluster_samples:
+        samples = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
+        if len(samples) == 0:
+            distances.append(np.inf)
+            continue
+        distances.append(float(np.min(np.linalg.norm(samples - point[None, :], axis=1))))
+    return np.asarray(distances, dtype=np.float32)
 
 
 def distance_to_origin_rays(
@@ -212,6 +243,168 @@ def lab_ab_samples_from_piece(
     return ab_samples, bgr_samples
 
 
+def sticker_segments_from_piece(
+    frame: np.ndarray,
+    roi_xyxy: tuple[int, int, int, int],
+    piece_mask: np.ndarray,
+    class_id: int,
+    *,
+    spatial_weight: float = 1.0,
+    max_iterations: int = 30,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    x1, y1, x2, y2 = roi_xyxy
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0 or not bool(piece_mask.any()):
+        return []
+
+    sticker_count = min(
+        STICKER_COUNTS_BY_CLASS.get(class_id, 1),
+        int(piece_mask.sum()),
+    )
+    if sticker_count <= 1:
+        mean_ab, mean_bgr = lab_ab_samples_from_piece(
+            frame,
+            roi_xyxy,
+            piece_mask,
+            max_samples=1,
+            average_color=True,
+        )
+        return [(piece_mask, mean_bgr[0], mean_ab[0])] if len(mean_bgr) else []
+
+    labels = rgbxy_kmeans_labels(
+        crop,
+        piece_mask,
+        cluster_count=sticker_count,
+        spatial_weight=spatial_weight,
+        max_iterations=max_iterations,
+    )
+    stickers = []
+    for cluster_index in range(sticker_count):
+        sticker_mask = piece_mask & (labels == cluster_index)
+        if not bool(sticker_mask.any()):
+            continue
+        mean_ab, mean_bgr = lab_ab_samples_from_piece(
+            frame,
+            roi_xyxy,
+            sticker_mask,
+            max_samples=1,
+            average_color=True,
+        )
+        if len(mean_bgr) == 0:
+            continue
+        stickers.append((sticker_mask, mean_bgr[0], mean_ab[0]))
+    return stickers
+
+
+def rgbxy_kmeans_labels(
+    crop_bgr: np.ndarray,
+    mask: np.ndarray,
+    *,
+    cluster_count: int,
+    spatial_weight: float = 1.0,
+    max_iterations: int = 30,
+) -> np.ndarray:
+    ys, xs = np.nonzero(mask)
+    labels_image = np.full(mask.shape, -1, dtype=np.int32)
+    if len(xs) == 0 or cluster_count <= 0:
+        return labels_image
+
+    k = min(cluster_count, len(xs))
+    rgb = crop_bgr[ys, xs, ::-1].astype(np.float32)
+    x_scale = max(mask.shape[1] - 1, 1)
+    y_scale = max(mask.shape[0] - 1, 1)
+    xy = np.column_stack(
+        [
+            xs.astype(np.float32) / x_scale * 255.0,
+            ys.astype(np.float32) / y_scale * 255.0,
+        ]
+    )
+    features = np.column_stack([rgb, xy * float(spatial_weight)]).astype(np.float32)
+    centers = initialize_kmeans_centers(features, k)
+    labels = np.zeros(len(features), dtype=np.int32)
+    for _ in range(max_iterations):
+        distances = np.linalg.norm(features[:, None, :] - centers[None, :, :], axis=2)
+        next_labels = distances.argmin(axis=1).astype(np.int32)
+        next_centers = centers.copy()
+        for cluster_index in range(k):
+            members = features[next_labels == cluster_index]
+            if len(members) > 0:
+                next_centers[cluster_index] = members.mean(axis=0)
+        if np.array_equal(labels, next_labels) and np.allclose(centers, next_centers):
+            labels = next_labels
+            break
+        centers = next_centers
+        labels = next_labels
+
+    labels = collapse_similar_sticker_labels(labels, rgb, k)
+    labels = reorder_sticker_labels(labels, features, int(labels.max()) + 1)
+    labels_image[ys, xs] = labels
+    return labels_image
+
+
+def initialize_kmeans_centers(features: np.ndarray, cluster_count: int) -> np.ndarray:
+    centers = [features[0]]
+    while len(centers) < cluster_count:
+        distances = np.min(
+            np.linalg.norm(features[:, None, :] - np.asarray(centers)[None, :, :], axis=2),
+            axis=1,
+        )
+        centers.append(features[int(np.argmax(distances))])
+    return np.asarray(centers, dtype=np.float32)
+
+
+def reorder_sticker_labels(
+    labels: np.ndarray,
+    features: np.ndarray,
+    cluster_count: int,
+) -> np.ndarray:
+    centers = []
+    for cluster_index in range(cluster_count):
+        members = features[labels == cluster_index]
+        if len(members) == 0:
+            centers.append((np.inf, np.inf, cluster_index))
+            continue
+        center = members.mean(axis=0)
+        centers.append((float(center[4]), float(center[3]), cluster_index))
+    ordered_indexes = [cluster_index for _, _, cluster_index in sorted(centers)]
+    remap = {old_index: new_index for new_index, old_index in enumerate(ordered_indexes)}
+    return np.asarray([remap[int(label)] for label in labels], dtype=np.int32)
+
+
+def collapse_similar_sticker_labels(
+    labels: np.ndarray,
+    rgb: np.ndarray,
+    cluster_count: int,
+    *,
+    color_distance_threshold: float = 28.0,
+) -> np.ndarray:
+    remap = {cluster_index: cluster_index for cluster_index in range(cluster_count)}
+    means = []
+    for cluster_index in range(cluster_count):
+        members = rgb[labels == cluster_index]
+        means.append(members.mean(axis=0) if len(members) > 0 else None)
+
+    for cluster_index in range(cluster_count):
+        if means[cluster_index] is None:
+            continue
+        for previous_index in range(cluster_index):
+            if means[previous_index] is None:
+                continue
+            distance = float(np.linalg.norm(means[cluster_index] - means[previous_index]))
+            if distance <= color_distance_threshold:
+                remap[cluster_index] = remap[previous_index]
+                break
+
+    compact_indexes = {
+        old_index: new_index
+        for new_index, old_index in enumerate(sorted(set(remap.values())))
+    }
+    return np.asarray(
+        [compact_indexes[remap[int(label)]] for label in labels],
+        dtype=np.int32,
+    )
+
+
 def concatenate_samples(
     ab_batches: list[np.ndarray],
     bgr_batches: list[np.ndarray],
@@ -260,7 +453,7 @@ def draw_piece_segments(
     roi_width = x2 - x1
     count = 0
     confidence_labels = []
-    center_color_numbers = []
+    sticker_color_numbers = []
     classifier_bgr_batches = []
     for index in range(len(boxes)):
         class_id = int(boxes.cls[index].item())
@@ -296,32 +489,38 @@ def draw_piece_segments(
                     continue
                 cv2.polylines(frame, [points], isClosed=True, color=color, thickness=2)
 
-        _, center_bgr_samples = (
-            lab_ab_samples_from_piece(
-                frame,
-                roi_xyxy,
-                draw_mask,
-                max_samples=1,
-                average_color=True,
-            )
-            if color_classifier is not None and class_id == CENTER_CLASS_ID
-            else (np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8))
+        stickers = sticker_segments_from_piece(
+            frame,
+            roi_xyxy,
+            draw_mask,
+            class_id,
         )
-        if (
-            color_classifier is not None
-            and color_classifier.ready
-            and getattr(args, "show_center_color_classification", True)
-            and class_id == CENTER_CLASS_ID
-            and len(center_bgr_samples) > 0
-        ):
-            cluster_index = color_classifier.classify_bgr(center_bgr_samples[0])
-            if cluster_index is not None and cluster_index < len(color_classifier.centroids):
-                centroid_rgb = color_classifier.centroids[cluster_index]
-                color = tuple(int(value) for value in centroid_rgb[::-1])
-                center_color_numbers.append((label_at, cluster_index + 1))
+        if not stickers:
+            stickers = [
+                (draw_mask, np.empty((0,), dtype=np.uint8), np.empty((0,), dtype=np.float32))
+            ]
 
         roi_overlay = overlay[y1:y2, x1:x2]
-        roi_overlay[draw_mask] = color
+        for sticker_mask, sticker_bgr, _ in stickers:
+            sticker_color = color
+            if (
+                color_classifier is not None
+                and color_classifier.ready
+                and getattr(args, "show_center_color_classification", True)
+                and len(sticker_bgr) == 3
+            ):
+                cluster_index = color_classifier.classify_bgr(sticker_bgr)
+                if cluster_index is not None and cluster_index < len(color_classifier.centroids):
+                    centroid_rgb = color_classifier.centroids[cluster_index]
+                    sticker_color = tuple(int(value) for value in centroid_rgb[::-1])
+                    sticker_ys, sticker_xs = np.nonzero(sticker_mask)
+                    sticker_label_at = (
+                        int(sticker_xs.mean()) + x1,
+                        int(sticker_ys.mean()) + y1,
+                    )
+                    sticker_color_numbers.append((sticker_label_at, cluster_index + 1))
+            roi_overlay[sticker_mask] = sticker_color
+
         ab_samples, bgr_samples = lab_ab_samples_from_piece(
             frame,
             roi_xyxy,
@@ -333,16 +532,10 @@ def draw_piece_segments(
             ab_batches.append(ab_samples)
             bgr_batches.append(bgr_samples)
         if color_classifier is not None:
-            if args.average_mask_color:
-                _, classifier_bgr_samples = lab_ab_samples_from_piece(
-                    frame,
-                    roi_xyxy,
-                    draw_mask,
-                    args.color_plot_samples_per_frame,
-                    average_color=False,
-                )
-            else:
-                classifier_bgr_samples = bgr_samples
+            classifier_bgr_samples = np.asarray(
+                [sticker_bgr for _, sticker_bgr, _ in stickers if len(sticker_bgr) == 3],
+                dtype=np.uint8,
+            ).reshape(-1, 3)
             if len(classifier_bgr_samples) > 0:
                 classifier_bgr_batches.append(classifier_bgr_samples)
         count += 1
@@ -371,7 +564,8 @@ def draw_piece_segments(
                 1,
                 cv2.LINE_AA,
             )
-    draw_center_color_numbers(frame, center_color_numbers)
+    if args.show_confidence or args.debug_overlay:
+        draw_center_color_numbers(frame, sticker_color_numbers)
     ab_samples, bgr_samples = concatenate_samples(
         ab_batches,
         bgr_batches,
@@ -544,6 +738,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=40.0,
         help="Minimum raw RGB vector length used while fitting color rays",
     )
+    parser.add_argument(
+        "--color-classifier-mode",
+        choices=COLOR_CLASSIFIER_MODES,
+        default="closest-cluster-point",
+        help=(
+            "Classify recognized sticker colors by nearest retained cluster sample "
+            "or by distance to the learned RGB origin-ray regression"
+        ),
+    )
     parser.add_argument("--color-plot-frames", type=int, default=90)
     parser.add_argument("--color-plot-samples-per-frame", type=int, default=800)
     parser.add_argument("--average-plot-point-size", type=float, default=36.0)
@@ -602,6 +805,7 @@ def main() -> int:
         min_brightness=args.center_color_min_brightness,
         raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
         raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
+        mode=args.color_classifier_mode,
     )
     color_plot_ab_batches = []
     color_plot_bgr_batches = []

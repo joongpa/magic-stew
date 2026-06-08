@@ -657,7 +657,44 @@ def rgb_origin_regression_rays(
         k,
         max_iterations,
     )
-    return _rays_from_clustered_samples(usable, centers, labels)
+    directions, centroids, _ = _rgb_clusters_from_clustered_samples(
+        usable,
+        centers,
+        labels,
+    )
+    return directions, centroids
+
+
+def rgb_origin_regression_clusters(
+    rgb_samples: NDArray[np.uint8] | NDArray[np.float32],
+    *,
+    cluster_count: int = 6,
+    min_brightness: float = 40.0,
+    max_iterations: int = 50,
+    raw_density_filter_radius: float = 0.0,
+    raw_density_filter_min_neighbors: int = 0,
+) -> tuple[NDArray[np.float32], NDArray[np.float32], list[NDArray[np.float32]]]:
+    """Fit origin rays and return the retained raw RGB samples for each cluster."""
+    samples, usable, unit_samples, _ = _prepare_rgb_regression_samples(
+        rgb_samples,
+        min_brightness=min_brightness,
+        raw_density_filter_radius=raw_density_filter_radius,
+        raw_density_filter_min_neighbors=raw_density_filter_min_neighbors,
+    )
+    if len(samples) == 0 or cluster_count <= 0 or len(usable) == 0:
+        return (
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0, 3), dtype=np.float32),
+            [],
+        )
+
+    k = min(cluster_count, len(unit_samples))
+    centers, labels = _fit_directional_kmeans(
+        unit_samples,
+        k,
+        max_iterations,
+    )
+    return _rgb_clusters_from_clustered_samples(usable, centers, labels)
 
 
 def rgb_regression_fit_sample_mask(
@@ -806,9 +843,23 @@ def _rays_from_clustered_samples(
     centers: NDArray[np.float32],
     labels: NDArray[np.int32],
 ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    directions, centroids, _ = _rgb_clusters_from_clustered_samples(
+        usable,
+        centers,
+        labels,
+    )
+    return directions, centroids
+
+
+def _rgb_clusters_from_clustered_samples(
+    usable: NDArray[np.float32],
+    centers: NDArray[np.float32],
+    labels: NDArray[np.int32],
+) -> tuple[NDArray[np.float32], NDArray[np.float32], list[NDArray[np.float32]]]:
     k = len(centers)
     centroids = []
     directions = []
+    clusters = []
     for cluster_index in range(k):
         members = usable[labels == cluster_index]
         if len(members) == 0:
@@ -819,17 +870,21 @@ def _rays_from_clustered_samples(
             continue
         centroids.append(centroid)
         directions.append(centroid / norm)
+        clusters.append(members.astype(np.float32, copy=True))
 
     if not centroids:
         return (
             np.empty((0, 3), dtype=np.float32),
             np.empty((0, 3), dtype=np.float32),
+            [],
         )
 
     order = np.argsort([_rgb_hue_sort_key(centroid) for centroid in centroids])
+    cluster_order = [clusters[int(index)] for index in order]
     return (
         np.asarray(directions, dtype=np.float32)[order],
         np.asarray(centroids, dtype=np.float32)[order],
+        cluster_order,
     )
 
 

@@ -159,7 +159,46 @@ def test_average_mask_color_returns_one_sample_per_piece():
     assert bgr_samples[0, 2] > bgr_samples[0, 0]
 
 
-def test_color_classifier_collects_pixel_samples_from_every_mask():
+def test_rgbxy_sticker_segmentation_splits_edge_into_two_color_regions():
+    frame = np.zeros((30, 30, 3), dtype=np.uint8)
+    frame[:, :] = [40, 40, 40]
+    frame[5:20, 5:12] = [0, 0, 220]
+    frame[5:20, 12:20] = [220, 0, 0]
+    piece_mask = np.zeros((30, 30), dtype=bool)
+    piece_mask[5:20, 5:20] = True
+
+    stickers = piece_seg_script.sticker_segments_from_piece(
+        frame,
+        (0, 0, 30, 30),
+        piece_mask,
+        class_id=1,
+    )
+    sticker_bgrs = np.asarray([sticker_bgr for _, sticker_bgr, _ in stickers])
+
+    assert len(stickers) == 2
+    assert (sticker_bgrs[:, 2] > sticker_bgrs[:, 0]).any()
+    assert (sticker_bgrs[:, 0] > sticker_bgrs[:, 2]).any()
+
+
+def test_rgbxy_sticker_segmentation_collapses_same_color_edge_region():
+    frame = np.zeros((30, 30, 3), dtype=np.uint8)
+    frame[:, :] = [40, 40, 40]
+    frame[5:20, 5:20] = [220, 0, 0]
+    piece_mask = np.zeros((30, 30), dtype=bool)
+    piece_mask[5:20, 5:20] = True
+
+    stickers = piece_seg_script.sticker_segments_from_piece(
+        frame,
+        (0, 0, 30, 30),
+        piece_mask,
+        class_id=1,
+    )
+
+    assert len(stickers) == 1
+    assert np.array_equal(stickers[0][1], [220, 0, 0])
+
+
+def test_color_classifier_collects_mean_samples_from_sticker_segments():
     frame = np.zeros((40, 40, 3), dtype=np.uint8)
     frame[:, :] = [40, 40, 40]
     frame[10:20, 10:17] = [0, 0, 220]
@@ -180,12 +219,12 @@ def test_color_classifier_collects_pixel_samples_from_every_mask():
 
     observed = np.asarray(classifier._rgb_samples)
     assert classifier.detected_frames == 1
-    assert len(observed) > 2
+    assert len(observed) == 2
     assert (observed[:, 0] > observed[:, 2]).any()
     assert (observed[:, 2] > observed[:, 0]).any()
 
 
-def test_learned_color_recolors_only_center_masks_after_classifier_ready():
+def test_learned_color_recolors_each_sticker_after_classifier_ready():
     frame = np.zeros((40, 40, 3), dtype=np.uint8)
     frame[:, :] = [40, 40, 40]
     frame[10:20, 10:17] = [0, 0, 220]
@@ -213,7 +252,8 @@ def test_learned_color_recolors_only_center_masks_after_classifier_ready():
 
     assert classifier.ready
     assert not np.array_equal(output[15, 15], piece_seg_script.CLASS_COLORS[0])
-    assert np.array_equal(output[15, 22], piece_seg_script.CLASS_COLORS[1])
+    assert not np.array_equal(output[15, 22], piece_seg_script.CLASS_COLORS[1])
+    assert np.array_equal(output[15, 22], [220, 0, 0])
 
 
 def test_dim_center_masks_are_not_recolored_by_classifier():
@@ -273,3 +313,67 @@ def test_classifier_uses_nearest_regression_line():
     )
 
     assert classifier.classify_bgr(np.array([0, 5, 5], dtype=np.uint8)) == 0
+
+
+def test_classifier_uses_nearest_cluster_sample_before_centroid():
+    classifier = piece_seg_script.ColorRayClassifier(
+        required_frames=1,
+        cluster_count=2,
+        min_brightness=1,
+    )
+    classifier.centroids = np.array(
+        [
+            [50.0, 0.0, 0.0],
+            [60.0, 10.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    classifier.cluster_samples = [
+        np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [100.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        np.array([[60.0, 10.0, 0.0]], dtype=np.float32),
+    ]
+
+    assert classifier.classify_bgr(np.array([0, 1, 100], dtype=np.uint8)) == 0
+
+
+def test_classifier_linear_regression_mode_ignores_cluster_samples():
+    classifier = piece_seg_script.ColorRayClassifier(
+        required_frames=1,
+        cluster_count=2,
+        min_brightness=1,
+        mode="linear-regression",
+    )
+    classifier.directions = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    classifier.centroids = np.array(
+        [
+            [200.0, 0.0, 0.0],
+            [4.0, 20.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    classifier.cluster_samples = [
+        np.array([[5.0, 5.0, 0.0]], dtype=np.float32),
+        np.array([[100.0, 0.0, 0.0]], dtype=np.float32),
+    ]
+
+    assert classifier.classify_bgr(np.array([0, 5, 5], dtype=np.uint8)) == 0
+
+
+def test_parser_exposes_color_classifier_mode():
+    args = piece_seg_script.build_parser().parse_args(
+        ["--color-classifier-mode", "linear-regression"]
+    )
+
+    assert args.color_classifier_mode == "linear-regression"
