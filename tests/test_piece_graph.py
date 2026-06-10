@@ -1,6 +1,11 @@
 import numpy as np
 
-from live_recognition.piece_graph import StickerNode, _legal_mask_adjacencies
+from live_recognition.piece_graph import (
+    PieceMask,
+    StickerNode,
+    _legal_mask_adjacencies,
+    build_piece_graph,
+)
 
 
 def node(node_id, piece_id, piece_type, centroid_xy, mask_slice):
@@ -53,3 +58,37 @@ def test_graph_does_not_connect_legal_neighbors_beyond_distance_threshold():
     edges = _legal_mask_adjacencies([center, edge], adjacency_radius_px=4)
 
     assert edges == []
+
+
+def test_graph_uses_unpadded_mask_geometry_and_padded_sampling_mask_for_color():
+    frame = np.zeros((30, 30, 3), dtype=np.uint8)
+    frame[10:20, 10:20] = [0, 0, 220]
+    frame[10:20, 10:12] = [220, 0, 0]
+
+    roi_mask = np.zeros((30, 30), dtype=bool)
+    roi_mask[10:20, 10:20] = True
+    sample_roi_mask = np.zeros((30, 30), dtype=bool)
+    sample_roi_mask[10:20, 10:12] = True
+    full_mask = roi_mask.astype(np.uint8) * 255
+
+    graph = build_piece_graph(
+        frame,
+        [
+            PieceMask(
+                piece_id=0,
+                class_id=0,
+                piece_type="center",
+                confidence=1.0,
+                mask=full_mask,
+                roi_mask=roi_mask,
+                roi_xyxy=(0, 0, 30, 30),
+                sample_roi_mask=sample_roi_mask,
+            )
+        ],
+        min_component_area_px=1,
+    )
+
+    assert len(graph.nodes) == 1
+    assert graph.nodes[0].centroid_xy == (14.5, 14.5)
+    assert graph.nodes[0].mask.sum() == full_mask.sum()
+    assert graph.nodes[0].mean_bgr == (220, 0, 0)

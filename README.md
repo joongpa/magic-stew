@@ -63,6 +63,35 @@ cube-piece-graph --source /path/to/frame.jpg --display
 piece segmentation model, clips piece masks to the detected cube, and draws legal graph
 edges between adjacent sticker centroids. Legal edges are center-edge and edge-corner.
 
+The ROI segmentation test command can also save a center/edge cube net from the same
+graph evidence:
+
+```bash
+python scripts/test_piece_seg_roi.py --source /path/to/frame.jpg --save runs/frame_roi.jpg --save-net runs/frame_net.png
+```
+
+For video sources, `--save-net` replaces the previous net with the latest processed
+frame after the color classifier is ready:
+
+```bash
+python scripts/test_piece_seg_roi.py --source /path/to/solve.mp4 --save-net runs/solve_net.png
+```
+
+Net construction starts only after the ROI color classifier has collected
+`--center-color-frames` detected frames. For a single image smoke test, pass
+`--center-color-frames 1`.
+
+The net uses the learned color classifier's cluster colors directly. Without a mapping,
+observed center clusters are drawn in a view-relative preview. To place those clusters
+onto physical cube faces, pass an explicit mapping such as:
+
+```bash
+python scripts/test_piece_seg_roi.py --source /path/to/solve.mp4 --save-net runs/solve_net.png --net-cluster-faces 1=R,2=U
+```
+
+When `--save-net` is used, the command also writes a cluster legend next to the net,
+for example `runs/solve_net_clusters.png`, and prints each learned cluster's BGR value.
+
 Add `--display` if you want an OpenCV preview window. Press `q` to exit the video window.
 
 ```bash

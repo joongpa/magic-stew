@@ -1,4 +1,4 @@
-"""Train YOLO11 nano segmentation locally on generated cube piece labels.
+"""Train YOLO11 nano segmentation locally on generated cube sticker labels.
 
 Expected input layout:
 
@@ -21,8 +21,7 @@ from collections import Counter
 from pathlib import Path
 
 
-CLASS_NAMES = ["center", "edge", "corner"]
-EXPECTED_LABEL_COUNTS = {9, 15, 19}
+CLASS_NAMES = ["center_sticker", "edge_sticker", "corner_sticker"]
 
 
 def label_lines(path: Path) -> list[str]:
@@ -65,7 +64,6 @@ def write_dataset(
     dataset_dir: Path,
     val_fraction: float,
     seed: int,
-    fail_on_bad_counts: bool,
 ) -> Path:
     pairs = collect_pairs(source_dir)
     random.Random(seed).shuffle(pairs)
@@ -81,7 +79,6 @@ def write_dataset(
 
     manifest = []
     summary = {}
-    bad_counts = []
     for split, split_pairs in splits.items():
         class_counts: Counter[int] = Counter()
         label_count_distribution: Counter[int] = Counter()
@@ -90,8 +87,6 @@ def write_dataset(
             lines = label_lines(label_path)
             label_count_distribution[len(lines)] += 1
             class_counts.update(validate_label_file(label_path))
-            if len(lines) not in EXPECTED_LABEL_COUNTS:
-                bad_counts.append((label_path, len(lines)))
 
             target_stem = f"{split}_{index:06d}"
             target_image = dataset_dir / "images" / split / f"{target_stem}{image_path.suffix.lower()}"
@@ -114,15 +109,6 @@ def write_dataset(
                 CLASS_NAMES[class_id]: class_counts[class_id] for class_id in range(len(CLASS_NAMES))
             },
         }
-
-    if bad_counts:
-        print(f"Warning: {len(bad_counts)} source labels do not have counts {sorted(EXPECTED_LABEL_COUNTS)}")
-        for label_path, count in bad_counts[:25]:
-            print(f"  {label_path}: {count}")
-        if len(bad_counts) > 25:
-            print(f"  ... {len(bad_counts) - 25} more")
-        if fail_on_bad_counts:
-            raise RuntimeError("Bad label counts found")
 
     (dataset_dir / "conversion_manifest.json").write_text(
         json.dumps(manifest, indent=2),
@@ -148,66 +134,58 @@ def write_dataset(
 def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
     from ultralytics import YOLO
 
-    # model = YOLO(args.model)
-    # model.train(
-    #     data=str(data_yaml),
-    #     epochs=args.epochs,
-    #     imgsz=args.imgsz,
-    #     batch=args.batch,
-    #     device=args.device,
-    #     project=str(runs_dir),
-    #     name=args.name,
-    #     patience=args.patience,
-    #     cache=args.cache,
-    #     plots=True,
-    # )
+    model = YOLO(args.model)
+    model.train(
+        data=str(data_yaml),
+        epochs=args.epochs,
+        imgsz=args.imgsz,
+        batch=args.batch,
+        device=args.device,
+        project=str(runs_dir),
+        name=args.name,
+        patience=args.patience,
+        cache=args.cache,
+        plots=True,
+    )
 
-    # best_model_path = runs_dir / args.name / "weights" / "best.pt"
-    # print(f"Best model: {best_model_path}")
+    best_model_path = runs_dir / args.name / "weights" / "best.pt"
+    print(f"Best model: {best_model_path}")
 
-    # best_model = YOLO(str(best_model_path))
-    # metrics = best_model.val(data=str(data_yaml), imgsz=args.imgsz, device=args.device)
-    # print(metrics)
-    # return best_model_path
-
-    YOLO("/Users/jeffpark/Documents/LiveRecognition/runs/segment/runs/cube_piece_seg_local/runs/cube_piece_yolo11n_seg-3/weights/best.pt").val()
+    best_model = YOLO(str(best_model_path))
+    metrics = best_model.val(data=str(data_yaml), imgsz=args.imgsz, device=args.device)
+    print(metrics)
+    return best_model_path
 
 
 def main() -> None:
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("--source-dir", type=Path, default=Path("synthetic_cube"))
-    # parser.add_argument("--workdir", type=Path, default=Path("runs/cube_piece_seg_local"))
-    # parser.add_argument("--val-fraction", type=float, default=0.2)
-    # parser.add_argument("--seed", type=int, default=17)
-    # parser.add_argument("--model", default="yolo11n-seg.pt")
-    # parser.add_argument("--epochs", type=int, default=100)
-    # parser.add_argument("--imgsz", type=int, default=256)
-    # parser.add_argument("--batch", type=int, default=-1)
-    # parser.add_argument("--device", default=0)
-    # parser.add_argument("--name", default="cube_piece_yolo11n_seg")
-    # parser.add_argument("--patience", type=int, default=25)
-    # parser.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)
-    # parser.add_argument("--fail-on-bad-counts", action="store_true")
-    # parser.add_argument("--prepare-only", action="store_true")
-    # args = parser.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source-dir", type=Path, default=Path("synthetic_cube"))
+    parser.add_argument("--workdir", type=Path, default=Path("runs/cube_piece_seg_local"))
+    parser.add_argument("--val-fraction", type=float, default=0.2)
+    parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--model", default="yolo11n-seg.pt")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--imgsz", type=int, default=256)
+    parser.add_argument("--batch", type=int, default=-1)
+    parser.add_argument("--device", default=0)
+    parser.add_argument("--name", default="cube_piece_yolo11n_seg")
+    parser.add_argument("--patience", type=int, default=25)
+    parser.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--prepare-only", action="store_true")
+    args = parser.parse_args()
 
-    # dataset_dir = args.workdir / "dataset"
-    # runs_dir = args.workdir / "runs"
-    # data_yaml = write_dataset(
-    #     source_dir=args.source_dir,
-    #     dataset_dir=dataset_dir,
-    #     val_fraction=args.val_fraction,
-    #     seed=args.seed,
-    #     fail_on_bad_counts=args.fail_on_bad_counts,
-    # )
+    dataset_dir = args.workdir / "dataset"
+    runs_dir = args.workdir / "runs"
+    data_yaml = write_dataset(
+        source_dir=args.source_dir,
+        dataset_dir=dataset_dir,
+        val_fraction=args.val_fraction,
+        seed=args.seed,
+    )
 
-    # if args.prepare_only:
-    #     print(f"Prepared dataset: {dataset_dir}")
-    #     return
-
-    data_yaml = None
-    runs_dir = None
-    args = None
+    if args.prepare_only:
+        print(f"Prepared dataset: {dataset_dir}")
+        return
 
     train(data_yaml, runs_dir, args)
 

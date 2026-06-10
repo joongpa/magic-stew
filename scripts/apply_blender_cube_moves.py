@@ -10,7 +10,9 @@ Assumptions:
 - The cube core is at the world origin.
 - Cubies are 1 meter wide, so cubie origins sit on the -1/0/1 grid.
 - Cubie objects use quaternion rotation mode.
-- Cubie object pass_index values are configured as grayscale mask labels.
+- Cubie object pass_index values identify physical cubies.
+- Sticker material pass_index values identify sticker colors; material pass_index 0 is
+  treated as non-sticker cubie plastic and is not labeled.
 - Blender axes are X=right, Z=up, and Y=front/back. Change FRONT_AXIS if needed.
 """
 
@@ -31,7 +33,6 @@ import bpy
 from mathutils import Quaternion, Vector
 
 import site
-from pathlib import Path
 
 PROJECT = Path("/Users/jeffpark/Documents/LiveRecognition")
 VENV = PROJECT / ".venv"
@@ -44,8 +45,8 @@ site.addsitedir(str(site_packages))
 FRONT_AXIS = "-Y"
 
 # Random scene defaults for synthetic data generation.
-DEFAULT_SCRAMBLE_LENGTH = 100
-CAMERA_DISTANCE_RANGE = (5.2, 7.2)
+DEFAULT_SCRAMBLE_LENGTH = 30
+CAMERA_DISTANCE_RANGE = (7.2, 9.2)
 CAMERA_ELEVATION_DEGREES = (12.0, 42.0)
 CAMERA_TARGET_JITTER = 0.25
 CAMERA_LENS_MM = 35.0
@@ -63,16 +64,42 @@ SOLVED_LOCATION_PROP = "synthetic_solved_location"
 SOLVED_ROTATION_PROP = "synthetic_solved_rotation"
 DEFAULT_OUTPUT_DIR = "synthetic_cube_dataset"
 DEFAULT_IMAGE_SIZE = 512
-CLASS_NAMES = ["center", "edge", "corner"]
+CLASS_NAMES = ["center_sticker", "edge_sticker", "corner_sticker"]
 INSTANCE_VALUES = {
     "center": [20, 40, 60, 80, 100, 120],
     "edge": [130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240],
     "corner": [248, 249, 250, 251, 252, 253, 254, 255],
 }
-MASK_VALUE_TO_CLASS = {
+CUBIE_PASS_INDEXES = [
+    cubie_value
+    for class_name in ("center", "edge", "corner")
+    for cubie_value in INSTANCE_VALUES[class_name]
+]
+STICKER_COLOR_INDEX_BY_MATERIAL_PASS_INDEX = {
+    material_pass_index: material_pass_index - 1 for material_pass_index in range(1, 7)
+}
+CUBIE_VALUE_TO_CLASS = {
     value: class_id
     for class_id, class_name in enumerate(CLASS_NAMES)
-    for value in INSTANCE_VALUES[class_name]
+    for value in INSTANCE_VALUES[class_name.removesuffix("_sticker")]
+}
+STICKER_TO_MASK_VALUE = {
+    sticker_key: mask_value
+    for mask_value, sticker_key in enumerate(
+        (
+            (sticker_color_index, cubie_value)
+            for cubie_value in CUBIE_PASS_INDEXES
+            for sticker_color_index in range(6)
+        ),
+        start=1,
+    )
+}
+MASK_VALUE_TO_STICKER = {
+    mask_value: sticker_key for sticker_key, mask_value in STICKER_TO_MASK_VALUE.items()
+}
+MASK_VALUE_TO_CLASS = {
+    mask_value: CUBIE_VALUE_TO_CLASS[cubie_value]
+    for mask_value, (_sticker_color_index, cubie_value) in MASK_VALUE_TO_STICKER.items()
 }
 MIN_SEGMENT_PIXELS = 8
 
@@ -362,6 +389,38 @@ def camera_ray(camera: bpy.types.Object, scene: bpy.types.Scene, x: int, y: int)
     return origin, direction
 
 
+def material_pass_index_for_hit(
+    hit_object: bpy.types.Object,
+    polygon_index: int,
+    depsgraph: bpy.types.Depsgraph,
+) -> int:
+    actual_hit_object = hit_object.evaluated_get(depsgraph)
+    if polygon_index < 0 or polygon_index >= len(actual_hit_object.data.polygons):
+        return 0
+    material_index = actual_hit_object.data.polygons[polygon_index].material_index
+    if material_index < 0 or material_index >= len(actual_hit_object.material_slots):
+        return 0
+
+    material = actual_hit_object.material_slots[material_index].material
+
+    if material is None:
+        return 0
+    return int(material.pass_index)
+
+
+def sticker_mask_value_for_hit(
+    hit_object: bpy.types.Object,
+    polygon_index: int,
+    depsgraph: bpy.types.Depsgraph,
+) -> int:
+    cubie_value = int(hit_object.pass_index)
+    material_value = material_pass_index_for_hit(hit_object, polygon_index, depsgraph)
+    sticker_color_index = STICKER_COLOR_INDEX_BY_MATERIAL_PASS_INDEX.get(material_value)
+    if sticker_color_index is None:
+        return 0
+    return STICKER_TO_MASK_VALUE.get((sticker_color_index, cubie_value), 0)
+
+
 def render_mask(path: Path, objects: list[bpy.types.Object]) -> bytearray:
     scene = bpy.context.scene
     camera = get_camera()
@@ -375,13 +434,17 @@ def render_mask(path: Path, objects: list[bpy.types.Object]) -> bytearray:
     for y in range(height):
         for x in range(width):
             origin, direction = camera_ray(camera, scene, x, y)
-            hit, _location, _normal, _index, hit_object, _matrix = scene.ray_cast(
+            hit, _location, _normal, polygon_index, hit_object, _matrix = scene.ray_cast(
                 depsgraph,
                 origin,
                 direction,
             )
             if hit and hit_object is not None and hit_object.name in cubie_names:
-                pixels[y * width + x] = max(0, min(hit_object.pass_index, 255))
+                pixels[y * width + x] = sticker_mask_value_for_hit(
+                    hit_object,
+                    polygon_index,
+                    depsgraph,
+                )
 
     write_grayscale_png(path, pixels, width, height)
     return pixels
@@ -454,7 +517,7 @@ def generate_dataset(
         moves = randomize_scene(scramble_length)
         objects = cube_objects()
 
-        stem = f"{(index + 800):06d}"
+        stem = f"{(index + 950):06d}"
         image_path = images_dir / f"{stem}.png"
         mask_path = masks_dir / f"{stem}.png"
         label_path = labels_dir / f"{stem}.txt"
@@ -468,7 +531,16 @@ def generate_dataset(
             "mask": str(mask_path),
             "label": str(label_path),
             "moves": moves,
-            "labels": {obj.name: obj.pass_index for obj in objects},
+            "cubie_labels": {obj.name: obj.pass_index for obj in objects},
+            "sticker_mask_values": {
+                str(mask_value): {
+                    "sticker_color_index": sticker_color_index,
+                    "cubie_pass_index": cubie_value,
+                    "material_pass_index": sticker_color_index + 1,
+                    "class": CLASS_NAMES[MASK_VALUE_TO_CLASS[mask_value]],
+                }
+                for mask_value, (sticker_color_index, cubie_value) in MASK_VALUE_TO_STICKER.items()
+            },
             "segments": len(yolo_lines),
         })
         print(f"Wrote {image_path}, {mask_path}, and {label_path}")

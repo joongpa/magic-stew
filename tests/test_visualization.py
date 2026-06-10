@@ -1,8 +1,14 @@
 import numpy as np
 import pytest
 
+import live_recognition.visualization as visualization
 from live_recognition.types import CubeCandidate, FrameResult
 from live_recognition.visualization import (
+    _convex_hull_indexes_2d,
+    _density_rgb_sample_cluster_indexes,
+    _form_fit_boundary_2d,
+    _normalize_rgb_brightness,
+    _projected_form_fit_boundary_points,
     _reliable_color_mask,
     build_lab_chroma_debug_view,
     build_luminance_debug_view,
@@ -15,6 +21,95 @@ from live_recognition.visualization import (
     save_rgb_samples_interactive_plot,
     save_rgb_samples_plot,
 )
+
+
+def test_normalize_rgb_brightness_projects_to_unit_sphere():
+    rgb_samples = np.array(
+        [
+            [10, 10, 10],
+            [3, 4, 0],
+            [0, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    normalized = _normalize_rgb_brightness(rgb_samples)
+
+    assert np.allclose(normalized[0], [1 / np.sqrt(3)] * 3)
+    assert np.allclose(normalized[1], [0.6, 0.8, 0.0])
+    assert np.allclose(normalized[2], [0.0, 0.0, 0.0])
+
+
+def test_convex_hull_indexes_2d_wrap_outer_points():
+    points = np.array(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [0.0, 1.0],
+            [0.5, 0.5],
+        ],
+        dtype=np.float32,
+    )
+
+    hull_indexes = _convex_hull_indexes_2d(points)
+
+    assert set(hull_indexes.tolist()) == {0, 1, 2, 3}
+
+
+def test_form_fit_boundary_2d_follows_concave_point_cloud():
+    points = []
+    for x in np.linspace(0.0, 1.0, 12):
+        points.append([x, 0.0])
+    for y in np.linspace(0.0, 1.0, 12):
+        points.append([0.0, y])
+    for x in np.linspace(0.0, 0.35, 6):
+        for y in np.linspace(0.0, 0.35, 6):
+            points.append([x, y])
+    points = np.asarray(points, dtype=np.float32)
+
+    boundary = _form_fit_boundary_2d(points)
+
+    assert len(boundary) >= 3
+    assert boundary[:, 0].max() > 0.9
+    assert boundary[:, 1].max() > 0.9
+    assert not np.any((boundary[:, 0] > 0.7) & (boundary[:, 1] > 0.7))
+
+
+def test_projected_form_fit_boundary_handles_line_like_clusters():
+    points = np.array(
+        [
+            [40.0, 10.0, 10.0],
+            [80.0, 20.0, 20.0],
+            [120.0, 30.0, 30.0],
+            [160.0, 40.0, 40.0],
+        ],
+        dtype=np.float32,
+    )
+
+    boundary = _projected_form_fit_boundary_points(points)
+
+    assert boundary.shape == (4, 3)
+    assert np.ptp(boundary[:, 0]) > 100
+
+
+def test_density_rgb_sample_cluster_indexes_merges_smallest_clusters_to_target_count():
+    rgb_samples = []
+    for angle in np.linspace(0.0, 0.5, 8):
+        direction = np.array([np.cos(angle), np.sin(angle), 0.0], dtype=np.float32)
+        rgb_samples.extend(direction * value for value in (100.0, 110.0, 120.0, 130.0))
+    rgb_samples = np.asarray(rgb_samples, dtype=np.uint8)
+
+    labels, centroids = _density_rgb_sample_cluster_indexes(
+        rgb_samples,
+        cluster_count=6,
+        min_brightness=1,
+        eps_radians=0.02,
+        min_points=2,
+    )
+
+    assert len(set(labels[labels >= 0].tolist())) == 6
+    assert centroids.shape == (6, 3)
 
 
 def test_draw_result_defaults_to_bounding_box_only_when_candidate_has_mask():
@@ -271,6 +366,43 @@ def test_save_rgb_samples_plot_can_color_by_cluster(tmp_path):
         assert angle_path.stat().st_size > 0
 
 
+def test_raw_density_rgb_static_plot_uses_raw_density_clusters(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_raw_density_clusters(rgb_samples, *, cluster_count, min_brightness, eps, min_points):
+        calls.append((len(rgb_samples), cluster_count, min_brightness, eps, min_points))
+        return (
+            np.zeros(len(rgb_samples), dtype=np.int32),
+            np.array([[220.0, 20.0, 20.0]], dtype=np.float32),
+        )
+
+    monkeypatch.setattr(
+        visualization,
+        "_raw_density_rgb_sample_cluster_indexes",
+        fake_raw_density_clusters,
+    )
+    bgr_samples = np.array(
+        [
+            [20, 20, 220],
+            [25, 25, 210],
+            [30, 30, 205],
+        ],
+        dtype=np.uint8,
+    )
+    output_path = tmp_path / "rgb_raw_density.png"
+
+    save_rgb_samples_plot(
+        bgr_samples,
+        str(output_path),
+        cluster_min_brightness=20,
+        density_cluster_raw_eps=18,
+        density_cluster_min_neighbors=3,
+        cluster_display_mode="raw-density",
+    )
+
+    assert calls == [(3, 6, 20, 18, 3)]
+
+
 def test_rgb_origin_regression_rays_finds_six_directions():
     base_colors = np.array(
         [
@@ -356,6 +488,75 @@ def test_save_rgb_samples_interactive_plot_can_draw_regression_lines(tmp_path):
     assert "RGB ray 1" in html
     assert "RGB ray 2" in html
     assert "RGB ray 3" in html
+
+
+def test_normalized_rgb_interactive_plot_draws_cluster_perimeters(tmp_path):
+    pytest.importorskip("plotly")
+    rgb_samples = np.array(
+        [
+            [220, 20, 20],
+            [210, 30, 20],
+            [220, 25, 35],
+            [205, 18, 32],
+            [20, 220, 20],
+            [30, 210, 20],
+            [25, 220, 35],
+            [18, 205, 32],
+            [20, 20, 220],
+            [30, 20, 210],
+            [25, 35, 220],
+            [18, 32, 205],
+        ],
+        dtype=np.uint8,
+    )
+    output_path = tmp_path / "rgb_normalized.html"
+
+    save_rgb_samples_interactive_plot(
+        rgb_samples[:, ::-1],
+        str(output_path),
+        normalize_rgb=True,
+        regression_cluster_count=3,
+        regression_min_brightness=20,
+    )
+
+    html = output_path.read_text()
+    assert "cluster 1 perimeter" in html
+    assert "cluster 2 perimeter" in html
+    assert "cluster 3 perimeter" in html
+
+
+def test_raw_density_rgb_interactive_plot_draws_clusters_instead_of_regressions(tmp_path):
+    pytest.importorskip("plotly")
+    rgb_samples = np.array(
+        [
+            [220, 20, 20],
+            [210, 30, 20],
+            [220, 25, 35],
+            [205, 18, 32],
+            [20, 220, 20],
+            [30, 210, 20],
+            [25, 220, 35],
+            [18, 205, 32],
+        ],
+        dtype=np.uint8,
+    )
+    output_path = tmp_path / "rgb_raw_density.html"
+
+    save_rgb_samples_interactive_plot(
+        rgb_samples[:, ::-1],
+        str(output_path),
+        regression_cluster_count=2,
+        regression_min_brightness=20,
+        density_cluster_raw_eps=35,
+        density_cluster_min_neighbors=3,
+        draw_regression_lines=True,
+        cluster_display_mode="raw-density",
+    )
+
+    html = output_path.read_text()
+    assert "cluster 1 perimeter" in html
+    assert "cluster 2 perimeter" in html
+    assert "RGB ray 1" not in html
 
 
 def test_save_hsv_samples_interactive_plot_writes_html(tmp_path):
