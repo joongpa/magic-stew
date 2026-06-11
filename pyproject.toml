@@ -26,6 +26,7 @@ dev = [
 [project.scripts]
 cube-orient = "live_recognition.cli:main"
 cube-piece-graph = "live_recognition.piece_graph_cli:main"
+cube-net = "live_recognition.net_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

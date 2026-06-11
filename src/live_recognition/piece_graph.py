@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from dataclasses import replace
 import os
 
 import cv2
@@ -10,21 +10,14 @@ from numpy.typing import NDArray
 
 from live_recognition.model_utils import ensure_yolo_config_dir, resolve_model_path
 from live_recognition.types import CubeCandidate
-from live_recognition.visualization import _gray_world_white_balance, _reliable_color_mask
+from live_recognition.visualization import _reliable_color_mask
 
 
 DEFAULT_PIECE_SEGMENTATION_MODEL = (
-    "runs/segment/runs/cube_piece_seg_local/runs/cube_piece_yolo11n_seg-3/weights/best.pt"
+    "runs/segment/runs/cube_piece_seg_sticker/runs/cube_piece_yolo11n_seg/weights/best.pt"
 )
 PIECE_TYPES = {"center", "edge", "corner"}
 LEGAL_ADJACENCIES = {frozenset(("center", "edge")), frozenset(("edge", "corner"))}
-MIN_PARALLEL_STICKER_PIECES = 4
-MAX_PARALLEL_STICKER_WORKERS = 4
-STICKER_COUNTS_BY_CLASS = {
-    0: 1,
-    1: 2,
-    2: 3,
-}
 
 
 @dataclass(frozen=True)
@@ -54,13 +47,6 @@ class StickerNode:
 class PieceGraph:
     nodes: list[StickerNode]
     edges: list[tuple[int, int]]
-
-
-@dataclass(frozen=True)
-class _RoiColorSamples:
-    crop_bgr: NDArray[np.uint8]
-    reliable_mask: NDArray[np.bool_]
-    lab_ab: NDArray[np.float32]
 
 
 class YOLOPieceSegmenter:
@@ -152,16 +138,70 @@ def build_piece_graph(
     *,
     adjacency_radius_px: int = 6,
     min_component_area_px: int = 12,
-    min_sticker_segment_ratio: float = 0.25,
 ) -> PieceGraph:
     nodes = _sticker_nodes_from_piece_masks(
         frame_bgr,
         piece_masks,
         min_component_area_px=min_component_area_px,
-        min_sticker_segment_ratio=min_sticker_segment_ratio,
     )
     edges = _legal_mask_adjacencies(nodes, adjacency_radius_px=adjacency_radius_px)
     return PieceGraph(nodes=nodes, edges=edges)
+
+
+def build_sticker_adjacency_graph(
+    nodes: list[StickerNode],
+    *,
+    adjacency_radius_px: int = 6,
+    infer_piece_ids: bool = True,
+) -> PieceGraph:
+    """Build a legal sticker adjacency graph from already-segmented sticker nodes."""
+    graph_nodes = (
+        infer_piece_ids_from_same_type_adjacencies(
+            nodes,
+            adjacency_radius_px=adjacency_radius_px,
+        )
+        if infer_piece_ids
+        else list(nodes)
+    )
+    return PieceGraph(
+        nodes=graph_nodes,
+        edges=_legal_mask_adjacencies(graph_nodes, adjacency_radius_px=adjacency_radius_px),
+    )
+
+
+def infer_piece_ids_from_same_type_adjacencies(
+    nodes: list[StickerNode],
+    *,
+    adjacency_radius_px: int,
+) -> list[StickerNode]:
+    """Group adjacent stickers of the same piece type into the same piece id."""
+    if not nodes:
+        return []
+
+    same_type_edges = _same_type_mask_adjacencies(nodes, adjacency_radius_px=adjacency_radius_px)
+    neighbors: dict[int, set[int]] = {node.node_id: set() for node in nodes}
+    for left_id, right_id in same_type_edges:
+        neighbors[left_id].add(right_id)
+        neighbors[right_id].add(left_id)
+
+    next_piece_id = 0
+    piece_id_by_node_id: dict[int, int] = {}
+    for node in nodes:
+        if node.node_id in piece_id_by_node_id:
+            continue
+        stack = [node.node_id]
+        while stack:
+            node_id = stack.pop()
+            if node_id in piece_id_by_node_id:
+                continue
+            piece_id_by_node_id[node_id] = next_piece_id
+            stack.extend(neighbors[node_id] - piece_id_by_node_id.keys())
+        next_piece_id += 1
+
+    return [
+        replace(node, piece_id=piece_id_by_node_id.get(node.node_id, node.piece_id))
+        for node in nodes
+    ]
 
 
 def clipped_square_roi(
@@ -199,67 +239,6 @@ def apply_mask_padding(mask: NDArray[np.bool_], padding_px: int) -> NDArray[np.b
     else:
         padded = cv2.dilate(mask_u8, kernel, iterations=1)
     return padded > 0
-
-
-def sticker_segments_from_piece(
-    frame_bgr: NDArray[np.uint8],
-    roi_xyxy: tuple[int, int, int, int],
-    piece_mask: NDArray[np.bool_],
-    class_id: int,
-    *,
-    spatial_weight: float = 1.0,
-    max_iterations: int = 30,
-    min_segment_ratio: float = 0.25,
-    color_samples: _RoiColorSamples | None = None,
-    sample_piece_mask: NDArray[np.bool_] | None = None,
-    max_kmeans_fit_samples: int = 2500,
-) -> list[tuple[NDArray[np.bool_], NDArray[np.uint8], NDArray[np.float32]]]:
-    x1, y1, x2, y2 = roi_xyxy
-    crop = frame_bgr[y1:y2, x1:x2]
-    if crop.size == 0 or not bool(piece_mask.any()):
-        return []
-
-    if color_samples is None:
-        color_samples = _roi_color_samples(crop)
-    sticker_count = min(
-        STICKER_COUNTS_BY_CLASS.get(class_id, 1),
-        int(piece_mask.sum()),
-    )
-    if sticker_count <= 1:
-        color_mask = _color_sample_mask(piece_mask, sample_piece_mask)
-        mean_ab, mean_bgr = _lab_ab_samples_from_roi(
-            color_samples,
-            color_mask,
-            max_samples=1,
-            average_color=True,
-        )
-        return [(piece_mask, mean_bgr[0], mean_ab[0])] if len(mean_bgr) else []
-
-    labels = _rgbxy_kmeans_labels(
-        crop,
-        piece_mask,
-        cluster_count=sticker_count,
-        spatial_weight=spatial_weight,
-        max_iterations=max_iterations,
-        min_segment_ratio=min_segment_ratio,
-        max_fit_samples=max_kmeans_fit_samples,
-    )
-    stickers = []
-    for cluster_index in sorted(int(label) for label in np.unique(labels[labels >= 0])):
-        sticker_mask = piece_mask & (labels == cluster_index)
-        if not bool(sticker_mask.any()):
-            continue
-        color_mask = _color_sample_mask(sticker_mask, sample_piece_mask)
-        mean_ab, mean_bgr = _lab_ab_samples_from_roi(
-            color_samples,
-            color_mask,
-            max_samples=1,
-            average_color=True,
-        )
-        if len(mean_bgr) == 0:
-            continue
-        stickers.append((sticker_mask, mean_bgr[0], mean_ab[0]))
-    return stickers
 
 
 def draw_piece_graph(
@@ -320,97 +299,39 @@ def _sticker_nodes_from_piece_masks(
     piece_masks: list[PieceMask],
     *,
     min_component_area_px: int,
-    min_sticker_segment_ratio: float,
 ) -> list[StickerNode]:
     nodes = []
-    color_samples_by_roi = _color_samples_by_roi(frame_bgr, piece_masks)
-    sticker_batches = _sticker_batches_from_piece_masks(
-        frame_bgr,
-        piece_masks,
-        min_sticker_segment_ratio=min_sticker_segment_ratio,
-        color_samples_by_roi=color_samples_by_roi,
-    )
-    for piece_mask, stickers in zip(piece_masks, sticker_batches, strict=True):
+    for piece_mask in piece_masks:
+        if int(piece_mask.roi_mask.sum()) < min_component_area_px:
+            continue
         x1, y1, _, _ = piece_mask.roi_xyxy
-        for sticker_mask, mean_bgr, _ in stickers:
-            if int(sticker_mask.sum()) < min_component_area_px:
-                continue
+        sticker_ys, sticker_xs = np.nonzero(piece_mask.roi_mask)
+        if len(sticker_xs) == 0:
+            continue
 
-            sticker_ys, sticker_xs = np.nonzero(sticker_mask)
-            if len(sticker_xs) == 0:
-                continue
+        mean_bgr = _mean_bgr_from_roi_mask(
+            frame_bgr,
+            piece_mask.roi_xyxy,
+            _color_sample_mask(piece_mask.roi_mask, piece_mask.sample_roi_mask),
+        )
+        if mean_bgr is None:
+            continue
 
-            full_mask = np.zeros_like(piece_mask.mask)
-            full_mask[
-                y1 : y1 + sticker_mask.shape[0],
-                x1 : x1 + sticker_mask.shape[1],
-            ] = sticker_mask.astype(np.uint8) * 255
-            nodes.append(
-                StickerNode(
-                    node_id=len(nodes),
-                    piece_id=piece_mask.piece_id,
-                    piece_type=piece_mask.piece_type,
-                    confidence=piece_mask.confidence,
-                    centroid_xy=(
-                        float(sticker_xs.mean() + x1),
-                        float(sticker_ys.mean() + y1),
-                    ),
-                    mask=full_mask,
-                    mean_bgr=tuple(int(channel) for channel in mean_bgr),
-                )
-            )
-    return nodes
-
-
-def _sticker_batches_from_piece_masks(
-    frame_bgr: NDArray[np.uint8],
-    piece_masks: list[PieceMask],
-    *,
-    min_sticker_segment_ratio: float,
-    color_samples_by_roi: dict[tuple[int, int, int, int], _RoiColorSamples],
-) -> list[list[tuple[NDArray[np.bool_], NDArray[np.uint8], NDArray[np.float32]]]]:
-    if len(piece_masks) < MIN_PARALLEL_STICKER_PIECES:
-        return [
-            _sticker_batch_from_piece_mask(
-                frame_bgr,
-                piece_mask,
-                min_sticker_segment_ratio=min_sticker_segment_ratio,
-                color_samples_by_roi=color_samples_by_roi,
-            )
-            for piece_mask in piece_masks
-        ]
-
-    max_workers = min(MAX_PARALLEL_STICKER_WORKERS, len(piece_masks))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        return list(
-            executor.map(
-                lambda piece_mask: _sticker_batch_from_piece_mask(
-                    frame_bgr,
-                    piece_mask,
-                    min_sticker_segment_ratio=min_sticker_segment_ratio,
-                    color_samples_by_roi=color_samples_by_roi,
+        nodes.append(
+            StickerNode(
+                node_id=len(nodes),
+                piece_id=piece_mask.piece_id,
+                piece_type=piece_mask.piece_type,
+                confidence=piece_mask.confidence,
+                centroid_xy=(
+                    float(sticker_xs.mean() + x1),
+                    float(sticker_ys.mean() + y1),
                 ),
-                piece_masks,
+                mask=piece_mask.mask,
+                mean_bgr=mean_bgr,
             )
         )
-
-
-def _sticker_batch_from_piece_mask(
-    frame_bgr: NDArray[np.uint8],
-    piece_mask: PieceMask,
-    *,
-    min_sticker_segment_ratio: float,
-    color_samples_by_roi: dict[tuple[int, int, int, int], _RoiColorSamples],
-) -> list[tuple[NDArray[np.bool_], NDArray[np.uint8], NDArray[np.float32]]]:
-    return sticker_segments_from_piece(
-        frame_bgr,
-        piece_mask.roi_xyxy,
-        piece_mask.roi_mask,
-        piece_mask.class_id,
-        min_segment_ratio=min_sticker_segment_ratio,
-        color_samples=color_samples_by_roi.get(piece_mask.roi_xyxy),
-        sample_piece_mask=piece_mask.sample_roi_mask,
-    )
+    return nodes
 
 
 def _color_sample_mask(
@@ -424,20 +345,30 @@ def _color_sample_mask(
     return sample_mask if bool(sample_mask.any()) else sticker_mask
 
 
-def _color_samples_by_roi(
+def _mean_bgr_from_roi_mask(
     frame_bgr: NDArray[np.uint8],
-    piece_masks: list[PieceMask],
-) -> dict[tuple[int, int, int, int], _RoiColorSamples]:
-    color_samples = {}
-    for piece_mask in piece_masks:
-        if piece_mask.roi_xyxy in color_samples:
-            continue
-        x1, y1, x2, y2 = piece_mask.roi_xyxy
-        crop = frame_bgr[y1:y2, x1:x2]
-        if crop.size == 0:
-            continue
-        color_samples[piece_mask.roi_xyxy] = _roi_color_samples(crop)
-    return color_samples
+    roi_xyxy: tuple[int, int, int, int],
+    sample_mask: NDArray[np.bool_],
+) -> tuple[int, int, int] | None:
+    x1, y1, x2, y2 = roi_xyxy
+    crop = frame_bgr[y1:y2, x1:x2]
+    if crop.size == 0 or not bool(sample_mask.any()):
+        return None
+
+    reliable_mask = _reliable_color_mask(crop) & sample_mask
+    if int(reliable_mask.sum()) < 10:
+        reliable_mask = sample_mask
+    if not bool(reliable_mask.any()):
+        return None
+
+    mean_bgr = (
+        crop[reliable_mask]
+        .astype(np.float32)
+        .mean(axis=0)
+        .clip(0, 255)
+        .astype(np.uint8)
+    )
+    return tuple(int(channel) for channel in mean_bgr)
 
 
 def _piece_mask_bool(
@@ -452,232 +383,6 @@ def _piece_mask_bool(
         interpolation=cv2.INTER_LINEAR,
     )
     return mask > 0.5
-
-
-def _lab_ab_samples_from_piece(
-    frame_bgr: NDArray[np.uint8],
-    roi_xyxy: tuple[int, int, int, int],
-    piece_mask: NDArray[np.bool_],
-    max_samples: int,
-    average_color: bool,
-) -> tuple[NDArray[np.float32], NDArray[np.uint8]]:
-    x1, y1, x2, y2 = roi_xyxy
-    crop = frame_bgr[y1:y2, x1:x2]
-    if crop.size == 0 or not bool(piece_mask.any()):
-        return np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
-
-    return _lab_ab_samples_from_roi(
-        _roi_color_samples(crop),
-        piece_mask,
-        max_samples=max_samples,
-        average_color=average_color,
-    )
-
-
-def _roi_color_samples(crop_bgr: NDArray[np.uint8]) -> _RoiColorSamples:
-    reliable_mask = _reliable_color_mask(crop_bgr)
-    balanced = _gray_world_white_balance(crop_bgr, reliable_mask)
-    lab_ab = cv2.cvtColor(balanced, cv2.COLOR_BGR2LAB)[:, :, 1:3].astype(np.float32)
-    return _RoiColorSamples(
-        crop_bgr=crop_bgr,
-        reliable_mask=reliable_mask,
-        lab_ab=lab_ab,
-    )
-
-
-def _lab_ab_samples_from_roi(
-    color_samples: _RoiColorSamples,
-    piece_mask: NDArray[np.bool_],
-    max_samples: int,
-    average_color: bool,
-) -> tuple[NDArray[np.float32], NDArray[np.uint8]]:
-    if not bool(piece_mask.any()):
-        return np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
-
-    reliable_mask = color_samples.reliable_mask & piece_mask
-    if int(reliable_mask.sum()) < 10:
-        reliable_mask = piece_mask.copy()
-    if not bool(reliable_mask.any()):
-        return np.empty((0, 2), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
-
-    ab_samples = color_samples.lab_ab[reliable_mask]
-    bgr_samples = color_samples.crop_bgr[reliable_mask]
-    if average_color:
-        mean_bgr_sample = (
-            bgr_samples.astype(np.float32)
-            .mean(axis=0, keepdims=True)
-            .clip(0, 255)
-            .astype(np.uint8)
-        )
-        return (
-            ab_samples.mean(axis=0, keepdims=True).astype(np.float32),
-            mean_bgr_sample,
-        )
-    if len(ab_samples) > max_samples:
-        indexes = np.linspace(0, len(ab_samples) - 1, max_samples, dtype=np.int32)
-        ab_samples = ab_samples[indexes]
-        bgr_samples = bgr_samples[indexes]
-    return ab_samples, bgr_samples
-
-
-def _rgbxy_kmeans_labels(
-    crop_bgr: NDArray[np.uint8],
-    mask: NDArray[np.bool_],
-    *,
-    cluster_count: int,
-    spatial_weight: float = 1.0,
-    max_iterations: int = 30,
-    min_segment_ratio: float = 0.25,
-    max_fit_samples: int = 2500,
-) -> NDArray[np.int32]:
-    ys, xs = np.nonzero(mask)
-    labels_image = np.full(mask.shape, -1, dtype=np.int32)
-    if len(xs) == 0 or cluster_count <= 0:
-        return labels_image
-
-    k = min(cluster_count, len(xs))
-    rgb = crop_bgr[ys, xs, ::-1].astype(np.float32)
-    x_scale = max(mask.shape[1] - 1, 1)
-    y_scale = max(mask.shape[0] - 1, 1)
-    xy = np.column_stack(
-        [
-            xs.astype(np.float32) / x_scale * 255.0,
-            ys.astype(np.float32) / y_scale * 255.0,
-        ]
-    )
-    features = np.column_stack([rgb, xy * float(spatial_weight)]).astype(np.float32)
-    fit_features = _kmeans_fit_features(features, max_fit_samples)
-    centers = _initialize_kmeans_centers(fit_features, k)
-    fit_labels = np.zeros(len(fit_features), dtype=np.int32)
-    for _ in range(max_iterations):
-        distances = _squared_distances(fit_features, centers)
-        next_fit_labels = distances.argmin(axis=1).astype(np.int32)
-        next_centers = centers.copy()
-        for cluster_index in range(k):
-            members = fit_features[next_fit_labels == cluster_index]
-            if len(members) > 0:
-                next_centers[cluster_index] = members.mean(axis=0)
-        if np.array_equal(fit_labels, next_fit_labels) and np.allclose(centers, next_centers):
-            fit_labels = next_fit_labels
-            break
-        centers = next_centers
-        fit_labels = next_fit_labels
-
-    labels = _squared_distances(features, centers).argmin(axis=1).astype(np.int32)
-    labels = _merge_small_sticker_labels(
-        labels,
-        features,
-        k,
-        min_segment_ratio=min_segment_ratio,
-    )
-    labels = _reorder_sticker_labels(labels, features, int(labels.max()) + 1)
-    labels_image[ys, xs] = labels
-    return labels_image
-
-
-def _kmeans_fit_features(
-    features: NDArray[np.float32],
-    max_fit_samples: int,
-) -> NDArray[np.float32]:
-    if max_fit_samples <= 0 or len(features) <= max_fit_samples:
-        return features
-
-    indexes = np.linspace(0, len(features) - 1, max_fit_samples, dtype=np.int32)
-    return features[indexes]
-
-
-def _squared_distances(
-    samples: NDArray[np.float32],
-    centers: NDArray[np.float32],
-) -> NDArray[np.float32]:
-    delta = samples[:, None, :] - centers[None, :, :]
-    return np.einsum("ijk,ijk->ij", delta, delta, optimize=True)
-
-
-def _initialize_kmeans_centers(
-    features: NDArray[np.float32],
-    cluster_count: int,
-) -> NDArray[np.float32]:
-    centers = [features[0]]
-    while len(centers) < cluster_count:
-        distances = np.min(
-            _squared_distances(features, np.asarray(centers, dtype=np.float32)),
-            axis=1,
-        )
-        centers.append(features[int(np.argmax(distances))])
-    return np.asarray(centers, dtype=np.float32)
-
-
-def _reorder_sticker_labels(
-    labels: NDArray[np.int32],
-    features: NDArray[np.float32],
-    cluster_count: int,
-) -> NDArray[np.int32]:
-    centers = []
-    for cluster_index in range(cluster_count):
-        members = features[labels == cluster_index]
-        if len(members) == 0:
-            centers.append((np.inf, np.inf, cluster_index))
-            continue
-        center = members.mean(axis=0)
-        centers.append((float(center[4]), float(center[3]), cluster_index))
-    ordered_indexes = [cluster_index for _, _, cluster_index in sorted(centers)]
-    remap = {old_index: new_index for new_index, old_index in enumerate(ordered_indexes)}
-    return np.asarray([remap[int(label)] for label in labels], dtype=np.int32)
-
-
-def _merge_small_sticker_labels(
-    labels: NDArray[np.int32],
-    features: NDArray[np.float32],
-    cluster_count: int,
-    *,
-    min_segment_ratio: float,
-) -> NDArray[np.int32]:
-    if min_segment_ratio <= 0 or cluster_count <= 1:
-        return labels
-
-    sizes = np.bincount(labels, minlength=cluster_count)
-    if len(sizes) == 0:
-        return labels
-
-    largest_size = int(sizes.max())
-    if largest_size <= 0:
-        return labels
-
-    min_size = largest_size * float(min_segment_ratio)
-    keep_indexes = np.flatnonzero(sizes >= min_size)
-    if len(keep_indexes) == 0:
-        keep_indexes = np.array([int(sizes.argmax())], dtype=np.int32)
-
-    centers = []
-    for cluster_index in range(cluster_count):
-        members = features[labels == cluster_index]
-        if len(members) == 0:
-            centers.append(np.full(features.shape[1], np.inf, dtype=np.float32))
-        else:
-            centers.append(members.mean(axis=0))
-    centers_array = np.asarray(centers, dtype=np.float32)
-    kept_centers = centers_array[keep_indexes]
-    kept_index_set = set(int(index) for index in keep_indexes)
-
-    next_labels = labels.copy()
-    for cluster_index in range(cluster_count):
-        if cluster_index in kept_index_set:
-            continue
-        member_mask = labels == cluster_index
-        if not bool(member_mask.any()):
-            continue
-        distances = _squared_distances(features[member_mask], kept_centers)
-        nearest_kept = keep_indexes[distances.argmin(axis=1)]
-        next_labels[member_mask] = nearest_kept
-
-    compact_indexes = {
-        old_index: new_index for new_index, old_index in enumerate(sorted(set(next_labels)))
-    }
-    return np.asarray(
-        [compact_indexes[int(label)] for label in next_labels],
-        dtype=np.int32,
-    )
 
 
 def _legal_mask_adjacencies(
@@ -738,6 +443,42 @@ def _legal_mask_adjacencies(
         reverse_candidate = candidates_by_node_piece.get(reverse_key)
         if reverse_candidate is not None and reverse_candidate[2] == source_node_id:
             edges.add(tuple(sorted((source_node_id, target_node_id))))
+    return sorted(edges)
+
+
+def _same_type_mask_adjacencies(
+    nodes: list[StickerNode],
+    *,
+    adjacency_radius_px: int,
+) -> list[tuple[int, int]]:
+    if not nodes:
+        return []
+
+    radius = max(0, int(adjacency_radius_px))
+    kernel = None
+    if radius > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (radius * 2 + 1, radius * 2 + 1),
+        )
+    dilated_masks = [
+        cv2.dilate(node.mask, kernel, iterations=1) if kernel is not None else node.mask
+        for node in nodes
+    ]
+
+    edges = []
+    for left_index, left in enumerate(nodes):
+        for right_index in range(left_index + 1, len(nodes)):
+            right = nodes[right_index]
+            if left.piece_type != right.piece_type:
+                continue
+            if _masks_within_radius(
+                left.mask,
+                right.mask,
+                dilated_masks[left_index],
+                dilated_masks[right_index],
+            ):
+                edges.append(tuple(sorted((left.node_id, right.node_id))))
     return sorted(edges)
 
 

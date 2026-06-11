@@ -49,16 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-sticker-area",
         type=int,
         default=12,
-        help="Minimum connected-component area kept as a sticker node",
-    )
-    parser.add_argument(
-        "--min-sticker-segment-ratio",
-        type=float,
-        default=0.25,
-        help=(
-            "Merge RGBXY sticker segments smaller than this fraction of the largest "
-            "segment before graph node creation; 0 disables"
-        ),
+        help="Minimum sticker mask area kept as a graph node",
     )
     parser.add_argument(
         "--roi-padding",
@@ -70,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--segmentation-padding-px",
         type=int,
         default=-2,
-        help="Pixel padding applied to each piece mask before sticker splitting",
+        help="Pixel padding applied to each sticker mask before color sampling",
     )
     parser.add_argument("--save", type=Path, help="Optional output graph overlay image path")
     parser.add_argument("--display", action="store_true", help="Show an OpenCV preview window")
@@ -118,7 +109,6 @@ def main() -> int:
         piece_masks,
         adjacency_radius_px=args.adjacency_radius,
         min_component_area_px=args.min_sticker_area,
-        min_sticker_segment_ratio=args.min_sticker_segment_ratio,
     )
     output = draw_piece_graph(
         frame,

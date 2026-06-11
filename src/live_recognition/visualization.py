@@ -205,7 +205,7 @@ def save_rgb_samples_plot(
     raw_density_filter_min_neighbors: int = 0,
     density_cluster_raw_eps: float = RAW_RGB_DENSITY_EPS,
     density_cluster_min_neighbors: int = NORMALIZED_RGB_DENSITY_MIN_POINTS,
-    cluster_display_mode: str = "regression",
+    cluster_display_mode: str = "raw",
 ) -> list[str]:
     if len(bgr_samples) == 0:
         raise ValueError("No RGB samples available for plotting")
@@ -231,13 +231,8 @@ def save_rgb_samples_plot(
                 min_points=density_cluster_min_neighbors,
             )
         else:
-            cluster_indexes, cluster_centroids = _rgb_sample_cluster_indexes(
-                rgb_samples,
-                cluster_count=cluster_count,
-                min_brightness=cluster_min_brightness,
-                raw_density_filter_radius=raw_density_filter_radius,
-                raw_density_filter_min_neighbors=raw_density_filter_min_neighbors,
-            )
+            cluster_indexes = np.full(len(rgb_samples), -1, dtype=np.int32)
+            cluster_centroids = np.empty((0, 3), dtype=np.float32)
         unknown_color = np.asarray([0.55, 0.55, 0.55], dtype=np.float32)
         colors = np.asarray(
             [
@@ -302,17 +297,17 @@ def save_rgb_samples_interactive_plot(
     title: str = "Reliable pixels in RGB",
     normalize_rgb: bool = False,
     point_size: float = 2,
-    draw_regression_lines: bool = True,
-    regression_cluster_count: int = 6,
-    regression_min_brightness: float = 40.0,
-    regression_line_width: float = 4,
+    cluster_count: int = 6,
+    cluster_min_brightness: float = 40.0,
     color_by_cluster: bool = False,
     raw_density_filter_radius: float = 0.0,
     raw_density_filter_min_neighbors: int = 0,
     density_cluster_eps_radians: float = NORMALIZED_RGB_DENSITY_EPS_RADIANS,
     density_cluster_raw_eps: float = RAW_RGB_DENSITY_EPS,
     density_cluster_min_neighbors: int = NORMALIZED_RGB_DENSITY_MIN_POINTS,
-    cluster_display_mode: str = "regression",
+    cluster_display_mode: str = "raw",
+    cluster_indexes: NDArray[np.int32] | None = None,
+    cluster_centroids: NDArray[np.float32] | None = None,
 ) -> str:
     if len(bgr_samples) == 0:
         raise ValueError("No RGB samples available for plotting")
@@ -334,23 +329,24 @@ def save_rgb_samples_interactive_plot(
         axis_range = [0, 1]
         axis_prefix = "normalized "
 
+    has_external_clusters = cluster_indexes is not None and cluster_centroids is not None
     use_raw_density_clusters = cluster_display_mode == "raw-density"
-    if use_raw_density_clusters:
+    if has_external_clusters:
+        cluster_indexes = np.asarray(cluster_indexes, dtype=np.int32).reshape(-1)
+        if len(cluster_indexes) != len(rgb_samples):
+            raise ValueError("cluster_indexes must have one entry per RGB sample")
+        cluster_centroids = np.asarray(cluster_centroids, dtype=np.float32).reshape(-1, 3)
+    elif use_raw_density_clusters:
         cluster_indexes, cluster_centroids = _raw_density_rgb_sample_cluster_indexes(
             rgb_samples,
-            cluster_count=regression_cluster_count,
-            min_brightness=regression_min_brightness,
+            cluster_count=cluster_count,
+            min_brightness=cluster_min_brightness,
             eps=density_cluster_raw_eps,
             min_points=density_cluster_min_neighbors,
         )
     else:
-        cluster_indexes, cluster_centroids = _rgb_sample_cluster_indexes(
-            rgb_samples,
-            cluster_count=regression_cluster_count,
-            min_brightness=regression_min_brightness,
-            raw_density_filter_radius=raw_density_filter_radius,
-            raw_density_filter_min_neighbors=raw_density_filter_min_neighbors,
-        )
+        cluster_indexes = np.full(len(rgb_samples), -1, dtype=np.int32)
+        cluster_centroids = np.empty((0, 3), dtype=np.float32)
     traces = _interactive_sample_traces(
         go,
         plot_samples,
@@ -367,7 +363,16 @@ def save_rgb_samples_interactive_plot(
             "cluster=%{customdata[3]}<extra></extra>"
         ),
     )
-    if use_raw_density_clusters:
+    if normalize_rgb and has_external_clusters:
+        traces.extend(
+            _normalized_rgb_cluster_perimeter_traces(
+                go,
+                plot_samples,
+                cluster_indexes,
+                cluster_centroids,
+            )
+        )
+    elif use_raw_density_clusters:
         traces.extend(
             _normalized_rgb_cluster_perimeter_traces(
                 go,
@@ -379,8 +384,8 @@ def save_rgb_samples_interactive_plot(
     elif normalize_rgb:
         density_cluster_indexes, density_cluster_centroids = _density_rgb_sample_cluster_indexes(
             rgb_samples,
-            cluster_count=regression_cluster_count,
-            min_brightness=regression_min_brightness,
+            cluster_count=cluster_count,
+            min_brightness=cluster_min_brightness,
             eps_radians=density_cluster_eps_radians,
             min_points=density_cluster_min_neighbors,
         )
@@ -392,19 +397,6 @@ def save_rgb_samples_interactive_plot(
                 density_cluster_centroids,
             )
         )
-    if draw_regression_lines and not normalize_rgb and not use_raw_density_clusters:
-        traces.extend(
-            _rgb_origin_regression_line_traces(
-                go,
-                rgb_samples,
-                cluster_count=regression_cluster_count,
-                min_brightness=regression_min_brightness,
-                line_width=regression_line_width,
-                raw_density_filter_radius=raw_density_filter_radius,
-                raw_density_filter_min_neighbors=raw_density_filter_min_neighbors,
-            )
-        )
-
     figure = go.Figure(data=traces)
     figure.update_layout(
         title=title,
@@ -445,13 +437,8 @@ def save_hsv_samples_interactive_plot(
 
     rgb_samples = cv2.cvtColor(bgr_samples.reshape(-1, 1, 3), cv2.COLOR_BGR2RGB).reshape(-1, 3)
     hsv_samples = cv2.cvtColor(bgr_samples.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
-    cluster_indexes, cluster_centroids = _rgb_sample_cluster_indexes(
-        rgb_samples,
-        cluster_count=cluster_count,
-        min_brightness=cluster_min_brightness,
-        raw_density_filter_radius=raw_density_filter_radius,
-        raw_density_filter_min_neighbors=raw_density_filter_min_neighbors,
-    )
+    cluster_indexes = np.full(len(rgb_samples), -1, dtype=np.int32)
+    cluster_centroids = np.empty((0, 3), dtype=np.float32)
     figure = go.Figure(
         data=_interactive_sample_traces(
             go,
@@ -482,48 +469,6 @@ def save_hsv_samples_interactive_plot(
     )
     figure.write_html(output_path, include_plotlyjs="cdn", full_html=True)
     return output_path
-
-
-def _rgb_origin_regression_line_traces(
-    go,
-    rgb_samples: NDArray[np.uint8],
-    *,
-    cluster_count: int,
-    min_brightness: float,
-    line_width: float,
-    raw_density_filter_radius: float,
-    raw_density_filter_min_neighbors: int,
-) -> list:
-    directions, centroids = rgb_origin_regression_rays(
-        rgb_samples,
-        cluster_count=cluster_count,
-        min_brightness=min_brightness,
-        raw_density_filter_radius=raw_density_filter_radius,
-        raw_density_filter_min_neighbors=raw_density_filter_min_neighbors,
-    )
-    traces = []
-    axis_max = 255.0
-    for index, (direction, centroid) in enumerate(zip(directions, centroids)):
-        endpoint_scale = axis_max / max(float(direction.max()), 1e-6)
-        endpoint = direction * endpoint_scale
-        color = f"rgb({int(centroid[0])},{int(centroid[1])},{int(centroid[2])})"
-        traces.append(
-            go.Scatter3d(
-                x=[0, endpoint[0]],
-                y=[0, endpoint[1]],
-                z=[0, endpoint[2]],
-                mode="lines",
-                line={"color": color, "width": line_width},
-                name=f"RGB ray {index + 1}",
-                hovertemplate=(
-                    "origin ray<br>"
-                    f"centroid RGB=({centroid[0]:.1f}, {centroid[1]:.1f}, {centroid[2]:.1f})"
-                    "<extra></extra>"
-                ),
-            )
-        )
-    return traces
-
 
 def _interactive_sample_traces(
     go,
@@ -1137,53 +1082,6 @@ def _raw_color_sample_traces(
     return traces
 
 
-def _rgb_sample_cluster_indexes(
-    rgb_samples: NDArray[np.uint8],
-    *,
-    cluster_count: int,
-    min_brightness: float,
-    raw_density_filter_radius: float,
-    raw_density_filter_min_neighbors: int,
-) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
-    directions, centroids = rgb_origin_regression_rays(
-        rgb_samples,
-        cluster_count=cluster_count,
-        min_brightness=min_brightness,
-        raw_density_filter_radius=raw_density_filter_radius,
-        raw_density_filter_min_neighbors=raw_density_filter_min_neighbors,
-    )
-    if len(directions) == 0:
-        return (
-            np.full(len(rgb_samples), -1, dtype=np.int32),
-            np.empty((0, 3), dtype=np.float32),
-        )
-
-    fit_sample_mask = rgb_regression_fit_sample_mask(
-        rgb_samples,
-        min_brightness=min_brightness,
-        cluster_count=cluster_count,
-        raw_density_filter_radius=raw_density_filter_radius,
-        raw_density_filter_min_neighbors=raw_density_filter_min_neighbors,
-    )
-    distances = np.stack(
-        [distance_to_origin_ray(rgb_sample, directions) for rgb_sample in rgb_samples],
-        axis=0,
-    )
-    cluster_indexes = distances.argmin(axis=1).astype(np.int32)
-    cluster_indexes[~fit_sample_mask] = -1
-    return cluster_indexes, centroids
-
-
-def distance_to_origin_ray(
-    rgb_sample: NDArray[np.uint8] | NDArray[np.float32],
-    directions: NDArray[np.float32],
-) -> NDArray[np.float32]:
-    point = np.asarray(rgb_sample, dtype=np.float32).reshape(3)
-    projections = np.maximum(directions @ point, 0.0)
-    closest_points = directions * projections[:, None]
-    return np.linalg.norm(point[None, :] - closest_points, axis=1)
-
-
 def _cluster_hex_colors(
     cluster_indexes: NDArray[np.int32],
     centroids: NDArray[np.float32],
@@ -1211,314 +1109,6 @@ def _cluster_rgb_color(
     if cluster_index < 0 or cluster_index >= len(centroids):
         return np.array([140, 140, 140], dtype=np.float32)
     return np.clip(centroids[cluster_index], 0, 255)
-
-
-def rgb_origin_regression_rays(
-    rgb_samples: NDArray[np.uint8] | NDArray[np.float32],
-    *,
-    cluster_count: int = 6,
-    min_brightness: float = 40.0,
-    max_iterations: int = 50,
-    raw_density_filter_radius: float = 0.0,
-    raw_density_filter_min_neighbors: int = 0,
-) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    """Fit origin rays after rejecting sparse samples in raw RGB space."""
-    samples, usable, unit_samples, _ = _prepare_rgb_regression_samples(
-        rgb_samples,
-        min_brightness=min_brightness,
-        raw_density_filter_radius=raw_density_filter_radius,
-        raw_density_filter_min_neighbors=raw_density_filter_min_neighbors,
-    )
-    if len(samples) == 0 or cluster_count <= 0 or len(usable) == 0:
-        return (
-            np.empty((0, 3), dtype=np.float32),
-            np.empty((0, 3), dtype=np.float32),
-        )
-
-    k = min(cluster_count, len(unit_samples))
-    centers, labels = _fit_directional_kmeans(
-        unit_samples,
-        k,
-        max_iterations,
-    )
-    directions, centroids, _ = _rgb_clusters_from_clustered_samples(
-        usable,
-        centers,
-        labels,
-    )
-    return directions, centroids
-
-
-def rgb_origin_regression_clusters(
-    rgb_samples: NDArray[np.uint8] | NDArray[np.float32],
-    *,
-    cluster_count: int = 6,
-    min_brightness: float = 40.0,
-    max_iterations: int = 50,
-    raw_density_filter_radius: float = 0.0,
-    raw_density_filter_min_neighbors: int = 0,
-) -> tuple[NDArray[np.float32], NDArray[np.float32], list[NDArray[np.float32]]]:
-    """Fit origin rays and return the retained raw RGB samples for each cluster."""
-    samples, usable, unit_samples, _ = _prepare_rgb_regression_samples(
-        rgb_samples,
-        min_brightness=min_brightness,
-        raw_density_filter_radius=raw_density_filter_radius,
-        raw_density_filter_min_neighbors=raw_density_filter_min_neighbors,
-    )
-    if len(samples) == 0 or cluster_count <= 0 or len(usable) == 0:
-        return (
-            np.empty((0, 3), dtype=np.float32),
-            np.empty((0, 3), dtype=np.float32),
-            [],
-        )
-
-    k = min(cluster_count, len(unit_samples))
-    centers, labels = _fit_directional_kmeans(
-        unit_samples,
-        k,
-        max_iterations,
-    )
-    return _rgb_clusters_from_clustered_samples(usable, centers, labels)
-
-
-def rgb_regression_fit_sample_mask(
-    rgb_samples: NDArray[np.uint8] | NDArray[np.float32],
-    *,
-    min_brightness: float = 40.0,
-    cluster_count: int = 6,
-    max_iterations: int = 50,
-    raw_density_filter_radius: float = 0.0,
-    raw_density_filter_min_neighbors: int = 0,
-) -> NDArray[np.bool_]:
-    samples, usable, unit_samples, sample_indexes = _prepare_rgb_regression_samples(
-        rgb_samples,
-        min_brightness=min_brightness,
-        raw_density_filter_radius=raw_density_filter_radius,
-        raw_density_filter_min_neighbors=raw_density_filter_min_neighbors,
-    )
-    fit_mask = np.zeros(len(samples), dtype=bool)
-    if len(unit_samples) == 0 or cluster_count <= 0:
-        return fit_mask
-
-    k = min(cluster_count, len(unit_samples))
-    centers, labels = _fit_directional_kmeans(
-        unit_samples,
-        k,
-        max_iterations,
-    )
-    fit_mask[sample_indexes] = True
-    return fit_mask
-
-
-def _prepare_rgb_regression_samples(
-    rgb_samples: NDArray[np.uint8] | NDArray[np.float32],
-    *,
-    min_brightness: float,
-    raw_density_filter_radius: float = 0.0,
-    raw_density_filter_min_neighbors: int = 0,
-) -> tuple[
-    NDArray[np.float32],
-    NDArray[np.float32],
-    NDArray[np.float32],
-    NDArray[np.int32],
-]:
-    samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
-    if len(samples) == 0:
-        return (
-            np.empty((0, 3), dtype=np.float32),
-            np.empty((0, 3), dtype=np.float32),
-            np.empty((0, 3), dtype=np.float32),
-            np.empty((0,), dtype=np.int32),
-        )
-
-    brightness = np.linalg.norm(samples, axis=1)
-    brightness_mask = brightness >= min_brightness
-    if not bool(brightness_mask.any()):
-        brightness_mask = brightness > 0
-    usable = samples[brightness_mask]
-    sample_indexes = np.flatnonzero(brightness_mask).astype(np.int32)
-    if len(usable) == 0:
-        return (
-            samples,
-            np.empty((0, 3), dtype=np.float32),
-            np.empty((0, 3), dtype=np.float32),
-            np.empty((0,), dtype=np.int32),
-        )
-
-    density_mask = _raw_density_sample_mask(
-        usable,
-        radius=raw_density_filter_radius,
-        min_neighbors=raw_density_filter_min_neighbors,
-    )
-    usable = usable[density_mask]
-    sample_indexes = sample_indexes[density_mask]
-    if len(usable) == 0:
-        return (
-            samples,
-            np.empty((0, 3), dtype=np.float32),
-            np.empty((0, 3), dtype=np.float32),
-            np.empty((0,), dtype=np.int32),
-        )
-
-    usable_brightness = np.maximum(np.linalg.norm(usable, axis=1, keepdims=True), 1e-6)
-    unit_samples = usable / usable_brightness
-    return samples, usable, unit_samples, sample_indexes
-
-
-def _raw_density_sample_mask(
-    samples: NDArray[np.float32],
-    *,
-    radius: float,
-    min_neighbors: int,
-) -> NDArray[np.bool_]:
-    if radius <= 0 or min_neighbors <= 0 or len(samples) == 0:
-        return np.ones(len(samples), dtype=bool)
-
-    quantized_samples = np.rint(np.clip(samples, 0, 255)).astype(np.int16)
-    unique_samples, inverse_indexes, sample_counts = np.unique(
-        quantized_samples,
-        axis=0,
-        return_inverse=True,
-        return_counts=True,
-    )
-    unique_samples_float = unique_samples.astype(np.float32)
-    cell_size = float(radius)
-    radius_squared = cell_size * cell_size
-    cells: dict[tuple[int, int, int], list[int]] = {}
-    cell_coords = np.floor(unique_samples_float / cell_size).astype(np.int32)
-    for index, coord in enumerate(cell_coords):
-        key = (int(coord[0]), int(coord[1]), int(coord[2]))
-        cells.setdefault(key, []).append(index)
-
-    neighbor_counts = np.zeros(len(unique_samples), dtype=np.int32)
-    offsets = [
-        (dx, dy, dz)
-        for dx in (-1, 0, 1)
-        for dy in (-1, 0, 1)
-        for dz in (-1, 0, 1)
-    ]
-    for key, indexes in cells.items():
-        source_indexes = np.asarray(indexes, dtype=np.int32)
-        source_samples = unique_samples_float[source_indexes]
-        for offset in offsets:
-            neighbor_key = (
-                key[0] + offset[0],
-                key[1] + offset[1],
-                key[2] + offset[2],
-            )
-            neighbor_indexes_list = cells.get(neighbor_key)
-            if neighbor_indexes_list is None:
-                continue
-            neighbor_indexes = np.asarray(neighbor_indexes_list, dtype=np.int32)
-            neighbor_samples = unique_samples_float[neighbor_indexes]
-            distances_squared = np.sum(
-                (source_samples[:, None, :] - neighbor_samples[None, :, :]) ** 2,
-                axis=2,
-            )
-            neighbor_counts[source_indexes] += (
-                (distances_squared <= radius_squared) * sample_counts[neighbor_indexes]
-            ).sum(axis=1)
-
-    return (neighbor_counts[inverse_indexes] - 1) >= min_neighbors
-
-
-def _rays_from_clustered_samples(
-    usable: NDArray[np.float32],
-    centers: NDArray[np.float32],
-    labels: NDArray[np.int32],
-) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    directions, centroids, _ = _rgb_clusters_from_clustered_samples(
-        usable,
-        centers,
-        labels,
-    )
-    return directions, centroids
-
-
-def _rgb_clusters_from_clustered_samples(
-    usable: NDArray[np.float32],
-    centers: NDArray[np.float32],
-    labels: NDArray[np.int32],
-) -> tuple[NDArray[np.float32], NDArray[np.float32], list[NDArray[np.float32]]]:
-    k = len(centers)
-    centroids = []
-    directions = []
-    clusters = []
-    for cluster_index in range(k):
-        members = usable[labels == cluster_index]
-        if len(members) == 0:
-            continue
-        centroid = members.mean(axis=0)
-        norm = float(np.linalg.norm(centroid))
-        if norm <= 1e-6:
-            continue
-        centroids.append(centroid)
-        directions.append(centroid / norm)
-        clusters.append(members.astype(np.float32, copy=True))
-
-    if not centroids:
-        return (
-            np.empty((0, 3), dtype=np.float32),
-            np.empty((0, 3), dtype=np.float32),
-            [],
-        )
-
-    order = np.argsort([_rgb_hue_sort_key(centroid) for centroid in centroids])
-    cluster_order = [clusters[int(index)] for index in order]
-    return (
-        np.asarray(directions, dtype=np.float32)[order],
-        np.asarray(centroids, dtype=np.float32)[order],
-        cluster_order,
-    )
-
-
-def _fit_directional_kmeans(
-    unit_samples: NDArray[np.float32],
-    cluster_count: int,
-    max_iterations: int,
-) -> tuple[NDArray[np.float32], NDArray[np.int32]]:
-    centers = _initialize_direction_centers(
-        unit_samples,
-        cluster_count,
-    )
-    labels = np.zeros(len(unit_samples), dtype=np.int32)
-    for _ in range(max_iterations):
-        distances = np.linalg.norm(unit_samples[:, None, :] - centers[None, :, :], axis=2)
-        next_labels = distances.argmin(axis=1)
-        next_centers = centers.copy()
-        for cluster_index in range(cluster_count):
-            members = unit_samples[next_labels == cluster_index]
-            if len(members) > 0:
-                center = members.mean(axis=0)
-                next_centers[cluster_index] = center / max(float(np.linalg.norm(center)), 1e-6)
-        if np.array_equal(labels, next_labels) and np.allclose(centers, next_centers):
-            centers = next_centers
-            labels = next_labels
-            break
-        centers = next_centers
-        labels = next_labels
-    return centers, labels
-
-
-def _initialize_direction_centers(
-    unit_samples: NDArray[np.float32],
-    cluster_count: int,
-) -> NDArray[np.float32]:
-    first_index = int(np.argmax(np.linalg.norm(unit_samples, axis=1)))
-    centers = [unit_samples[first_index]]
-    while len(centers) < cluster_count:
-        distances = np.min(
-            np.linalg.norm(unit_samples[:, None, :] - np.asarray(centers)[None, :, :], axis=2),
-            axis=1,
-        )
-        centers.append(unit_samples[int(np.argmax(distances))])
-    return np.asarray(centers, dtype=np.float32)
-
-
-def _rgb_hue_sort_key(rgb: NDArray[np.float32]) -> float:
-    rgb_u8 = np.clip(np.asarray(rgb).reshape(1, 1, 3), 0, 255).astype(np.uint8)
-    hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2HSV)
-    return float(hsv[0, 0, 0])
 
 
 def _rgb_plot_output_paths(output_path: str) -> list[Path]:

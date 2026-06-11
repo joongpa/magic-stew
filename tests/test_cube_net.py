@@ -3,6 +3,7 @@ import numpy as np
 from live_recognition.cube_net import (
     CubeColorScheme,
     CubeNetState,
+    build_observed_cube_net_from_graph,
     build_cube_net_from_graph,
     draw_cube_net,
 )
@@ -32,7 +33,11 @@ def test_net_places_observed_centers():
         edges=[],
     )
 
-    state = build_cube_net_from_graph(graph, scheme=scheme)
+    state = build_cube_net_from_graph(
+        graph,
+        scheme=scheme,
+        classified_colors_by_node_id={0: "green"},
+    )
 
     assert state.cells[("F", 1, 1)].color == "green"
 
@@ -49,7 +54,11 @@ def test_net_places_edge_only_when_piece_connects_to_two_centers():
         edges=[(0, 2), (1, 3)],
     )
 
-    state = build_cube_net_from_graph(graph, scheme=scheme)
+    state = build_cube_net_from_graph(
+        graph,
+        scheme=scheme,
+        classified_colors_by_node_id={0: "green", 1: "red", 2: "green", 3: "red"},
+    )
 
     assert state.cells[("F", 1, 2)].color == "green"
     assert state.cells[("R", 1, 0)].color == "red"
@@ -66,13 +75,17 @@ def test_net_does_not_place_edge_with_one_center_connection():
         edges=[(0, 1)],
     )
 
-    state = build_cube_net_from_graph(graph, scheme=scheme)
+    state = build_cube_net_from_graph(
+        graph,
+        scheme=scheme,
+        classified_colors_by_node_id={0: "green", 1: "green", 2: "red"},
+    )
 
     assert ("F", 1, 2) not in state.cells
     assert state.cells[("F", 1, 1)].color == "green"
 
 
-def test_net_can_use_classifier_cluster_colors_and_face_mapping():
+def test_net_can_use_explicit_node_colors_and_face_mapping():
     learned_bgr = (7, 8, 240)
     graph = PieceGraph(
         nodes=[node(0, 0, "center", (40, 40), (0, 0, 0))],
@@ -115,3 +128,32 @@ def test_draw_cube_net_writes_nonblank_image():
     assert image.ndim == 3
     assert image.shape[2] == 3
     assert image.mean() < 245
+
+
+def test_observed_net_uses_raw_bgr():
+    raw_bgr = (12, 34, 56)
+    graph = PieceGraph(
+        nodes=[node(0, 0, "center", (40, 40), raw_bgr)],
+        edges=[],
+    )
+
+    state = build_observed_cube_net_from_graph(graph)
+
+    assert state.cells[("F", 1, 1)].color == "node-0"
+    assert state.cells[("F", 1, 1)].bgr == raw_bgr
+
+
+def test_observed_net_places_corner_from_adjacent_edge_face():
+    graph = PieceGraph(
+        nodes=[
+            node(0, 0, "center", (40, 40), (0, 200, 0)),
+            node(1, 1, "edge", (40, 25), (0, 180, 0)),
+            node(2, 2, "corner", (25, 25), (0, 160, 0)),
+        ],
+        edges=[(0, 1), (1, 2)],
+    )
+
+    state = build_observed_cube_net_from_graph(graph)
+
+    assert state.cells[("F", 0, 1)].bgr == (0, 180, 0)
+    assert state.cells[("F", 0, 0)].bgr == (0, 160, 0)

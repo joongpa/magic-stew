@@ -5,6 +5,7 @@ from live_recognition.piece_graph import (
     StickerNode,
     _legal_mask_adjacencies,
     build_piece_graph,
+    build_sticker_adjacency_graph,
 )
 
 
@@ -92,3 +93,22 @@ def test_graph_uses_unpadded_mask_geometry_and_padded_sampling_mask_for_color():
     assert graph.nodes[0].centroid_xy == (14.5, 14.5)
     assert graph.nodes[0].mask.sum() == full_mask.sum()
     assert graph.nodes[0].mean_bgr == (220, 0, 0)
+
+
+def test_sticker_graph_groups_adjacent_same_type_nodes_as_one_piece():
+    first_edge_sticker = node(0, 10, "edge", (10.0, 10.0), (10, 12, 10, 12))
+    second_edge_sticker = node(1, 11, "edge", (13.0, 10.0), (10, 12, 13, 15))
+    center = node(2, 12, "center", (7.0, 10.0), (10, 12, 7, 9))
+
+    graph = build_sticker_adjacency_graph(
+        [first_edge_sticker, second_edge_sticker, center],
+        adjacency_radius_px=2,
+    )
+
+    edge_piece_ids = {
+        graph.nodes[0].piece_id,
+        graph.nodes[1].piece_id,
+    }
+    assert len(edge_piece_ids) == 1
+    assert graph.nodes[2].piece_id not in edge_piece_ids
+    assert graph.edges == [(0, 2)]

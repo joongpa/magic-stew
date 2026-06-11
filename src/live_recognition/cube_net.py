@@ -52,23 +52,6 @@ class CubeColorScheme:
     def color_to_face(self) -> dict[ColorName, Face]:
         return {color: face for face, color in self.face_colors.items()}
 
-    def classify_bgr(self, bgr: tuple[int, int, int]) -> ColorName:
-        sample = np.asarray([[bgr]], dtype=np.uint8)
-        sample_lab = cv2.cvtColor(sample, cv2.COLOR_BGR2LAB).astype(np.float32)[0, 0]
-        return min(
-            self.palette_bgr,
-            key=lambda color: float(
-                np.linalg.norm(
-                    sample_lab
-                    - cv2.cvtColor(
-                        np.asarray([[self.palette_bgr[color]]], dtype=np.uint8),
-                        cv2.COLOR_BGR2LAB,
-                    ).astype(np.float32)[0, 0]
-                )
-            ),
-        )
-
-
 @dataclass(frozen=True)
 class NetCell:
     color: ColorName
@@ -173,6 +156,55 @@ def build_cube_net_from_graph(
     return state
 
 
+def build_observed_cube_net_from_graph(graph: PieceGraph) -> CubeNetState:
+    """Construct a view-relative net from observed sticker BGR values only."""
+    nodes_by_id = {node.node_id: node for node in graph.nodes}
+    centers = [node for node in graph.nodes if node.piece_type == "center"]
+    ordered_centers, face_order = _view_relative_center_order_and_faces(centers)
+    center_face_by_id = {
+        center.node_id: face for center, face in zip(ordered_centers, face_order)
+    }
+    centers_by_id = {center.node_id: center for center in centers}
+    center_by_face = {
+        center_face_by_id[center.node_id]: center
+        for center in centers
+        if center.node_id in center_face_by_id
+    }
+
+    state = CubeNetState()
+    for center in centers:
+        face = center_face_by_id.get(center.node_id)
+        if face is None:
+            continue
+        _add_observed_node_cell(state, center, face, 1, 1)
+
+    center_edges = _center_edge_connections(graph, nodes_by_id)
+    edge_face_by_node_id: dict[int, Face] = {}
+    for edge_id, center_ids in center_edges.items():
+        known_center_ids = [
+            center_id for center_id in center_ids if center_id in center_face_by_id
+        ]
+        if len(known_center_ids) != 1:
+            continue
+        edge = nodes_by_id[edge_id]
+        center = centers_by_id[known_center_ids[0]]
+        face = center_face_by_id[known_center_ids[0]]
+        edge_face_by_node_id[edge_id] = face
+        row, col = _edge_cell_for_center(center, edge)
+        _add_observed_node_cell(state, edge, face, row, col)
+
+    corner_edges = _corner_edge_connections(graph, nodes_by_id)
+    for corner_id, edge_ids in corner_edges.items():
+        corner = nodes_by_id[corner_id]
+        face = _nearest_known_edge_face(corner, edge_ids, nodes_by_id, edge_face_by_node_id)
+        if face is None or face not in center_by_face:
+            continue
+        row, col = _corner_cell_for_center(center_by_face[face], corner)
+        _add_observed_node_cell(state, corner, face, row, col)
+
+    return state
+
+
 def draw_cube_net(
     state: CubeNetState,
     *,
@@ -209,14 +241,7 @@ def _node_colors(
     scheme: CubeColorScheme,
     classified_colors_by_node_id: dict[int, ColorName] | None,
 ) -> dict[int, ColorName]:
-    colors = {
-        node.node_id: scheme.classify_bgr(node.mean_bgr)
-        for node in graph.nodes
-        if node.mean_bgr != (0, 0, 0)
-    }
-    if classified_colors_by_node_id:
-        colors.update(classified_colors_by_node_id)
-    return colors
+    return dict(classified_colors_by_node_id or {})
 
 
 def _color_to_face(
@@ -312,12 +337,73 @@ def _edge_nodes_by_piece(nodes: list[StickerNode]) -> dict[int, list[StickerNode
     return edge_nodes
 
 
+def _corner_edge_connections(
+    graph: PieceGraph,
+    nodes_by_id: dict[int, StickerNode],
+) -> dict[int, list[int]]:
+    edge_ids_by_corner_id: dict[int, list[int]] = defaultdict(list)
+    for left_id, right_id in graph.edges:
+        left = nodes_by_id[left_id]
+        right = nodes_by_id[right_id]
+        if left.piece_type == "corner" and right.piece_type == "edge":
+            edge_ids_by_corner_id[left_id].append(right_id)
+        elif right.piece_type == "corner" and left.piece_type == "edge":
+            edge_ids_by_corner_id[right_id].append(left_id)
+    return edge_ids_by_corner_id
+
+
 def _edge_cell_for_center(center: StickerNode, edge: StickerNode) -> tuple[int, int]:
     dx = edge.centroid_xy[0] - center.centroid_xy[0]
     dy = edge.centroid_xy[1] - center.centroid_xy[1]
     if abs(dx) >= abs(dy):
         return 1, 2 if dx > 0 else 0
     return (2 if dy > 0 else 0), 1
+
+
+def _corner_cell_for_center(center: StickerNode, corner: StickerNode) -> tuple[int, int]:
+    dx = corner.centroid_xy[0] - center.centroid_xy[0]
+    dy = corner.centroid_xy[1] - center.centroid_xy[1]
+    return (2 if dy > 0 else 0), (2 if dx > 0 else 0)
+
+
+def _nearest_known_edge_face(
+    corner: StickerNode,
+    edge_ids: list[int],
+    nodes_by_id: dict[int, StickerNode],
+    edge_face_by_node_id: dict[int, Face],
+) -> Face | None:
+    candidates = [
+        (_node_distance(corner, nodes_by_id[edge_id]), edge_face_by_node_id[edge_id])
+        for edge_id in edge_ids
+        if edge_id in edge_face_by_node_id
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def _node_distance(left: StickerNode, right: StickerNode) -> float:
+    left_xy = np.asarray(left.centroid_xy, dtype=np.float32)
+    right_xy = np.asarray(right.centroid_xy, dtype=np.float32)
+    return float(np.linalg.norm(left_xy - right_xy))
+
+
+def _add_observed_node_cell(
+    state: CubeNetState,
+    node: StickerNode,
+    face: Face,
+    row: int,
+    col: int,
+) -> None:
+    state.add_cell(
+        face,
+        row,
+        col,
+        f"node-{node.node_id}",
+        "observed",
+        node.confidence,
+        bgr=node.mean_bgr,
+    )
 
 
 def _bgr_for_color(

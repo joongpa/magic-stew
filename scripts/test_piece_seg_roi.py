@@ -37,7 +37,6 @@ from live_recognition.piece_graph import (  # noqa: E402
 )
 from live_recognition.visualization import (  # noqa: E402
     _reliable_color_mask,
-    rgb_origin_regression_clusters,
     save_hsv_samples_interactive_plot,
     save_rgb_samples_interactive_plot,
     save_rgb_samples_plot,
@@ -47,7 +46,7 @@ from live_recognition.visualization import (  # noqa: E402
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 DEFAULT_STICKER_MODEL = (
     ROOT
-    / "runs/cube_piece_seg_local/runs/cube_piece_yolo11n_seg-3/weights/best.pt"
+    / "runs/segment/runs/cube_piece_seg_sticker/runs/cube_piece_yolo11n_seg/weights/best.pt"
 )
 CLASS_COLORS = {
     0: (80, 220, 255),   # center
@@ -56,92 +55,53 @@ CLASS_COLORS = {
 }
 STICKER_CLASS_NAMES = ["center_sticker", "edge_sticker", "corner_sticker"]
 CENTER_CLASS_ID = 0
-COLOR_CLASSIFIER_MODES = (
-    "closest-cluster-point",
-    "closest-cluster-normalized",
-    "density-cluster",
-    "linear-regression",
-    "normalized-centroid-regression",
-    "raw-density-cluster",
-)
 STICKER_COLOR_SAMPLE_COUNT = 10
 DRAW_COLOR_SAMPLE_POINTS = True
 DENSITY_CLUSTER_EPS_RADIANS = 0.08
-DENSITY_CLUSTER_RAW_EPS = 24.0
 DENSITY_CLUSTER_MIN_POINTS = 4
 
 
-class ColorRayClassifier:
+class ColorDensityClassifier:
     def __init__(
         self,
         *,
         required_frames: int = 30,
         cluster_count: int = 6,
         min_brightness: float = 40.0,
-        raw_density_filter_radius: float = 0.0,
-        raw_density_filter_min_neighbors: int = 0,
         density_cluster_eps_radians: float = DENSITY_CLUSTER_EPS_RADIANS,
-        density_cluster_raw_eps: float = DENSITY_CLUSTER_RAW_EPS,
         density_cluster_min_neighbors: int = DENSITY_CLUSTER_MIN_POINTS,
-        mode: str = "closest-cluster-point",
     ) -> None:
-        if mode not in COLOR_CLASSIFIER_MODES:
-            raise ValueError(f"Unsupported color classifier mode: {mode}")
         self.required_frames = max(1, required_frames)
         self.cluster_count = max(1, cluster_count)
         self.min_brightness = min_brightness
-        self.raw_density_filter_radius = raw_density_filter_radius
-        self.raw_density_filter_min_neighbors = raw_density_filter_min_neighbors
         self.density_cluster_eps_radians = density_cluster_eps_radians
-        self.density_cluster_raw_eps = density_cluster_raw_eps
         self.density_cluster_min_neighbors = max(1, density_cluster_min_neighbors)
-        self.mode = mode
         self.detected_frames = 0
         self._rgb_samples: list[np.ndarray] = []
-        self.directions = np.empty((0, 3), dtype=np.float32)
         self.centroids = np.empty((0, 3), dtype=np.float32)
         self.cluster_samples: list[np.ndarray] = []
 
     @property
     def ready(self) -> bool:
-        return len(self.directions) > 0 or len(self.cluster_samples) > 0
+        return len(self.cluster_samples) > 0
 
     def observe_frame(self, bgr_samples: np.ndarray) -> None:
         if self.ready or len(bgr_samples) == 0:
             return
 
         bgr_samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
-        rgb_samples = bgr_samples[:, ::-1]
-        self._rgb_samples.extend(rgb_samples)
+        self._rgb_samples.extend(bgr_samples[:, ::-1])
         self.detected_frames += 1
         if self.detected_frames < self.required_frames:
             return
 
-        samples = np.asarray(self._rgb_samples, dtype=np.uint8)
-        if self.mode == "density-cluster":
-            self.directions, self.centroids, self.cluster_samples = density_rgb_clusters(
-                samples,
-                target_clusters=self.cluster_count,
-                min_brightness=self.min_brightness,
-                eps_radians=self.density_cluster_eps_radians,
-                min_points=self.density_cluster_min_neighbors,
-            )
-        elif self.mode == "raw-density-cluster":
-            self.directions, self.centroids, self.cluster_samples = raw_density_rgb_clusters(
-                samples,
-                target_clusters=self.cluster_count,
-                min_brightness=self.min_brightness,
-                eps=self.density_cluster_raw_eps,
-                min_points=self.density_cluster_min_neighbors,
-            )
-        else:
-            self.directions, self.centroids, self.cluster_samples = rgb_origin_regression_clusters(
-                samples,
-                cluster_count=self.cluster_count,
-                min_brightness=self.min_brightness,
-                raw_density_filter_radius=self.raw_density_filter_radius,
-                raw_density_filter_min_neighbors=self.raw_density_filter_min_neighbors,
-            )
+        self.centroids, self.cluster_samples = density_rgb_clusters(
+            np.asarray(self._rgb_samples, dtype=np.uint8),
+            target_clusters=self.cluster_count,
+            min_brightness=self.min_brightness,
+            eps_radians=self.density_cluster_eps_radians,
+            min_points=self.density_cluster_min_neighbors,
+        )
 
     def classify_bgr(self, bgr_sample: np.ndarray) -> int | None:
         if not self.ready:
@@ -151,37 +111,12 @@ class ColorRayClassifier:
         if float(np.linalg.norm(rgb)) < self.min_brightness:
             return None
 
-        if self.mode == "linear-regression":
-            distances = distance_to_origin_rays(rgb, self.directions)
-        elif self.mode == "normalized-centroid-regression":
-            distances = distance_to_normalized_cluster_centroid_rays(
-                rgb,
-                self.cluster_samples,
-            )
-            if len(distances) == 0:
-                distances = distance_to_origin_rays(rgb, self.directions)
-        elif self.mode == "closest-cluster-normalized":
-            distances = distance_to_normalized_rgb_clusters(rgb, self.cluster_samples)
-            if len(distances) == 0:
-                distances = distance_to_origin_rays(rgb, self.directions)
-        elif self.mode == "density-cluster":
-            distances = angular_distance_to_normalized_rgb_clusters(
-                rgb,
-                self.cluster_samples,
-            )
-            if len(distances) == 0 or float(distances.min()) > self.density_cluster_eps_radians:
-                return None
-        elif self.mode == "raw-density-cluster":
-            distances = distance_to_rgb_clusters(rgb, self.cluster_samples)
-            if len(distances) == 0 or float(distances.min()) > self.density_cluster_raw_eps:
-                return None
-        else:
-            distances = distance_to_rgb_clusters(rgb, self.cluster_samples)
-            if len(distances) == 0:
-                distances = distance_to_origin_rays(rgb, self.directions)
-        if len(distances) == 0:
+        distances = angular_distance_to_normalized_rgb_clusters(
+            rgb,
+            self.cluster_samples,
+        )
+        if len(distances) == 0 or float(distances.min()) > self.density_cluster_eps_radians:
             return None
-
         return int(distances.argmin())
 
     def classify_bgr_samples(self, bgr_samples: np.ndarray) -> int | None:
@@ -199,43 +134,10 @@ class ColorRayClassifier:
         return int(np.bincount(np.asarray(votes, dtype=np.int32)).argmax())
 
 
-def distance_to_rgb_clusters(
-    rgb_sample: np.ndarray,
-    cluster_samples: list[np.ndarray],
-) -> np.ndarray:
-    point = np.asarray(rgb_sample, dtype=np.float32).reshape(3)
-    distances = []
-    for samples in cluster_samples:
-        samples = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-        if len(samples) == 0:
-            distances.append(np.inf)
-            continue
-        distances.append(float(np.min(np.linalg.norm(samples - point[None, :], axis=1))))
-    return np.asarray(distances, dtype=np.float32)
-
-
 def normalized_rgb_points(rgb_samples: np.ndarray) -> np.ndarray:
     samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
     brightness = np.maximum(np.linalg.norm(samples, axis=1, keepdims=True), 1.0)
     return samples / brightness
-
-
-def distance_to_normalized_rgb_clusters(
-    rgb_sample: np.ndarray,
-    cluster_samples: list[np.ndarray],
-) -> np.ndarray:
-    point = normalized_rgb_points(np.asarray(rgb_sample, dtype=np.float32).reshape(1, 3))[0]
-    distances = []
-    for samples in cluster_samples:
-        samples = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-        if len(samples) == 0:
-            distances.append(np.inf)
-            continue
-        normalized_samples = normalized_rgb_points(samples)
-        distances.append(
-            float(np.min(np.linalg.norm(normalized_samples - point[None, :], axis=1)))
-        )
-    return np.asarray(distances, dtype=np.float32)
 
 
 def angular_distance_to_normalized_rgb_clusters(
@@ -262,15 +164,15 @@ def density_rgb_clusters(
     min_brightness: float,
     eps_radians: float = DENSITY_CLUSTER_EPS_RADIANS,
     min_points: int = DENSITY_CLUSTER_MIN_POINTS,
-) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
+) -> tuple[np.ndarray, list[np.ndarray]]:
     samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
     if len(samples) == 0 or target_clusters <= 0:
-        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32), []
+        return np.empty((0, 3), dtype=np.float32), []
 
     brightness = np.linalg.norm(samples, axis=1)
     usable = samples[brightness >= min_brightness]
     if len(usable) < min_points:
-        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32), []
+        return np.empty((0, 3), dtype=np.float32), []
 
     labels = density_bin_labels(
         normalized_rgb_points(usable),
@@ -286,94 +188,30 @@ def density_rgb_clusters(
     clusters = merge_smallest_clusters_to_nearest_neighbor(
         clusters,
         target_count=target_clusters,
-        normalize_centroids=True,
     )
 
-    directions = []
     centroids = []
+    retained_clusters = []
     for members in clusters:
         centroid = members.mean(axis=0)
-        direction = normalized_rgb_points(members).mean(axis=0)
-        norm = float(np.linalg.norm(direction))
-        if norm <= 1e-6:
+        if float(np.linalg.norm(centroid)) <= 1e-6:
             continue
-        directions.append(direction / norm)
         centroids.append(centroid)
+        retained_clusters.append(members)
 
-    return (
-        np.asarray(directions, dtype=np.float32),
-        np.asarray(centroids, dtype=np.float32),
-        clusters,
-    )
-
-
-def raw_density_rgb_clusters(
-    rgb_samples: np.ndarray,
-    *,
-    target_clusters: int,
-    min_brightness: float,
-    eps: float = DENSITY_CLUSTER_RAW_EPS,
-    min_points: int = DENSITY_CLUSTER_MIN_POINTS,
-) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
-    samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
-    if len(samples) == 0 or target_clusters <= 0:
-        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32), []
-
-    brightness = np.linalg.norm(samples, axis=1)
-    usable = samples[brightness >= min_brightness]
-    if len(usable) < min_points:
-        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32), []
-
-    labels = raw_density_bin_labels(
-        usable,
-        eps=eps,
-        min_points=min_points,
-    )
-
-    clusters = []
-    for label in sorted(set(int(value) for value in labels if value >= 0)):
-        members = usable[labels == label]
-        if len(members) >= min_points:
-            clusters.append(members.astype(np.float32, copy=True))
-    clusters = merge_smallest_clusters_to_nearest_neighbor(
-        clusters,
-        target_count=target_clusters,
-        normalize_centroids=False,
-    )
-
-    directions = []
-    centroids = []
-    for members in clusters:
-        centroid = members.mean(axis=0)
-        direction = normalized_rgb_points(members).mean(axis=0)
-        norm = float(np.linalg.norm(direction))
-        if norm <= 1e-6:
-            continue
-        directions.append(direction / norm)
-        centroids.append(centroid)
-
-    return (
-        np.asarray(directions, dtype=np.float32),
-        np.asarray(centroids, dtype=np.float32),
-        clusters,
-    )
+    return np.asarray(centroids, dtype=np.float32), retained_clusters
 
 
 def merge_smallest_clusters_to_nearest_neighbor(
     clusters: list[np.ndarray],
     *,
     target_count: int,
-    normalize_centroids: bool,
 ) -> list[np.ndarray]:
     clusters = [np.asarray(cluster, dtype=np.float32).reshape(-1, 3) for cluster in clusters]
     clusters = [cluster for cluster in clusters if len(cluster) > 0]
     while len(clusters) > target_count:
         smallest_index = min(range(len(clusters)), key=lambda index: len(clusters[index]))
-        nearest_index = nearest_cluster_index(
-            clusters,
-            smallest_index,
-            normalize_centroids=normalize_centroids,
-        )
+        nearest_index = nearest_cluster_index(clusters, smallest_index)
         clusters[nearest_index] = np.concatenate(
             [clusters[nearest_index], clusters[smallest_index]],
             axis=0,
@@ -383,43 +221,19 @@ def merge_smallest_clusters_to_nearest_neighbor(
     return clusters
 
 
-def nearest_cluster_index(
-    clusters: list[np.ndarray],
-    source_index: int,
-    *,
-    normalize_centroids: bool,
-) -> int:
-    source_centroid = cluster_distance_centroid(
-        clusters[source_index],
-        normalize_centroids=normalize_centroids,
-    )
+def nearest_cluster_index(clusters: list[np.ndarray], source_index: int) -> int:
+    source_centroid = normalized_rgb_points(clusters[source_index]).mean(axis=0)
     best_index = 0 if source_index != 0 else 1
     best_distance = np.inf
     for index, cluster in enumerate(clusters):
         if index == source_index:
             continue
-        centroid = cluster_distance_centroid(
-            cluster,
-            normalize_centroids=normalize_centroids,
-        )
+        centroid = normalized_rgb_points(cluster).mean(axis=0)
         distance = float(np.linalg.norm(source_centroid - centroid))
         if distance < best_distance:
             best_distance = distance
             best_index = index
     return best_index
-
-
-def cluster_distance_centroid(
-    cluster: np.ndarray,
-    *,
-    normalize_centroids: bool,
-) -> np.ndarray:
-    centroid = np.asarray(cluster, dtype=np.float32).reshape(-1, 3).mean(axis=0)
-    if normalize_centroids:
-        norm = float(np.linalg.norm(centroid))
-        if norm > 1e-6:
-            centroid = centroid / norm
-    return centroid
 
 
 def density_bin_labels(
@@ -490,112 +304,6 @@ def density_bin_labels(
         if label >= 0:
             labels[sample_index] = label
     return labels
-
-
-def raw_density_bin_labels(
-    rgb_samples: np.ndarray,
-    *,
-    eps: float,
-    min_points: int,
-) -> np.ndarray:
-    samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
-    labels = np.full(len(samples), -1, dtype=np.int32)
-    if len(samples) == 0:
-        return labels
-
-    cell_size = max(float(eps), 1e-6)
-    cell_keys, sample_cell_indexes, cell_counts = np.unique(
-        np.floor(samples / cell_size).astype(np.int32),
-        axis=0,
-        return_inverse=True,
-        return_counts=True,
-    )
-    cell_lookup = {
-        tuple(int(value) for value in cell_key): cell_index
-        for cell_index, cell_key in enumerate(cell_keys)
-    }
-    cell_neighbor_counts = np.zeros(len(cell_keys), dtype=np.int32)
-    for cell_index, cell_key in enumerate(cell_keys):
-        base_cell = tuple(int(value) for value in cell_key)
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                for dz in (-1, 0, 1):
-                    neighbor_index = cell_lookup.get(
-                        (base_cell[0] + dx, base_cell[1] + dy, base_cell[2] + dz)
-                    )
-                    if neighbor_index is not None:
-                        cell_neighbor_counts[cell_index] += cell_counts[neighbor_index]
-
-    dense_cells = cell_neighbor_counts >= int(min_points)
-    cell_labels = np.full(len(cell_keys), -1, dtype=np.int32)
-    cluster_id = 0
-    for start_cell in np.flatnonzero(dense_cells):
-        if cell_labels[start_cell] >= 0:
-            continue
-        queue = [int(start_cell)]
-        cell_labels[start_cell] = cluster_id
-        while queue:
-            current = queue.pop()
-            base_cell = tuple(int(value) for value in cell_keys[current])
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    for dz in (-1, 0, 1):
-                        neighbor_index = cell_lookup.get(
-                            (base_cell[0] + dx, base_cell[1] + dy, base_cell[2] + dz)
-                        )
-                        if (
-                            neighbor_index is None
-                            or not dense_cells[neighbor_index]
-                            or cell_labels[neighbor_index] >= 0
-                        ):
-                            continue
-                        cell_labels[neighbor_index] = cluster_id
-                        queue.append(neighbor_index)
-        cluster_id += 1
-
-    for sample_index, cell_index in enumerate(sample_cell_indexes):
-        label = cell_labels[cell_index]
-        if label >= 0:
-            labels[sample_index] = label
-    return labels
-
-
-def normalized_cluster_centroid_directions(
-    cluster_samples: list[np.ndarray],
-) -> np.ndarray:
-    directions = []
-    for samples in cluster_samples:
-        samples = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-        if len(samples) == 0:
-            continue
-        normalized_samples = normalized_rgb_points(samples)
-        centroid = normalized_samples.mean(axis=0)
-        norm = float(np.linalg.norm(centroid))
-        if norm <= 1e-6:
-            continue
-        directions.append(centroid / norm)
-    return np.asarray(directions, dtype=np.float32)
-
-
-def distance_to_normalized_cluster_centroid_rays(
-    rgb_sample: np.ndarray,
-    cluster_samples: list[np.ndarray],
-) -> np.ndarray:
-    directions = normalized_cluster_centroid_directions(cluster_samples)
-    return distance_to_origin_rays(rgb_sample, directions)
-
-
-def distance_to_origin_rays(
-    rgb_sample: np.ndarray,
-    directions: np.ndarray,
-) -> np.ndarray:
-    point = np.asarray(rgb_sample, dtype=np.float32).reshape(3)
-    if len(directions) == 0:
-        return np.empty((0,), dtype=np.float32)
-
-    projections = np.maximum(directions @ point, 0.0)
-    closest_points = directions * projections[:, None]
-    return np.linalg.norm(point[None, :] - closest_points, axis=1)
 
 
 def parse_source(source: str) -> int | str:
@@ -721,7 +429,7 @@ def draw_color_sample_points(
         return
 
     for xs, ys in sample_points:
-        for x, y in zip(xs, ys, strict=True):
+        for x, y in zip(xs, ys):
             center = (int(x), int(y))
             cv2.circle(frame, center, 2, (0, 0, 0), -1, cv2.LINE_AA)
             cv2.circle(frame, center, 1, (255, 255, 255), -1, cv2.LINE_AA)
@@ -738,49 +446,6 @@ def sticker_color_samples_at_points(
     return crop[ys, xs].astype(np.uint8)
 
 
-def stickers_for_ready_color_classifier(
-    frame: np.ndarray,
-    roi_xyxy: tuple[int, int, int, int],
-    stickers: list[tuple[np.ndarray, np.ndarray]],
-    color_classifier: ColorRayClassifier | None,
-    color_samples: tuple[np.ndarray, np.ndarray] | None = None,
-) -> list[tuple[np.ndarray, np.ndarray, int | None]]:
-    classified_stickers = []
-    if color_classifier is None or not color_classifier.ready:
-        return [(mask, bgr, None) for mask, bgr in stickers]
-
-    grouped_masks: dict[tuple[str, int], list[np.ndarray]] = {}
-    group_order = []
-    for sticker_index, (sticker_mask, sticker_bgr) in enumerate(stickers):
-        cluster_index = (
-            color_classifier.classify_bgr_samples(sticker_bgr)
-            if len(sticker_bgr) > 0
-            else None
-        )
-        if cluster_index is not None and cluster_index < len(color_classifier.centroids):
-            key = ("cluster", int(cluster_index))
-        else:
-            key = ("raw", sticker_index)
-        if key not in grouped_masks:
-            grouped_masks[key] = []
-            group_order.append(key)
-        grouped_masks[key].append(sticker_mask)
-
-    for key in group_order:
-        merged_mask = np.zeros_like(grouped_masks[key][0], dtype=bool)
-        for sticker_mask in grouped_masks[key]:
-            merged_mask |= sticker_mask
-        if color_samples is None:
-            x1, y1, x2, y2 = roi_xyxy
-            color_samples = roi_color_samples(frame[y1:y2, x1:x2])
-        sample_bgr = sticker_color_samples_from_roi(color_samples, merged_mask)
-        if len(sample_bgr) == 0:
-            continue
-        cluster_index = key[1] if key[0] == "cluster" else None
-        classified_stickers.append((merged_mask, sample_bgr, cluster_index))
-    return classified_stickers
-
-
 def direct_sticker_graph(
     nodes: list[StickerNode],
     *,
@@ -792,9 +457,36 @@ def direct_sticker_graph(
     )
 
 
+def stickers_for_ready_color_classifier(
+    frame: np.ndarray,
+    roi_xyxy: tuple[int, int, int, int],
+    stickers: list[tuple[np.ndarray, np.ndarray]],
+    color_classifier: ColorDensityClassifier | None,
+    color_samples: tuple[np.ndarray, np.ndarray] | None = None,
+) -> list[tuple[np.ndarray, np.ndarray, int | None]]:
+    if color_classifier is None or not color_classifier.ready:
+        return [(mask, bgr, None) for mask, bgr in stickers]
+
+    classified_stickers = []
+    for sticker_index, (sticker_mask, sticker_bgr) in enumerate(stickers):
+        cluster_index = (
+            color_classifier.classify_bgr_samples(sticker_bgr)
+            if len(sticker_bgr) > 0
+            else None
+        )
+        if color_samples is None:
+            x1, y1, x2, y2 = roi_xyxy
+            color_samples = roi_color_samples(frame[y1:y2, x1:x2])
+        sample_bgr = sticker_color_samples_from_roi(color_samples, sticker_mask)
+        if len(sample_bgr) == 0:
+            sample_bgr = sticker_bgr
+        classified_stickers.append((sticker_mask, sample_bgr, cluster_index))
+    return classified_stickers
+
+
 def classified_net_colors_from_graph(
     graph,
-    color_classifier: ColorRayClassifier,
+    color_classifier: ColorDensityClassifier,
 ) -> tuple[dict[int, str], dict[str, tuple[int, int, int]]]:
     colors_by_node_id = {}
     bgr_by_color = {}
@@ -835,56 +527,9 @@ def parse_net_cluster_faces(value: str) -> dict[str, str]:
     return face_by_color
 
 
-def cluster_legend_path(net_path: Path) -> Path:
-    return net_path.with_name(f"{net_path.stem}_clusters{net_path.suffix}")
-
-
 def normalized_rgb_html_plot_path(rgb_html_path: Path) -> Path:
     suffix = rgb_html_path.suffix or ".html"
     return rgb_html_path.with_name(f"{rgb_html_path.stem}_normalized{suffix}")
-
-
-def draw_color_cluster_legend(color_classifier: ColorRayClassifier) -> np.ndarray:
-    swatch_size = 48
-    row_height = 64
-    width = 300
-    height = max(row_height, row_height * max(1, len(color_classifier.centroids)))
-    image = np.full((height, width, 3), 245, dtype=np.uint8)
-    for index, centroid_rgb in enumerate(color_classifier.centroids):
-        y1 = index * row_height + 8
-        y2 = y1 + swatch_size
-        x1 = 12
-        x2 = x1 + swatch_size
-        centroid_bgr = tuple(int(value) for value in centroid_rgb[::-1])
-        cv2.rectangle(image, (x1, y1), (x2, y2), centroid_bgr, -1)
-        cv2.rectangle(image, (x1, y1), (x2, y2), (35, 35, 35), 1)
-        cv2.putText(
-            image,
-            f"cluster {index + 1}",
-            (x2 + 14, y1 + 31),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.72,
-            (30, 30, 30),
-            2,
-            cv2.LINE_AA,
-        )
-    return image
-
-
-def save_color_cluster_legend(
-    color_classifier: ColorRayClassifier,
-    net_path: Path | None,
-) -> None:
-    if net_path is None or not color_classifier.ready:
-        return
-    legend_path = cluster_legend_path(net_path)
-    legend_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(legend_path), draw_color_cluster_legend(color_classifier))
-    cluster_summary = ", ".join(
-        f"{index + 1}=BGR{tuple(int(value) for value in centroid_rgb[::-1])}"
-        for index, centroid_rgb in enumerate(color_classifier.centroids)
-    )
-    print(f"Saved {legend_path} with learned clusters: {cluster_summary}")
 
 
 def save_rgb_html_plots(
@@ -894,27 +539,25 @@ def save_rgb_html_plots(
     title: str,
     normalize_rgb: bool,
     args,
+    color_classifier: ColorDensityClassifier | None = None,
 ) -> None:
-    use_raw_density_plot = args.color_classifier_mode == "raw-density-cluster"
+    cluster_indexes = None
+    cluster_centroids = None
+    if color_classifier is not None and color_classifier.ready:
+        cluster_indexes = classifier_cluster_indexes_for_bgr_samples(
+            color_classifier,
+            bgr_samples,
+        )
+        cluster_centroids = color_classifier.centroids
+
     save_rgb_samples_interactive_plot(
         bgr_samples,
         str(rgb_html_path),
         title=title,
         normalize_rgb=normalize_rgb,
         point_size=args.plotly_point_size,
-        draw_regression_lines=args.show_rgb_regressions and not use_raw_density_plot,
-        regression_cluster_count=args.rgb_regression_clusters,
-        regression_min_brightness=args.rgb_regression_min_brightness,
-        regression_line_width=args.plotly_regression_line_width,
-        color_by_cluster=args.plotly_color_by_cluster,
-        raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
-        raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
-        density_cluster_eps_radians=args.density_cluster_eps_radians,
-        density_cluster_raw_eps=args.density_cluster_raw_eps,
-        density_cluster_min_neighbors=args.density_cluster_min_neighbors,
-        cluster_display_mode=(
-            "raw-density" if use_raw_density_plot else "regression"
-        ),
+        cluster_indexes=cluster_indexes,
+        cluster_centroids=cluster_centroids,
     )
     save_rgb_samples_interactive_plot(
         bgr_samples,
@@ -922,16 +565,24 @@ def save_rgb_html_plots(
         title=f"{title} normalized to brightness",
         normalize_rgb=True,
         point_size=args.plotly_point_size,
-        draw_regression_lines=False,
-        regression_cluster_count=args.rgb_regression_clusters,
-        regression_min_brightness=args.rgb_regression_min_brightness,
-        regression_line_width=args.plotly_regression_line_width,
-        color_by_cluster=args.plotly_color_by_cluster,
-        raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
-        raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
-        density_cluster_eps_radians=args.density_cluster_eps_radians,
-        density_cluster_raw_eps=args.density_cluster_raw_eps,
-        density_cluster_min_neighbors=args.density_cluster_min_neighbors,
+        cluster_indexes=cluster_indexes,
+        cluster_centroids=cluster_centroids,
+    )
+
+
+def classifier_cluster_indexes_for_bgr_samples(
+    color_classifier: ColorDensityClassifier,
+    bgr_samples: np.ndarray,
+) -> np.ndarray:
+    samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
+    return np.asarray(
+        [
+            -1
+            if (cluster_index := color_classifier.classify_bgr(sample)) is None
+            else cluster_index
+            for sample in samples
+        ],
+        dtype=np.int32,
     )
 
 
@@ -955,7 +606,7 @@ def draw_sticker_segments(
     sticker_model,
     roi_xyxy,
     args,
-    color_classifier: ColorRayClassifier | None = None,
+    color_classifier: ColorDensityClassifier | None = None,
     cube_net_state: CubeNetState | None = None,
     prediction_roi: np.ndarray | None = None,
 ) -> tuple[int, np.ndarray]:
@@ -1083,16 +734,17 @@ def draw_sticker_segments(
                 and color_classifier.ready
                 and getattr(args, "show_sticker_color_classification", True)
                 and len(sticker_bgr) > 0
+                and cluster_index is not None
+                and cluster_index < len(color_classifier.centroids)
             ):
-                if cluster_index is not None and cluster_index < len(color_classifier.centroids):
-                    centroid_rgb = color_classifier.centroids[cluster_index]
-                    sticker_color = tuple(int(value) for value in centroid_rgb[::-1])
-                    sticker_ys, sticker_xs = np.nonzero(sticker_mask)
-                    sticker_label_at = (
-                        int(sticker_xs.mean()) + x1,
-                        int(sticker_ys.mean()) + y1,
-                    )
-                    sticker_color_numbers.append((sticker_label_at, cluster_index + 1))
+                centroid_rgb = color_classifier.centroids[cluster_index]
+                sticker_color = tuple(int(value) for value in centroid_rgb[::-1])
+                sticker_ys, sticker_xs = np.nonzero(sticker_mask)
+                sticker_label_at = (
+                    int(sticker_xs.mean()) + x1,
+                    int(sticker_ys.mean()) + y1,
+                )
+                sticker_color_numbers.append((sticker_label_at, cluster_index + 1))
             roi_overlay[sticker_mask] = sticker_color
 
         sticker_bgr_batches = []
@@ -1127,16 +779,11 @@ def draw_sticker_segments(
             sticker_nodes,
             adjacency_radius_px=args.graph_adjacency_radius,
         )
-        if cube_net_state is not None and (
-            color_classifier is None or color_classifier.ready
-        ):
-            classified_colors = None
-            classified_bgr = None
-            if color_classifier is not None:
-                classified_colors, classified_bgr = classified_net_colors_from_graph(
-                    graph,
-                    color_classifier,
-                )
+        if cube_net_state is not None and color_classifier is not None and color_classifier.ready:
+            classified_colors, classified_bgr = classified_net_colors_from_graph(
+                graph,
+                color_classifier,
+            )
             cube_net_state.replace_with(
                 build_cube_net_from_graph(
                     graph,
@@ -1244,7 +891,7 @@ def process_frame(
     bbox_detector,
     sticker_model,
     args,
-    color_classifier: ColorRayClassifier | None = None,
+    color_classifier: ColorDensityClassifier | None = None,
     cube_net_state: CubeNetState | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     output = frame.copy()
@@ -1357,75 +1004,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Plot RGB coordinates normalized by RGB vector length",
     )
     parser.add_argument(
-        "--hide-rgb-regressions",
-        dest="show_rgb_regressions",
-        action="store_false",
-        help="Do not draw k-means origin-ray regressions on the interactive RGB plot",
-    )
-    parser.add_argument(
-        "--rgb-regression-clusters",
-        type=int,
-        default=6,
-        help="Number of RGB origin-ray regressions to fit for the interactive plot",
-    )
-    parser.add_argument(
-        "--rgb-regression-min-brightness",
-        type=float,
-        default=40.0,
-        help="Minimum raw RGB vector length used while fitting RGB regressions",
-    )
-    parser.add_argument(
-        "--rgb-regression-raw-density-filter-radius",
-        type=float,
-        default=0.0,
-        help="Reject RGB samples with too few raw-space neighbors inside this radius; 0 disables",
-    )
-    parser.add_argument(
-        "--rgb-regression-raw-density-filter-min-neighbors",
-        type=int,
-        default=0,
-        help="Minimum other samples required inside the raw-density filter radius; 0 disables",
-    )
-    parser.add_argument(
         "--hide-sticker-color-classification",
         dest="show_sticker_color_classification",
         action="store_false",
-        help="Do not recolor sticker masks using the learned color rays",
+        help="Do not recolor sticker masks using density-cluster color classification",
     )
     parser.add_argument(
         "--sticker-color-frames",
         type=int,
-        default=30,
-        help="Detected frames of sticker color samples to collect before recoloring stickers",
+        default=90,
+        help="Detected frames of sticker color samples to collect before classifying stickers",
     )
     parser.add_argument(
         "--sticker-color-min-brightness",
         type=float,
         default=40.0,
-        help="Minimum raw RGB vector length used while fitting color rays",
+        help="Minimum raw RGB vector length used while fitting density color clusters",
+    )
+    parser.add_argument(
+        "--color-cluster-count",
+        "--rgb-regression-clusters",
+        dest="color_cluster_count",
+        type=int,
+        default=6,
+        help="Target number of density color clusters to keep",
     )
     parser.add_argument(
         "--color-classifier-mode",
-        choices=COLOR_CLASSIFIER_MODES,
-        default="closest-cluster-point",
-        help=(
-            "Classify recognized sticker colors by nearest retained RGB cluster sample, "
-            "nearest brightness-normalized cluster sample, normalized RGB density cluster, "
-            "raw RGB density cluster, learned RGB origin-ray regression, "
-            "or origin-ray regression from normalized-cluster centroids"
-        ),
+        choices=("density-cluster",),
+        default="density-cluster",
+        help="Color classification mode. Only density-cluster is supported.",
     )
     parser.add_argument(
         "--density-cluster-eps-radians",
+        "--cluster-eps-radians",
+        dest="density_cluster_eps_radians",
         type=float,
         default=DENSITY_CLUSTER_EPS_RADIANS,
         help="Angular radius for normalized RGB density clustering",
-    )
-    parser.add_argument(
-        "--density-cluster-raw-eps",
-        type=float,
-        default=DENSITY_CLUSTER_RAW_EPS,
-        help="Euclidean RGB radius for raw RGB density clustering",
     )
     parser.add_argument(
         "--density-cluster-min-neighbors",
@@ -1441,17 +1057,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Marker size for interactive Plotly RGB/HSV plots",
-    )
-    parser.add_argument(
-        "--plotly-regression-line-width",
-        type=float,
-        default=4.0,
-        help="Line width for RGB regression rays in the interactive Plotly plot",
-    )
-    parser.add_argument(
-        "--plotly-color-by-cluster",
-        action="store_true",
-        help="Color interactive Plotly points by learned RGB cluster instead of raw color",
     )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--save", type=Path)
@@ -1477,7 +1082,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(
         show_bbox=True,
         show_confidence=True,
-        show_rgb_regressions=True,
         show_sticker_color_classification=True,
         use_bbox_detector=True,
     )
@@ -1501,16 +1105,12 @@ def main() -> int:
     sticker_model = YOLO(str(args.sticker_model))
     source = parse_source(args.source)
     plot_point_size = args.average_plot_point_size
-    color_classifier = ColorRayClassifier(
+    color_classifier = ColorDensityClassifier(
         required_frames=args.sticker_color_frames,
-        cluster_count=args.rgb_regression_clusters,
+        cluster_count=args.color_cluster_count,
         min_brightness=args.sticker_color_min_brightness,
-        raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
-        raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
         density_cluster_eps_radians=args.density_cluster_eps_radians,
-        density_cluster_raw_eps=args.density_cluster_raw_eps,
         density_cluster_min_neighbors=args.density_cluster_min_neighbors,
-        mode=args.color_classifier_mode,
     )
     color_plot_bgr_batches = []
     color_plot_detected_frames = 0
@@ -1545,18 +1145,6 @@ def main() -> int:
                     title="Sticker segmentation reliable pixels in RGB",
                     point_size=plot_point_size,
                     normalize_rgb=args.normalize_rgb_plot,
-                    color_by_cluster=args.plotly_color_by_cluster,
-                    cluster_count=args.rgb_regression_clusters,
-                    cluster_min_brightness=args.rgb_regression_min_brightness,
-                    raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
-                    raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
-                    density_cluster_raw_eps=args.density_cluster_raw_eps,
-                    density_cluster_min_neighbors=args.density_cluster_min_neighbors,
-                    cluster_display_mode=(
-                        "raw-density"
-                        if args.color_classifier_mode == "raw-density-cluster"
-                        else "regression"
-                    ),
                 )
             if args.rgb_html_plot:
                 save_rgb_html_plots(
@@ -1565,6 +1153,7 @@ def main() -> int:
                     title="Sticker segmentation reliable pixels in RGB",
                     normalize_rgb=args.normalize_rgb_plot,
                     args=args,
+                    color_classifier=color_classifier,
                 )
             if args.hsv_html_plot:
                 save_hsv_samples_interactive_plot(
@@ -1572,18 +1161,12 @@ def main() -> int:
                     str(args.hsv_html_plot),
                     title="Sticker segmentation reliable pixels in HSV",
                     point_size=args.plotly_point_size,
-                    color_by_cluster=args.plotly_color_by_cluster,
-                    cluster_count=args.rgb_regression_clusters,
-                    cluster_min_brightness=args.rgb_regression_min_brightness,
-                    raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
-                    raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
                 )
         if args.save:
             cv2.imwrite(str(args.save), output)
         if args.save_net and cube_net_state is not None:
             args.save_net.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(args.save_net), draw_cube_net(cube_net_state))
-            save_color_cluster_legend(color_classifier, args.save_net)
         if args.display:
             cv2.imshow("cube sticker segmentation", output)
             cv2.waitKey(0)
@@ -1652,7 +1235,6 @@ def main() -> int:
     if args.save_net and cube_net_state is not None:
         args.save_net.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(args.save_net), draw_cube_net(cube_net_state))
-        save_color_cluster_legend(color_classifier, args.save_net)
     if args.rgb_color_plot or args.rgb_html_plot or args.hsv_html_plot:
         if not color_plot_bgr_batches:
             raise SystemExit("Could not collect color plot samples from any segmented frames")
@@ -1664,18 +1246,6 @@ def main() -> int:
                 title=f"Sticker segmentation RGB samples across {color_plot_detected_frames} frames",
                 point_size=plot_point_size,
                 normalize_rgb=args.normalize_rgb_plot,
-                color_by_cluster=args.plotly_color_by_cluster,
-                cluster_count=args.rgb_regression_clusters,
-                cluster_min_brightness=args.rgb_regression_min_brightness,
-                raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
-                raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
-                density_cluster_raw_eps=args.density_cluster_raw_eps,
-                density_cluster_min_neighbors=args.density_cluster_min_neighbors,
-                cluster_display_mode=(
-                    "raw-density"
-                    if args.color_classifier_mode == "raw-density-cluster"
-                    else "regression"
-                ),
             )
         if args.rgb_html_plot:
             save_rgb_html_plots(
@@ -1684,6 +1254,7 @@ def main() -> int:
                 title=f"Sticker segmentation RGB samples across {color_plot_detected_frames} frames",
                 normalize_rgb=args.normalize_rgb_plot,
                 args=args,
+                color_classifier=color_classifier,
             )
         if args.hsv_html_plot:
             save_hsv_samples_interactive_plot(
@@ -1691,11 +1262,6 @@ def main() -> int:
                 str(args.hsv_html_plot),
                 title=f"Sticker segmentation HSV samples across {color_plot_detected_frames} frames",
                 point_size=args.plotly_point_size,
-                color_by_cluster=args.plotly_color_by_cluster,
-                cluster_count=args.rgb_regression_clusters,
-                cluster_min_brightness=args.rgb_regression_min_brightness,
-                raw_density_filter_radius=args.rgb_regression_raw_density_filter_radius,
-                raw_density_filter_min_neighbors=args.rgb_regression_raw_density_filter_min_neighbors,
             )
     return 0
 

@@ -103,14 +103,9 @@ def default_args(**overrides):
         "show_confidence": False,
         "mask_opacity": 1.0,
         "color_plot_samples_per_frame": 800,
-        "show_sticker_color_classification": True,
         "draw_sticker_graph": False,
         "graph_adjacency_radius": 6,
         "graph_min_sticker_area": 12,
-        "net_cluster_faces": {},
-        "density_cluster_eps_radians": piece_seg_script.DENSITY_CLUSTER_EPS_RADIANS,
-        "density_cluster_raw_eps": piece_seg_script.DENSITY_CLUSTER_RAW_EPS,
-        "density_cluster_min_neighbors": piece_seg_script.DENSITY_CLUSTER_MIN_POINTS,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -235,7 +230,7 @@ def test_sticker_color_sample_points_are_random_inside_mask():
     repeat_ys, repeat_xs = piece_seg_script.random_mask_sample_points(mask, 6)
 
     assert len(xs) == 6
-    assert len(set(zip(xs, ys, strict=True))) == 6
+    assert len(set(zip(xs, ys))) == 6
     assert mask[ys, xs].all()
     assert np.array_equal(xs, repeat_xs)
     assert np.array_equal(ys, repeat_ys)
@@ -289,476 +284,28 @@ def test_process_frame_graph_uses_unpadded_mask_when_sampling_is_padded():
     assert graph.nodes[0].mask.sum() == 100 * 255
 
 
-def test_process_frame_can_accumulate_cube_net_from_roi_graph():
-    frame = np.zeros((40, 40, 3), dtype=np.uint8)
-    frame[:, :] = [40, 40, 40]
-    frame[10:20, 10:20] = [0, 0, 220]
-    args = default_args(graph_min_sticker_area=1, net_cluster_faces={"cluster-1": "R"})
-    net_state = piece_seg_script.CubeNetState()
-    classifier = piece_seg_script.ColorRayClassifier(required_frames=1)
-    classifier.centroids = np.array([[220.0, 0.0, 0.0]], dtype=np.float32)
-    classifier.cluster_samples = [np.array([[220.0, 0.0, 0.0]], dtype=np.float32)]
-
-    piece_seg_script.process_frame(
-        frame,
-        StubBboxDetector(),
-        StubStickerModel(),
-        args,
-        classifier,
-        cube_net_state=net_state,
-    )
-
-    assert net_state.cells[("R", 1, 1)].color == "cluster-1"
-    assert net_state.cells[("R", 1, 1)].bgr == (0, 0, 220)
-    assert net_state.cells[("R", 1, 1)].source == "observed"
-
-
-def test_process_frame_waits_for_color_sampling_before_cube_net_accumulation():
+def test_process_frame_does_not_accumulate_cube_net_without_classifier():
     frame = np.zeros((40, 40, 3), dtype=np.uint8)
     frame[:, :] = [40, 40, 40]
     frame[10:20, 10:20] = [0, 0, 220]
     args = default_args(graph_min_sticker_area=1)
     net_state = piece_seg_script.CubeNetState()
-    classifier = piece_seg_script.ColorRayClassifier(required_frames=2)
 
     piece_seg_script.process_frame(
         frame,
         StubBboxDetector(),
         StubStickerModel(),
         args,
-        classifier,
         cube_net_state=net_state,
     )
 
-    assert classifier.ready is False
     assert net_state.cells == {}
-
-
-def test_color_classifier_collects_regular_samples_from_sticker_detections():
-    frame = np.zeros((40, 40, 3), dtype=np.uint8)
-    frame[:, :] = [40, 40, 40]
-    frame[10:20, 10:17] = [0, 0, 220]
-    frame[10:20, 17:25] = [220, 0, 0]
-    classifier = piece_seg_script.ColorRayClassifier(
-        required_frames=1,
-        cluster_count=2,
-        min_brightness=20,
-    )
-
-    _, _ = piece_seg_script.process_frame(
-        frame,
-        StubBboxDetector(),
-        StubMixedStickerModel(),
-        default_args(),
-        classifier,
-    )
-
-    observed = np.asarray(classifier._rgb_samples)
-    assert classifier.detected_frames == 1
-    assert len(observed) == 20
-    assert (observed[:, 0] > observed[:, 2]).any()
-    assert (observed[:, 2] > observed[:, 0]).any()
-
-
-def test_ready_color_classifier_merges_same_color_sticker_segments():
-    frame = np.zeros((30, 30, 3), dtype=np.uint8)
-    frame[:, :] = [40, 40, 40]
-    frame[5:20, 5:12] = [0, 0, 220]
-    frame[5:20, 12:20] = [0, 0, 180]
-    left_mask = np.zeros((30, 30), dtype=bool)
-    left_mask[5:20, 5:12] = True
-    right_mask = np.zeros((30, 30), dtype=bool)
-    right_mask[5:20, 12:20] = True
-    classifier = piece_seg_script.ColorRayClassifier(
-        required_frames=1,
-        cluster_count=1,
-        min_brightness=20,
-    )
-    classifier.centroids = np.array([[220.0, 0.0, 0.0]], dtype=np.float32)
-    classifier.cluster_samples = [np.array([[220.0, 0.0, 0.0]], dtype=np.float32)]
-    stickers = [
-        (left_mask, np.array([[0, 0, 220]], dtype=np.uint8)),
-        (right_mask, np.array([[0, 0, 180]], dtype=np.uint8)),
-    ]
-
-    merged = piece_seg_script.stickers_for_ready_color_classifier(
-        frame,
-        (0, 0, 30, 30),
-        stickers,
-        classifier,
-    )
-
-    assert len(merged) == 1
-    assert merged[0][2] == 0
-    assert int(merged[0][0].sum()) == int(left_mask.sum() + right_mask.sum())
-
-
-def test_learned_color_recolors_each_sticker_after_classifier_ready():
-    frame = np.zeros((40, 40, 3), dtype=np.uint8)
-    frame[:, :] = [40, 40, 40]
-    frame[10:20, 10:17] = [0, 0, 220]
-    frame[10:20, 17:25] = [220, 0, 0]
-    classifier = piece_seg_script.ColorRayClassifier(
-        required_frames=1,
-        cluster_count=2,
-        min_brightness=20,
-    )
-
-    piece_seg_script.process_frame(
-        frame,
-        StubBboxDetector(),
-        StubMixedStickerModel(),
-        default_args(),
-        classifier,
-    )
-    output, _ = piece_seg_script.process_frame(
-        frame,
-        StubBboxDetector(),
-        StubMixedStickerModel(),
-        default_args(),
-        classifier,
-    )
-
-    assert classifier.ready
-    assert not np.array_equal(output[15, 15], piece_seg_script.CLASS_COLORS[0])
-    assert not np.array_equal(output[15, 22], piece_seg_script.CLASS_COLORS[1])
-    assert np.any(np.all(output == [220, 0, 0], axis=2))
-
-
-def test_dim_sticker_masks_are_not_recolored_by_classifier():
-    frame = np.zeros((40, 40, 3), dtype=np.uint8)
-    frame[:, :] = [40, 40, 40]
-    frame[10:20, 10:17] = [0, 0, 220]
-    frame[10:20, 17:25] = [220, 0, 0]
-    classifier = piece_seg_script.ColorRayClassifier(
-        required_frames=1,
-        cluster_count=2,
-        min_brightness=120,
-    )
-
-    piece_seg_script.process_frame(
-        frame,
-        StubBboxDetector(),
-        StubMixedStickerModel(),
-        default_args(),
-        classifier,
-    )
-    dim_frame = np.zeros((40, 40, 3), dtype=np.uint8)
-    dim_frame[:, :] = [5, 5, 5]
-    dim_frame[10:20, 10:17] = [0, 0, 25]
-    dim_frame[10:20, 17:25] = [25, 0, 0]
-
-    output, _ = piece_seg_script.process_frame(
-        dim_frame,
-        StubBboxDetector(),
-        StubMixedStickerModel(),
-        default_args(),
-        classifier,
-    )
-
-    assert classifier.ready
-    assert not np.any(np.all(output == [0, 0, 220], axis=2))
-    assert not np.any(np.all(output == [220, 0, 0], axis=2))
-
-
-def test_classifier_uses_nearest_regression_line():
-    classifier = piece_seg_script.ColorRayClassifier(
-        required_frames=1,
-        cluster_count=2,
-        min_brightness=1,
-    )
-    classifier.directions = np.array(
-        [
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    classifier.centroids = np.array(
-        [
-            [200.0, 0.0, 0.0],
-            [4.0, 20.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-
-    assert classifier.classify_bgr(np.array([0, 5, 5], dtype=np.uint8)) == 0
-
-
-def test_classifier_uses_nearest_cluster_sample_before_centroid():
-    classifier = piece_seg_script.ColorRayClassifier(
-        required_frames=1,
-        cluster_count=2,
-        min_brightness=1,
-    )
-    classifier.centroids = np.array(
-        [
-            [50.0, 0.0, 0.0],
-            [60.0, 10.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    classifier.cluster_samples = [
-        np.array(
-            [
-                [0.0, 0.0, 0.0],
-                [100.0, 0.0, 0.0],
-            ],
-            dtype=np.float32,
-        ),
-        np.array([[60.0, 10.0, 0.0]], dtype=np.float32),
-    ]
-
-    assert classifier.classify_bgr(np.array([0, 1, 100], dtype=np.uint8)) == 0
-
-
-def test_normalized_rgb_cluster_distance_ignores_brightness():
-    distances = piece_seg_script.distance_to_normalized_rgb_clusters(
-        np.array([100.0, 0.0, 0.0], dtype=np.float32),
-        [
-            np.array([[10.0, 0.0, 0.0]], dtype=np.float32),
-            np.array([[70.0, 70.0, 0.0]], dtype=np.float32),
-        ],
-    )
-
-    assert distances[0] == 0
-    assert distances[1] > 0
-
-
-def test_classifier_can_use_nearest_brightness_normalized_cluster_sample():
-    classifier = piece_seg_script.ColorRayClassifier(
-        required_frames=1,
-        cluster_count=2,
-        min_brightness=1,
-        mode="closest-cluster-normalized",
-    )
-    classifier.centroids = np.array(
-        [
-            [10.0, 0.0, 0.0],
-            [100.0, 30.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    classifier.cluster_samples = [
-        np.array([[10.0, 0.0, 0.0]], dtype=np.float32),
-        np.array([[100.0, 30.0, 0.0]], dtype=np.float32),
-    ]
-
-    assert classifier.classify_bgr(np.array([0, 0, 100], dtype=np.uint8)) == 0
-
-
-def test_normalized_cluster_centroid_directions_average_normalized_members():
-    directions = piece_seg_script.normalized_cluster_centroid_directions(
-        [
-            np.array(
-                [
-                    [100.0, 0.0, 0.0],
-                    [10.0, 0.0, 0.0],
-                ],
-                dtype=np.float32,
-            ),
-            np.array(
-                [
-                    [0.0, 100.0, 0.0],
-                    [0.0, 10.0, 0.0],
-                ],
-                dtype=np.float32,
-            ),
-        ]
-    )
-
-    assert np.allclose(directions[0], [1.0, 0.0, 0.0])
-    assert np.allclose(directions[1], [0.0, 1.0, 0.0])
-
-
-def test_classifier_can_use_normalized_cluster_centroid_regression():
-    classifier = piece_seg_script.ColorRayClassifier(
-        required_frames=1,
-        cluster_count=2,
-        min_brightness=1,
-        mode="normalized-centroid-regression",
-    )
-    classifier.centroids = np.array(
-        [
-            [30.0, 0.0, 0.0],
-            [100.0, 80.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    classifier.cluster_samples = [
-        np.array([[30.0, 0.0, 0.0], [80.0, 0.0, 0.0]], dtype=np.float32),
-        np.array([[100.0, 80.0, 0.0], [120.0, 96.0, 0.0]], dtype=np.float32),
-    ]
-
-    assert classifier.classify_bgr(np.array([0, 0, 180], dtype=np.uint8)) == 0
-
-
-def test_density_rgb_clusters_merges_smallest_clusters_to_target_count():
-    rgb_samples = []
-    for angle in np.linspace(0.0, 0.5, 8):
-        direction = np.array([np.cos(angle), np.sin(angle), 0.0], dtype=np.float32)
-        rgb_samples.extend(direction * value for value in (100.0, 110.0, 120.0, 130.0))
-    rgb_samples = np.asarray(rgb_samples, dtype=np.float32)
-
-    _, _, clusters = piece_seg_script.density_rgb_clusters(
-        rgb_samples,
-        target_clusters=6,
-        min_brightness=1,
-        eps_radians=0.02,
-        min_points=2,
-    )
-
-    assert len(clusters) == 6
-
-
-def test_raw_density_rgb_clusters_uses_raw_rgb_distance():
-    rgb_samples = np.array(
-        [
-            [100.0, 0.0, 0.0],
-            [105.0, 0.0, 0.0],
-            [110.0, 2.0, 0.0],
-            [0.0, 0.0, 100.0],
-            [0.0, 5.0, 105.0],
-            [2.0, 0.0, 110.0],
-        ],
-        dtype=np.float32,
-    )
-
-    _, centroids, clusters = piece_seg_script.raw_density_rgb_clusters(
-        rgb_samples,
-        target_clusters=6,
-        min_brightness=1,
-        eps=12,
-        min_points=2,
-    )
-
-    assert len(clusters) == 2
-    assert centroids.shape == (2, 3)
-
-
-def test_density_classifier_rejects_without_regression_fallback():
-    classifier = piece_seg_script.ColorRayClassifier(
-        required_frames=1,
-        cluster_count=2,
-        min_brightness=1,
-        mode="density-cluster",
-    )
-    classifier.directions = np.array([[0.0, 1.0, 0.0]], dtype=np.float32)
-    classifier.centroids = np.array([[0.0, 100.0, 0.0]], dtype=np.float32)
-    classifier.cluster_samples = [
-        np.array([[100.0, 0.0, 0.0]], dtype=np.float32),
-    ]
-
-    assert classifier.classify_bgr(np.array([0, 100, 0], dtype=np.uint8)) is None
-
-
-def test_raw_density_classifier_rejects_outside_raw_epsilon():
-    classifier = piece_seg_script.ColorRayClassifier(
-        required_frames=1,
-        cluster_count=2,
-        min_brightness=1,
-        density_cluster_raw_eps=12,
-        mode="raw-density-cluster",
-    )
-    classifier.centroids = np.array([[100.0, 0.0, 0.0]], dtype=np.float32)
-    classifier.cluster_samples = [
-        np.array([[100.0, 0.0, 0.0]], dtype=np.float32),
-    ]
-
-    assert classifier.classify_bgr(np.array([0, 0, 110], dtype=np.uint8)) == 0
-    assert classifier.classify_bgr(np.array([0, 0, 140], dtype=np.uint8)) is None
-
-
-def test_classifier_linear_regression_mode_ignores_cluster_samples():
-    classifier = piece_seg_script.ColorRayClassifier(
-        required_frames=1,
-        cluster_count=2,
-        min_brightness=1,
-        mode="linear-regression",
-    )
-    classifier.directions = np.array(
-        [
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    classifier.centroids = np.array(
-        [
-            [200.0, 0.0, 0.0],
-            [4.0, 20.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    classifier.cluster_samples = [
-        np.array([[5.0, 5.0, 0.0]], dtype=np.float32),
-        np.array([[100.0, 0.0, 0.0]], dtype=np.float32),
-    ]
-
-    assert classifier.classify_bgr(np.array([0, 5, 5], dtype=np.uint8)) == 0
-
-
-def test_parser_exposes_color_classifier_mode():
-    args = piece_seg_script.build_parser().parse_args(
-        ["--color-classifier-mode", "linear-regression"]
-    )
-
-    assert args.color_classifier_mode == "linear-regression"
 
 
 def test_parser_exposes_skip_bbox_option():
     args = piece_seg_script.build_parser().parse_args(["--skip-bbox"])
 
     assert args.use_bbox_detector is False
-
-
-def test_parser_exposes_normalized_cluster_color_classifier_mode():
-    args = piece_seg_script.build_parser().parse_args(
-        ["--color-classifier-mode", "closest-cluster-normalized"]
-    )
-
-    assert args.color_classifier_mode == "closest-cluster-normalized"
-
-
-def test_parser_exposes_density_cluster_color_classifier_mode():
-    args = piece_seg_script.build_parser().parse_args(
-        ["--color-classifier-mode", "density-cluster"]
-    )
-
-    assert args.color_classifier_mode == "density-cluster"
-
-
-def test_parser_exposes_raw_density_cluster_color_classifier_mode():
-    args = piece_seg_script.build_parser().parse_args(
-        ["--color-classifier-mode", "raw-density-cluster"]
-    )
-
-    assert args.color_classifier_mode == "raw-density-cluster"
-
-
-def test_parser_exposes_density_cluster_options():
-    args = piece_seg_script.build_parser().parse_args(
-        [
-            "--density-cluster-eps-radians",
-            "0.12",
-            "--density-cluster-raw-eps",
-            "18",
-            "--density-cluster-min-neighbors",
-            "7",
-        ]
-    )
-
-    assert args.density_cluster_eps_radians == 0.12
-    assert args.density_cluster_raw_eps == 18
-    assert args.density_cluster_min_neighbors == 7
-
-
-def test_parser_exposes_normalized_centroid_regression_color_classifier_mode():
-    args = piece_seg_script.build_parser().parse_args(
-        ["--color-classifier-mode", "normalized-centroid-regression"]
-    )
-
-    assert args.color_classifier_mode == "normalized-centroid-regression"
 
 
 def test_parser_exposes_sticker_graph_options():
@@ -783,16 +330,34 @@ def test_parser_exposes_cube_net_output_option():
     assert str(args.save_net) == "runs/net.png"
 
 
-def test_parser_exposes_net_cluster_face_mapping():
+def test_parser_exposes_density_color_classifier_options():
     args = piece_seg_script.build_parser().parse_args(
-        ["--net-cluster-faces", "1=R,2=U"]
+        [
+            "--color-classifier-mode",
+            "density-cluster",
+            "--cluster-eps-radians",
+            "0.02",
+            "--density-cluster-min-neighbors",
+            "70",
+            "--sticker-color-min-brightness",
+            "50",
+        ]
     )
 
-    assert args.net_cluster_faces == {"cluster-1": "R", "cluster-2": "U"}
+    assert args.color_classifier_mode == "density-cluster"
+    assert args.density_cluster_eps_radians == 0.02
+    assert args.density_cluster_min_neighbors == 70
+    assert args.sticker_color_min_brightness == 50
 
 
-def test_color_cluster_legend_draws_classifier_centroids():
-    classifier = piece_seg_script.ColorRayClassifier(required_frames=1)
+def test_classifier_cluster_indexes_match_display_classifier():
+    classifier = piece_seg_script.ColorDensityClassifier(
+        required_frames=1,
+        cluster_count=2,
+        min_brightness=1,
+        density_cluster_eps_radians=0.2,
+        density_cluster_min_neighbors=2,
+    )
     classifier.centroids = np.array(
         [
             [220.0, 0.0, 0.0],
@@ -800,19 +365,25 @@ def test_color_cluster_legend_draws_classifier_centroids():
         ],
         dtype=np.float32,
     )
-    classifier.cluster_samples = [np.array([[220.0, 0.0, 0.0]], dtype=np.float32)]
+    classifier.cluster_samples = [
+        np.array([[220.0, 0.0, 0.0], [210.0, 5.0, 0.0]], dtype=np.float32),
+        np.array([[0.0, 220.0, 0.0], [5.0, 210.0, 0.0]], dtype=np.float32),
+    ]
+    bgr_samples = np.array(
+        [
+            [0, 0, 220],
+            [0, 220, 0],
+            [1, 1, 1],
+        ],
+        dtype=np.uint8,
+    )
 
-    legend = piece_seg_script.draw_color_cluster_legend(classifier)
+    indexes = piece_seg_script.classifier_cluster_indexes_for_bgr_samples(
+        classifier,
+        bgr_samples,
+    )
 
-    assert legend.shape[0] >= 128
-    assert (legend[16, 16] == [0, 0, 220]).all()
-    assert (legend[80, 16] == [0, 220, 0]).all()
-
-
-def test_cluster_legend_path_uses_net_path_stem():
-    path = piece_seg_script.cluster_legend_path(Path("runs/net.png"))
-
-    assert path == Path("runs/net_clusters.png")
+    assert indexes.tolist() == [0, 1, -1]
 
 
 def test_normalized_rgb_html_plot_path_uses_rgb_html_stem():
