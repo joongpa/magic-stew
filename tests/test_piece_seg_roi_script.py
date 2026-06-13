@@ -59,9 +59,11 @@ class RecordingStickerModel:
 
     def __init__(self):
         self.source_shape = None
+        self.source = None
 
     def predict(self, source, conf, imgsz, verbose):
         self.source_shape = source.shape[:2]
+        self.source = source.copy()
         mask = np.zeros((1, source.shape[0], source.shape[1]), dtype=np.float32)
         mask[:, 2:8, 5:15] = 1.0
         masks = SimpleNamespace(
@@ -133,7 +135,7 @@ def test_process_frame_uses_same_output_when_collecting_plot_samples():
     assert len(bgr_samples) > 1
 
 
-def test_process_frame_can_skip_bbox_detector_and_segment_full_frame():
+def test_process_frame_can_use_sticker_only_viewport_without_bbox_detector():
     frame = np.zeros((40, 40, 3), dtype=np.uint8)
     frame[:, :] = [40, 40, 40]
     frame[5:15, 5:15] = [0, 0, 220]
@@ -142,7 +144,7 @@ def test_process_frame_can_skip_bbox_detector_and_segment_full_frame():
         frame,
         RaisingBboxDetector(),
         StubStickerModel(),
-        default_args(use_bbox_detector=False),
+        default_args(use_bbox_detector=False, sticker_imgsz=40),
     )
 
     assert bgr_samples.shape == (10, 3)
@@ -150,22 +152,68 @@ def test_process_frame_can_skip_bbox_detector_and_segment_full_frame():
     assert np.any(np.all(output == piece_seg_script.CLASS_COLORS[0], axis=2))
 
 
-def test_skip_bbox_downscales_segmentation_input():
+def test_sticker_only_scales_square_viewport_to_model_size():
     frame = np.zeros((40, 80, 3), dtype=np.uint8)
     frame[:, :] = [40, 40, 40]
-    frame[8:32, 20:60] = [0, 0, 220]
+    frame[8:16, 30:50] = [0, 0, 220]
     sticker_model = RecordingStickerModel()
 
-    _, bgr_samples = piece_seg_script.process_frame(
+    output, bgr_samples = piece_seg_script.process_frame(
         frame,
         RaisingBboxDetector(),
         sticker_model,
         default_args(use_bbox_detector=False, sticker_imgsz=20),
     )
 
-    assert sticker_model.source_shape == (10, 20)
+    assert sticker_model.source_shape == (20, 20)
+    assert sticker_model.source is not None
+    assert np.any(sticker_model.source[:, :, 2] > sticker_model.source[:, :, 0])
+    assert output.shape == (20, 20, 3)
     assert bgr_samples.shape == (10, 3)
     assert (bgr_samples[:, 2] > bgr_samples[:, 0]).all()
+
+
+def test_sticker_only_viewport_uses_same_roi_overlay_flow_as_bbox_mode():
+    frame = np.zeros((40, 80, 3), dtype=np.uint8)
+    args = default_args(use_bbox_detector=False, sticker_imgsz=20, show_bbox=True)
+
+    output, _ = piece_seg_script.process_frame(
+        frame,
+        RaisingBboxDetector(),
+        RecordingStickerModel(),
+        args,
+    )
+
+    assert output.shape == (20, 20, 3)
+    assert output[0, 0].tolist() == [40, 220, 40]
+    assert output[19, 19].tolist() == [40, 220, 40]
+
+
+def test_centered_square_viewport_uses_largest_square_from_frame():
+    assert piece_seg_script.centered_square_viewport(640, 480) == (80, 0, 560, 480)
+
+
+def test_resize_to_square_size_scales_viewport_to_model_input_size():
+    image = np.zeros((40, 40, 3), dtype=np.uint8)
+
+    resized = piece_seg_script.resize_to_square_size(image, 20)
+
+    assert resized.shape == (20, 20, 3)
+
+
+def test_frame_for_processing_scales_sticker_only_viewbox():
+    frame = np.zeros((40, 80, 3), dtype=np.uint8)
+    frame[:, 0:20] = [220, 0, 0]
+    frame[:, 20:60] = [0, 0, 220]
+    frame[:, 60:80] = [0, 220, 0]
+
+    working_frame = piece_seg_script.frame_for_processing(
+        frame,
+        default_args(use_bbox_detector=False, sticker_imgsz=20),
+    )
+
+    assert working_frame.shape == (20, 20, 3)
+    assert np.all(working_frame[:, :, 2] > working_frame[:, :, 0])
 
 
 def test_sticker_sampling_uses_same_mask_as_rendering():
@@ -302,10 +350,18 @@ def test_process_frame_does_not_accumulate_cube_net_without_classifier():
     assert net_state.cells == {}
 
 
-def test_parser_exposes_skip_bbox_option():
-    args = piece_seg_script.build_parser().parse_args(["--skip-bbox"])
+def test_parser_exposes_sticker_only_option():
+    args = piece_seg_script.build_parser().parse_args(["--sticker-only"])
 
     assert args.use_bbox_detector is False
+
+
+def test_parser_keeps_skip_bbox_as_hidden_compatibility_alias():
+    parser = piece_seg_script.build_parser()
+    args = parser.parse_args(["--skip-bbox"])
+
+    assert args.use_bbox_detector is False
+    assert "--skip-bbox" not in parser.format_help()
 
 
 def test_parser_exposes_sticker_graph_options():

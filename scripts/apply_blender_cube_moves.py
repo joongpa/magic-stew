@@ -59,6 +59,14 @@ BACKGROUND_DISTANCE = 4.0
 BACKGROUND_SIZE = 12.0
 BACKGROUND_IMAGE_URL = "https://picsum.photos/256/256"
 BACKGROUND_IMAGE_PATH = f"{tempfile.gettempdir()}/synthetic_cube_background.jpg"
+BACKGROUND_CUBIE_COLLECTION_NAME = "SyntheticBackgroundCubies"
+BACKGROUND_CUBIE_PREFIX = "SyntheticBackgroundCubie"
+BACKGROUND_CUBIE_DISTANCE_RANGE = (3.0, 3.8)
+BACKGROUND_CUBIE_RIGHT_RANGE = (-8, 8)
+BACKGROUND_CUBIE_UP_RANGE = (-6, 6)
+BACKGROUND_CUBIE_SCALE_RANGE = (0.65, 1.05)
+DEFAULT_BACKGROUND_CUBIE_PROBABILITY = 0.0
+DEFAULT_MAX_BACKGROUND_CUBIES = 3
 
 SOLVED_LOCATION_PROP = "synthetic_solved_location"
 SOLVED_ROTATION_PROP = "synthetic_solved_rotation"
@@ -304,7 +312,72 @@ def randomize_background() -> None:
     background.rotation_quaternion = camera.rotation_quaternion
 
 
-def randomize_scene(scramble_length: int = DEFAULT_SCRAMBLE_LENGTH) -> list[str]:
+def clear_background_cubies() -> None:
+    for obj in list(bpy.data.objects):
+        if obj.name.startswith(BACKGROUND_CUBIE_PREFIX):
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+
+def background_cubie_collection() -> bpy.types.Collection:
+    collection = bpy.data.collections.get(BACKGROUND_CUBIE_COLLECTION_NAME)
+    if collection is None:
+        collection = bpy.data.collections.new(BACKGROUND_CUBIE_COLLECTION_NAME)
+        bpy.context.scene.collection.children.link(collection)
+    return collection
+
+
+def randomize_background_cubies(
+    source_objects: list[bpy.types.Object],
+    probability: float,
+    max_count: int,
+) -> int:
+    clear_background_cubies()
+    if probability <= 0.0 or max_count <= 0 or random.random() >= probability:
+        return 0
+
+    camera = get_camera()
+    camera_rotation = camera.rotation_quaternion
+    camera_direction = camera_rotation @ Vector((0.0, 0.0, -1.0))
+    camera_right = camera_rotation @ Vector((1.0, 0.0, 0.0))
+    camera_up = camera_rotation @ Vector((0.0, 1.0, 0.0))
+    collection = background_cubie_collection()
+
+    count = random.randint(1, max_count)
+    for index in range(count):
+        source = random.choice(source_objects)
+        cubie = source.copy()
+        cubie.data = source.data
+        cubie.animation_data_clear()
+        cubie.name = f"{BACKGROUND_CUBIE_PREFIX}.{index:03d}"
+
+        depth = random.uniform(*BACKGROUND_CUBIE_DISTANCE_RANGE)
+        right = random.uniform(*BACKGROUND_CUBIE_RIGHT_RANGE)
+        up = random.uniform(*BACKGROUND_CUBIE_UP_RANGE)
+        cubie.location = (camera_direction * depth) + (camera_right * right) + (camera_up * up)
+        cubie.rotation_mode = "QUATERNION"
+        cubie.rotation_quaternion = Quaternion(
+            (
+                random.uniform(-1.0, 1.0),
+                random.uniform(-1.0, 1.0),
+                random.uniform(-1.0, 1.0),
+                random.uniform(-1.0, 1.0),
+            )
+        ).normalized()
+        cubie.scale = (1.0, 1.0, 1.0)
+        cubie.scale *= random.uniform(*BACKGROUND_CUBIE_SCALE_RANGE)
+
+        collection.objects.link(cubie)
+
+    bpy.context.view_layer.update()
+    return count
+
+
+def randomize_scene(
+    scramble_length: int = DEFAULT_SCRAMBLE_LENGTH,
+    background_cubie_probability: float = DEFAULT_BACKGROUND_CUBIE_PROBABILITY,
+    max_background_cubies: int = DEFAULT_MAX_BACKGROUND_CUBIES,
+) -> tuple[list[str], int]:
+    clear_background_cubies()
     objects = cube_objects()
     reset_cube(objects)
 
@@ -320,7 +393,13 @@ def randomize_scene(scramble_length: int = DEFAULT_SCRAMBLE_LENGTH) -> list[str]
 
     for move in moves:
         rotate_face(objects, move)
-    return moves
+
+    background_cubies = randomize_background_cubies(
+        objects,
+        probability=background_cubie_probability,
+        max_count=max_background_cubies,
+    )
+    return moves, background_cubies
 
 
 def configure_render(width: int, height: int) -> None:
@@ -502,6 +581,8 @@ def generate_dataset(
     scramble_length: int,
     width: int,
     height: int,
+    background_cubie_probability: float,
+    max_background_cubies: int,
 ) -> None:
     images_dir = output_dir / "images"
     masks_dir = output_dir / "masks"
@@ -514,10 +595,14 @@ def generate_dataset(
 
     metadata = []
     for index in range(count):
-        moves = randomize_scene(scramble_length)
+        moves, background_cubies = randomize_scene(
+            scramble_length,
+            background_cubie_probability=background_cubie_probability,
+            max_background_cubies=max_background_cubies,
+        )
         objects = cube_objects()
 
-        stem = f"{(index + 950):06d}"
+        stem = f"{(index):06d}"
         image_path = images_dir / f"{stem}.png"
         mask_path = masks_dir / f"{stem}.png"
         label_path = labels_dir / f"{stem}.txt"
@@ -532,6 +617,7 @@ def generate_dataset(
             "label": str(label_path),
             "moves": moves,
             "cubie_labels": {obj.name: obj.pass_index for obj in objects},
+            "background_cubies": background_cubies,
             "sticker_mask_values": {
                 str(mask_value): {
                     "sticker_color_index": sticker_color_index,
@@ -543,7 +629,10 @@ def generate_dataset(
             },
             "segments": len(yolo_lines),
         })
-        print(f"Wrote {image_path}, {mask_path}, and {label_path}")
+        print(
+            f"Wrote {image_path}, {mask_path}, and {label_path} "
+            f"with {background_cubies} background cubies"
+        )
 
     metadata_path = output_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -566,6 +655,18 @@ def cli_args() -> argparse.Namespace:
     parser.add_argument("--scramble-length", type=int, default=DEFAULT_SCRAMBLE_LENGTH)
     parser.add_argument("--width", type=int, default=DEFAULT_IMAGE_SIZE)
     parser.add_argument("--height", type=int, default=DEFAULT_IMAGE_SIZE)
+    parser.add_argument(
+        "--background-cubie-probability",
+        type=float,
+        default=DEFAULT_BACKGROUND_CUBIE_PROBABILITY,
+        help="Probability of adding unlabeled individual cubie distractors behind the cube.",
+    )
+    parser.add_argument(
+        "--max-background-cubies",
+        type=int,
+        default=DEFAULT_MAX_BACKGROUND_CUBIES,
+        help="Maximum number of unlabeled background cubie distractors when enabled.",
+    )
 
     argv = sys.argv
     if "--" not in argv:
@@ -584,6 +685,8 @@ def main() -> None:
         scramble_length=args.scramble_length,
         width=args.width,
         height=args.height,
+        background_cubie_probability=args.background_cubie_probability,
+        max_background_cubies=args.max_background_cubies,
     )
 
 

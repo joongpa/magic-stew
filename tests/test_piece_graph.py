@@ -6,6 +6,7 @@ from live_recognition.piece_graph import (
     _legal_mask_adjacencies,
     build_piece_graph,
     build_sticker_adjacency_graph,
+    draw_piece_graph,
 )
 
 
@@ -23,7 +24,7 @@ def node(node_id, piece_id, piece_type, centroid_xy, mask_slice):
     )
 
 
-def test_graph_connects_node_to_closest_node_on_neighboring_piece():
+def test_graph_connects_all_adjacent_stickers():
     center = node(0, 0, "center", (10.0, 10.0), (10, 12, 10, 12))
     near_edge_sticker = node(1, 1, "edge", (12.0, 10.0), (10, 12, 12, 14))
     far_edge_sticker = node(2, 1, "edge", (18.0, 10.0), (10, 12, 18, 20))
@@ -33,23 +34,24 @@ def test_graph_connects_node_to_closest_node_on_neighboring_piece():
         adjacency_radius_px=8,
     )
 
-    assert edges == [(0, 1)]
+    assert edges == [(0, 1), (0, 2), (1, 2)]
 
 
-def test_graph_connects_closest_legal_neighbors_without_mask_contact():
+def test_graph_connects_adjacent_stickers_regardless_of_piece_type():
     center = node(0, 0, "center", (10.5, 10.5), (10, 12, 10, 12))
     near_edge = node(1, 1, "edge", (15.5, 10.5), (10, 12, 15, 17))
     far_edge = node(2, 1, "edge", (22.5, 10.5), (10, 12, 21, 24))
-    illegal_corner = node(3, 3, "corner", (13.5, 10.5), (10, 12, 13, 15))
+    corner = node(3, 3, "corner", (13.5, 10.5), (10, 12, 13, 15))
 
     edges = _legal_mask_adjacencies(
-        [center, near_edge, far_edge, illegal_corner],
+        [center, near_edge, far_edge, corner],
         adjacency_radius_px=4,
     )
 
     assert (0, 1) in edges
     assert (0, 2) not in edges
-    assert (0, 3) not in edges
+    assert (0, 3) in edges
+    assert (1, 3) in edges
 
 
 def test_graph_does_not_connect_legal_neighbors_beyond_distance_threshold():
@@ -59,6 +61,23 @@ def test_graph_does_not_connect_legal_neighbors_beyond_distance_threshold():
     edges = _legal_mask_adjacencies([center, edge], adjacency_radius_px=4)
 
     assert edges == []
+
+
+def test_sticker_graph_consumes_adjacency_radius():
+    center = node(0, 0, "center", (5.0, 5.0), (4, 6, 4, 6))
+    edge = node(1, 1, "edge", (9.0, 5.0), (4, 6, 9, 11))
+
+    small_radius_graph = build_sticker_adjacency_graph(
+        [center, edge],
+        adjacency_radius_px=1,
+    )
+    large_radius_graph = build_sticker_adjacency_graph(
+        [center, edge],
+        adjacency_radius_px=4,
+    )
+
+    assert small_radius_graph.edges == []
+    assert large_radius_graph.edges == [(0, 1)]
 
 
 def test_graph_uses_unpadded_mask_geometry_and_padded_sampling_mask_for_color():
@@ -111,4 +130,13 @@ def test_sticker_graph_groups_adjacent_same_type_nodes_as_one_piece():
     }
     assert len(edge_piece_ids) == 1
     assert graph.nodes[2].piece_id not in edge_piece_ids
-    assert graph.edges == [(0, 2)]
+    assert graph.edges == [(0, 1), (0, 2)]
+
+
+def test_draw_piece_graph_can_overlay_sticker_node_masks_without_piece_masks():
+    frame = np.zeros((24, 24, 3), dtype=np.uint8)
+    sticker = node(0, 0, "center", (10.0, 10.0), (10, 12, 10, 12))
+
+    output = draw_piece_graph(frame, build_sticker_adjacency_graph([sticker]))
+
+    assert np.any(output[10:12, 10:12] != frame[10:12, 10:12])

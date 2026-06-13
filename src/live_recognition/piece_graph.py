@@ -17,7 +17,6 @@ DEFAULT_PIECE_SEGMENTATION_MODEL = (
     "runs/segment/runs/cube_piece_seg_sticker/runs/cube_piece_yolo11n_seg/weights/best.pt"
 )
 PIECE_TYPES = {"center", "edge", "corner"}
-LEGAL_ADJACENCIES = {frozenset(("center", "edge")), frozenset(("edge", "corner"))}
 
 
 @dataclass(frozen=True)
@@ -47,6 +46,14 @@ class StickerNode:
 class PieceGraph:
     nodes: list[StickerNode]
     edges: list[tuple[int, int]]
+
+
+@dataclass(frozen=True)
+class _MaskAdjacencyData:
+    node: StickerNode
+    mask_bbox: tuple[int, int, int, int]
+    expanded_bbox: tuple[int, int, int, int]
+    dilated_mask: NDArray[np.uint8]
 
 
 class YOLOPieceSegmenter:
@@ -138,12 +145,18 @@ def build_piece_graph(
     *,
     adjacency_radius_px: int = 6,
     min_component_area_px: int = 12,
+    infer_piece_ids: bool = False,
 ) -> PieceGraph:
     nodes = _sticker_nodes_from_piece_masks(
         frame_bgr,
         piece_masks,
         min_component_area_px=min_component_area_px,
     )
+    if infer_piece_ids:
+        nodes = infer_piece_ids_from_same_type_adjacencies(
+            nodes,
+            adjacency_radius_px=adjacency_radius_px,
+        )
     edges = _legal_mask_adjacencies(nodes, adjacency_radius_px=adjacency_radius_px)
     return PieceGraph(nodes=nodes, edges=edges)
 
@@ -154,7 +167,7 @@ def build_sticker_adjacency_graph(
     adjacency_radius_px: int = 6,
     infer_piece_ids: bool = True,
 ) -> PieceGraph:
-    """Build a legal sticker adjacency graph from already-segmented sticker nodes."""
+    """Build a geometric sticker adjacency graph from already-segmented sticker nodes."""
     graph_nodes = (
         infer_piece_ids_from_same_type_adjacencies(
             nodes,
@@ -257,6 +270,13 @@ def draw_piece_graph(
         for piece_mask in piece_masks:
             color = _piece_type_color(piece_mask.piece_type)
             mask = piece_mask.mask > 0
+            overlay[mask] = color
+        output = cv2.addWeighted(output, 0.70, overlay, 0.30, 0)
+    elif draw_masks:
+        overlay = output.copy()
+        for node in graph.nodes:
+            color = _piece_type_color(node.piece_type)
+            mask = node.mask > 0
             overlay[mask] = color
         output = cv2.addWeighted(output, 0.70, overlay, 0.30, 0)
 
@@ -393,56 +413,16 @@ def _legal_mask_adjacencies(
     if not nodes:
         return []
 
-    radius = max(0, int(adjacency_radius_px))
-    kernel = None
-    if radius > 0:
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (radius * 2 + 1, radius * 2 + 1),
-        )
-    dilated_masks = [
-        cv2.dilate(node.mask, kernel, iterations=1) if kernel is not None else node.mask
-        for node in nodes
-    ]
+    adjacency_data = _mask_adjacency_data(nodes, adjacency_radius_px)
 
-    candidates_by_node_piece: dict[tuple[int, int], tuple[float, int, int]] = {}
-    for left_index, left in enumerate(nodes):
-        for right_index in range(left_index + 1, len(nodes)):
-            right = nodes[right_index]
-            if left.piece_id == right.piece_id:
+    edges = []
+    for left_index, left_data in enumerate(adjacency_data):
+        left = left_data.node
+        for right_data in adjacency_data[left_index + 1 :]:
+            right = right_data.node
+            if not _mask_data_within_radius(left_data, right_data):
                 continue
-            if frozenset((left.piece_type, right.piece_type)) not in LEGAL_ADJACENCIES:
-                continue
-            if not _masks_within_radius(
-                left.mask,
-                right.mask,
-                dilated_masks[left_index],
-                dilated_masks[right_index],
-            ):
-                continue
-            distance = _centroid_distance(left, right)
-            _record_closest_piece_candidate(
-                candidates_by_node_piece,
-                source_node_id=left.node_id,
-                target_piece_id=right.piece_id,
-                target_node_id=right.node_id,
-                distance=distance,
-            )
-            _record_closest_piece_candidate(
-                candidates_by_node_piece,
-                source_node_id=right.node_id,
-                target_piece_id=left.piece_id,
-                target_node_id=left.node_id,
-                distance=distance,
-            )
-
-    edges = set()
-    piece_ids_by_node_id = {node.node_id: node.piece_id for node in nodes}
-    for (source_node_id, _), (_, _, target_node_id) in candidates_by_node_piece.items():
-        reverse_key = (target_node_id, piece_ids_by_node_id[source_node_id])
-        reverse_candidate = candidates_by_node_piece.get(reverse_key)
-        if reverse_candidate is not None and reverse_candidate[2] == source_node_id:
-            edges.add(tuple(sorted((source_node_id, target_node_id))))
+            edges.append(tuple(sorted((left.node_id, right.node_id))))
     return sorted(edges)
 
 
@@ -454,6 +434,23 @@ def _same_type_mask_adjacencies(
     if not nodes:
         return []
 
+    adjacency_data = _mask_adjacency_data(nodes, adjacency_radius_px)
+    edges = []
+    for left_index, left_data in enumerate(adjacency_data):
+        left = left_data.node
+        for right_data in adjacency_data[left_index + 1 :]:
+            right = right_data.node
+            if left.piece_type != right.piece_type:
+                continue
+            if _mask_data_within_radius(left_data, right_data):
+                edges.append(tuple(sorted((left.node_id, right.node_id))))
+    return sorted(edges)
+
+
+def _mask_adjacency_data(
+    nodes: list[StickerNode],
+    adjacency_radius_px: int,
+) -> list[_MaskAdjacencyData]:
     radius = max(0, int(adjacency_radius_px))
     kernel = None
     if radius > 0:
@@ -461,25 +458,87 @@ def _same_type_mask_adjacencies(
             cv2.MORPH_ELLIPSE,
             (radius * 2 + 1, radius * 2 + 1),
         )
-    dilated_masks = [
-        cv2.dilate(node.mask, kernel, iterations=1) if kernel is not None else node.mask
-        for node in nodes
-    ]
 
-    edges = []
-    for left_index, left in enumerate(nodes):
-        for right_index in range(left_index + 1, len(nodes)):
-            right = nodes[right_index]
-            if left.piece_type != right.piece_type:
-                continue
-            if _masks_within_radius(
-                left.mask,
-                right.mask,
-                dilated_masks[left_index],
-                dilated_masks[right_index],
-            ):
-                edges.append(tuple(sorted((left.node_id, right.node_id))))
-    return sorted(edges)
+    data = []
+    for node in nodes:
+        bbox = _mask_bbox(node.mask)
+        if bbox is None:
+            continue
+
+        height, width = node.mask.shape[:2]
+        expanded_bbox = _expand_bbox(bbox, radius, width, height)
+        x1, y1, x2, y2 = expanded_bbox
+        mask_crop = node.mask[y1:y2, x1:x2]
+        dilated_mask = cv2.dilate(mask_crop, kernel, iterations=1) if kernel is not None else mask_crop
+        data.append(
+            _MaskAdjacencyData(
+                node=node,
+                mask_bbox=bbox,
+                expanded_bbox=expanded_bbox,
+                dilated_mask=dilated_mask,
+            )
+        )
+    return data
+
+
+def _mask_data_within_radius(
+    left: _MaskAdjacencyData,
+    right: _MaskAdjacencyData,
+) -> bool:
+    return (
+        _dilated_crop_intersects_mask(left, right)
+        or _dilated_crop_intersects_mask(right, left)
+    )
+
+
+def _dilated_crop_intersects_mask(
+    dilated: _MaskAdjacencyData,
+    target: _MaskAdjacencyData,
+) -> bool:
+    intersection = _bbox_intersection(dilated.expanded_bbox, target.mask_bbox)
+    if intersection is None:
+        return False
+
+    x1, y1, x2, y2 = intersection
+    dx1, dy1, _, _ = dilated.expanded_bbox
+    dilated_crop = dilated.dilated_mask[y1 - dy1 : y2 - dy1, x1 - dx1 : x2 - dx1]
+    target_crop = target.node.mask[y1:y2, x1:x2]
+    return cv2.countNonZero(cv2.bitwise_and(dilated_crop, target_crop)) > 0
+
+
+def _mask_bbox(mask: NDArray[np.uint8]) -> tuple[int, int, int, int] | None:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _expand_bbox(
+    bbox: tuple[int, int, int, int],
+    radius: int,
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = bbox
+    return (
+        max(0, x1 - radius),
+        max(0, y1 - radius),
+        min(width, x2 + radius),
+        min(height, y2 + radius),
+    )
+
+
+def _bbox_intersection(
+    left: tuple[int, int, int, int],
+    right: tuple[int, int, int, int],
+) -> tuple[int, int, int, int] | None:
+    x1 = max(left[0], right[0])
+    y1 = max(left[1], right[1])
+    x2 = min(left[2], right[2])
+    y2 = min(left[3], right[3])
+    if x1 >= x2 or y1 >= y2:
+        return None
+    return x1, y1, x2, y2
 
 
 def _masks_within_radius(

@@ -24,6 +24,15 @@ NET_FACE_LAYOUT: dict[Face, tuple[int, int]] = {
     "D": (3, 6),
 }
 
+FACE_SIDE_BY_NEIGHBOR: dict[Face, dict[Face, tuple[int, int]]] = {
+    "F": {"U": (0, 1), "R": (1, 2), "D": (2, 1), "L": (1, 0)},
+    "R": {"U": (0, 1), "B": (1, 2), "D": (2, 1), "F": (1, 0)},
+    "B": {"U": (0, 1), "L": (1, 2), "D": (2, 1), "R": (1, 0)},
+    "L": {"U": (0, 1), "F": (1, 2), "D": (2, 1), "B": (1, 0)},
+    "U": {"B": (0, 1), "R": (1, 2), "F": (2, 1), "L": (1, 0)},
+    "D": {"F": (0, 1), "R": (1, 2), "B": (2, 1), "L": (1, 0)},
+}
+
 
 @dataclass(frozen=True)
 class CubeColorScheme:
@@ -137,17 +146,24 @@ def build_cube_net_from_graph(
         center_ids = {center_id for _, center_id in connected}
         if len(connected) != 2 or len(center_ids) != 2:
             continue
+        faces_by_node_id = {
+            edge_node.node_id: center_face_by_id[center_id]
+            for edge_node, center_id in connected
+        }
         for edge_node, center_id in connected:
             color = color_by_node_id.get(edge_node.node_id)
             if color is None:
                 continue
             center = centers_by_id[center_id]
             face = center_face_by_id[center_id]
-            row, col = _edge_cell_for_center(center, edge_node)
+            neighbor_face = _edge_piece_neighbor_face(edge_node, faces_by_node_id)
+            row_col = _edge_cell_for_neighbor_face(face, neighbor_face)
+            if row_col is None:
+                row_col = _edge_cell_for_center(center, edge_node)
             state.add_cell(
                 face,
-                row,
-                col,
+                row_col[0],
+                row_col[1],
                 color,
                 "observed",
                 edge_node.confidence,
@@ -164,43 +180,30 @@ def build_observed_cube_net_from_graph(graph: PieceGraph) -> CubeNetState:
     center_face_by_id = {
         center.node_id: face for center, face in zip(ordered_centers, face_order)
     }
-    centers_by_id = {center.node_id: center for center in centers}
-    center_by_face = {
-        center_face_by_id[center.node_id]: center
-        for center in centers
-        if center.node_id in center_face_by_id
-    }
 
     state = CubeNetState()
-    for center in centers:
+    neighbors_by_id = _graph_neighbors(graph.edges)
+    edge_cell_overrides = _cross_face_edge_cell_overrides(
+        graph,
+        nodes_by_id,
+        center_face_by_id,
+    )
+    face_cells_by_face: dict[Face, dict[tuple[int, int], StickerNode]] = {}
+    for center in ordered_centers:
         face = center_face_by_id.get(center.node_id)
         if face is None:
             continue
-        _add_observed_node_cell(state, center, face, 1, 1)
+        face_cells_by_face[face] = _face_cells_from_graph(
+            center,
+            nodes_by_id,
+            neighbors_by_id,
+            edge_cell_overrides,
+        )
 
-    center_edges = _center_edge_connections(graph, nodes_by_id)
-    edge_face_by_node_id: dict[int, Face] = {}
-    for edge_id, center_ids in center_edges.items():
-        known_center_ids = [
-            center_id for center_id in center_ids if center_id in center_face_by_id
-        ]
-        if len(known_center_ids) != 1:
-            continue
-        edge = nodes_by_id[edge_id]
-        center = centers_by_id[known_center_ids[0]]
-        face = center_face_by_id[known_center_ids[0]]
-        edge_face_by_node_id[edge_id] = face
-        row, col = _edge_cell_for_center(center, edge)
-        _add_observed_node_cell(state, edge, face, row, col)
-
-    corner_edges = _corner_edge_connections(graph, nodes_by_id)
-    for corner_id, edge_ids in corner_edges.items():
-        corner = nodes_by_id[corner_id]
-        face = _nearest_known_edge_face(corner, edge_ids, nodes_by_id, edge_face_by_node_id)
-        if face is None or face not in center_by_face:
-            continue
-        row, col = _corner_cell_for_center(center_by_face[face], corner)
-        _add_observed_node_cell(state, corner, face, row, col)
+    _expand_cross_face_same_type_cells(face_cells_by_face, graph, nodes_by_id)
+    for face, cells in face_cells_by_face.items():
+        for (row, col), node in cells.items():
+            _add_observed_node_cell(state, node, face, row, col)
 
     return state
 
@@ -329,6 +332,388 @@ def _center_edge_connections(
     return center_ids_by_edge_id
 
 
+def _cross_face_edge_cell_overrides(
+    graph: PieceGraph,
+    nodes_by_id: dict[int, StickerNode],
+    center_face_by_id: dict[int, Face],
+) -> dict[tuple[int, int], tuple[int, int]]:
+    center_edges = _center_edge_connections(graph, nodes_by_id)
+    overrides: dict[tuple[int, int], tuple[int, int]] = {}
+    for left_id, right_id in graph.edges:
+        left = nodes_by_id[left_id]
+        right = nodes_by_id[right_id]
+        if left.piece_type != "edge" or right.piece_type != "edge":
+            continue
+
+        left_center_id = _edge_center_id(left, center_edges, nodes_by_id, center_face_by_id)
+        right_center_id = _edge_center_id(right, center_edges, nodes_by_id, center_face_by_id)
+        if left_center_id is None or right_center_id is None or left_center_id == right_center_id:
+            continue
+
+        left_face = center_face_by_id[left_center_id]
+        right_face = center_face_by_id[right_center_id]
+        left_cell = _edge_cell_for_neighbor_face(left_face, right_face)
+        right_cell = _edge_cell_for_neighbor_face(right_face, left_face)
+        if left_cell is not None:
+            overrides[(left_center_id, left.node_id)] = left_cell
+        if right_cell is not None:
+            overrides[(right_center_id, right.node_id)] = right_cell
+    return overrides
+
+
+def _edge_center_id(
+    edge: StickerNode,
+    center_edges: dict[int, list[int]],
+    nodes_by_id: dict[int, StickerNode],
+    center_face_by_id: dict[int, Face],
+) -> int | None:
+    center_ids = [
+        center_id
+        for center_id in center_edges.get(edge.node_id, [])
+        if center_id in center_face_by_id
+    ]
+    if not center_ids:
+        return None
+    return min(center_ids, key=lambda center_id: _node_distance(edge, nodes_by_id[center_id]))
+
+
+def _graph_neighbors(edges: list[tuple[int, int]]) -> dict[int, set[int]]:
+    neighbors: dict[int, set[int]] = defaultdict(set)
+    for left_id, right_id in edges:
+        neighbors[left_id].add(right_id)
+        neighbors[right_id].add(left_id)
+    return neighbors
+
+
+def _face_cells_from_graph(
+    center: StickerNode,
+    nodes_by_id: dict[int, StickerNode],
+    neighbors_by_id: dict[int, set[int]],
+    edge_cell_overrides: dict[tuple[int, int], tuple[int, int]],
+) -> dict[tuple[int, int], StickerNode]:
+    cells_by_node_id: dict[int, tuple[int, int]] = {center.node_id: (1, 1)}
+
+    for neighbor_id in neighbors_by_id.get(center.node_id, set()):
+        neighbor = nodes_by_id[neighbor_id]
+        cell = edge_cell_overrides.get((center.node_id, neighbor_id))
+        if cell is None:
+            cell = _seed_cell_from_center(center, neighbor)
+        if cell is not None:
+            cells_by_node_id[neighbor_id] = cell
+
+    changed = True
+    while changed:
+        changed = False
+        for node_id, cell in list(cells_by_node_id.items()):
+            node = nodes_by_id[node_id]
+            for neighbor_id in neighbors_by_id.get(node_id, set()):
+                if neighbor_id in cells_by_node_id:
+                    continue
+                neighbor = nodes_by_id[neighbor_id]
+                inferred = _infer_neighbor_cell(center, node, cell, neighbor)
+                if inferred is None:
+                    continue
+                cells_by_node_id[neighbor_id] = inferred
+                changed = True
+
+    _refine_corner_cells_from_edges(cells_by_node_id, nodes_by_id, neighbors_by_id)
+    return _dedupe_face_cells(center, cells_by_node_id, nodes_by_id)
+
+
+def _seed_cell_from_center(
+    center: StickerNode,
+    node: StickerNode,
+) -> tuple[int, int] | None:
+    if node.piece_type == "center":
+        return (1, 1) if node.node_id == center.node_id else None
+    if node.piece_type == "edge":
+        return _edge_cell_for_center(center, node)
+    if node.piece_type == "corner":
+        return _corner_cell_for_center(center, node)
+    return None
+
+
+def _infer_neighbor_cell(
+    center: StickerNode,
+    node: StickerNode,
+    cell: tuple[int, int],
+    neighbor: StickerNode,
+) -> tuple[int, int] | None:
+    row, col = cell
+    if neighbor.piece_type == "center":
+        return None
+
+    if node.piece_type == "center":
+        return _seed_cell_from_center(center, neighbor)
+
+    if node.piece_type == "edge" and neighbor.piece_type == "corner":
+        fallback_row, fallback_col = _corner_cell_for_center(center, neighbor)
+        return _corner_cell_from_single_edge(row, col, fallback_row, fallback_col)
+
+    if node.piece_type == "corner" and neighbor.piece_type == "edge":
+        return _edge_cell_for_corner(center, node, neighbor)
+
+    return None
+
+
+def _edge_cell_for_corner(
+    center: StickerNode,
+    corner: StickerNode,
+    edge: StickerNode,
+) -> tuple[int, int] | None:
+    corner_row, corner_col = _corner_cell_for_center(center, corner)
+    edge_row, edge_col = _edge_cell_for_center(center, edge)
+    if edge_col == 1:
+        return corner_row, 1
+    if edge_row == 1:
+        return 1, corner_col
+    return edge_row, edge_col
+
+
+def _refine_corner_cells_from_edges(
+    cells_by_node_id: dict[int, tuple[int, int]],
+    nodes_by_id: dict[int, StickerNode],
+    neighbors_by_id: dict[int, set[int]],
+) -> None:
+    for node_id, node in nodes_by_id.items():
+        if node.piece_type != "corner":
+            continue
+        edge_cells = [
+            (cells_by_node_id[neighbor_id], nodes_by_id[neighbor_id])
+            for neighbor_id in neighbors_by_id.get(node_id, set())
+            if neighbor_id in cells_by_node_id and nodes_by_id[neighbor_id].piece_type == "edge"
+        ]
+        row_edge_rows = [
+            (_node_distance(node, edge), row)
+            for (row, col), edge in edge_cells
+            if col == 1 and row != 1
+        ]
+        col_edge_cols = [
+            (_node_distance(node, edge), col)
+            for (row, col), edge in edge_cells
+            if row == 1 and col != 1
+        ]
+        if row_edge_rows and col_edge_cols:
+            cells_by_node_id[node_id] = (
+                min(row_edge_rows, key=lambda candidate: candidate[0])[1],
+                min(col_edge_cols, key=lambda candidate: candidate[0])[1],
+            )
+
+
+def _dedupe_face_cells(
+    center: StickerNode,
+    cells_by_node_id: dict[int, tuple[int, int]],
+    nodes_by_id: dict[int, StickerNode],
+) -> dict[tuple[int, int], StickerNode]:
+    candidates: dict[tuple[int, int], tuple[float, StickerNode]] = {}
+    for node_id, cell in cells_by_node_id.items():
+        row, col = cell
+        if not (0 <= row <= 2 and 0 <= col <= 2):
+            continue
+        node = nodes_by_id[node_id]
+        score = _cell_assignment_score(center, node, row, col)
+        current = candidates.get(cell)
+        if current is None or score < current[0]:
+            candidates[cell] = (score, node)
+    return {cell: node for cell, (_, node) in candidates.items()}
+
+
+def _cell_assignment_score(
+    center: StickerNode,
+    node: StickerNode,
+    row: int,
+    col: int,
+) -> float:
+    expected_type = "center" if (row, col) == (1, 1) else "edge" if row == 1 or col == 1 else "corner"
+    type_penalty = 0.0 if node.piece_type == expected_type else 10_000.0
+    if node.node_id == center.node_id:
+        type_penalty -= 1_000.0
+    return type_penalty + _node_distance(center, node)
+
+
+def _expand_cross_face_same_type_cells(
+    face_cells_by_face: dict[Face, dict[tuple[int, int], StickerNode]],
+    graph: PieceGraph,
+    nodes_by_id: dict[int, StickerNode],
+) -> None:
+    neighbors_by_id = _graph_neighbors(graph.edges)
+    face_node_cells: dict[Face, dict[int, tuple[int, int]]] = {
+        face: {node.node_id: cell for cell, node in cells.items()}
+        for face, cells in face_cells_by_face.items()
+    }
+    assigned_node_ids = {
+        node_id
+        for node_cells in face_node_cells.values()
+        for node_id in node_cells
+    }
+
+    changed = True
+    while changed:
+        changed = False
+        candidates_by_node: dict[int, dict[tuple[Face, tuple[int, int]], tuple[int, float]]] = (
+            defaultdict(dict)
+        )
+        for face, node_cells in face_node_cells.items():
+            for node_id, cell in node_cells.items():
+                source = nodes_by_id[node_id]
+                for neighbor_id in neighbors_by_id.get(node_id, set()):
+                    if neighbor_id in assigned_node_ids:
+                        continue
+                    neighbor = nodes_by_id[neighbor_id]
+                    for target_face, target_cell in _cross_face_neighbor_cells(
+                        face,
+                        cell,
+                        neighbor.piece_type,
+                    ):
+                        target = (target_face, target_cell)
+                        current = candidates_by_node[neighbor_id].get(target)
+                        support = 1 if current is None else current[0] + 1
+                        distance = _node_distance(source, neighbor)
+                        total_distance = distance if current is None else current[1] + distance
+                        candidates_by_node[neighbor_id][target] = (
+                            support,
+                            total_distance,
+                        )
+
+        candidates_by_cell: dict[Face, dict[tuple[int, int], dict[int, tuple[int, float]]]] = (
+            defaultdict(lambda: defaultdict(dict))
+        )
+        for node_id, node_candidates in candidates_by_node.items():
+            target_face, target_cell = min(
+                node_candidates,
+                key=lambda target: (
+                    -node_candidates[target][0],
+                    node_candidates[target][1],
+                    target[0],
+                    target[1],
+                ),
+            )
+            candidates_by_cell[target_face][target_cell][node_id] = node_candidates[
+                (target_face, target_cell)
+            ]
+
+        for face, cells in candidates_by_cell.items():
+            face_cells_by_face.setdefault(face, {})
+            face_node_cells.setdefault(face, {})
+            for cell, node_candidates in cells.items():
+                if cell in face_cells_by_face[face]:
+                    continue
+                node_id = min(
+                    node_candidates,
+                    key=lambda candidate_id: (
+                        -node_candidates[candidate_id][0],
+                        node_candidates[candidate_id][1],
+                        candidate_id,
+                    ),
+                )
+                face_cells_by_face[face][cell] = nodes_by_id[node_id]
+                face_node_cells[face][node_id] = cell
+                assigned_node_ids.add(node_id)
+                changed = True
+
+
+def _cross_face_cells(face: Face, cell: tuple[int, int]) -> list[tuple[Face, tuple[int, int]]]:
+    vector = _face_cell_vector(face, cell)
+    cells = []
+    for neighbor_face, side in FACE_SIDE_BY_NEIGHBOR.get(face, {}).items():
+        if not _cell_on_side(cell, side):
+            continue
+        neighbor_cell = _vector_face_cell(neighbor_face, vector)
+        if neighbor_cell is not None:
+            cells.append((neighbor_face, neighbor_cell))
+    return cells
+
+
+def _cross_face_neighbor_cells(
+    face: Face,
+    cell: tuple[int, int],
+    neighbor_piece_type: str,
+) -> list[tuple[Face, tuple[int, int]]]:
+    candidates = []
+    for target_face, target_cell in _cross_face_cells(face, cell):
+        target_piece_type = _cell_piece_type(target_cell)
+        if target_piece_type == neighbor_piece_type:
+            candidates.append((target_face, target_cell))
+        elif target_piece_type == "edge" and neighbor_piece_type == "corner":
+            candidates.extend(
+                (target_face, corner_cell)
+                for corner_cell in _corner_cells_for_edge_cell(target_cell)
+            )
+        elif target_piece_type == "corner" and neighbor_piece_type == "edge":
+            candidates.extend(
+                (target_face, edge_cell)
+                for edge_cell in _edge_cells_for_corner_cell(target_cell)
+            )
+    return candidates
+
+
+def _corner_cells_for_edge_cell(cell: tuple[int, int]) -> list[tuple[int, int]]:
+    row, col = cell
+    if row in (0, 2) and col == 1:
+        return [(row, 0), (row, 2)]
+    if col in (0, 2) and row == 1:
+        return [(0, col), (2, col)]
+    return []
+
+
+def _edge_cells_for_corner_cell(cell: tuple[int, int]) -> list[tuple[int, int]]:
+    row, col = cell
+    if row not in (0, 2) or col not in (0, 2):
+        return []
+    return [(row, 1), (1, col)]
+
+
+def _cell_on_side(cell: tuple[int, int], side: tuple[int, int]) -> bool:
+    row, col = cell
+    side_row, side_col = side
+    if side_row in (0, 2):
+        return row == side_row
+    if side_col in (0, 2):
+        return col == side_col
+    return False
+
+
+def _face_cell_vector(face: Face, cell: tuple[int, int]) -> tuple[int, int, int]:
+    row, col = cell
+    if face == "F":
+        return col - 1, row - 1, 1
+    if face == "B":
+        return 1 - col, row - 1, -1
+    if face == "R":
+        return 1, row - 1, 1 - col
+    if face == "L":
+        return -1, row - 1, col - 1
+    if face == "U":
+        return col - 1, -1, row - 1
+    return col - 1, 1, 1 - row
+
+
+def _vector_face_cell(face: Face, vector: tuple[int, int, int]) -> tuple[int, int] | None:
+    x, y, z = vector
+    if face == "F" and z == 1:
+        return y + 1, x + 1
+    if face == "B" and z == -1:
+        return y + 1, 1 - x
+    if face == "R" and x == 1:
+        return y + 1, 1 - z
+    if face == "L" and x == -1:
+        return y + 1, z + 1
+    if face == "U" and y == -1:
+        return z + 1, x + 1
+    if face == "D" and y == 1:
+        return 1 - z, x + 1
+    return None
+
+
+def _cell_piece_type(cell: tuple[int, int]) -> str:
+    row, col = cell
+    if (row, col) == (1, 1):
+        return "center"
+    if row == 1 or col == 1:
+        return "edge"
+    return "corner"
+
+
 def _edge_nodes_by_piece(nodes: list[StickerNode]) -> dict[int, list[StickerNode]]:
     edge_nodes: dict[int, list[StickerNode]] = defaultdict(list)
     for node in nodes:
@@ -337,19 +722,28 @@ def _edge_nodes_by_piece(nodes: list[StickerNode]) -> dict[int, list[StickerNode
     return edge_nodes
 
 
-def _corner_edge_connections(
-    graph: PieceGraph,
-    nodes_by_id: dict[int, StickerNode],
-) -> dict[int, list[int]]:
-    edge_ids_by_corner_id: dict[int, list[int]] = defaultdict(list)
-    for left_id, right_id in graph.edges:
-        left = nodes_by_id[left_id]
-        right = nodes_by_id[right_id]
-        if left.piece_type == "corner" and right.piece_type == "edge":
-            edge_ids_by_corner_id[left_id].append(right_id)
-        elif right.piece_type == "corner" and left.piece_type == "edge":
-            edge_ids_by_corner_id[right_id].append(left_id)
-    return edge_ids_by_corner_id
+def _edge_piece_neighbor_face(
+    edge: StickerNode,
+    faces_by_node_id: dict[int, Face],
+) -> Face | None:
+    face = faces_by_node_id.get(edge.node_id)
+    if face is None:
+        return None
+    neighbor_faces = {
+        other_face
+        for node_id, other_face in faces_by_node_id.items()
+        if node_id != edge.node_id and other_face != face
+    }
+    for neighbor_face in sorted(neighbor_faces):
+        if neighbor_face in FACE_SIDE_BY_NEIGHBOR.get(face, {}):
+            return neighbor_face
+    return None
+
+
+def _edge_cell_for_neighbor_face(face: Face, neighbor_face: Face | None) -> tuple[int, int] | None:
+    if neighbor_face is None:
+        return None
+    return FACE_SIDE_BY_NEIGHBOR.get(face, {}).get(neighbor_face)
 
 
 def _edge_cell_for_center(center: StickerNode, edge: StickerNode) -> tuple[int, int]:
@@ -366,20 +760,19 @@ def _corner_cell_for_center(center: StickerNode, corner: StickerNode) -> tuple[i
     return (2 if dy > 0 else 0), (2 if dx > 0 else 0)
 
 
-def _nearest_known_edge_face(
-    corner: StickerNode,
-    edge_ids: list[int],
-    nodes_by_id: dict[int, StickerNode],
-    edge_face_by_node_id: dict[int, Face],
-) -> Face | None:
-    candidates = [
-        (_node_distance(corner, nodes_by_id[edge_id]), edge_face_by_node_id[edge_id])
-        for edge_id in edge_ids
-        if edge_id in edge_face_by_node_id
-    ]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda candidate: candidate[0])[1]
+def _corner_cell_from_single_edge(
+    edge_row: int,
+    edge_col: int,
+    fallback_row: int,
+    fallback_col: int,
+) -> tuple[int, int]:
+    row = fallback_row
+    col = fallback_col
+    if edge_col == 1 and edge_row != 1:
+        row = edge_row
+    if edge_row == 1 and edge_col != 1:
+        col = edge_col
+    return row, col
 
 
 def _node_distance(left: StickerNode, right: StickerNode) -> float:

@@ -56,7 +56,6 @@ CLASS_COLORS = {
 STICKER_CLASS_NAMES = ["center_sticker", "edge_sticker", "corner_sticker"]
 CENTER_CLASS_ID = 0
 STICKER_COLOR_SAMPLE_COUNT = 10
-DRAW_COLOR_SAMPLE_POINTS = True
 DENSITY_CLUSTER_EPS_RADIANS = 0.08
 DENSITY_CLUSTER_MIN_POINTS = 4
 
@@ -421,20 +420,6 @@ def sticker_color_samples_from_roi(
     return crop[ys, xs].astype(np.uint8)
 
 
-def draw_color_sample_points(
-    frame: np.ndarray,
-    sample_points: list[tuple[np.ndarray, np.ndarray]],
-) -> None:
-    if not DRAW_COLOR_SAMPLE_POINTS:
-        return
-
-    for xs, ys in sample_points:
-        for x, y in zip(xs, ys):
-            center = (int(x), int(y))
-            cv2.circle(frame, center, 2, (0, 0, 0), -1, cv2.LINE_AA)
-            cv2.circle(frame, center, 1, (255, 255, 255), -1, cv2.LINE_AA)
-
-
 def sticker_color_samples_at_points(
     color_samples: tuple[np.ndarray, np.ndarray],
     ys: np.ndarray,
@@ -608,11 +593,10 @@ def draw_sticker_segments(
     args,
     color_classifier: ColorDensityClassifier | None = None,
     cube_net_state: CubeNetState | None = None,
-    prediction_roi: np.ndarray | None = None,
 ) -> tuple[int, np.ndarray]:
     x1, y1, x2, y2 = roi_xyxy
     results = sticker_model.predict(
-        source=prediction_roi if prediction_roi is not None else roi,
+        source=roi,
         conf=args.sticker_conf,
         imgsz=args.sticker_imgsz,
         verbose=False,
@@ -635,7 +619,6 @@ def draw_sticker_segments(
     sticker_color_numbers = []
     classifier_bgr_batches = []
     sticker_nodes = []
-    color_sample_points = []
     mask_data = result.masks.data.detach().cpu().numpy()
     color_samples = roi_color_samples(roi)
     for index in range(len(boxes)):
@@ -686,8 +669,6 @@ def draw_sticker_segments(
             sample_ys,
             sample_xs,
         )
-        if len(sample_xs) > 0:
-            color_sample_points.append((sample_xs + x1, sample_ys + y1))
         raw_stickers = (
             [(draw_mask, sample_bgr)]
             if len(sample_bgr)
@@ -823,7 +804,6 @@ def draw_sticker_segments(
             )
     if args.show_confidence or args.debug_overlay:
         draw_sticker_color_numbers(frame, sticker_color_numbers)
-    draw_color_sample_points(frame, color_sample_points)
     bgr_samples = concatenate_samples(
         bgr_batches,
         args.color_plot_samples_per_frame,
@@ -836,25 +816,6 @@ def draw_sticker_segments(
         )
         color_classifier.observe_frame(classifier_bgr_samples)
     return count, bgr_samples
-
-
-def downscale_to_max_size(image: np.ndarray, max_size: int) -> np.ndarray:
-    if max_size <= 0:
-        return image
-
-    height, width = image.shape[:2]
-    longest_side = max(height, width)
-    if longest_side <= max_size:
-        return image
-
-    scale = max_size / float(longest_side)
-    resized_width = max(1, int(round(width * scale)))
-    resized_height = max(1, int(round(height * scale)))
-    return cv2.resize(
-        image,
-        (resized_width, resized_height),
-        interpolation=cv2.INTER_AREA,
-    )
 
 
 def draw_sticker_color_numbers(
@@ -894,24 +855,14 @@ def process_frame(
     color_classifier: ColorDensityClassifier | None = None,
     cube_net_state: CubeNetState | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    output = frame.copy()
-    height, width = frame.shape[:2]
-    if getattr(args, "use_bbox_detector", True):
-        candidate = bbox_detector.detect(frame)
-        if candidate is None:
-            return output, np.empty((0, 3), dtype=np.uint8)
-        roi_xyxy = clipped_square_roi(candidate.bbox_xyxy, width, height, args.roi_padding)
-    else:
-        candidate = None
-        roi_xyxy = (0, 0, width, height)
+    working_frame = frame_for_processing(frame, args)
+    output = working_frame.copy()
+    roi_xyxy, candidate = roi_for_frame(working_frame, bbox_detector, args)
+    if roi_xyxy is None:
+        return output, np.empty((0, 3), dtype=np.uint8)
 
     x1, y1, x2, y2 = roi_xyxy
-    roi = frame[y1:y2, x1:x2]
-    prediction_roi = (
-        downscale_to_max_size(roi, args.sticker_imgsz)
-        if not getattr(args, "use_bbox_detector", True)
-        else None
-    )
+    roi = working_frame[y1:y2, x1:x2]
     segment_count, bgr_samples = draw_sticker_segments(
         output,
         roi,
@@ -920,16 +871,15 @@ def process_frame(
         args,
         color_classifier,
         cube_net_state,
-        prediction_roi=prediction_roi,
     )
 
-    if candidate is not None and (args.show_bbox or args.debug_overlay):
+    if args.show_bbox or args.debug_overlay:
         cv2.rectangle(output, (x1, y1), (x2, y2), (40, 220, 40), 2)
     if args.debug_overlay:
         debug_label = (
             f"cube {candidate.confidence:.2f} segments {segment_count}"
             if candidate is not None
-            else f"full frame segments {segment_count}"
+            else f"sticker viewport segments {segment_count}"
         )
         cv2.putText(
             output,
@@ -944,6 +894,45 @@ def process_frame(
     return output, bgr_samples
 
 
+def frame_for_processing(frame: np.ndarray, args) -> np.ndarray:
+    if getattr(args, "use_bbox_detector", True):
+        return frame
+
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = centered_square_viewport(width, height)
+    return resize_to_square_size(frame[y1:y2, x1:x2], args.sticker_imgsz)
+
+
+def roi_for_frame(
+    frame: np.ndarray,
+    bbox_detector,
+    args,
+) -> tuple[tuple[int, int, int, int] | None, object | None]:
+    height, width = frame.shape[:2]
+    if not getattr(args, "use_bbox_detector", True):
+        return (0, 0, width, height), None
+
+    candidate = bbox_detector.detect(frame)
+    if candidate is None:
+        return None, None
+    return clipped_square_roi(candidate.bbox_xyxy, width, height, args.roi_padding), candidate
+
+
+def centered_square_viewport(width: int, height: int) -> tuple[int, int, int, int]:
+    viewport_size = min(width, height)
+    center_x = width // 2
+    center_y = height // 2
+    x1 = max(0, min(width - viewport_size, center_x - viewport_size // 2))
+    y1 = max(0, min(height - viewport_size, center_y - viewport_size // 2))
+    return x1, y1, x1 + viewport_size, y1 + viewport_size
+
+
+def resize_to_square_size(image: np.ndarray, size: int) -> np.ndarray:
+    if size <= 0:
+        return image
+    return cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default="0", help="Camera index, video path, or image path")
@@ -954,10 +943,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bbox-imgsz", type=int, default=640)
     parser.add_argument("--sticker-imgsz", type=int, default=256)
     parser.add_argument(
+        "--sticker-only",
+        dest="use_bbox_detector",
+        action="store_false",
+        help="Only run the sticker segment model on a centered square viewport",
+    )
+    parser.add_argument(
         "--skip-bbox",
         dest="use_bbox_detector",
         action="store_false",
-        help="Run sticker segmentation on the full frame instead of first detecting a cube ROI",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--roi-padding", type=float, default=0.08)
     parser.add_argument(
