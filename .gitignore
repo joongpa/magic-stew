@@ -7,9 +7,13 @@ dist/
 build/
 *.egg-info/
 .DS_Store
-data/raw/
-data/processed/
+data/
+synthetic_cube/
+synthetic_cube_dataset/
+synthetic_cube.zip
 checkpoints/
 *.pt
 .ultralytics/
 runs/
+__pycache__/
+.matplotlib-cache/
