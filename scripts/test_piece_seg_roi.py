@@ -1,10 +1,10 @@
-"""Test YOLO sticker segmentation on a cube bounding-box ROI.
+"""Test YOLO sticker poses on a cube bounding-box ROI.
 
 Pipeline:
 1. Detect the whole cube with the existing bbox detector.
 2. Crop a padded square ROI around that bbox.
-3. Run the center/edge/corner sticker segmentation model on the ROI.
-4. Draw the ROI-space masks back onto the original OpenCV frame.
+3. Run the face/sticker pose model on the ROI.
+4. Rasterize sticker keypoint quads and draw them back onto the original OpenCV frame.
 """
 
 from __future__ import annotations
@@ -46,15 +46,18 @@ from live_recognition.visualization import (  # noqa: E402
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 DEFAULT_STICKER_MODEL = (
     ROOT
-    / "runs/segment/runs/cube_piece_seg_sticker/runs/cube_piece_yolo11n_seg/weights/best.pt"
+    / "runs/pose/runs/cube_piece_pose_geometric_small/runs/cube_piece_yolo11n_pose/weights/best.pt"
 )
 CLASS_COLORS = {
-    0: (80, 220, 255),   # center
-    1: (80, 255, 120),   # edge
+    0: (80, 220, 255),   # legacy center
+    1: (80, 220, 255),   # center
     2: (255, 120, 80),   # corner
+    3: (80, 255, 120),   # edge
 }
-STICKER_CLASS_NAMES = ["center_sticker", "edge_sticker", "corner_sticker"]
-CENTER_CLASS_ID = 0
+STICKER_CLASS_NAMES = ["center_sticker", "corner_sticker", "edge_sticker"]
+FACE_CLASS_NAMES = {"visible_face"}
+FACE_OUTLINE_COLOR = (255, 255, 255)
+CENTER_CLASS_ID = 1
 STICKER_COLOR_SAMPLE_COUNT = 10
 DENSITY_CLUSTER_EPS_RADIANS = 0.08
 DENSITY_CLUSTER_MIN_POINTS = 4
@@ -361,6 +364,124 @@ def sticker_mask_bool(
     return mask > 0.5
 
 
+def tensor_to_numpy(value) -> np.ndarray | None:
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return np.asarray(value)
+
+
+def sticker_pose_keypoints(result, roi_width: int, roi_height: int) -> np.ndarray | None:
+    keypoints = getattr(result, "keypoints", None)
+    if keypoints is None:
+        return None
+
+    xy = tensor_to_numpy(getattr(keypoints, "xy", None))
+    if xy is not None:
+        xy = np.asarray(xy, dtype=np.float32)
+    else:
+        xyn = tensor_to_numpy(getattr(keypoints, "xyn", None))
+        if xyn is not None:
+            xy = np.asarray(xyn, dtype=np.float32)
+            xy[..., 0] *= roi_width
+            xy[..., 1] *= roi_height
+        else:
+            data = tensor_to_numpy(getattr(keypoints, "data", None))
+            if data is None:
+                return None
+            xy = np.asarray(data, dtype=np.float32)[..., :2]
+
+    if xy.ndim != 3 or xy.shape[-1] < 2:
+        return None
+    if xy.shape[1] < 4:
+        return None
+    if xy.size == 0:
+        return None
+    if float(np.nanmax(xy[..., :2])) <= 1.5:
+        xy = xy.copy()
+        xy[..., 0] *= roi_width
+        xy[..., 1] *= roi_height
+    return xy[..., :2]
+
+
+def sticker_pose_mask_bool(
+    keypoints_xy: np.ndarray,
+    index: int,
+    roi_width: int,
+    roi_height: int,
+) -> np.ndarray:
+    if index >= len(keypoints_xy):
+        return np.zeros((roi_height, roi_width), dtype=bool)
+
+    points = np.asarray(keypoints_xy[index, :4], dtype=np.float32)
+    if points.shape != (4, 2) or not np.isfinite(points).all():
+        return np.zeros((roi_height, roi_width), dtype=bool)
+
+    points[:, 0] = np.clip(points[:, 0], 0, roi_width - 1)
+    points[:, 1] = np.clip(points[:, 1], 0, roi_height - 1)
+    contour_points = np.ascontiguousarray(points.reshape((-1, 1, 2)), dtype=np.float32)
+    if abs(float(cv2.contourArea(contour_points))) < 1.0:
+        return np.zeros((roi_height, roi_width), dtype=bool)
+
+    mask = np.zeros((roi_height, roi_width), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, np.rint(points).astype(np.int32), 255)
+    return mask > 0
+
+
+def visible_face_pose_quad(
+    keypoints_xy: np.ndarray | None,
+    index: int,
+    roi_xyxy: tuple[int, int, int, int],
+) -> np.ndarray | None:
+    if keypoints_xy is None or index >= len(keypoints_xy):
+        return None
+
+    x1, y1, x2, y2 = roi_xyxy
+    roi_width = x2 - x1
+    roi_height = y2 - y1
+    points = np.asarray(keypoints_xy[index, :4], dtype=np.float32)
+    if points.shape != (4, 2) or not np.isfinite(points).all():
+        return None
+
+    points[:, 0] = np.clip(points[:, 0], 0, roi_width - 1) + x1
+    points[:, 1] = np.clip(points[:, 1], 0, roi_height - 1) + y1
+    return points.astype(np.float32)
+
+
+def draw_visible_face_poses(frame: np.ndarray, quads: list[np.ndarray]) -> None:
+    for quad in quads:
+        contour = np.rint(quad).astype(np.int32).reshape((-1, 1, 2))
+        cv2.polylines(frame, [contour], isClosed=True, color=FACE_OUTLINE_COLOR, thickness=2, lineType=cv2.LINE_AA)
+
+        top_left, top_right, bottom_right, bottom_left = quad
+        for fraction in (1.0 / 3.0, 2.0 / 3.0):
+            left = top_left + ((bottom_left - top_left) * fraction)
+            right = top_right + ((bottom_right - top_right) * fraction)
+            top = top_left + ((top_right - top_left) * fraction)
+            bottom = bottom_left + ((bottom_right - bottom_left) * fraction)
+            cv2.line(
+                frame,
+                tuple(np.rint(left).astype(np.int32)),
+                tuple(np.rint(right).astype(np.int32)),
+                FACE_OUTLINE_COLOR,
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.line(
+                frame,
+                tuple(np.rint(top).astype(np.int32)),
+                tuple(np.rint(bottom).astype(np.int32)),
+                FACE_OUTLINE_COLOR,
+                1,
+                cv2.LINE_AA,
+            )
+
+
 def class_name_for_id(result, sticker_model, class_id: int) -> str:
     names = getattr(result, "names", None) or getattr(sticker_model, "names", {}) or {}
     return str(names.get(class_id, class_id)).lower()
@@ -517,6 +638,16 @@ def normalized_rgb_html_plot_path(rgb_html_path: Path) -> Path:
     return rgb_html_path.with_name(f"{rgb_html_path.stem}_normalized{suffix}")
 
 
+def color_features_enabled(args) -> bool:
+    return int(getattr(args, "color_plot_frames", 0)) > 0
+
+
+def color_plot_outputs_requested(args) -> bool:
+    return color_features_enabled(args) and bool(
+        args.rgb_color_plot or args.rgb_html_plot or args.hsv_html_plot
+    )
+
+
 def save_rgb_html_plots(
     bgr_samples: np.ndarray,
     rgb_html_path: Path,
@@ -606,30 +737,46 @@ def draw_sticker_segments(
         return 0, np.empty((0, 3), dtype=np.uint8)
 
     result = results[0]
-    masks = result.masks
     boxes = result.boxes
-    if masks is None or boxes is None:
+    if boxes is None:
         return 0, np.empty((0, 3), dtype=np.uint8)
 
     overlay = frame.copy()
     roi_height = y2 - y1
     roi_width = x2 - x1
+    keypoints_xy = sticker_pose_keypoints(result, roi_width, roi_height)
+    mask_data = None
+    result_masks = getattr(result, "masks", None)
+    if keypoints_xy is None and result_masks is not None:
+        mask_data = result_masks.data.detach().cpu().numpy()
+    if keypoints_xy is None and mask_data is None:
+        return 0, np.empty((0, 3), dtype=np.uint8)
+
     count = 0
     confidence_labels = []
     sticker_color_numbers = []
     classifier_bgr_batches = []
     sticker_nodes = []
-    mask_data = result.masks.data.detach().cpu().numpy()
+    visible_face_quads = []
     color_samples = roi_color_samples(roi)
     for index in range(len(boxes)):
         class_id = int(boxes.cls[index].item())
         class_name = class_name_for_id(result, sticker_model, class_id)
+        if class_name in FACE_CLASS_NAMES:
+            quad = visible_face_pose_quad(keypoints_xy, index, roi_xyxy)
+            if quad is not None:
+                visible_face_quads.append(quad)
+            continue
         if class_name not in STICKER_CLASS_NAMES:
             continue
         piece_type = sticker_piece_type(class_name)
         color = CLASS_COLORS.get(class_id, (255, 255, 255))
 
-        mask_bool = sticker_mask_bool(mask_data, index, roi_width, roi_height)
+        mask_bool = (
+            sticker_pose_mask_bool(keypoints_xy, index, roi_width, roi_height)
+            if keypoints_xy is not None
+            else sticker_mask_bool(mask_data, index, roi_width, roi_height)
+        )
         if not mask_bool.any():
             continue
 
@@ -804,6 +951,7 @@ def draw_sticker_segments(
             )
     if args.show_confidence or args.debug_overlay:
         draw_sticker_color_numbers(frame, sticker_color_numbers)
+    draw_visible_face_poses(frame, visible_face_quads)
     bgr_samples = concatenate_samples(
         bgr_batches,
         args.color_plot_samples_per_frame,
@@ -877,9 +1025,9 @@ def process_frame(
         cv2.rectangle(output, (x1, y1), (x2, y2), (40, 220, 40), 2)
     if args.debug_overlay:
         debug_label = (
-            f"cube {candidate.confidence:.2f} segments {segment_count}"
+            f"cube {candidate.confidence:.2f} stickers {segment_count}"
             if candidate is not None
-            else f"sticker viewport segments {segment_count}"
+            else f"sticker viewport stickers {segment_count}"
         )
         cv2.putText(
             output,
@@ -946,7 +1094,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--sticker-only",
         dest="use_bbox_detector",
         action="store_false",
-        help="Only run the sticker segment model on a centered square viewport",
+        help="Only run the sticker pose model on a centered square viewport",
     )
     parser.add_argument(
         "--skip-bbox",
@@ -959,13 +1107,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--segmentation-padding-px",
         type=int,
         default=-2,
-        help="Pixel padding applied to each segmentation mask before sampling; negative values erode",
+        help="Pixel padding applied to each rasterized sticker pose before sampling; negative values erode",
     )
     parser.add_argument(
         "--draw-sticker-graph",
         dest="draw_sticker_graph",
         action="store_true",
-        help="Draw sticker graph nodes and edges on top of the segmentation overlay",
+        help="Draw sticker graph nodes and edges on top of the sticker overlay",
     )
     parser.add_argument(
         "--adjacency-radius",
@@ -1044,7 +1192,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DENSITY_CLUSTER_MIN_POINTS,
         help="Minimum normalized RGB points in the epsilon neighborhood for a density core point",
     )
-    parser.add_argument("--color-plot-frames", type=int, default=90)
+    parser.add_argument(
+        "--color-plot-frames",
+        type=int,
+        default=90,
+        help="Detected frames of color samples to collect for plots; 0 disables color classification/recoloring.",
+    )
     parser.add_argument("--color-plot-samples-per-frame", type=int, default=800)
     parser.add_argument("--average-plot-point-size", type=float, default=36.0)
     parser.add_argument(
@@ -1100,13 +1253,18 @@ def main() -> int:
     sticker_model = YOLO(str(args.sticker_model))
     source = parse_source(args.source)
     plot_point_size = args.average_plot_point_size
-    color_classifier = ColorDensityClassifier(
-        required_frames=args.sticker_color_frames,
-        cluster_count=args.color_cluster_count,
-        min_brightness=args.sticker_color_min_brightness,
-        density_cluster_eps_radians=args.density_cluster_eps_radians,
-        density_cluster_min_neighbors=args.density_cluster_min_neighbors,
+    color_classifier = (
+        ColorDensityClassifier(
+            required_frames=args.sticker_color_frames,
+            cluster_count=args.color_cluster_count,
+            min_brightness=args.sticker_color_min_brightness,
+            density_cluster_eps_radians=args.density_cluster_eps_radians,
+            density_cluster_min_neighbors=args.density_cluster_min_neighbors,
+        )
+        if color_features_enabled(args)
+        else None
     )
+    color_plot_requested = color_plot_outputs_requested(args)
     color_plot_bgr_batches = []
     color_plot_detected_frames = 0
     cube_net_state = CubeNetState() if args.save_net else None
@@ -1128,7 +1286,7 @@ def main() -> int:
             color_classifier,
             cube_net_state,
         )
-        if args.rgb_color_plot or args.rgb_html_plot or args.hsv_html_plot:
+        if color_plot_requested:
             if len(bgr_samples) == 0:
                 raise SystemExit(
                     "Could not collect color plot samples because no stickers were segmented"
@@ -1137,7 +1295,7 @@ def main() -> int:
                 save_rgb_samples_plot(
                     bgr_samples,
                     str(args.rgb_color_plot),
-                    title="Sticker segmentation reliable pixels in RGB",
+                    title="Sticker pose reliable pixels in RGB",
                     point_size=plot_point_size,
                     normalize_rgb=args.normalize_rgb_plot,
                 )
@@ -1145,7 +1303,7 @@ def main() -> int:
                 save_rgb_html_plots(
                     bgr_samples,
                     args.rgb_html_plot,
-                    title="Sticker segmentation reliable pixels in RGB",
+                    title="Sticker pose reliable pixels in RGB",
                     normalize_rgb=args.normalize_rgb_plot,
                     args=args,
                     color_classifier=color_classifier,
@@ -1154,7 +1312,7 @@ def main() -> int:
                 save_hsv_samples_interactive_plot(
                     bgr_samples,
                     str(args.hsv_html_plot),
-                    title="Sticker segmentation reliable pixels in HSV",
+                    title="Sticker pose reliable pixels in HSV",
                     point_size=args.plotly_point_size,
                 )
         if args.save:
@@ -1163,7 +1321,7 @@ def main() -> int:
             args.save_net.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(args.save_net), draw_cube_net(cube_net_state))
         if args.display:
-            cv2.imshow("cube sticker segmentation", output)
+            cv2.imshow("cube sticker poses", output)
             cv2.waitKey(0)
             cv2.destroyAllWindows()
         return 0
@@ -1210,14 +1368,14 @@ def main() -> int:
 
         if args.save and args.once:
             cv2.imwrite(str(args.save), output)
-        if args.rgb_color_plot or args.rgb_html_plot or args.hsv_html_plot:
+        if color_plot_requested:
             if color_plot_detected_frames < args.color_plot_frames and len(bgr_samples) > 0:
                 color_plot_bgr_batches.append(bgr_samples)
                 color_plot_detected_frames += 1
                 if color_plot_detected_frames >= args.color_plot_frames and not args.display:
                     break
         if args.display:
-            cv2.imshow("cube sticker segmentation", output)
+            cv2.imshow("cube sticker poses", output)
             key = cv2.waitKey(0 if args.once else 1) & 0xFF
             if key == ord("q"):
                 break
@@ -1230,7 +1388,7 @@ def main() -> int:
     if args.save_net and cube_net_state is not None:
         args.save_net.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(args.save_net), draw_cube_net(cube_net_state))
-    if args.rgb_color_plot or args.rgb_html_plot or args.hsv_html_plot:
+    if color_plot_requested:
         if not color_plot_bgr_batches:
             raise SystemExit("Could not collect color plot samples from any segmented frames")
         bgr_samples = np.concatenate(color_plot_bgr_batches, axis=0)
@@ -1238,7 +1396,7 @@ def main() -> int:
             save_rgb_samples_plot(
                 bgr_samples,
                 str(args.rgb_color_plot),
-                title=f"Sticker segmentation RGB samples across {color_plot_detected_frames} frames",
+                title=f"Sticker pose RGB samples across {color_plot_detected_frames} frames",
                 point_size=plot_point_size,
                 normalize_rgb=args.normalize_rgb_plot,
             )
@@ -1246,7 +1404,7 @@ def main() -> int:
             save_rgb_html_plots(
                 bgr_samples,
                 args.rgb_html_plot,
-                title=f"Sticker segmentation RGB samples across {color_plot_detected_frames} frames",
+                title=f"Sticker pose RGB samples across {color_plot_detected_frames} frames",
                 normalize_rgb=args.normalize_rgb_plot,
                 args=args,
                 color_classifier=color_classifier,
@@ -1255,7 +1413,7 @@ def main() -> int:
             save_hsv_samples_interactive_plot(
                 bgr_samples,
                 str(args.hsv_html_plot),
-                title=f"Sticker segmentation HSV samples across {color_plot_detected_frames} frames",
+                title=f"Sticker pose HSV samples across {color_plot_detected_frames} frames",
                 point_size=args.plotly_point_size,
             )
     return 0

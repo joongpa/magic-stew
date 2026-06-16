@@ -1,14 +1,14 @@
-"""Train YOLO11 nano segmentation locally on generated cube sticker labels.
+"""Train YOLO11 nano pose locally on generated cube face/sticker labels.
 
 Expected input layout:
 
-    synthetic_cube/
+    synthetic_cube_dataset/
       images/*.png
       labels/*.txt
-      masks/*.png          # optional, not used for training
+      masks/*.png          # optional visualization masks, not used for training
 
 The script shuffles image/label pairs with a fixed seed, writes a local
-Ultralytics dataset layout, and trains yolo11n-seg.pt.
+Ultralytics dataset layout, and trains yolo11n-pose.pt.
 """
 
 from __future__ import annotations
@@ -21,7 +21,10 @@ from collections import Counter
 from pathlib import Path
 
 
-CLASS_NAMES = ["center_sticker", "edge_sticker", "corner_sticker"]
+CLASS_NAMES = ["visible_face", "center_sticker", "corner_sticker", "edge_sticker"]
+KEYPOINTS_PER_OBJECT = 4
+VALUES_PER_KEYPOINT = 3
+YOLO_POSE_FIELD_COUNT = 5 + (KEYPOINTS_PER_OBJECT * VALUES_PER_KEYPOINT)
 
 
 def label_lines(path: Path) -> list[str]:
@@ -32,11 +35,32 @@ def validate_label_file(path: Path) -> Counter[int]:
     counts: Counter[int] = Counter()
     for line_number, line in enumerate(label_lines(path), start=1):
         parts = line.split()
-        if len(parts) < 7 or (len(parts) - 1) % 2 != 0:
-            raise ValueError(f"{path}:{line_number} is not valid YOLO segmentation format")
+        if len(parts) != YOLO_POSE_FIELD_COUNT:
+            raise ValueError(
+                f"{path}:{line_number} is not valid YOLO pose format; "
+                f"expected {YOLO_POSE_FIELD_COUNT} fields, got {len(parts)}"
+            )
         class_id = int(float(parts[0]))
         if class_id < 0 or class_id >= len(CLASS_NAMES):
             raise ValueError(f"{path}:{line_number} has invalid class id {class_id}")
+        values = [float(part) for part in parts[1:]]
+        for value_index, value in enumerate(values[:4], start=1):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{path}:{line_number} bbox value {value_index} is outside [0, 1]: {value}")
+        keypoint_values = values[4:]
+        for keypoint_index in range(KEYPOINTS_PER_OBJECT):
+            x, y, visibility = keypoint_values[
+                keypoint_index * VALUES_PER_KEYPOINT : (keypoint_index + 1) * VALUES_PER_KEYPOINT
+            ]
+            if not 0.0 <= x <= 1.0 or not 0.0 <= y <= 1.0:
+                raise ValueError(
+                    f"{path}:{line_number} keypoint {keypoint_index + 1} is outside [0, 1]: "
+                    f"({x}, {y})"
+                )
+            if visibility not in {0.0, 1.0, 2.0}:
+                raise ValueError(
+                    f"{path}:{line_number} keypoint {keypoint_index + 1} has invalid visibility {visibility}"
+                )
         counts[class_id] += 1
     return counts
 
@@ -99,13 +123,13 @@ def write_dataset(
                 "source_label": str(label_path),
                 "image": str(target_image),
                 "label": str(target_label),
-                "segments": len(lines),
+                "poses": len(lines),
             })
 
         summary[split] = {
             "images": len(split_pairs),
             "label_count_distribution": dict(sorted(label_count_distribution.items())),
-            "class_segments": {
+            "class_poses": {
                 CLASS_NAMES[class_id]: class_counts[class_id] for class_id in range(len(CLASS_NAMES))
             },
         }
@@ -120,6 +144,7 @@ def write_dataset(
         "path: " + str(dataset_dir.resolve()) + "\n"
         "train: images/train\n"
         "val: images/val\n"
+        f"kpt_shape: [{KEYPOINTS_PER_OBJECT}, {VALUES_PER_KEYPOINT}]\n"
         "names:\n"
         + "".join(f"  {index}: {name}\n" for index, name in enumerate(CLASS_NAMES)),
         encoding="utf-8",
@@ -159,16 +184,16 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source-dir", type=Path, default=Path("synthetic_cube"))
-    parser.add_argument("--workdir", type=Path, default=Path("runs/cube_piece_seg_local"))
+    parser.add_argument("--source-dir", type=Path, default=Path("synthetic_cube_dataset"))
+    parser.add_argument("--workdir", type=Path, default=Path("runs/cube_piece_pose_local"))
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--model", default="yolo11n-seg.pt")
+    parser.add_argument("--model", default="yolo11n-pose.pt")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", type=int, default=256)
     parser.add_argument("--batch", type=int, default=-1)
-    parser.add_argument("--device", default=0)
-    parser.add_argument("--name", default="cube_piece_yolo11n_seg")
+    parser.add_argument("--device", default="mps")
+    parser.add_argument("--name", default="cube_piece_yolo11n_pose")
     parser.add_argument("--patience", type=int, default=25)
     parser.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--prepare-only", action="store_true")

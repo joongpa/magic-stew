@@ -38,6 +38,36 @@ class StubMixedBoxes:
         return 2
 
 
+class StubPoseBoxes:
+    cls = [SimpleNamespace(item=lambda: 1)]
+    conf = [SimpleNamespace(item=lambda: 0.9)]
+
+    def __len__(self):
+        return 1
+
+
+class StubFacePoseBoxes:
+    cls = [SimpleNamespace(item=lambda: 0)]
+    conf = [SimpleNamespace(item=lambda: 0.9)]
+
+    def __len__(self):
+        return 1
+
+
+class TensorLike:
+    def __init__(self, data):
+        self.data = data
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return self.data
+
+
 class StubStickerModel:
     names = {0: "center_sticker", 1: "edge_sticker", 2: "corner_sticker"}
 
@@ -52,6 +82,52 @@ class StubStickerModel:
             )
         )
         return [SimpleNamespace(masks=masks, boxes=StubBoxes())]
+
+
+class StubPoseStickerModel:
+    names = {0: "visible_face", 1: "center_sticker", 2: "corner_sticker", 3: "edge_sticker"}
+
+    def predict(self, source, conf, imgsz, verbose):
+        keypoints = np.array(
+            [
+                [
+                    [5.0, 5.0],
+                    [15.0, 5.0],
+                    [15.0, 15.0],
+                    [5.0, 15.0],
+                ]
+            ],
+            dtype=np.float32,
+        )
+        return [
+            SimpleNamespace(
+                keypoints=SimpleNamespace(xy=TensorLike(keypoints)),
+                boxes=StubPoseBoxes(),
+            )
+        ]
+
+
+class StubVisibleFacePoseModel:
+    names = {0: "visible_face", 1: "center_sticker", 2: "corner_sticker", 3: "edge_sticker"}
+
+    def predict(self, source, conf, imgsz, verbose):
+        keypoints = np.array(
+            [
+                [
+                    [5.0, 5.0],
+                    [15.0, 5.0],
+                    [15.0, 15.0],
+                    [5.0, 15.0],
+                ]
+            ],
+            dtype=np.float32,
+        )
+        return [
+            SimpleNamespace(
+                keypoints=SimpleNamespace(xy=TensorLike(keypoints)),
+                boxes=StubFacePoseBoxes(),
+            )
+        ]
 
 
 class RecordingStickerModel:
@@ -150,6 +226,39 @@ def test_process_frame_can_use_sticker_only_viewport_without_bbox_detector():
     assert bgr_samples.shape == (10, 3)
     assert (bgr_samples[:, 2] > bgr_samples[:, 0]).all()
     assert np.any(np.all(output == piece_seg_script.CLASS_COLORS[0], axis=2))
+
+
+def test_process_frame_accepts_pose_keypoint_stickers():
+    frame = np.zeros((40, 40, 3), dtype=np.uint8)
+    frame[:, :] = [40, 40, 40]
+    frame[10:20, 10:20] = [0, 0, 220]
+
+    output, bgr_samples = piece_seg_script.process_frame(
+        frame,
+        StubBboxDetector(),
+        StubPoseStickerModel(),
+        default_args(),
+    )
+
+    assert bgr_samples.shape == (10, 3)
+    assert (bgr_samples[:, 2] > bgr_samples[:, 0]).all()
+    assert np.any(np.all(output == piece_seg_script.CLASS_COLORS[1], axis=2))
+
+
+def test_process_frame_draws_visible_face_pose_outline_only():
+    frame = np.zeros((40, 40, 3), dtype=np.uint8)
+
+    output, bgr_samples = piece_seg_script.process_frame(
+        frame,
+        StubBboxDetector(),
+        StubVisibleFacePoseModel(),
+        default_args(),
+    )
+
+    assert bgr_samples.shape == (0, 3)
+    assert np.any(np.all(output == piece_seg_script.FACE_OUTLINE_COLOR, axis=2))
+    assert output[12:18, 12:18].max() > 0
+    assert output[15, 15].tolist() == [0, 0, 0]
 
 
 def test_sticker_only_scales_square_viewport_to_model_size():
@@ -404,6 +513,20 @@ def test_parser_exposes_density_color_classifier_options():
     assert args.density_cluster_eps_radians == 0.02
     assert args.density_cluster_min_neighbors == 70
     assert args.sticker_color_min_brightness == 50
+
+
+def test_color_plot_frames_zero_disables_color_features():
+    args = piece_seg_script.build_parser().parse_args(
+        [
+            "--color-plot-frames",
+            "0",
+            "--rgb-color-plot",
+            "runs/colors.png",
+        ]
+    )
+
+    assert piece_seg_script.color_features_enabled(args) is False
+    assert piece_seg_script.color_plot_outputs_requested(args) is False
 
 
 def test_classifier_cluster_indexes_match_display_classifier():
