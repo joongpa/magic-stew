@@ -69,7 +69,7 @@ class TensorLike:
 
 
 class StubStickerModel:
-    names = {0: "center_sticker", 1: "edge_sticker", 2: "corner_sticker"}
+    names = {0: "U_sticker", 1: "F_sticker", 2: "R_sticker"}
 
     def predict(self, source, conf, imgsz, verbose):
         mask = np.zeros((1, source.shape[0], source.shape[1]), dtype=np.float32)
@@ -85,7 +85,7 @@ class StubStickerModel:
 
 
 class StubPoseStickerModel:
-    names = {0: "visible_face", 1: "center_sticker", 2: "corner_sticker", 3: "edge_sticker"}
+    names = {0: "U_sticker"}
 
     def predict(self, source, conf, imgsz, verbose):
         keypoints = np.array(
@@ -108,7 +108,7 @@ class StubPoseStickerModel:
 
 
 class StubVisibleFacePoseModel:
-    names = {0: "visible_face", 1: "center_sticker", 2: "corner_sticker", 3: "edge_sticker"}
+    names = {0: "U_sticker"}
 
     def predict(self, source, conf, imgsz, verbose):
         keypoints = np.array(
@@ -131,7 +131,7 @@ class StubVisibleFacePoseModel:
 
 
 class RecordingStickerModel:
-    names = {0: "center_sticker", 1: "edge_sticker", 2: "corner_sticker"}
+    names = {0: "U_sticker", 1: "F_sticker", 2: "R_sticker"}
 
     def __init__(self):
         self.source_shape = None
@@ -153,7 +153,7 @@ class RecordingStickerModel:
 
 
 class StubMixedStickerModel:
-    names = {0: "center_sticker", 1: "edge_sticker", 2: "corner_sticker"}
+    names = {0: "U_sticker", 1: "F_sticker", 2: "R_sticker"}
 
     def predict(self, source, conf, imgsz, verbose):
         mask = np.zeros((2, source.shape[0], source.shape[1]), dtype=np.float32)
@@ -228,7 +228,7 @@ def test_process_frame_can_use_sticker_only_viewport_without_bbox_detector():
     assert np.any(np.all(output == piece_seg_script.CLASS_COLORS[0], axis=2))
 
 
-def test_process_frame_accepts_pose_keypoint_stickers():
+def test_process_frame_requires_segmentation_masks():
     frame = np.zeros((40, 40, 3), dtype=np.uint8)
     frame[:, :] = [40, 40, 40]
     frame[10:20, 10:20] = [0, 0, 220]
@@ -240,12 +240,11 @@ def test_process_frame_accepts_pose_keypoint_stickers():
         default_args(),
     )
 
-    assert bgr_samples.shape == (10, 3)
-    assert (bgr_samples[:, 2] > bgr_samples[:, 0]).all()
-    assert np.any(np.all(output == piece_seg_script.CLASS_COLORS[1], axis=2))
+    assert bgr_samples.shape == (0, 3)
+    assert np.array_equal(output, frame)
 
 
-def test_process_frame_draws_visible_face_pose_outline_only():
+def test_process_frame_ignores_pose_only_outputs():
     frame = np.zeros((40, 40, 3), dtype=np.uint8)
 
     output, bgr_samples = piece_seg_script.process_frame(
@@ -256,9 +255,7 @@ def test_process_frame_draws_visible_face_pose_outline_only():
     )
 
     assert bgr_samples.shape == (0, 3)
-    assert np.any(np.all(output == piece_seg_script.FACE_OUTLINE_COLOR, axis=2))
-    assert output[12:18, 12:18].max() > 0
-    assert output[15, 15].tolist() == [0, 0, 0]
+    assert np.array_equal(output, frame)
 
 
 def test_sticker_only_scales_square_viewport_to_model_size():
@@ -359,8 +356,8 @@ def test_segmentation_padding_changes_displayed_and_sampled_mask_not_graph_mask(
 
     assert len(bgr_samples) > 1
     assert (bgr_samples[:, 2] > bgr_samples[:, 0]).all()
-    assert (output[10, 10] == [40, 40, 40]).all()
-    assert not (output[15, 15] == [40, 40, 40]).all()
+    assert (output[10, 10] == [0, 0, 0]).all()
+    assert not (output[15, 15] == [0, 0, 0]).all()
 
 
 def test_sticker_color_sampling_returns_ten_samples_per_sticker():

@@ -28,7 +28,6 @@ import tempfile
 import urllib.request
 
 import bpy
-from bpy_extras.object_utils import world_to_camera_view
 from mathutils import Matrix, Quaternion, Vector
 
 import site
@@ -87,65 +86,22 @@ HAND_X_ROTATION_DEGREES = (-90.0, 0.0, 90.0)
 
 SOLVED_LOCATION_PROP = "synthetic_solved_location"
 SOLVED_ROTATION_PROP = "synthetic_solved_rotation"
-DEFAULT_OUTPUT_DIR = "synthetic_cube_dataset"
+DEFAULT_OUTPUT_DIR = "data/synthetic_cube_dataset"
 DEFAULT_IMAGE_SIZE = 512
 CUBE_HALF_EXTENT = 1.5
 CUBE_GRID_LINES = (-1.5, -0.5, 0.5, 1.5)
-CLASS_NAMES = ["visible_face", "center_sticker", "corner_sticker", "edge_sticker"]
-FACE_CLASS_ID = 0
-STICKER_CLASS_ID_BY_CUBIE_TYPE = {
-    "center": CLASS_NAMES.index("center_sticker"),
-    "corner": CLASS_NAMES.index("corner_sticker"),
-    "edge": CLASS_NAMES.index("edge_sticker"),
+CLASS_NAMES = ["U_sticker", "F_sticker", "R_sticker"]
+CLASS_ID_BY_FACE = {
+    "U": CLASS_NAMES.index("U_sticker"),
+    "F": CLASS_NAMES.index("F_sticker"),
+    "R": CLASS_NAMES.index("R_sticker"),
 }
-INSTANCE_VALUES = {
-    "center": [20, 40, 60, 80, 100, 120],
-    "edge": [130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240],
-    "corner": [248, 249, 250, 251, 252, 253, 254, 255],
+MASK_COLOR_BGR_BY_FACE = {
+    "U": (255, 255, 255),
+    "F": (0, 255, 0),
+    "R": (0, 0, 255),
 }
-CUBIE_PASS_INDEXES = [
-    cubie_value
-    for class_name in ("center", "edge", "corner")
-    for cubie_value in INSTANCE_VALUES[class_name]
-]
-STICKER_COLOR_INDEX_BY_MATERIAL_PASS_INDEX = {
-    material_pass_index: material_pass_index - 1 for material_pass_index in range(1, 7)
-}
-CUBIE_VALUE_TO_CLASS = {
-    value: STICKER_CLASS_ID_BY_CUBIE_TYPE[class_name]
-    for class_name in ("center", "edge", "corner")
-    for value in INSTANCE_VALUES[class_name]
-}
-STICKER_TO_MASK_VALUE = {
-    sticker_key: mask_value
-    for mask_value, sticker_key in enumerate(
-        (
-            (sticker_color_index, cubie_value)
-            for cubie_value in CUBIE_PASS_INDEXES
-            for sticker_color_index in range(6)
-        ),
-        start=1,
-    )
-}
-MASK_VALUE_TO_STICKER = {
-    mask_value: sticker_key for sticker_key, mask_value in STICKER_TO_MASK_VALUE.items()
-}
-MASK_VALUE_TO_CLASS = {
-    mask_value: CUBIE_VALUE_TO_CLASS[cubie_value]
-    for mask_value, (_sticker_color_index, cubie_value) in MASK_VALUE_TO_STICKER.items()
-}
-MIN_STICKER_VISIBLE_FRACTION = 0.15
-STICKER_VISIBLE_SAMPLE_GRID = 7
-MIN_STICKER_VISIBLE_SAMPLES = 3
-PROJECTION_BOUNDS_EPSILON_PX = 1.5
-SURFACE_FRONT_TOLERANCE_METERS = 0.015
-SURFACE_BACK_TOLERANCE_METERS = float('inf')
-KEYPOINT_VISIBILITY_INSET_FRACTIONS = (0.015, 0.035, 0.07)
-GRID_STICKER_MASK_VALUE_BY_CLASS = {
-    "center_sticker": 80,
-    "corner_sticker": 240,
-    "edge_sticker": 180,
-}
+MIN_VISIBLE_STICKER_AREA_PX = 8
 
 
 def parse_axis(axis_name: str) -> Vector:
@@ -692,352 +648,11 @@ def camera_ray(camera: bpy.types.Object, scene: bpy.types.Scene, x: int, y: int)
     return origin, direction
 
 
-def camera_rays(camera: bpy.types.Object, scene: bpy.types.Scene) -> list[tuple[Vector, Vector]]:
-    width = scene.render.resolution_x
-    height = scene.render.resolution_y
-    return [
-        camera_ray(camera, scene, x, y)
-        for y in range(height)
-        for x in range(width)
-    ]
-
-
 def normalize_point(x: float, y: float, width: int, height: int) -> tuple[float, float]:
     return (
         max(0.0, min(x / width, 1.0)),
         max(0.0, min(y / height, 1.0)),
     )
-
-
-def project_world_point(point: Vector, width: int, height: int) -> tuple[float, float]:
-    projected = world_to_camera_view(bpy.context.scene, get_camera(), point)
-    return projected.x * width, (1.0 - projected.y) * height
-
-
-def point_visibility_for_projection(
-    point: tuple[float, float],
-    width: int,
-    height: int,
-    visible: bool,
-) -> int:
-    x, y = point
-    if not (
-        -PROJECTION_BOUNDS_EPSILON_PX <= x <= width + PROJECTION_BOUNDS_EPSILON_PX
-        and -PROJECTION_BOUNDS_EPSILON_PX <= y <= height + PROJECTION_BOUNDS_EPSILON_PX
-    ):
-        return 0
-    return 2 if visible else 1
-
-
-def ray_reaches_cube_surface(point: Vector, cubie_names: set[str], depsgraph: bpy.types.Depsgraph) -> bool:
-    camera = get_camera()
-    direction = point - camera.location
-    distance = direction.length
-    if distance <= 1e-6:
-        return False
-
-    hit, location, _normal, _polygon_index, hit_object, _matrix = bpy.context.scene.ray_cast(
-        depsgraph,
-        camera.location,
-        direction.normalized(),
-        distance=distance + SURFACE_BACK_TOLERANCE_METERS,
-    )
-    if not hit or hit_object is None:
-        return False
-    hit_distance = (location - camera.location).length
-    if hit_distance >= distance - SURFACE_FRONT_TOLERANCE_METERS:
-        return True
-    return hit_object.name in cubie_names
-
-
-def keypoint_visibility_samples(corner: Vector, center: Vector) -> list[Vector]:
-    return [corner.lerp(center, fraction) for fraction in KEYPOINT_VISIBILITY_INSET_FRACTIONS]
-
-
-def any_sample_reaches_cube_surface(
-    samples: list[Vector],
-    cubie_names: set[str],
-    depsgraph: bpy.types.Depsgraph,
-) -> bool:
-    return any(ray_reaches_cube_surface(sample, cubie_names, depsgraph) for sample in samples)
-
-
-def cube_face_specs() -> list[tuple[str, Vector, list[Vector]]]:
-    half = CUBE_HALF_EXTENT
-    specs = []
-    for axis_index, axis_name in enumerate(("x", "y", "z")):
-        for sign in (-1.0, 1.0):
-            normal_values = [0.0, 0.0, 0.0]
-            normal_values[axis_index] = sign
-            normal = Vector(normal_values)
-            corners = []
-            free_indexes = [index for index in range(3) if index != axis_index]
-            for first in (-half, half):
-                for second in (-half, half):
-                    values = [0.0, 0.0, 0.0]
-                    values[axis_index] = sign * half
-                    values[free_indexes[0]] = first
-                    values[free_indexes[1]] = second
-                    corners.append(Vector(values))
-            specs.append((f"{axis_name}{'+' if sign > 0.0 else '-'}", normal, corners))
-    return specs
-
-
-def vector_projected_to_plane(vector: Vector, normal: Vector) -> Vector:
-    return vector - normal * vector.dot(normal)
-
-
-def fallback_face_down(normal: Vector) -> Vector:
-    down = vector_projected_to_plane(Vector((0.0, 0.0, -1.0)), normal)
-    if down.length <= 1e-6:
-        down = vector_projected_to_plane(Vector((0.0, -1.0, 0.0)), normal)
-    if down.length <= 1e-6:
-        down = vector_projected_to_plane(Vector((1.0, 0.0, 0.0)), normal)
-    down.normalize()
-    return down
-
-
-def face_down_direction(normal: Vector, visible_normals: list[Vector]) -> Vector:
-    down = Vector((0.0, 0.0, 0.0))
-    for visible_normal in visible_normals:
-        if visible_normal.dot(normal) < 0.999:
-            down += visible_normal * CUBE_HALF_EXTENT
-
-    down = vector_projected_to_plane(down, normal)
-    if down.length <= 1e-6:
-        return fallback_face_down(normal)
-
-    down.normalize()
-    return down
-
-
-def order_face_quad_items(
-    world_points: list[Vector],
-    projected_points: list[tuple[float, float]],
-    visibilities: list[int],
-    normal: Vector,
-    down: Vector,
-) -> tuple[list[tuple[float, float]], list[int]]:
-    center = sum(world_points, Vector((0.0, 0.0, 0.0))) / len(world_points)
-    right = normal.cross(down)
-    if right.length <= 1e-6:
-        right = vector_projected_to_plane(Vector((1.0, 0.0, 0.0)), normal)
-    right.normalize()
-
-    indexed = []
-    for index, world_point in enumerate(world_points):
-        offset = world_point - center
-        x = offset.dot(right)
-        y = offset.dot(down)
-        indexed.append((index, x, y, math.atan2(y, x)))
-
-    ordered = sorted(indexed, key=lambda item: item[3])
-    start = min(range(len(ordered)), key=lambda index: (ordered[index][2], ordered[index][1]))
-    ordered = ordered[start:] + ordered[:start]
-    ordered_indexes = [index for index, _x, _y, _angle in ordered]
-    return [projected_points[index] for index in ordered_indexes], [visibilities[index] for index in ordered_indexes]
-
-
-def projected_cube_face_quads(
-    objects: list[bpy.types.Object],
-    width: int,
-    height: int,
-) -> list[dict[str, object]]:
-    camera = get_camera()
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    cubie_names = {obj.name for obj in objects}
-    face_candidates = []
-    for face_name, normal, corners in cube_face_specs():
-        face_center = normal * CUBE_HALF_EXTENT
-        if (camera.location - face_center).dot(normal) <= 0.0:
-            continue
-
-        points = []
-        visibilities = []
-        for corner in corners:
-            projected = project_world_point(corner, width, height)
-            points.append(projected)
-            visibilities.append(
-                point_visibility_for_projection(
-                    projected,
-                    width,
-                    height,
-                    any_sample_reaches_cube_surface(
-                        keypoint_visibility_samples(corner, face_center),
-                        cubie_names,
-                        depsgraph,
-                    ),
-                )
-            )
-
-        min_x = min(x for x, _y in points)
-        max_x = max(x for x, _y in points)
-        min_y = min(y for _x, y in points)
-        max_y = max(y for _x, y in points)
-        if max_x < 0.0 or min_x > width or max_y < 0.0 or min_y > height:
-            continue
-
-        face_candidates.append({
-            "face": face_name,
-            "normal": normal,
-            "world_points": corners,
-            "points": points,
-            "visibilities": visibilities,
-        })
-
-    visible_normals = [candidate["normal"] for candidate in face_candidates]
-    quads = []
-    for candidate in face_candidates:
-        down = face_down_direction(candidate["normal"], visible_normals)
-        ordered_points, ordered_visibilities = order_face_quad_items(
-            candidate["world_points"],
-            candidate["points"],
-            candidate["visibilities"],
-            candidate["normal"],
-            down,
-        )
-        quads.append({
-            "face": candidate["face"],
-            "points": ordered_points,
-            "visibilities": ordered_visibilities,
-            "keypoint_order": "toward_visible_face_intersection",
-        })
-    return quads
-
-
-def yolo_pose_line_for_quad(
-    class_id: int,
-    points: list[tuple[float, float]],
-    visibilities: list[int],
-    width: int,
-    height: int,
-) -> str:
-    min_x = max(0.0, min(x for x, _y in points))
-    max_x = min(float(width), max(x for x, _y in points))
-    min_y = max(0.0, min(y for _x, y in points))
-    max_y = min(float(height), max(y for _x, y in points))
-
-    center_x = ((min_x + max_x) / 2.0) / width
-    center_y = ((min_y + max_y) / 2.0) / height
-    box_width = (max_x - min_x) / width
-    box_height = (max_y - min_y) / height
-    values = [
-        str(class_id),
-        f"{center_x:.6f}",
-        f"{center_y:.6f}",
-        f"{box_width:.6f}",
-        f"{box_height:.6f}",
-    ]
-
-    for (x, y), visibility in zip(points, visibilities):
-        nx, ny = normalize_point(x, y, width, height)
-        values.extend((f"{nx:.6f}", f"{ny:.6f}", str(visibility)))
-    return " ".join(values)
-
-
-def face_pose_labels(
-    objects: list[bpy.types.Object],
-    width: int,
-    height: int,
-) -> tuple[list[dict[str, object]], list[str]]:
-    face_quads = projected_cube_face_quads(objects, width, height)
-    lines = [
-        yolo_pose_line_for_quad(
-            FACE_CLASS_ID,
-            face_quad["points"],
-            face_quad["visibilities"],
-            width,
-            height,
-        )
-        for face_quad in face_quads
-    ]
-    return face_quads, lines
-
-
-def projected_polygon_area(points: list[tuple[float, float]]) -> float:
-    if len(points) < 3:
-        return 0.0
-
-    return abs(
-        sum(
-            points[index][0] * points[(index + 1) % len(points)][1]
-            - points[(index + 1) % len(points)][0] * points[index][1]
-            for index in range(len(points))
-        )
-        * 0.5
-    )
-
-
-def bilinear_quad_point(points: list[Vector], u: float, v: float) -> Vector:
-    top = points[0].lerp(points[1], u)
-    bottom = points[3].lerp(points[2], u)
-    return top.lerp(bottom, v)
-
-
-def sticker_visible_sample_count(
-    quad_world: list[Vector],
-    cubie_names: set[str],
-    depsgraph: bpy.types.Depsgraph,
-) -> int:
-    visible_samples = 0
-    for row in range(STICKER_VISIBLE_SAMPLE_GRID):
-        v = (row + 0.5) / STICKER_VISIBLE_SAMPLE_GRID
-        for column in range(STICKER_VISIBLE_SAMPLE_GRID):
-            u = (column + 0.5) / STICKER_VISIBLE_SAMPLE_GRID
-            if ray_reaches_cube_surface(
-                bilinear_quad_point(quad_world, u, v),
-                cubie_names,
-                depsgraph,
-            ):
-                visible_samples += 1
-    return visible_samples
-
-
-def cube_face_grid_specs() -> list[tuple[str, Vector, int, int, int]]:
-    specs = []
-    for axis_index, axis_name in enumerate(("x", "y", "z")):
-        free_indexes = [index for index in range(3) if index != axis_index]
-        for sign in (-1.0, 1.0):
-            normal_values = [0.0, 0.0, 0.0]
-            normal_values[axis_index] = sign
-            specs.append((
-                f"{axis_name}{'+' if sign > 0.0 else '-'}",
-                Vector(normal_values),
-                axis_index,
-                free_indexes[0],
-                free_indexes[1],
-            ))
-    return specs
-
-
-def grid_sticker_class_name(row: int, column: int) -> str:
-    if row == 1 and column == 1:
-        return "center_sticker"
-    if row == 1 or column == 1:
-        return "edge_sticker"
-    return "corner_sticker"
-
-
-def grid_cell_world_quad(
-    axis_index: int,
-    u_index: int,
-    v_index: int,
-    sign: float,
-    row: int,
-    column: int,
-) -> list[Vector]:
-    u0 = CUBE_GRID_LINES[column]
-    u1 = CUBE_GRID_LINES[column + 1]
-    v0 = CUBE_GRID_LINES[row]
-    v1 = CUBE_GRID_LINES[row + 1]
-    corners = []
-    for u, v in ((u0, v0), (u1, v0), (u1, v1), (u0, v1)):
-        values = [0.0, 0.0, 0.0]
-        values[axis_index] = sign * CUBE_HALF_EXTENT
-        values[u_index] = u
-        values[v_index] = v
-        corners.append(Vector(values))
-    return corners
 
 
 def axis_vector(axis_index: int, sign: float = 1.0) -> Vector:
@@ -1046,249 +661,262 @@ def axis_vector(axis_index: int, sign: float = 1.0) -> Vector:
     return Vector(values)
 
 
-def order_quad_relative_to_face_center(
-    quad_world: list[Vector],
-    normal: Vector,
-    v_index: int,
-) -> list[Vector]:
-    center = sum(quad_world, Vector((0.0, 0.0, 0.0))) / len(quad_world)
-    face_center = normal * CUBE_HALF_EXTENT
-    down = face_center - center
-    down = down - normal * down.dot(normal)
-    if down.length <= 1e-6:
-        down = axis_vector(v_index)
-        down = down - normal * down.dot(normal)
-    down.normalize()
-
-    right = normal.cross(down)
-    if right.length <= 1e-6:
-        right = axis_vector(0)
-        right = right - normal * right.dot(normal)
-    right.normalize()
-
-    indexed = []
-    for index, point in enumerate(quad_world):
-        offset = point - center
-        x = offset.dot(right)
-        y = offset.dot(down)
-        indexed.append((index, x, y, math.atan2(y, x)))
-
-    ordered = sorted(indexed, key=lambda item: item[3])
-    start = min(range(len(ordered)), key=lambda index: (ordered[index][2], ordered[index][1]))
-    ordered = ordered[start:] + ordered[:start]
-    return [quad_world[index] for index, _x, _y, _angle in ordered]
+def nearest_axis_vector(vector: Vector, exclude: set[tuple[int, int]] | None = None) -> Vector:
+    exclude = exclude or set()
+    best_axis = 0
+    best_sign = 1
+    best_dot = -1.0
+    for axis_index in range(3):
+        for sign in (-1, 1):
+            if (axis_index, sign) in exclude:
+                continue
+            axis = axis_vector(axis_index, float(sign))
+            dot = vector.normalized().dot(axis) if vector.length > 1e-6 else -1.0
+            if dot > best_dot:
+                best_axis = axis_index
+                best_sign = sign
+                best_dot = dot
+    return axis_vector(best_axis, float(best_sign))
 
 
-def grid_sticker_poses(
-    objects: list[bpy.types.Object],
-    width: int,
-    height: int,
-    visible_face_names: set[str],
-) -> list[dict[str, object]]:
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    cubie_names = {obj.name for obj in objects}
-    poses = []
-
-    for face_name, normal, axis_index, u_index, v_index in cube_face_grid_specs():
-        if face_name not in visible_face_names:
-            continue
-
-        sign = 1.0 if normal[axis_index] > 0.0 else -1.0
-        for row in range(3):
-            for column in range(3):
-                quad_world = grid_cell_world_quad(axis_index, u_index, v_index, sign, row, column)
-                quad_world = order_quad_relative_to_face_center(quad_world, normal, v_index)
-                quad_points = [project_world_point(point, width, height) for point in quad_world]
-                projected_area = projected_polygon_area(quad_points)
-                if projected_area <= 0.0:
-                    continue
-
-                visible_samples = sticker_visible_sample_count(quad_world, cubie_names, depsgraph)
-                visible_fraction = visible_samples / (STICKER_VISIBLE_SAMPLE_GRID * STICKER_VISIBLE_SAMPLE_GRID)
-                if visible_samples < MIN_STICKER_VISIBLE_SAMPLES or visible_fraction < MIN_STICKER_VISIBLE_FRACTION:
-                    continue
-
-                center = sum(quad_world, Vector((0.0, 0.0, 0.0))) / len(quad_world)
-                visibilities = [
-                    point_visibility_for_projection(
-                        projected_point,
-                        width,
-                        height,
-                        any_sample_reaches_cube_surface(
-                            keypoint_visibility_samples(world_point, center),
-                            cubie_names,
-                            depsgraph,
-                        ),
-                    )
-                    for world_point, projected_point in zip(quad_world, quad_points)
-                ]
-
-                class_name = grid_sticker_class_name(row, column)
-                class_id = CLASS_NAMES.index(class_name)
-                poses.append({
-                    "mask_value": GRID_STICKER_MASK_VALUE_BY_CLASS[class_name],
-                    "class_id": class_id,
-                    "class": class_name,
-                    "face": face_name,
-                    "row": row,
-                    "column": column,
-                    "keypoint_order": "relative_to_face_center",
-                    "points": quad_points,
-                    "visibilities": visibilities,
-                    "projected_area": projected_area,
-                    "visible_samples": visible_samples,
-                    "visible_fraction": visible_fraction,
-                })
-    return poses
+def axis_key(vector: Vector) -> tuple[int, int]:
+    axis_index = max(range(3), key=lambda index: abs(vector[index]))
+    return axis_index, 1 if vector[axis_index] >= 0.0 else -1
 
 
-def sticker_pose_line(
-    class_id: int,
-    points: list[tuple[float, float]],
-    visibilities: list[int],
-    width: int,
-    height: int,
-) -> str:
-    min_x = max(0.0, min(x for x, _y in points))
-    max_x = min(float(width), max(x for x, _y in points))
-    min_y = max(0.0, min(y for _x, y in points))
-    max_y = min(float(height), max(y for _x, y in points))
-
-    center_x = ((min_x + max_x) / 2.0) / width
-    center_y = ((min_y + max_y) / 2.0) / height
-    box_width = (max_x - min_x) / width
-    box_height = (max_y - min_y) / height
-    values = [
-        str(class_id),
-        f"{center_x:.6f}",
-        f"{center_y:.6f}",
-        f"{box_width:.6f}",
-        f"{box_height:.6f}",
-    ]
-
-    for (x, y), visibility in zip(points, visibilities):
-        nx, ny = normalize_point(x, y, width, height)
-        values.extend((f"{nx:.6f}", f"{ny:.6f}", str(visibility)))
-    return " ".join(values)
+def visible_world_normals() -> list[Vector]:
+    normals = []
+    for axis_index in range(3):
+        for sign in (-1.0, 1.0):
+            normal = axis_vector(axis_index, sign)
+            if normal.dot(get_camera().location) > 0.0:
+                normals.append(normal)
+    return normals
 
 
-def sticker_pose_labels(poses: list[dict[str, object]], width: int, height: int) -> list[str]:
-    return [
-        sticker_pose_line(
-            int(pose["class_id"]),
-            pose["points"],
-            pose["visibilities"],
-            width,
-            height,
-        )
-        for pose in poses
-    ]
+def camera_relative_axes(visible_normals: list[Vector]) -> dict[str, Vector]:
+    camera = get_camera()
+    up_reference = Vector((0.0, 0.0, 1.0))
+    u_axis = max(visible_normals, key=lambda normal: normal.dot(up_reference)) if visible_normals else up_reference
 
-
-def write_pose_labels(path: Path, lines: list[str]) -> None:
-    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-
-
-def draw_pose_corner_visibility(mask, points, visibilities, cv2) -> None:
-    white = (255, 255, 255) if len(mask.shape) == 3 else 255
-    black = (0, 0, 0) if len(mask.shape) == 3 else 0
-    gray = (160, 160, 160) if len(mask.shape) == 3 else 160
-    for point, visibility in zip(points.reshape(-1, 2), visibilities):
-        if visibility == 0:
-            continue
-
-        x, y = (int(value) for value in point)
-        if visibility == 2:
-            cv2.circle(mask, (x, y), radius=3, color=white, thickness=-1, lineType=cv2.LINE_AA)
-            cv2.circle(mask, (x, y), radius=4, color=black, thickness=1, lineType=cv2.LINE_AA)
-            continue
-
-        cv2.circle(mask, (x, y), radius=4, color=gray, thickness=1, lineType=cv2.LINE_AA)
-        cv2.line(mask, (x - 3, y - 3), (x + 3, y + 3), color=gray, thickness=1, lineType=cv2.LINE_AA)
-        cv2.line(mask, (x - 3, y + 3), (x + 3, y - 3), color=gray, thickness=1, lineType=cv2.LINE_AA)
-
-
-def draw_sticker_orientation_arrow(mask, points, pose: dict[str, object], cv2) -> None:
-    class_name = pose.get("class")
-    if class_name not in {"edge_sticker", "corner_sticker"}:
-        return
-
-    flat_points = points.reshape(-1, 2)
-    if len(flat_points) < 4:
-        return
-
-    if class_name == "edge_sticker":
-        start_point = (flat_points[0] + flat_points[1]) / 2.0
-        end_point = (flat_points[2] + flat_points[3]) / 2.0
+    side_normals = [normal for normal in visible_normals if axis_key(normal) != axis_key(u_axis)]
+    if len(side_normals) >= 2:
+        first, second = side_normals[:2]
+        if (u_axis.cross(first)).dot(second) > 0.5:
+            f_axis = first
+            r_axis = second
+        else:
+            f_axis = second
+            r_axis = first
+    elif len(side_normals) == 1:
+        f_axis = side_normals[0]
+        r_axis = nearest_axis_vector(u_axis.cross(f_axis))
     else:
-        start_point = flat_points[0]
-        end_point = flat_points[2]
+        camera_direction = camera.location - u_axis * camera.location.dot(u_axis)
+        f_axis = nearest_axis_vector(camera_direction, {axis_key(u_axis), axis_key(-u_axis)})
+        r_axis = nearest_axis_vector(u_axis.cross(f_axis), {axis_key(u_axis), axis_key(-u_axis), axis_key(f_axis), axis_key(-f_axis)})
 
-    start = tuple(int(round(value)) for value in start_point)
-    end = tuple(int(round(value)) for value in end_point)
-    cv2.arrowedLine(mask, start, end, color=(0, 0, 255), thickness=1, line_type=cv2.LINE_AA, tipLength=0.25)
-
-
-def draw_pose_point_zero_marker(mask, points, cv2) -> None:
-    flat_points = points.reshape(-1, 2)
-    if len(flat_points) == 0:
-        return
-
-    x, y = (int(value) for value in flat_points[0])
-    cv2.circle(mask, (x, y), radius=6, color=(255, 0, 0), thickness=-1, lineType=cv2.LINE_AA)
-    cv2.circle(mask, (x, y), radius=7, color=(255, 255, 255), thickness=1, lineType=cv2.LINE_AA)
+    return {
+        "U": u_axis,
+        "D": -u_axis,
+        "F": f_axis,
+        "B": -f_axis,
+        "R": r_axis,
+        "L": -r_axis,
+    }
 
 
-def write_sticker_pose_mask(path: Path, poses: list[dict[str, object]], width: int, height: int) -> None:
+def material_pass_index_for_hit(
+    hit_object: bpy.types.Object,
+    polygon_index: int,
+    depsgraph: bpy.types.Depsgraph,
+) -> int:
+    actual_hit_object = hit_object.evaluated_get(depsgraph)
+    if polygon_index < 0 or polygon_index >= len(actual_hit_object.data.polygons):
+        return 0
+    material_index = actual_hit_object.data.polygons[polygon_index].material_index
+    if material_index < 0 or material_index >= len(actual_hit_object.material_slots):
+        return 0
+
+    material = actual_hit_object.material_slots[material_index].material
+    if material is None:
+        return 0
+    return int(material.pass_index)
+
+
+def camera_relative_face_for_normal(normal: Vector, axes: dict[str, Vector]) -> str | None:
+    normal_key = axis_key(normal)
+    for face in ("U", "F", "R"):
+        if axis_key(axes[face]) == normal_key:
+            return face
+    return None
+
+
+def sticker_grid_index(value: float) -> int:
+    return max(0, min(2, int(math.floor(value + CUBE_HALF_EXTENT))))
+
+
+def hit_sticker_row_column(location: Vector, normal: Vector) -> tuple[int, int]:
+    axis_index, _sign = axis_key(normal)
+    free_indexes = [index for index in range(3) if index != axis_index]
+    return sticker_grid_index(location[free_indexes[1]]), sticker_grid_index(location[free_indexes[0]])
+
+
+def sticker_mask_value(face: str, row: int, column: int) -> int:
+    return 1 + CLASS_ID_BY_FACE[face] * 9 + row * 3 + column
+
+
+def sticker_class_id_for_mask_value(mask_value: int) -> int:
+    return (mask_value - 1) // 9
+
+
+def sticker_face_for_mask_value(mask_value: int) -> str:
+    class_id = sticker_class_id_for_mask_value(mask_value)
+    class_name = CLASS_NAMES[class_id]
+    return class_name.removesuffix("_sticker")
+
+
+def sticker_metadata_for_mask_value(mask_value: int) -> dict[str, object]:
+    zero_based = mask_value - 1
+    class_id = zero_based // 9
+    cell_index = zero_based % 9
+    row = cell_index // 3
+    column = cell_index % 3
+    return {
+        "mask_value": mask_value,
+        "class_id": class_id,
+        "class": CLASS_NAMES[class_id],
+        "face": CLASS_NAMES[class_id].removesuffix("_sticker"),
+        "row": row,
+        "column": column,
+    }
+
+
+def sticker_mask_value_for_hit(
+    hit_object: bpy.types.Object,
+    polygon_index: int,
+    location: Vector,
+    normal: Vector,
+    axes: dict[str, Vector],
+    depsgraph: bpy.types.Depsgraph,
+) -> int:
+    if material_pass_index_for_hit(hit_object, polygon_index, depsgraph) <= 0:
+        return 0
+    face = camera_relative_face_for_normal(normal, axes)
+    if face is None:
+        return 0
+    row, column = hit_sticker_row_column(location, normal)
+    return sticker_mask_value(face, row, column)
+
+
+def write_color_mask_png(path: Path, pixels: bytearray, width: int, height: int) -> None:
     try:
         import cv2
         import numpy as np
     except ImportError:
         raise RuntimeError(
-            "OpenCV and NumPy are required to draw sticker pose masks. "
-            "Install cv2 in Blender's Python environment before generating training data."
+            "OpenCV and NumPy are required to write sticker segmentation masks. "
+            "Install cv2 and numpy in Blender's Python environment before generating training data."
         ) from None
 
-    mask = np.zeros((height, width, 3), dtype=np.uint8)
-    for pose in poses:
-        points = np.asarray(pose["points"], dtype=np.float32)
-        points = np.rint(points).astype(np.int32).reshape((-1, 1, 2))
-        mask_value = int(pose["mask_value"])
-        cv2.fillConvexPoly(mask, points, (mask_value, mask_value, mask_value))
-        cv2.polylines(mask, [points], isClosed=True, color=(255, 255, 255), thickness=1, lineType=cv2.LINE_AA)
-        draw_sticker_orientation_arrow(mask, points, pose, cv2)
-        draw_pose_corner_visibility(mask, points, pose["visibilities"], cv2)
-
-    cv2.imwrite(str(path), mask)
+    source = np.frombuffer(bytes(pixels), dtype=np.uint8).reshape((height, width))
+    output = np.zeros((height, width, 3), dtype=np.uint8)
+    for mask_value in np.unique(source):
+        mask_value = int(mask_value)
+        if mask_value <= 0:
+            continue
+        face = sticker_face_for_mask_value(mask_value)
+        output[source == mask_value] = MASK_COLOR_BGR_BY_FACE[face]
+    cv2.imwrite(str(path), output)
 
 
-def draw_face_quads_on_mask(path: Path, face_quads: list[dict[str, object]]) -> None:
-    if not face_quads:
-        return
+def render_sticker_mask(path: Path | None, objects: list[bpy.types.Object]) -> tuple[bytearray, dict[str, object]]:
+    visible_normals = visible_world_normals()
+    axes = camera_relative_axes(visible_normals)
+    camera = get_camera()
+    scene = bpy.context.scene
+    width = scene.render.resolution_x
+    height = scene.render.resolution_y
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    cubie_names = {obj.name for obj in cube_objects()}
+    pixels = bytearray(width * height)
 
+    bpy.context.view_layer.update()
+    for y in range(height):
+        for x in range(width):
+            origin, direction = camera_ray(camera, scene, x, y)
+            hit, location, normal, polygon_index, hit_object, _matrix = scene.ray_cast(
+                depsgraph,
+                origin,
+                direction,
+            )
+            if not hit or hit_object is None or hit_object.name not in cubie_names:
+                continue
+            pixels[y * width + x] = sticker_mask_value_for_hit(
+                hit_object,
+                polygon_index,
+                location,
+                normal,
+                axes,
+                depsgraph,
+            )
+
+    if path is not None:
+        write_color_mask_png(path, pixels, width, height)
+    return pixels, {
+        "visible_normals": [[normal.x, normal.y, normal.z] for normal in visible_normals],
+        "axes": {name: [axis.x, axis.y, axis.z] for name, axis in axes.items()},
+    }
+
+
+def yolo_segments_with_cv2(pixels: bytearray, width: int, height: int) -> tuple[list[str], list[dict[str, object]]]:
     try:
         import cv2
         import numpy as np
     except ImportError:
         raise RuntimeError(
-            "OpenCV and NumPy are required to draw face pose masks. "
-            "Install cv2 in Blender's Python environment before generating training data."
+            "OpenCV and NumPy are required to write non-rectangular YOLO segmentation labels. "
+            "Install cv2 and numpy in Blender's Python environment before generating training data."
         ) from None
 
-    mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    if mask is None:
-        raise RuntimeError(f"Could not read mask for face pose visualization: {path}")
-    if len(mask.shape) == 2:
-        mask = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    mask = np.frombuffer(bytes(pixels), dtype=np.uint8).reshape((height, width))
+    lines = []
+    segments = []
+    for mask_value in sorted(int(value) for value in np.unique(mask) if int(value) > 0):
+        binary = (mask == mask_value).astype(np.uint8) * 255
+        contours, _hierarchy = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for component_index, contour in enumerate(contours):
+            area = cv2.contourArea(contour)
+            if area < MIN_VISIBLE_STICKER_AREA_PX:
+                continue
 
-    for face_quad in face_quads:
-        points = np.asarray(face_quad["points"], dtype=np.float32)
-        points = np.rint(points).astype(np.int32).reshape((-1, 1, 2))
-        cv2.polylines(mask, [points], isClosed=True, color=(255, 255, 255), thickness=2, lineType=cv2.LINE_AA)
-        draw_pose_corner_visibility(mask, points, face_quad["visibilities"], cv2)
-        draw_pose_point_zero_marker(mask, points, cv2)
+            epsilon = 0.0008 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
+            if len(approx) < 3:
+                continue
 
-    cv2.imwrite(str(path), mask)
+            metadata = sticker_metadata_for_mask_value(mask_value)
+            values = [str(metadata["class_id"])]
+            points = []
+            for x, y in approx:
+                nx, ny = normalize_point(float(x), float(y), width, height)
+                values.append(f"{nx:.6f}")
+                values.append(f"{ny:.6f}")
+                points.append((float(x), float(y)))
+            lines.append(" ".join(values))
+            segments.append({
+                **metadata,
+                "component_index": component_index,
+                "points": points,
+                "visible_area_px": int(area),
+            })
+    return lines, segments
+
+
+def write_yolo_segments(path: Path, pixels: bytearray, width: int, height: int) -> tuple[list[str], list[dict[str, object]]]:
+    lines, segments = yolo_segments_with_cv2(pixels, width, height)
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return lines, segments
 
 
 def generate_dataset(
@@ -1339,20 +967,8 @@ def generate_dataset(
                 max_degrees=max_cube_rotational_blur_degrees,
                 samples=cube_rotational_blur_samples,
             )
-            face_quads, face_lines = face_pose_labels(objects, width, height)
-            visible_face_names = {str(face_quad["face"]) for face_quad in face_quads}
-            sticker_poses = grid_sticker_poses(
-                objects,
-                width,
-                height,
-                visible_face_names,
-            )
-            sticker_lines = sticker_pose_labels(sticker_poses, width, height)
-            yolo_lines = face_lines + sticker_lines
-            write_pose_labels(label_path, yolo_lines)
-            if mask_path is not None:
-                write_sticker_pose_mask(mask_path, sticker_poses, width, height)
-                draw_face_quads_on_mask(mask_path, face_quads)
+            mask_pixels, face_geometry = render_sticker_mask(mask_path, objects)
+            yolo_lines, stickers = write_yolo_segments(label_path, mask_pixels, width, height)
         finally:
             restore_hand_objects(hands, hand_states)
 
@@ -1366,23 +982,14 @@ def generate_dataset(
             "background_cubies": background_cubies,
             "cube_rotational_blur": rotational_blur,
             "hands": hand_randomization,
-            "visible_faces": face_quads,
-            "sticker_poses": sticker_poses,
-            "sticker_mask_values": {
-                str(mask_value): {
-                    "sticker_color_index": sticker_color_index,
-                    "cubie_pass_index": cubie_value,
-                    "material_pass_index": sticker_color_index + 1,
-                    "class": CLASS_NAMES[MASK_VALUE_TO_CLASS[mask_value]],
-                }
-                for mask_value, (sticker_color_index, cubie_value) in MASK_VALUE_TO_STICKER.items()
-            },
-            "poses": len(yolo_lines),
+            "face_geometry": face_geometry,
+            "stickers": stickers,
+            "segments": len(yolo_lines),
         })
         mask_message = f", {mask_path}" if mask_path is not None else ""
         print(
             f"Wrote {image_path}{mask_message}, and {label_path} "
-            f"with {len(face_lines)} face poses, {len(sticker_lines)} sticker poses, "
+            f"with {len(yolo_lines)} sticker segments, "
             f"{background_cubies} background cubies "
             f"and {'rotational blur' if rotational_blur else 'no rotational blur'}"
         )
@@ -1394,7 +1001,6 @@ def generate_dataset(
         "path: " + str(output_dir.resolve()) + "\n"
         "train: images\n"
         "val: images\n"
-        "kpt_shape: [4, 3]\n"
         "names:\n"
         + "".join(f"  {index}: {name}\n" for index, name in enumerate(CLASS_NAMES)),
         encoding="utf-8",
@@ -1442,7 +1048,7 @@ def cli_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-masks",
         action="store_true",
-        help="Skip writing visualization masks; pose labels still use the internal raycast mask.",
+        help="Skip writing visualization masks; segmentation labels are still written.",
     )
 
     argv = sys.argv
