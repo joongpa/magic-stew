@@ -249,14 +249,55 @@ def default_args(**overrides):
         "debug_overlay": False,
         "show_bbox": False,
         "show_confidence": False,
+        "show_original_underlay": False,
         "mask_opacity": 1.0,
         "color_plot_samples_per_frame": 800,
         "draw_sticker_graph": False,
         "graph_adjacency_radius": 6,
         "graph_min_sticker_area": 12,
+        "draw_cube_grid_fit": False,
+        "cube_grid_fit_line_thickness": 2,
+        "cube_grid_fit_min_coverage": 0.88,
+        "empty_space_line_width": 5,
+        "basis_angle_bucket_degrees": 5.0,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def projected_cube_sticker_masks(
+    *,
+    roi_shape=(140, 140),
+    origin=(54.0, 61.0),
+    axes=((48.0, -18.0), (12.0, 46.0), (-42.0, -22.0)),
+    inset=0.18,
+):
+    masks = []
+    origin = np.asarray(origin, dtype=np.float32)
+    axes = np.asarray(axes, dtype=np.float32)
+    for first_index, second_index in ((0, 1), (1, 2), (2, 0)):
+        first_axis = axes[first_index]
+        second_axis = axes[second_index]
+        for row in range(3):
+            for column in range(3):
+                low_u = (column + inset) / 3.0
+                high_u = (column + 1.0 - inset) / 3.0
+                low_v = (row + inset) / 3.0
+                high_v = (row + 1.0 - inset) / 3.0
+                points = np.asarray(
+                    [
+                        origin + first_axis * low_u + second_axis * low_v,
+                        origin + first_axis * high_u + second_axis * low_v,
+                        origin + first_axis * high_u + second_axis * high_v,
+                        origin + first_axis * low_u + second_axis * high_v,
+                    ],
+                    dtype=np.float32,
+                )
+                mask_u8 = np.zeros(roi_shape, dtype=np.uint8)
+                cv2 = piece_seg_script.cv2
+                cv2.fillConvexPoly(mask_u8, np.round(points).astype(np.int32), 1)
+                masks.append(mask_u8 > 0)
+    return masks
 
 
 def test_process_frame_uses_same_output_when_collecting_plot_samples():
@@ -309,6 +350,28 @@ def test_process_frame_ignores_pose_only_outputs():
 
     assert bgr_samples.shape == (0, 3)
     assert np.array_equal(output, frame)
+
+
+def test_process_frame_can_show_original_image_under_overlay():
+    frame = np.zeros((40, 40, 3), dtype=np.uint8)
+    frame[:, :] = [40, 40, 40]
+    frame[10:20, 10:20] = [0, 0, 220]
+    args = default_args(show_original_underlay=True, mask_opacity=0.5)
+
+    output, bgr_samples = piece_seg_script.process_frame(
+        frame,
+        StubBboxDetector(),
+        StubStickerModel(),
+        args,
+    )
+
+    assert len(bgr_samples) > 1
+    assert np.array_equal(output[0, 0], np.asarray([40, 40, 40], dtype=np.uint8))
+    expected_blend = (
+        np.asarray([0, 0, 220], dtype=np.float32) * 0.5
+        + np.asarray(piece_seg_script.DEFAULT_STICKER_MASK_COLOR, dtype=np.float32) * 0.5
+    ).astype(np.uint8)
+    assert np.array_equal(output[15, 15], expected_blend)
 
 
 def test_roi_tracker_runs_bbox_once_and_moves_roi_from_sticker_bounds_center():
@@ -452,6 +515,483 @@ def test_resize_to_square_size_scales_viewport_to_model_input_size():
     assert resized.shape == (20, 20, 3)
 
 
+def test_low_intersection_lines_draw_four_side_lines_per_sticker_quad():
+    left_mask = np.zeros((40, 40), dtype=bool)
+    right_mask = np.zeros((40, 40), dtype=bool)
+    left_mask[10:30, 8:16] = True
+    right_mask[10:30, 24:32] = True
+
+    overlay = piece_seg_script.low_intersection_sticker_lines(
+        [left_mask, right_mask],
+        roi_shape=(40, 40),
+        line_width_px=5,
+    )
+    lines = overlay.lines
+
+    assert len(overlay.sampled_points_xy) == 8
+    assert len(overlay.quad_edge_segments_xy) == 8
+    assert len(lines) == 8
+    point_indexes = np.round(overlay.sampled_points_xy).astype(np.int32)
+    assert left_mask[
+        point_indexes[:, 1],
+        point_indexes[:, 0],
+    ].any()
+    assert right_mask[
+        point_indexes[:, 1],
+        point_indexes[:, 0],
+    ].any()
+    assert all(line.length_px > 30 for line in lines)
+
+
+def test_low_intersection_lines_are_deterministic_for_same_mask():
+    mask = np.zeros((60, 60), dtype=bool)
+    mask[8:22, 8:52] = True
+    mask[38:52, 8:52] = True
+    mask[8:52, 8:16] = True
+
+    first_overlay = piece_seg_script.low_intersection_sticker_lines(
+        [mask],
+        roi_shape=(60, 60),
+        line_width_px=5,
+    )
+    second_overlay = piece_seg_script.low_intersection_sticker_lines(
+        [mask],
+        roi_shape=(60, 60),
+        line_width_px=5,
+    )
+
+    assert np.array_equal(first_overlay.sampled_points_xy, second_overlay.sampled_points_xy)
+    assert [(line.start_xy, line.end_xy) for line in first_overlay.lines] == [
+        (line.start_xy, line.end_xy) for line in second_overlay.lines
+    ]
+
+
+def test_low_intersection_line_angles_come_from_quad_sides():
+    mask = np.zeros((50, 50), dtype=bool)
+    mask[20:28, 8:42] = True
+
+    overlay = piece_seg_script.low_intersection_sticker_lines(
+        [mask],
+        roi_shape=(50, 50),
+        line_width_px=3,
+    )
+
+    assert overlay.lines
+    side_angles = []
+    for start, end in overlay.quad_edge_segments_xy:
+        delta = end - start
+        side_angles.append(float(np.degrees(np.arctan2(delta[1], delta[0])) % 180.0))
+
+    assert all(
+        min(
+            abs(((line.angle_degrees - side_angle + 90.0) % 180.0) - 90.0)
+            for side_angle in side_angles
+        ) <= 1e-3
+        for line in overlay.lines
+    )
+
+
+def test_basis_vectors_average_angles_around_two_histogram_peaks():
+    lines = [
+        piece_seg_script.LowIntersectionLine(
+            score=0.0,
+            intersection_px=0,
+            length_px=10,
+            angle_degrees=angle,
+            start_xy=(0.0, 0.0),
+            end_xy=(1.0, 0.0),
+        )
+        for angle in [2.0, 7.0, 12.0, 48.0, 53.0, 58.0, 120.0]
+    ]
+
+    vectors = piece_seg_script._basis_vectors_from_line_angle_histogram(
+        lines,
+        bucket_degrees=5.0,
+    )
+    angles = sorted(float(np.degrees(np.arctan2(vector[1], vector[0])) % 180.0) for vector in vectors)
+
+    assert len(angles) == 2
+    assert abs(angles[0] - 7.0) < 0.5
+    assert abs(angles[1] - 53.0) < 0.5
+
+
+def test_overlay_points_come_from_sticker_quads():
+    left_mask = np.zeros((50, 50), dtype=bool)
+    right_mask = np.zeros((50, 50), dtype=bool)
+    left_mask[12:38, 8:16] = True
+    right_mask[12:38, 34:42] = True
+
+    overlay = piece_seg_script.low_intersection_sticker_lines(
+        [left_mask, right_mask],
+        roi_shape=(50, 50),
+        line_width_px=5,
+    )
+
+    points = overlay.sampled_points_xy
+    assert len(points) == 8
+    edge_mask = piece_seg_script._sticker_edge_mask([left_mask, right_mask], roi_shape=(50, 50))
+    assert edge_mask is not None
+    indexes = np.round(points).astype(np.int32)
+    assert edge_mask[indexes[:, 1], indexes[:, 0]].all()
+
+
+def test_sticker_quad_fit_preserves_skewed_quadrilateral_shape():
+    mask = np.zeros((50, 50), dtype=np.uint8)
+    expected = np.asarray(
+        [
+            [10, 12],
+            [36, 8],
+            [32, 34],
+            [7, 28],
+        ],
+        dtype=np.int32,
+    )
+    piece_seg_script.cv2.fillConvexPoly(mask, expected, 1)
+
+    quad = piece_seg_script._sticker_mask_quad_points(mask > 0, roi_shape=(50, 50))
+
+    assert quad is not None
+    assert len(quad) == 4
+    for corner in expected.astype(np.float32):
+        distances = np.linalg.norm(quad - corner, axis=1)
+        assert float(distances.min()) <= 2.0
+
+
+def test_low_intersection_lines_extend_to_roi_bounds():
+    mask = np.zeros((50, 50), dtype=bool)
+    mask[12:38, 12:18] = True
+    mask[12:38, 32:38] = True
+
+    overlay = piece_seg_script.low_intersection_sticker_lines(
+        [mask],
+        roi_shape=(50, 50),
+        line_width_px=6,
+    )
+    lines = overlay.lines
+
+    assert lines
+    assert any(line.length_px > 45 for line in lines)
+    assert all(0 <= line.start_xy[0] <= 49 and 0 <= line.end_xy[0] <= 49 for line in lines)
+    assert all(0 <= line.start_xy[1] <= 49 and 0 <= line.end_xy[1] <= 49 for line in lines)
+
+
+def test_draw_low_intersection_lines_uses_inclusion_width():
+    frame = np.zeros((50, 50, 3), dtype=np.uint8)
+    overlay = piece_seg_script.EmptySpaceLineOverlay(
+        lines=[
+            piece_seg_script.LowIntersectionLine(
+                score=0.1,
+                intersection_px=0,
+                length_px=20,
+                angle_degrees=0.0,
+                start_xy=(10.0, 35.0),
+                end_xy=(40.0, 35.0),
+            )
+        ],
+        sampled_points_xy=np.empty((0, 2), dtype=np.float32),
+        line_width_px=7,
+    )
+
+    piece_seg_script.draw_low_intersection_lines(
+        frame,
+        overlay,
+        offset_xy=(0, 0),
+    )
+
+    yellow_pixels = (
+        (frame[:, :, 0] < 80)
+        & (frame[:, :, 1] > 100)
+        & (frame[:, :, 2] > 100)
+    )
+    ys = np.flatnonzero(np.any(yellow_pixels[:, 20:30], axis=1))
+    assert ys[-1] - ys[0] + 1 >= 7
+
+
+def test_draw_low_intersection_lines_draws_fitted_quad_edges():
+    frame = np.zeros((40, 40, 3), dtype=np.uint8)
+    overlay = piece_seg_script.EmptySpaceLineOverlay(
+        lines=[],
+        sampled_points_xy=np.empty((0, 2), dtype=np.float32),
+        quad_edge_segments_xy=np.asarray(
+            [
+                [[8.0, 12.0], [30.0, 12.0]],
+                [[30.0, 12.0], [30.0, 28.0]],
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+    piece_seg_script.draw_low_intersection_lines(frame, overlay, offset_xy=(0, 0))
+
+    magenta_pixels = (
+        (frame[:, :, 0] > 100)
+        & (frame[:, :, 1] < 80)
+        & (frame[:, :, 2] > 100)
+    )
+    assert magenta_pixels.any()
+
+
+def test_draw_low_intersection_lines_draws_basis_vectors_at_center():
+    frame = np.zeros((60, 60, 3), dtype=np.uint8)
+    overlay = piece_seg_script.EmptySpaceLineOverlay(
+        lines=[],
+        sampled_points_xy=np.empty((0, 2), dtype=np.float32),
+        basis_vectors_xy=np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+        basis_center_xy=(30.0, 30.0),
+    )
+
+    piece_seg_script.draw_low_intersection_lines(frame, overlay, offset_xy=(0, 0))
+
+    blue_pixels = (
+        (frame[:, :, 0] > 100)
+        & (frame[:, :, 1] < 80)
+        & (frame[:, :, 2] < 80)
+    )
+    red_pixels = (
+        (frame[:, :, 0] < 80)
+        & (frame[:, :, 1] < 80)
+        & (frame[:, :, 2] > 100)
+    )
+    assert blue_pixels.any()
+    assert red_pixels.any()
+
+
+def test_form_fit_area_does_not_include_convex_hull_corner():
+    mask = np.zeros((80, 80), dtype=bool)
+    mask[10:25, 10:65] = True
+    mask[10:65, 10:25] = True
+
+    form_mask = piece_seg_script._form_fit_sticker_area_mask(mask)
+
+    assert form_mask is not None
+    assert not form_mask[62, 62]
+    assert form_mask[18, 56]
+    assert form_mask[56, 18]
+
+
+def test_projected_cube_grid_fit_covers_stickers_and_follows_edges():
+    masks = projected_cube_sticker_masks()
+
+    fit = piece_seg_script.fit_projected_cube_grid(
+        masks,
+        roi_shape=(140, 140),
+        line_thickness_px=1,
+        minimum_coverage=0.9,
+    )
+
+    assert fit is not None
+    assert fit.coverage_ratio >= 0.9
+    assert fit.line_edge_distance_score < 0.2
+
+
+def test_projected_cube_grid_edge_score_prefers_lines_near_sticker_edges():
+    masks = projected_cube_sticker_masks()
+    union_mask = piece_seg_script._union_sticker_mask(masks, (140, 140))
+    assert union_mask is not None
+    coverage_points = piece_seg_script._sample_mask_xy_points(union_mask, max_points=160)
+    edge_distance_image = piece_seg_script._sticker_edge_distance_image(
+        masks,
+        roi_shape=(140, 140),
+    )
+    assert edge_distance_image is not None
+    axes = np.asarray(
+        [
+            [48.0, -18.0],
+            [12.0, 46.0],
+            [-42.0, -22.0],
+        ],
+        dtype=np.float32,
+    )
+    origin = np.asarray((54.0, 61.0), dtype=np.float32)
+    hull, lines = piece_seg_script._projected_cube_grid_geometry(axes)
+    aligned_hull = hull + origin
+    aligned_lines = [
+        (
+            tuple((np.asarray(start, dtype=np.float32) + origin).tolist()),
+            tuple((np.asarray(end, dtype=np.float32) + origin).tolist()),
+        )
+        for start, end in lines
+    ]
+    shifted_lines = [
+        (
+            tuple((np.asarray(start, dtype=np.float32) + origin + (20.0, -16.0)).tolist()),
+            tuple((np.asarray(end, dtype=np.float32) + origin + (20.0, -16.0)).tolist()),
+        )
+        for start, end in lines
+    ]
+
+    aligned = piece_seg_script._score_projected_cube_grid_from_edge_distance(
+        edge_distance_image,
+        coverage_points_xy=coverage_points,
+        mask_area=float(union_mask.sum()),
+        hull_points_xy=aligned_hull,
+        line_segments_xy=aligned_lines,
+        line_thickness_px=1,
+        minimum_coverage=0.9,
+    )
+    shifted = piece_seg_script._score_projected_cube_grid_from_edge_distance(
+        edge_distance_image,
+        coverage_points_xy=coverage_points,
+        mask_area=float(union_mask.sum()),
+        hull_points_xy=aligned_hull,
+        line_segments_xy=shifted_lines,
+        line_thickness_px=1,
+        minimum_coverage=0.9,
+    )
+
+    assert aligned.line_edge_distance_score < shifted.line_edge_distance_score
+    assert aligned.score < shifted.score
+
+
+def test_projected_cube_grid_line_score_overlooks_unsupported_empty_lines():
+    enough_good_lines = np.asarray(
+        [0.01, 0.02, 0.01, 0.03, 0.02, 0.01, 0.04, 0.02, 0.95, 0.98, 1.0],
+        dtype=np.float32,
+    )
+    too_few_good_lines = np.asarray(
+        [0.01, 0.02, 0.95, 0.98, 1.0, 0.99, 0.97, 0.96, 0.94, 0.93, 0.92],
+        dtype=np.float32,
+    )
+
+    enough_score = piece_seg_script._robust_line_edge_distance_score(enough_good_lines)
+    sparse_score = piece_seg_script._robust_line_edge_distance_score(too_few_good_lines)
+
+    assert enough_score < 0.05
+    assert sparse_score > enough_score + 0.15
+
+
+def test_projected_cube_candidates_are_limited_by_observed_edge_directions():
+    masks = projected_cube_sticker_masks()
+    edge_mask = piece_seg_script._sticker_edge_mask(masks, roi_shape=(140, 140))
+    assert edge_mask is not None
+
+    directions = piece_seg_script._dominant_edge_direction_angles(edge_mask)
+    filtered = piece_seg_script._projected_cube_axis_candidates_for_edge_directions(directions)
+    all_candidates = piece_seg_script._projected_cube_axis_candidates()
+
+    assert len(directions) == 3
+    assert 0 < len(filtered) < len(all_candidates)
+    assert all(
+        piece_seg_script._candidate_direction_alignment_cost(candidate, directions)
+        <= piece_seg_script.CUBE_GRID_FIT_DIRECTION_TOLERANCE_RADIANS
+        for candidate in filtered
+    )
+
+
+def test_projected_cube_axis_candidates_are_possible_cube_projections():
+    candidates = piece_seg_script._projected_cube_axis_candidates()
+
+    assert candidates
+    assert all(
+        piece_seg_script._cube_projected_axes_are_possible(candidate)
+        for candidate in candidates
+    )
+    assert all(
+        piece_seg_script._projected_cube_silhouette_is_hexagonal(candidate)
+        for candidate in candidates
+    )
+
+
+def test_projected_cube_axis_validator_rejects_impossible_grid():
+    impossible_axes = np.asarray(
+        [
+            [1.0, 0.0],
+            [0.8, 0.2],
+            [-0.2, 0.9],
+        ],
+        dtype=np.float32,
+    )
+
+    assert not piece_seg_script._cube_projected_axes_are_possible(impossible_axes)
+
+
+def test_projected_cube_axis_validator_rejects_rectangle_silhouette():
+    rectangle_axes = np.asarray(
+        [
+            [1.0, 0.0],
+            [0.0, 0.72],
+            [-1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    assert not piece_seg_script._projected_cube_silhouette_is_hexagonal(rectangle_axes)
+    assert not piece_seg_script._cube_projected_axes_are_possible(rectangle_axes)
+
+
+def test_projected_cube_grid_score_penalizes_missing_sticker_coverage():
+    masks = projected_cube_sticker_masks()
+    union_mask = piece_seg_script._union_sticker_mask(masks, (140, 140))
+    assert union_mask is not None
+    axes = np.asarray(
+        [
+            [48.0, -18.0],
+            [12.0, 46.0],
+            [-42.0, -22.0],
+        ],
+        dtype=np.float32,
+    )
+    hull, lines = piece_seg_script._projected_cube_grid_geometry(axes)
+    displacement = np.asarray((104.0, 108.0), dtype=np.float32)
+    misplaced_hull = hull + displacement
+    misplaced_lines = [
+        (
+            tuple((np.asarray(start, dtype=np.float32) + displacement).tolist()),
+            tuple((np.asarray(end, dtype=np.float32) + displacement).tolist()),
+        )
+        for start, end in lines
+    ]
+
+    score = piece_seg_script._score_projected_cube_grid(
+        union_mask,
+        mask_area=float(union_mask.sum()),
+        hull_points_xy=misplaced_hull,
+        line_segments_xy=misplaced_lines,
+        line_thickness_px=1,
+        minimum_coverage=0.9,
+    )
+
+    assert score.coverage_ratio < 0.25
+    assert score.score > 2.5
+
+
+def test_parser_exposes_projected_cube_grid_fit_options():
+    args = piece_seg_script.build_parser().parse_args(
+        [
+            "--draw-cube-grid-fit",
+            "--cube-grid-fit-line-thickness",
+            "3",
+            "--cube-grid-fit-min-coverage",
+            "0.92",
+        ]
+    )
+
+    assert args.draw_cube_grid_fit is True
+    assert args.cube_grid_fit_line_thickness == 3
+    assert args.cube_grid_fit_min_coverage == 0.92
+
+
+def test_parser_exposes_low_intersection_line_options():
+    args = piece_seg_script.build_parser().parse_args(
+        [
+            "--empty-space-line-width",
+            "6",
+            "--basis-angle-bucket-degrees",
+            "10",
+        ]
+    )
+
+    assert args.empty_space_line_width == 6
+    assert args.basis_angle_bucket_degrees == 10
+
+
+def test_parser_defaults_low_intersection_line_options():
+    args = piece_seg_script.build_parser().parse_args([])
+
+    assert args.empty_space_line_width == 5
+    assert args.basis_angle_bucket_degrees == 5.0
+
+
 def test_sticker_sampling_uses_same_mask_as_rendering():
     frame = np.zeros((40, 40, 3), dtype=np.uint8)
     frame[:, :] = [40, 40, 40]
@@ -568,6 +1108,40 @@ def test_process_frame_graph_uses_unpadded_mask_when_sampling_is_padded():
     assert graph.nodes[0].mask.sum() == 100 * 255
 
 
+def test_process_frame_grid_fit_uses_unpadded_segmentation_mask():
+    frame = np.zeros((40, 40, 3), dtype=np.uint8)
+    frame[:, :] = [40, 40, 40]
+    args = default_args(
+        draw_cube_grid_fit=True,
+        segmentation_padding_px=-2,
+    )
+    captured = {}
+    original_low_intersection_sticker_lines = piece_seg_script.low_intersection_sticker_lines
+    original_draw_low_intersection_lines = piece_seg_script.draw_low_intersection_lines
+
+    def capture_low_intersection_lines(sticker_masks, **kwargs):
+        captured["mask_sum"] = int(sticker_masks[0].sum())
+        return piece_seg_script.EmptySpaceLineOverlay(
+            lines=[],
+            sampled_points_xy=np.empty((0, 2), dtype=np.float32),
+        )
+
+    piece_seg_script.low_intersection_sticker_lines = capture_low_intersection_lines
+    piece_seg_script.draw_low_intersection_lines = lambda *args, **kwargs: None
+    try:
+        piece_seg_script.process_frame(
+            frame,
+            StubBboxDetector(),
+            StubStickerModel(),
+            args,
+        )
+    finally:
+        piece_seg_script.low_intersection_sticker_lines = original_low_intersection_sticker_lines
+        piece_seg_script.draw_low_intersection_lines = original_draw_low_intersection_lines
+
+    assert captured["mask_sum"] == 100
+
+
 def test_process_frame_does_not_accumulate_cube_net_without_classifier():
     frame = np.zeros((40, 40, 3), dtype=np.uint8)
     frame[:, :] = [40, 40, 40]
@@ -600,6 +1174,12 @@ def test_parser_exposes_sticker_graph_options():
     assert args.draw_sticker_graph is True
     assert args.graph_adjacency_radius == 9
     assert args.graph_min_sticker_area == 5
+
+
+def test_parser_exposes_original_underlay_option():
+    args = piece_seg_script.build_parser().parse_args(["--show-original-underlay"])
+
+    assert args.show_original_underlay is True
 
 
 def test_parser_exposes_roi_tracking_gain_option():

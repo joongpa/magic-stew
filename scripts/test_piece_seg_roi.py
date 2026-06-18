@@ -10,7 +10,9 @@ Pipeline:
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
+from itertools import combinations
 from pathlib import Path
 from time import perf_counter
 
@@ -54,6 +56,12 @@ STICKER_CLASS_NAMES = {"u_sticker", "f_sticker", "r_sticker"}
 STICKER_COLOR_SAMPLE_COUNT = 10
 DENSITY_CLUSTER_EPS_RADIANS = 0.08
 DENSITY_CLUSTER_MIN_POINTS = 4
+CUBE_GRID_FIT_SAMPLE_POINTS = 160
+CUBE_GRID_FIT_REFINE_CANDIDATES = 8
+CUBE_GRID_FIT_SUPPORTED_LINE_DISTANCE = 0.18
+CUBE_GRID_FIT_DIRECTION_TOLERANCE_RADIANS = 0.32
+EMPTY_SPACE_LINE_WIDTH_PX = 5
+BASIS_VECTOR_ANGLE_BUCKET_DEGREES = 5.0
 
 
 @dataclass
@@ -123,6 +131,53 @@ class RoiTracker:
             frame_width,
             frame_height,
         )
+
+
+@dataclass(frozen=True)
+class ProjectedCubeGridFit:
+    score: float
+    line_edge_distance_score: float
+    coverage_ratio: float
+    hull_area_ratio: float
+    hull_points_xy: np.ndarray
+    line_segments_xy: list[tuple[tuple[float, float], tuple[float, float]]]
+
+
+@dataclass(frozen=True)
+class LowIntersectionLine:
+    score: float
+    intersection_px: int
+    length_px: int
+    angle_degrees: float
+    start_xy: tuple[float, float]
+    end_xy: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class EmptySpaceLineOverlay:
+    lines: list[LowIntersectionLine]
+    sampled_points_xy: np.ndarray
+    line_width_px: int = EMPTY_SPACE_LINE_WIDTH_PX
+    quad_edge_segments_xy: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 2, 2), dtype=np.float32)
+    )
+    basis_vectors_xy: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 2), dtype=np.float32)
+    )
+    basis_center_xy: tuple[float, float] | None = None
+
+
+@dataclass(frozen=True)
+class StickerEdgePointSample:
+    points_xy: np.ndarray
+    sticker_indexes: np.ndarray
+
+
+@dataclass(frozen=True)
+class StickerQuadGeometry:
+    points_xy: np.ndarray
+    sticker_indexes: np.ndarray
+    edge_segments_xy: np.ndarray
 
 
 class ColorDensityClassifier:
@@ -455,6 +510,1515 @@ def sticker_mask_bool(
     return mask > 0.5
 
 
+def low_intersection_sticker_lines(
+    sticker_masks: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+    line_width_px: int = EMPTY_SPACE_LINE_WIDTH_PX,
+    angle_bucket_degrees: float = BASIS_VECTOR_ANGLE_BUCKET_DEGREES,
+    **_: object,
+) -> EmptySpaceLineOverlay:
+    union_mask = _union_sticker_mask(sticker_masks, roi_shape)
+    if union_mask is None:
+        return EmptySpaceLineOverlay(lines=[], sampled_points_xy=np.empty((0, 2), dtype=np.float32))
+    line_width = max(1.0, float(line_width_px))
+    quad_geometry = _sticker_quad_geometry(
+        sticker_masks,
+        roi_shape=roi_shape,
+    )
+    quad_points = quad_geometry.points_xy
+    if len(quad_points) < 2 or len(quad_geometry.edge_segments_xy) == 0:
+        return EmptySpaceLineOverlay(
+            lines=[],
+            sampled_points_xy=quad_points,
+            line_width_px=int(round(line_width)),
+            quad_edge_segments_xy=quad_geometry.edge_segments_xy,
+        )
+
+    lines: list[LowIntersectionLine] = []
+    for edge_start, edge_end in quad_geometry.edge_segments_xy:
+        candidate = _infinite_line_from_points(edge_start, edge_end)
+        if candidate is None:
+            continue
+        point, direction, _normal = candidate
+        segment = _clip_infinite_line_to_roi(point, direction, roi_shape)
+        if segment is None:
+            continue
+        start, end = segment
+        length_px = int(round(float(np.linalg.norm(end - start))))
+        angle_degrees = float(np.degrees(np.arctan2(direction[1], direction[0])) % 180.0)
+        lines.append(
+            LowIntersectionLine(
+                score=0.0,
+                intersection_px=0,
+                length_px=length_px,
+                angle_degrees=angle_degrees,
+                start_xy=(float(start[0]), float(start[1])),
+                end_xy=(float(end[0]), float(end[1])),
+            )
+        )
+
+    basis_vectors = _basis_vectors_from_line_angle_histogram(
+        lines,
+        bucket_degrees=angle_bucket_degrees,
+    )
+    roi_height, roi_width = roi_shape
+    return EmptySpaceLineOverlay(
+        lines=lines,
+        sampled_points_xy=quad_points,
+        line_width_px=int(round(line_width)),
+        quad_edge_segments_xy=quad_geometry.edge_segments_xy,
+        basis_vectors_xy=basis_vectors,
+        basis_center_xy=((roi_width - 1) / 2.0, (roi_height - 1) / 2.0),
+    )
+
+
+def _basis_vectors_from_line_angle_histogram(
+    lines: list[LowIntersectionLine],
+    *,
+    bucket_degrees: float,
+    basis_count: int = 2,
+) -> np.ndarray:
+    if not lines or basis_count <= 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    bucket_size = max(float(bucket_degrees), 1e-6)
+    bucket_count = max(1, int(np.ceil(180.0 / bucket_size)))
+    angles = np.asarray([line.angle_degrees % 180.0 for line in lines], dtype=np.float32)
+    bucket_indexes = np.minimum(
+        np.floor(angles / bucket_size).astype(np.int32),
+        bucket_count - 1,
+    )
+    counts = np.bincount(bucket_indexes, minlength=bucket_count).astype(np.int32)
+    peak_scores = (
+        counts
+        + np.roll(counts, 1)
+        + np.roll(counts, -1)
+    )
+
+    vectors = []
+    suppressed = np.zeros(bucket_count, dtype=bool)
+    for _ in range(basis_count):
+        available_scores = peak_scores.copy()
+        available_scores[suppressed] = -1
+        peak_index = int(np.argmax(available_scores))
+        if available_scores[peak_index] <= 0:
+            break
+
+        center = (peak_index + 0.5) * bucket_size
+        lower = center - bucket_size * 1.5
+        upper = center + bucket_size * 1.5
+        nearby = np.asarray(
+            [_angle_in_half_open_axial_window(angle, lower, upper) for angle in angles],
+            dtype=bool,
+        )
+        vector = _average_axial_angle_vector(angles[nearby])
+        if vector is not None:
+            vectors.append(vector)
+
+        for neighbor_offset in (-1, 0, 1):
+            suppressed[(peak_index + neighbor_offset) % bucket_count] = True
+
+    if not vectors:
+        return np.empty((0, 2), dtype=np.float32)
+    return np.asarray(vectors, dtype=np.float32)
+
+
+def _angle_in_half_open_axial_window(angle_degrees: float, lower: float, upper: float) -> bool:
+    angle = float(angle_degrees) % 180.0
+    width = max(float(upper - lower), 0.0)
+    lower = float(lower) % 180.0
+    if width >= 180.0:
+        return True
+    return ((angle - lower) % 180.0) < width
+
+
+def _average_axial_angle_vector(angles_degrees: np.ndarray) -> np.ndarray | None:
+    angles = np.asarray(angles_degrees, dtype=np.float32).reshape(-1)
+    if len(angles) == 0:
+        return None
+    doubled = np.radians(angles * 2.0)
+    mean_x = float(np.cos(doubled).mean())
+    mean_y = float(np.sin(doubled).mean())
+    if float(np.hypot(mean_x, mean_y)) <= 1e-6:
+        return None
+    angle = 0.5 * float(np.arctan2(mean_y, mean_x))
+    return np.asarray((np.cos(angle), np.sin(angle)), dtype=np.float32)
+
+
+def _mask_convex_hull_points(mask: np.ndarray) -> np.ndarray | None:
+    points = cv2.findNonZero((np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8) * 255)
+    if points is None or len(points) < 3:
+        return None
+    return cv2.convexHull(points).reshape(-1, 2).astype(np.float32)
+
+
+def _form_fit_sticker_area_mask(union_mask: np.ndarray) -> np.ndarray | None:
+    binary = (np.asarray(union_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+    bounds = _mask_bounds_xyxy(union_mask)
+    if bounds is None:
+        return None
+
+    x1, y1, x2, y2 = bounds
+    span = max(x2 - x1, y2 - y1)
+    radius = max(4, int(round(span * 0.08)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+    form = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+    form = cv2.dilate(form, kernel, iterations=1)
+    contours, _ = cv2.findContours(form, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    filled = np.zeros_like(binary)
+    for contour in contours:
+        if cv2.contourArea(contour) > 0:
+            cv2.drawContours(filled, [contour], -1, 255, thickness=-1)
+    return filled > 0 if bool(filled.any()) else None
+
+
+def _normalized_sticker_masks(
+    sticker_masks: list[np.ndarray],
+    roi_shape: tuple[int, int],
+) -> list[np.ndarray]:
+    roi_height, roi_width = roi_shape
+    normalized = []
+    for mask in sticker_masks:
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != (roi_height, roi_width):
+            mask = cv2.resize(
+                mask.astype(np.uint8),
+                (roi_width, roi_height),
+                interpolation=cv2.INTER_NEAREST,
+            ) > 0
+        if bool(mask.any()):
+            normalized.append(mask)
+    return normalized
+
+
+def _sample_empty_form_points(
+    union_mask: np.ndarray,
+    form_mask: np.ndarray,
+    sticker_masks: list[np.ndarray],
+    *,
+    sample_count: int,
+) -> np.ndarray:
+    if sample_count <= 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    empty_mask = _interior_gap_mask(union_mask, form_mask, sticker_masks)
+    ys, xs = np.nonzero(empty_mask)
+    if len(xs) == 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    seed = _mask_seed(empty_mask)
+    rng = np.random.default_rng(seed)
+    size = min(sample_count, len(xs))
+    indexes = rng.choice(len(xs), size=size, replace=False)
+    return np.stack([xs[indexes], ys[indexes]], axis=1).astype(np.float32)
+
+
+def _interior_gap_mask(
+    union_mask: np.ndarray,
+    form_mask: np.ndarray,
+    sticker_masks: list[np.ndarray],
+) -> np.ndarray:
+    empty_mask = form_mask & ~union_mask
+    if not bool(empty_mask.any()):
+        return empty_mask
+
+    form_u8 = form_mask.astype(np.uint8) * 255
+    union_u8 = union_mask.astype(np.uint8) * 255
+    distance_from_form_edge = cv2.distanceTransform(form_u8, cv2.DIST_L2, 3)
+    distance_from_stickers = cv2.distanceTransform(255 - union_u8, cv2.DIST_L2, 3)
+    form_edge_margin = max(3.0, min(form_mask.shape[:2]) * 0.035)
+    sticker_gap_reach = max(6.0, min(form_mask.shape[:2]) * 0.14)
+    multi_sticker_nearby = _near_multiple_stickers_mask(
+        sticker_masks,
+        max_distance=sticker_gap_reach,
+    )
+    gap_mask = (
+        empty_mask
+        & (distance_from_form_edge >= form_edge_margin)
+        & (distance_from_stickers <= sticker_gap_reach)
+        & multi_sticker_nearby
+    )
+    if int(gap_mask.sum()) >= 8:
+        return gap_mask
+
+    fallback = (
+        empty_mask
+        & (distance_from_form_edge >= form_edge_margin)
+        & (distance_from_stickers <= sticker_gap_reach)
+    )
+    return fallback if bool(fallback.any()) else empty_mask
+
+
+def _near_multiple_stickers_mask(
+    sticker_masks: list[np.ndarray],
+    *,
+    max_distance: float,
+) -> np.ndarray:
+    if not sticker_masks:
+        return np.zeros((0, 0), dtype=bool)
+
+    nearby_count = np.zeros(sticker_masks[0].shape, dtype=np.uint8)
+    for mask in sticker_masks:
+        source = np.where(mask, 0, 255).astype(np.uint8)
+        distances = cv2.distanceTransform(source, cv2.DIST_L2, 3)
+        nearby_count += (distances <= max_distance).astype(np.uint8)
+    return nearby_count >= 2 if len(sticker_masks) >= 2 else nearby_count >= 1
+
+
+def _mask_seed(mask: np.ndarray) -> int:
+    ys, xs = np.nonzero(mask)
+    return int(mask.sum() + ys.sum() * 31 + xs.sum() * 131) & 0xFFFFFFFF
+
+
+def _infinite_line_from_points(
+    start_xy: np.ndarray,
+    end_xy: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    start = np.asarray(start_xy, dtype=np.float32)
+    end = np.asarray(end_xy, dtype=np.float32)
+    vector = end - start
+    length = float(np.linalg.norm(vector))
+    if length <= 1e-6:
+        return None
+    direction = vector / length
+    normal = np.asarray((-direction[1], direction[0]), dtype=np.float32)
+    return start, direction, normal
+
+
+def _sample_segment_integer_points(start_xy: np.ndarray, end_xy: np.ndarray) -> np.ndarray:
+    start = np.asarray(start_xy, dtype=np.float32)
+    end = np.asarray(end_xy, dtype=np.float32)
+    length = int(round(float(np.linalg.norm(end - start))))
+    if length <= 0:
+        return np.empty((0, 2), dtype=np.int32)
+    t = np.linspace(0.0, 1.0, length + 1, dtype=np.float32)
+    points = start[None, :] * (1.0 - t[:, None]) + end[None, :] * t[:, None]
+    return np.round(points).astype(np.int32)
+
+
+def _line_intersectionality_profile(
+    line_points_xy: np.ndarray,
+    *,
+    union_mask: np.ndarray,
+    edge_distance_image: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    points = np.asarray(line_points_xy, dtype=np.int32).reshape(-1, 2)
+    if len(points) == 0:
+        return np.empty(0, dtype=np.float32), np.empty(0, dtype=bool)
+
+    height, width = union_mask.shape[:2]
+    xs = np.clip(points[:, 0], 0, width - 1)
+    ys = np.clip(points[:, 1], 0, height - 1)
+    intersects = union_mask[ys, xs]
+    edge_distances = edge_distance_image[ys, xs]
+    normalized_edge_distance = np.minimum(edge_distances / 9.0, 1.0)
+    scores = np.where(
+        intersects,
+        0.35 + 0.65 * normalized_edge_distance,
+        0.04 + 0.32 * normalized_edge_distance,
+    )
+    return scores.astype(np.float32), intersects.astype(bool)
+
+
+def _best_low_intersectionality_region_score(point_scores: np.ndarray) -> float:
+    scores = np.asarray(point_scores, dtype=np.float32).reshape(-1)
+    if len(scores) == 0:
+        return 1.0
+
+    window = min(len(scores), max(8, int(round(len(scores) * 0.35))))
+    if window == len(scores):
+        return float(scores.mean())
+    cumsum = np.concatenate([[0.0], np.cumsum(scores, dtype=np.float32)])
+    means = (cumsum[window:] - cumsum[:-window]) / float(window)
+    return float(np.min(means))
+
+
+def _clip_infinite_line_to_convex_polygon(
+    point_xy: np.ndarray,
+    direction_xy: np.ndarray,
+    polygon_xy: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    direction = np.asarray(direction_xy, dtype=np.float32)
+    point = np.asarray(point_xy, dtype=np.float32)
+    polygon = np.asarray(polygon_xy, dtype=np.float32).reshape(-1, 2)
+    if len(polygon) < 3:
+        return None
+
+    intersections = []
+    for start, end in zip(polygon, np.roll(polygon, -1, axis=0)):
+        edge = end - start
+        denominator = _cross_2d(direction, edge)
+        if abs(denominator) <= 1e-6:
+            continue
+        delta = start - point
+        line_t = _cross_2d(delta, edge) / denominator
+        edge_t = _cross_2d(delta, direction) / denominator
+        if -1e-4 <= edge_t <= 1.0 + 1e-4:
+            intersections.append(point + direction * line_t)
+
+    unique = []
+    for intersection in intersections:
+        if not any(float(np.linalg.norm(intersection - existing)) < 1e-3 for existing in unique):
+            unique.append(intersection)
+    if len(unique) < 2:
+        return None
+    unique.sort(key=lambda value: float(value @ direction))
+    return unique[0], unique[-1]
+
+
+def _clip_infinite_line_to_mask(
+    point_xy: np.ndarray,
+    direction_xy: np.ndarray,
+    mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    direction = np.asarray(direction_xy, dtype=np.float32)
+    point = np.asarray(point_xy, dtype=np.float32)
+    height, width = mask.shape[:2]
+    span = float(np.hypot(width, height) * 1.5)
+    sample_count = max(8, int(round(span * 2.0)))
+    t_values = np.linspace(-span, span, sample_count, dtype=np.float32)
+    points = point[None, :] + t_values[:, None] * direction[None, :]
+    xs = np.round(points[:, 0]).astype(np.int32)
+    ys = np.round(points[:, 1]).astype(np.int32)
+    valid = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+    inside = np.zeros(len(points), dtype=bool)
+    inside[valid] = mask[ys[valid], xs[valid]]
+
+    runs = []
+    start_index: int | None = None
+    for index, is_inside in enumerate(inside):
+        if is_inside and start_index is None:
+            start_index = index
+        elif not is_inside and start_index is not None:
+            runs.append((start_index, index - 1))
+            start_index = None
+    if start_index is not None:
+        runs.append((start_index, len(inside) - 1))
+    if not runs:
+        return None
+
+    best_start, best_end = max(runs, key=lambda run: run[1] - run[0])
+    if best_end <= best_start:
+        return None
+    return points[best_start].astype(np.float32), points[best_end].astype(np.float32)
+
+
+def _clip_infinite_line_to_roi(
+    point_xy: np.ndarray,
+    direction_xy: np.ndarray,
+    roi_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    roi_height, roi_width = roi_shape
+    rect = np.asarray(
+        [
+            [0.0, 0.0],
+            [float(roi_width - 1), 0.0],
+            [float(roi_width - 1), float(roi_height - 1)],
+            [0.0, float(roi_height - 1)],
+        ],
+        dtype=np.float32,
+    )
+    segment = _clip_infinite_line_to_convex_polygon(point_xy, direction_xy, rect)
+    if segment is None:
+        return None
+    start, end = segment
+    start = np.asarray(
+        (
+            np.clip(start[0], 0.0, float(roi_width - 1)),
+            np.clip(start[1], 0.0, float(roi_height - 1)),
+        ),
+        dtype=np.float32,
+    )
+    end = np.asarray(
+        (
+            np.clip(end[0], 0.0, float(roi_width - 1)),
+            np.clip(end[1], 0.0, float(roi_height - 1)),
+        ),
+        dtype=np.float32,
+    )
+    return start, end
+
+
+def _cross_2d(left: np.ndarray, right: np.ndarray) -> float:
+    return float(left[0] * right[1] - left[1] * right[0])
+
+
+def _diverse_low_intersection_lines(
+    candidates: list[LowIntersectionLine],
+    *,
+    max_lines: int,
+) -> list[LowIntersectionLine]:
+    selected: list[LowIntersectionLine] = []
+    for candidate in candidates:
+        if any(
+            abs(candidate.angle_degrees - selected_line.angle_degrees) < 1e-6
+            and _segment_midpoint_distance(candidate, selected_line) < 8.0
+            for selected_line in selected
+        ):
+            continue
+        selected.append(candidate)
+        if len(selected) >= max_lines:
+            break
+    return selected
+
+
+def _segment_midpoint_distance(left: LowIntersectionLine, right: LowIntersectionLine) -> float:
+    left_midpoint = (
+        np.asarray(left.start_xy, dtype=np.float32)
+        + np.asarray(left.end_xy, dtype=np.float32)
+    ) * 0.5
+    right_midpoint = (
+        np.asarray(right.start_xy, dtype=np.float32)
+        + np.asarray(right.end_xy, dtype=np.float32)
+    ) * 0.5
+    return float(np.linalg.norm(left_midpoint - right_midpoint))
+
+
+def draw_low_intersection_lines(
+    frame: np.ndarray,
+    overlay: EmptySpaceLineOverlay | list[LowIntersectionLine],
+    *,
+    offset_xy: tuple[int, int],
+) -> None:
+    offset = np.asarray(offset_xy, dtype=np.float32)
+    if isinstance(overlay, EmptySpaceLineOverlay):
+        sampled_points = overlay.sampled_points_xy
+        lines = overlay.lines
+        line_width_px = overlay.line_width_px
+        quad_edge_segments = overlay.quad_edge_segments_xy
+        basis_vectors = overlay.basis_vectors_xy
+        basis_center = overlay.basis_center_xy
+    else:
+        sampled_points = np.empty((0, 2), dtype=np.float32)
+        lines = overlay
+        line_width_px = EMPTY_SPACE_LINE_WIDTH_PX
+        quad_edge_segments = np.empty((0, 2, 2), dtype=np.float32)
+        basis_vectors = np.empty((0, 2), dtype=np.float32)
+        basis_center = None
+
+    for segment in np.asarray(quad_edge_segments, dtype=np.float32).reshape(-1, 2, 2):
+        start = segment[0] + offset
+        end = segment[1] + offset
+        start_xy = (int(round(start[0])), int(round(start[1])))
+        end_xy = (int(round(end[0])), int(round(end[1])))
+        cv2.line(
+            frame,
+            start_xy,
+            end_xy,
+            (0, 0, 0),
+            4,
+            lineType=cv2.LINE_AA,
+        )
+        cv2.line(
+            frame,
+            start_xy,
+            end_xy,
+            (255, 0, 255),
+            2,
+            lineType=cv2.LINE_AA,
+        )
+
+    for index, line in enumerate(lines):
+        start = np.asarray(line.start_xy, dtype=np.float32) + offset
+        end = np.asarray(line.end_xy, dtype=np.float32) + offset
+        color = (0, 255, 255) if index < 8 else (255, 255, 255)
+        thickness = max(1, int(round(float(line_width_px))))
+        cv2.line(
+            frame,
+            (int(round(start[0])), int(round(start[1]))),
+            (int(round(end[0])), int(round(end[1]))),
+            (0, 0, 0),
+            thickness + 2,
+            lineType=cv2.LINE_AA,
+        )
+        cv2.line(
+            frame,
+            (int(round(start[0])), int(round(start[1]))),
+            (int(round(end[0])), int(round(end[1]))),
+            color,
+            thickness,
+            lineType=cv2.LINE_AA,
+        )
+
+    for point in np.asarray(sampled_points, dtype=np.float32).reshape(-1, 2):
+        xy = point + offset
+        center = (int(round(xy[0])), int(round(xy[1])))
+        cv2.circle(frame, center, 6, (0, 0, 0), -1, lineType=cv2.LINE_AA)
+        cv2.circle(frame, center, 4, (255, 0, 255), -1, lineType=cv2.LINE_AA)
+
+    if basis_center is not None:
+        center = np.asarray(basis_center, dtype=np.float32) + offset
+        vector_length = max(18.0, min(frame.shape[:2]) * 0.10)
+        for vector, color in zip(
+            np.asarray(basis_vectors, dtype=np.float32).reshape(-1, 2),
+            [(255, 0, 0), (0, 0, 255)],
+        ):
+            norm = float(np.linalg.norm(vector))
+            if norm <= 1e-6:
+                continue
+            unit = vector / norm
+            start = center - unit * vector_length
+            end = center + unit * vector_length
+            start_xy = (int(round(start[0])), int(round(start[1])))
+            end_xy = (int(round(end[0])), int(round(end[1])))
+            cv2.line(frame, start_xy, end_xy, (0, 0, 0), 6, lineType=cv2.LINE_AA)
+            cv2.line(frame, start_xy, end_xy, color, 4, lineType=cv2.LINE_AA)
+
+    if len(sampled_points) > 0 or lines:
+        label_origin = (int(offset[0]) + 6, int(offset[1]) + 18)
+        label = f"quad pts {len(sampled_points)} lines {len(lines)}"
+        cv2.putText(
+            frame,
+            label,
+            label_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            label,
+            label_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def fit_projected_cube_grid(
+    sticker_masks: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+    line_thickness_px: int = 2,
+    minimum_coverage: float = 0.88,
+) -> ProjectedCubeGridFit | None:
+    union_mask = _union_sticker_mask(sticker_masks, roi_shape)
+    if union_mask is None:
+        return None
+
+    bounds = _mask_bounds_xyxy(union_mask)
+    if bounds is None:
+        return None
+
+    mask_area = max(float(union_mask.sum()), 1.0)
+    mask_points = _sample_mask_xy_points(
+        union_mask,
+        max_points=CUBE_GRID_FIT_SAMPLE_POINTS,
+    )
+    edge_mask = _sticker_edge_mask(
+        sticker_masks,
+        roi_shape=roi_shape,
+    )
+    if len(mask_points) == 0 or edge_mask is None:
+        return None
+    edge_distance_image = _distance_image_from_edge_mask(edge_mask)
+    edge_directions = _dominant_edge_direction_angles(edge_mask)
+    candidate_axes = _projected_cube_axis_candidates_for_edge_directions(edge_directions)
+
+    coarse_fits: list[tuple[float, np.ndarray, np.ndarray, list[tuple[tuple[float, float], tuple[float, float]]], np.ndarray]] = []
+    for axes in candidate_axes:
+        base_hull, base_lines = _projected_cube_grid_geometry(axes)
+        base_min = base_hull.min(axis=0)
+        base_max = base_hull.max(axis=0)
+        base_size = np.maximum(base_max - base_min, 1e-6)
+        bx1, by1, bx2, by2 = bounds
+        target_size = np.asarray((bx2 - bx1, by2 - by1), dtype=np.float32) * 1.08
+        base_scale = float(np.max(target_size / base_size))
+        base_center = (base_min + base_max) / 2.0
+        target_center = np.asarray(((bx1 + bx2) / 2.0, (by1 + by2) / 2.0), dtype=np.float32)
+        for scale_multiplier in (1.0, 1.15):
+            scale = base_scale * scale_multiplier
+            hull, lines = _transform_projected_cube_grid(
+                base_hull,
+                base_lines,
+                base_center=base_center,
+                scale=scale,
+                origin=target_center,
+            )
+            fit = _score_projected_cube_grid_from_edge_distance(
+                edge_distance_image,
+                coverage_points_xy=mask_points,
+                mask_area=mask_area,
+                hull_points_xy=hull,
+                line_segments_xy=lines,
+                line_thickness_px=line_thickness_px,
+                minimum_coverage=minimum_coverage,
+            )
+            coarse_fits.append((fit.score, base_hull, base_center, base_lines, target_center))
+
+    best_fit: ProjectedCubeGridFit | None = None
+    offset_step = max(float(max(target_size)) * 0.045, 1.0)
+    offset_candidates = (
+        (0.0, 0.0),
+        (-offset_step, 0.0),
+        (offset_step, 0.0),
+        (0.0, -offset_step),
+        (0.0, offset_step),
+    )
+    for _, base_hull, base_center, base_lines, target_center in sorted(
+        coarse_fits,
+        key=lambda item: item[0],
+    )[:CUBE_GRID_FIT_REFINE_CANDIDATES]:
+        base_min = base_hull.min(axis=0)
+        base_max = base_hull.max(axis=0)
+        base_size = np.maximum(base_max - base_min, 1e-6)
+        base_scale = float(np.max(target_size / base_size))
+        for scale_multiplier in (0.96, 1.08, 1.20):
+            scale = base_scale * scale_multiplier
+            for offset_x, offset_y in offset_candidates:
+                origin = target_center + np.asarray((offset_x, offset_y), dtype=np.float32)
+                hull, lines = _transform_projected_cube_grid(
+                    base_hull,
+                    base_lines,
+                    base_center=base_center,
+                    scale=scale,
+                    origin=origin,
+                )
+                fit = _score_projected_cube_grid_from_edge_distance(
+                    edge_distance_image,
+                    coverage_points_xy=mask_points,
+                    mask_area=mask_area,
+                    hull_points_xy=hull,
+                    line_segments_xy=lines,
+                    line_thickness_px=line_thickness_px,
+                    minimum_coverage=minimum_coverage,
+                )
+                if best_fit is None or fit.score < best_fit.score:
+                    best_fit = fit
+    return best_fit
+
+
+def _transform_projected_cube_grid(
+    base_hull: np.ndarray,
+    base_lines: list[tuple[tuple[float, float], tuple[float, float]]],
+    *,
+    base_center: np.ndarray,
+    scale: float,
+    origin: np.ndarray,
+) -> tuple[np.ndarray, list[tuple[tuple[float, float], tuple[float, float]]]]:
+    hull = (base_hull - base_center) * scale + origin
+    lines = [
+        (
+            tuple(((np.asarray(start) - base_center) * scale + origin).tolist()),
+            tuple(((np.asarray(end) - base_center) * scale + origin).tolist()),
+        )
+        for start, end in base_lines
+    ]
+    return hull, lines
+
+
+def _sample_mask_xy_points(mask: np.ndarray, *, max_points: int) -> np.ndarray:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    points = np.stack([xs, ys], axis=1).astype(np.float32)
+    if len(points) <= max_points:
+        return points
+
+    indexes = np.linspace(0, len(points) - 1, max_points, dtype=np.int32)
+    return points[indexes]
+
+
+def _sample_sticker_edge_xy_points(
+    sticker_masks: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+    max_points: int,
+) -> np.ndarray:
+    del max_points
+    return _sticker_quad_geometry(sticker_masks, roi_shape=roi_shape).points_xy
+
+
+def _sample_sticker_edge_points(
+    sticker_masks: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+    max_points: int,
+) -> StickerEdgePointSample:
+    del max_points
+    geometry = _sticker_quad_geometry(sticker_masks, roi_shape=roi_shape)
+    return StickerEdgePointSample(
+        points_xy=geometry.points_xy,
+        sticker_indexes=geometry.sticker_indexes,
+    )
+
+
+def _sticker_quad_geometry(
+    sticker_masks: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+) -> StickerQuadGeometry:
+    roi_height, roi_width = roi_shape
+    point_batches = []
+    sticker_index_batches = []
+    edge_batches = []
+    for sticker_index, mask in enumerate(sticker_masks):
+        quad = _sticker_mask_quad_points(mask, roi_shape=roi_shape)
+        if quad is None:
+            continue
+        point_batches.append(quad)
+        sticker_index_batches.append(
+            np.full(len(quad), sticker_index, dtype=np.int32)
+        )
+        edge_batches.append(np.stack([quad, np.roll(quad, -1, axis=0)], axis=1))
+
+    if not point_batches:
+        return StickerQuadGeometry(
+            points_xy=np.empty((0, 2), dtype=np.float32),
+            sticker_indexes=np.empty(0, dtype=np.int32),
+            edge_segments_xy=np.empty((0, 2, 2), dtype=np.float32),
+        )
+
+    return StickerQuadGeometry(
+        points_xy=np.concatenate(point_batches, axis=0).astype(np.float32),
+        sticker_indexes=np.concatenate(sticker_index_batches, axis=0),
+        edge_segments_xy=np.concatenate(edge_batches, axis=0).astype(np.float32),
+    )
+
+
+def _sticker_mask_quad_points(
+    mask: np.ndarray,
+    *,
+    roi_shape: tuple[int, int],
+) -> np.ndarray | None:
+    roi_height, roi_width = roi_shape
+    normalized = np.asarray(mask, dtype=bool)
+    if normalized.shape != (roi_height, roi_width):
+        normalized = cv2.resize(
+            normalized.astype(np.uint8),
+            (roi_width, roi_height),
+            interpolation=cv2.INTER_NEAREST,
+        ) > 0
+    points = cv2.findNonZero(normalized.astype(np.uint8) * 255)
+    if points is None or len(points) < 3:
+        return None
+
+    binary = normalized.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    perimeter = cv2.arcLength(contour, closed=True)
+    if perimeter <= 1e-6:
+        return None
+
+    for epsilon_ratio in np.linspace(0.005, 0.12, 32):
+        approx = cv2.approxPolyDP(contour, epsilon_ratio * perimeter, closed=True)
+        if len(approx) == 4:
+            return _order_quad_points_clockwise(approx.reshape(-1, 2).astype(np.float32))
+
+    hull = cv2.convexHull(contour).reshape(-1, 2).astype(np.float32)
+    if len(hull) == 4:
+        return _order_quad_points_clockwise(hull)
+    if len(hull) > 4:
+        return _max_area_quad_from_hull_points(hull)
+    return None
+
+
+def _max_area_quad_from_hull_points(hull_points_xy: np.ndarray) -> np.ndarray | None:
+    points = np.asarray(hull_points_xy, dtype=np.float32).reshape(-1, 2)
+    if len(points) < 4:
+        return None
+    if len(points) > 48:
+        indexes = np.linspace(0, len(points) - 1, 48, dtype=np.int32)
+        points = points[indexes]
+
+    best_quad = None
+    best_area = -1.0
+    for indexes in combinations(range(len(points)), 4):
+        quad = _order_quad_points_clockwise(points[list(indexes)])
+        area = float(cv2.contourArea(quad.reshape(-1, 1, 2)))
+        if area > best_area:
+            best_area = area
+            best_quad = quad
+    return best_quad
+
+
+def _order_quad_points_clockwise(points_xy: np.ndarray) -> np.ndarray:
+    points = np.asarray(points_xy, dtype=np.float32).reshape(-1, 2)
+    center = points.mean(axis=0)
+    angles = np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])
+    ordered = points[np.argsort(angles)]
+    start_index = int(np.lexsort((ordered[:, 0], ordered[:, 1]))[0])
+    return np.roll(ordered, -start_index, axis=0).astype(np.float32)
+
+
+def _sticker_edge_mask(
+    sticker_masks: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+) -> np.ndarray | None:
+    roi_height, roi_width = roi_shape
+    edge_mask = np.zeros((roi_height, roi_width), dtype=bool)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    for mask in sticker_masks:
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != edge_mask.shape:
+            mask = cv2.resize(
+                mask.astype(np.uint8),
+                (roi_width, roi_height),
+                interpolation=cv2.INTER_NEAREST,
+            ) > 0
+        if not bool(mask.any()):
+            continue
+        mask_u8 = mask.astype(np.uint8) * 255
+        eroded = cv2.erode(mask_u8, kernel, iterations=1)
+        edge_mask |= mask & (eroded == 0)
+    return edge_mask if bool(edge_mask.any()) else None
+
+
+def _sticker_edge_distance_image(
+    sticker_masks: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+) -> np.ndarray | None:
+    edge_mask = _sticker_edge_mask(sticker_masks, roi_shape=roi_shape)
+    if edge_mask is None:
+        return None
+    return _distance_image_from_edge_mask(edge_mask)
+
+
+def _distance_image_from_edge_mask(edge_mask: np.ndarray) -> np.ndarray:
+    distance_source = np.where(edge_mask, 0, 255).astype(np.uint8)
+    return cv2.distanceTransform(distance_source, cv2.DIST_L2, 3).astype(np.float32)
+
+
+def _union_sticker_mask(
+    sticker_masks: list[np.ndarray],
+    roi_shape: tuple[int, int],
+) -> np.ndarray | None:
+    roi_height, roi_width = roi_shape
+    union_mask = np.zeros((roi_height, roi_width), dtype=bool)
+    for mask in sticker_masks:
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != union_mask.shape:
+            mask = cv2.resize(
+                mask.astype(np.uint8),
+                (roi_width, roi_height),
+                interpolation=cv2.INTER_NEAREST,
+            ) > 0
+        union_mask |= mask
+    return union_mask if bool(union_mask.any()) else None
+
+
+def _mask_bounds_xyxy(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+@lru_cache(maxsize=1)
+def _projected_cube_axis_candidates() -> tuple[np.ndarray, ...]:
+    candidates_by_key: dict[tuple[int, ...], np.ndarray] = {}
+    for yaw_degrees in range(0, 360, 30):
+        for pitch_degrees in range(-50, 51, 25):
+            for roll_degrees in range(-50, 51, 25):
+                rotation = _rotation_matrix_xyz(
+                    np.radians(float(yaw_degrees)),
+                    np.radians(float(pitch_degrees)),
+                    np.radians(float(roll_degrees)),
+                )
+                axes = _visible_cube_axes_from_rotation(rotation)
+                if axes is None:
+                    continue
+                key = tuple(int(round(value * 1000)) for value in axes.reshape(-1))
+                candidates_by_key[key] = axes
+    return tuple(candidates_by_key.values())
+
+
+def _projected_cube_axis_candidates_for_edge_directions(
+    edge_direction_angles: np.ndarray,
+) -> tuple[np.ndarray, ...]:
+    candidates = _projected_cube_axis_candidates()
+    observed = np.asarray(edge_direction_angles, dtype=np.float32).reshape(-1)
+    if len(observed) < 2:
+        return candidates
+
+    scored = [
+        (_candidate_direction_alignment_cost(axes, observed), axes)
+        for axes in candidates
+    ]
+    filtered = [
+        axes
+        for cost, axes in scored
+        if cost <= CUBE_GRID_FIT_DIRECTION_TOLERANCE_RADIANS
+    ]
+    if filtered:
+        return tuple(filtered)
+
+    scored.sort(key=lambda item: item[0])
+    return tuple(axes for _, axes in scored[: min(12, len(scored))])
+
+
+def _dominant_edge_direction_angles(edge_mask: np.ndarray, *, max_directions: int = 3) -> np.ndarray:
+    edge_u8 = (np.asarray(edge_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+    height, width = edge_u8.shape[:2]
+    min_line_length = max(6, int(round(min(height, width) / 12.0)))
+    lines = cv2.HoughLinesP(
+        edge_u8,
+        rho=1,
+        theta=np.pi / 180.0,
+        threshold=max(8, min_line_length),
+        minLineLength=min_line_length,
+        maxLineGap=3,
+    )
+    if lines is None:
+        return np.empty(0, dtype=np.float32)
+
+    angles = []
+    weights = []
+    for line in lines.reshape(-1, 4):
+        x1, y1, x2, y2 = (float(value) for value in line)
+        dx = x2 - x1
+        dy = y2 - y1
+        length = float(np.hypot(dx, dy))
+        if length < min_line_length:
+            continue
+        angle = float(np.arctan2(dy, dx) % np.pi)
+        angles.append(angle)
+        weights.append(length)
+
+    if not angles:
+        return np.empty(0, dtype=np.float32)
+    return _dominant_angles_from_weighted_samples(
+        np.asarray(angles, dtype=np.float32),
+        np.asarray(weights, dtype=np.float32),
+        max_directions=max_directions,
+    )
+
+
+def _dominant_angles_from_weighted_samples(
+    angles: np.ndarray,
+    weights: np.ndarray,
+    *,
+    max_directions: int,
+) -> np.ndarray:
+    bin_count = 36
+    bins = np.zeros(bin_count, dtype=np.float32)
+    indexes = np.floor((angles % np.pi) / np.pi * bin_count).astype(np.int32) % bin_count
+    for index, weight in zip(indexes, weights):
+        bins[index] += float(weight)
+
+    selected = []
+    suppressed = np.zeros(bin_count, dtype=bool)
+    separation_bins = 3
+    for _ in range(max_directions):
+        available = np.where(suppressed, -1.0, bins)
+        best_index = int(np.argmax(available))
+        if available[best_index] <= 0.0:
+            break
+        neighbor_indexes = [(best_index + offset) % bin_count for offset in (-1, 0, 1)]
+        neighbor_weights = bins[neighbor_indexes]
+        if float(neighbor_weights.sum()) <= 1e-6:
+            angle = (best_index + 0.5) / bin_count * np.pi
+        else:
+            neighbor_angles = np.asarray(
+                [(index + 0.5) / bin_count * np.pi for index in neighbor_indexes],
+                dtype=np.float32,
+            )
+            angle = _weighted_undirected_angle_mean(neighbor_angles, neighbor_weights)
+        selected.append(angle)
+        for offset in range(-separation_bins, separation_bins + 1):
+            suppressed[(best_index + offset) % bin_count] = True
+    return np.asarray(selected, dtype=np.float32)
+
+
+def _weighted_undirected_angle_mean(angles: np.ndarray, weights: np.ndarray) -> float:
+    doubled = np.asarray(angles, dtype=np.float32) * 2.0
+    weights = np.asarray(weights, dtype=np.float32)
+    vector = np.asarray(
+        [
+            float(np.sum(np.cos(doubled) * weights)),
+            float(np.sum(np.sin(doubled) * weights)),
+        ],
+        dtype=np.float32,
+    )
+    if float(np.linalg.norm(vector)) <= 1e-6:
+        return float(angles[0] % np.pi)
+    return float((np.arctan2(vector[1], vector[0]) / 2.0) % np.pi)
+
+
+def _candidate_direction_alignment_cost(axes_xy: np.ndarray, observed_angles: np.ndarray) -> float:
+    candidate_angles = _axis_direction_angles(axes_xy)
+    observed = np.asarray(observed_angles, dtype=np.float32).reshape(-1)
+    if len(observed) == 0:
+        return 0.0
+
+    observed_to_candidate = [
+        min(_undirected_angle_distance(observed_angle, candidate_angle) for candidate_angle in candidate_angles)
+        for observed_angle in observed
+    ]
+    candidate_to_observed = [
+        min(_undirected_angle_distance(candidate_angle, observed_angle) for observed_angle in observed)
+        for candidate_angle in candidate_angles
+    ]
+    if len(observed) >= 3:
+        return float(max(max(observed_to_candidate), max(candidate_to_observed)))
+    return float(max(observed_to_candidate))
+
+
+def _axis_direction_angles(axes_xy: np.ndarray) -> np.ndarray:
+    axes = np.asarray(axes_xy, dtype=np.float32).reshape(-1, 2)
+    return np.asarray([float(np.arctan2(axis[1], axis[0]) % np.pi) for axis in axes], dtype=np.float32)
+
+
+def _undirected_angle_distance(left: float, right: float) -> float:
+    delta = abs((float(left) - float(right)) % np.pi)
+    return float(min(delta, np.pi - delta))
+
+
+def _rotation_matrix_xyz(yaw: float, pitch: float, roll: float) -> np.ndarray:
+    cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
+    cos_pitch, sin_pitch = np.cos(pitch), np.sin(pitch)
+    cos_roll, sin_roll = np.cos(roll), np.sin(roll)
+    rotate_x = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, cos_roll, -sin_roll],
+            [0.0, sin_roll, cos_roll],
+        ],
+        dtype=np.float32,
+    )
+    rotate_y = np.asarray(
+        [
+            [cos_pitch, 0.0, sin_pitch],
+            [0.0, 1.0, 0.0],
+            [-sin_pitch, 0.0, cos_pitch],
+        ],
+        dtype=np.float32,
+    )
+    rotate_z = np.asarray(
+        [
+            [cos_yaw, -sin_yaw, 0.0],
+            [sin_yaw, cos_yaw, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    return rotate_z @ rotate_y @ rotate_x
+
+
+def _visible_cube_axes_from_rotation(rotation: np.ndarray) -> np.ndarray | None:
+    axes_3d = np.asarray(rotation, dtype=np.float32).reshape(3, 3).T.copy()
+    for index in range(3):
+        if axes_3d[index, 2] > 0:
+            axes_3d[index] *= -1.0
+    depths = -axes_3d[:, 2]
+    if float(depths.min()) < 0.22:
+        return None
+    projected_axes = axes_3d[:, :2]
+    lengths = np.linalg.norm(projected_axes, axis=1)
+    if float(lengths.min()) < 0.28:
+        return None
+    axes = projected_axes / float(lengths.max())
+    if not _cube_projected_axes_are_possible(axes):
+        return None
+    return axes.astype(np.float32)
+
+
+def _cube_projected_axes_are_possible(axes_xy: np.ndarray, tolerance: float = 0.035) -> bool:
+    axes = np.asarray(axes_xy, dtype=np.float32).reshape(3, 2)
+    lengths = np.linalg.norm(axes, axis=1)
+    if float(lengths.min()) <= 1e-6:
+        return False
+    if not _projected_cube_silhouette_is_hexagonal(axes):
+        return False
+
+    edge_lengths_sq = []
+    for left_index in range(3):
+        for right_index in range(left_index + 1, 3):
+            dot_xy = float(axes[left_index] @ axes[right_index])
+            if dot_xy >= 0.0:
+                return False
+            left_length_sq = float(lengths[left_index] * lengths[left_index])
+            right_length_sq = float(lengths[right_index] * lengths[right_index])
+            discriminant = (
+                (left_length_sq + right_length_sq) ** 2
+                - 4.0 * (left_length_sq * right_length_sq - dot_xy * dot_xy)
+            )
+            if discriminant < 0.0:
+                return False
+            edge_length_sq = (
+                left_length_sq
+                + right_length_sq
+                + float(np.sqrt(discriminant))
+            ) / 2.0
+            edge_lengths_sq.append(edge_length_sq)
+
+    edge_lengths_sq = np.asarray(edge_lengths_sq, dtype=np.float32)
+    mean_edge_length_sq = float(edge_lengths_sq.mean())
+    if mean_edge_length_sq <= 1e-6:
+        return False
+    return bool(
+        np.all(np.abs(edge_lengths_sq - mean_edge_length_sq) <= tolerance * mean_edge_length_sq)
+    )
+
+
+def _projected_cube_silhouette_is_hexagonal(axes_xy: np.ndarray) -> bool:
+    hull_points, _ = _projected_cube_grid_geometry(axes_xy)
+    hull = cv2.convexHull(hull_points.astype(np.float32).reshape(-1, 1, 2)).reshape(-1, 2)
+    if len(hull) != 6:
+        return False
+
+    edges = np.roll(hull, -1, axis=0) - hull
+    edge_lengths = np.linalg.norm(edges, axis=1)
+    if float(edge_lengths.min()) < 0.12 * float(edge_lengths.max()):
+        return False
+
+    axes = np.asarray(axes_xy, dtype=np.float32).reshape(3, 2)
+    face_areas = [
+        abs(float(np.cross(axes[left_index], axes[right_index])))
+        for left_index, right_index in ((0, 1), (1, 2), (2, 0))
+    ]
+    return min(face_areas) >= 0.16 * max(face_areas)
+
+
+def _projected_cube_grid_geometry(
+    axes_xy: np.ndarray,
+) -> tuple[np.ndarray, list[tuple[tuple[float, float], tuple[float, float]]]]:
+    axes = np.asarray(axes_xy, dtype=np.float32).reshape(3, 2)
+    origin = np.zeros(2, dtype=np.float32)
+    hull_points = np.asarray(
+        [
+            axes[0],
+            axes[0] + axes[1],
+            axes[1],
+            axes[1] + axes[2],
+            axes[2],
+            axes[2] + axes[0],
+        ],
+        dtype=np.float32,
+    )
+
+    segments_by_key: dict[tuple[tuple[int, int], tuple[int, int]], tuple[tuple[float, float], tuple[float, float]]] = {}
+    for first_index, second_index in ((0, 1), (1, 2), (2, 0)):
+        first_axis = axes[first_index]
+        second_axis = axes[second_index]
+        for subdivision in range(4):
+            t = subdivision / 3.0
+            first_start = origin + first_axis * t
+            first_end = first_start + second_axis
+            second_start = origin + second_axis * t
+            second_end = second_start + first_axis
+            _add_unique_segment(segments_by_key, first_start, first_end)
+            _add_unique_segment(segments_by_key, second_start, second_end)
+
+    return hull_points, list(segments_by_key.values())
+
+
+def _add_unique_segment(
+    segments_by_key: dict[
+        tuple[tuple[int, int], tuple[int, int]],
+        tuple[tuple[float, float], tuple[float, float]],
+    ],
+    start: np.ndarray,
+    end: np.ndarray,
+) -> None:
+    start_key = tuple(int(round(value * 1000)) for value in start)
+    end_key = tuple(int(round(value * 1000)) for value in end)
+    key = tuple(sorted((start_key, end_key)))
+    segments_by_key[key] = (
+        (float(start[0]), float(start[1])),
+        (float(end[0]), float(end[1])),
+    )
+
+
+def _score_projected_cube_grid(
+    union_mask: np.ndarray,
+    *,
+    mask_area: float,
+    hull_points_xy: np.ndarray,
+    line_segments_xy: list[tuple[tuple[float, float], tuple[float, float]]],
+    line_thickness_px: int,
+    minimum_coverage: float,
+) -> ProjectedCubeGridFit:
+    hull_mask = np.zeros(union_mask.shape, dtype=np.uint8)
+    hull_contour = cv2.convexHull(np.round(hull_points_xy).astype(np.int32).reshape(-1, 1, 2))
+    cv2.fillConvexPoly(hull_mask, hull_contour, 255)
+    covered_pixels = float(np.count_nonzero(union_mask & (hull_mask > 0)))
+    coverage_ratio = covered_pixels / mask_area
+
+    line_mask = np.zeros(union_mask.shape, dtype=np.uint8)
+    thickness = max(1, int(line_thickness_px))
+    for start, end in line_segments_xy:
+        cv2.line(
+            line_mask,
+            (int(round(start[0])), int(round(start[1]))),
+            (int(round(end[0])), int(round(end[1]))),
+            255,
+            thickness,
+            lineType=cv2.LINE_AA,
+        )
+    line_intersection_ratio = float(np.count_nonzero(union_mask & (line_mask > 0))) / mask_area
+
+    hull_area = max(float(np.count_nonzero(hull_mask)), 1.0)
+    hull_area_ratio = hull_area / mask_area
+    bounds = _mask_bounds_xyxy(union_mask)
+    bbox_fill_penalty = 0.0
+    if bounds is not None:
+        bx1, by1, bx2, by2 = bounds
+        mask_bbox_area = max(float((bx2 - bx1) * (by2 - by1)), 1.0)
+        hx, hy, hw, hh = cv2.boundingRect(hull_contour)
+        hull_bbox_area = max(float(hw * hh), 1.0)
+        bbox_fill = mask_bbox_area / hull_bbox_area
+        bbox_fill_penalty = max(0.0, 0.58 - bbox_fill) * 0.9
+
+    coverage_penalty = max(0.0, minimum_coverage - coverage_ratio) * 4.0
+    size_penalty = max(0.0, hull_area_ratio - 2.85) * 0.10
+    score = line_intersection_ratio + coverage_penalty + bbox_fill_penalty + size_penalty
+    return ProjectedCubeGridFit(
+        score=float(score),
+        line_edge_distance_score=float(line_intersection_ratio),
+        coverage_ratio=float(coverage_ratio),
+        hull_area_ratio=float(hull_area_ratio),
+        hull_points_xy=np.asarray(hull_points_xy, dtype=np.float32),
+        line_segments_xy=line_segments_xy,
+    )
+
+
+def _score_projected_cube_grid_from_edge_distance(
+    edge_distance_image: np.ndarray,
+    *,
+    coverage_points_xy: np.ndarray,
+    mask_area: float,
+    hull_points_xy: np.ndarray,
+    line_segments_xy: list[tuple[tuple[float, float], tuple[float, float]]],
+    line_thickness_px: int,
+    minimum_coverage: float,
+) -> ProjectedCubeGridFit:
+    coverage_points = np.asarray(coverage_points_xy, dtype=np.float32).reshape(-1, 2)
+    hull_contour = cv2.convexHull(np.asarray(hull_points_xy, dtype=np.float32).reshape(-1, 1, 2))
+    hull = hull_contour.reshape(-1, 2).astype(np.float32)
+
+    inside_hull = _points_inside_convex_polygon(coverage_points, hull)
+    coverage_ratio = float(inside_hull.mean()) if len(coverage_points) else 0.0
+
+    line_scores = _line_edge_distance_scores(
+        edge_distance_image,
+        line_segments_xy,
+        line_thickness_px=line_thickness_px,
+    )
+    line_distance_score = _robust_line_edge_distance_score(line_scores, line_segments_xy)
+
+    hull_area = max(float(cv2.contourArea(hull_contour)), 1.0)
+    hull_area_ratio = hull_area / mask_area
+    point_min = coverage_points.min(axis=0) if len(coverage_points) else np.zeros(2, dtype=np.float32)
+    point_max = coverage_points.max(axis=0) if len(coverage_points) else np.ones(2, dtype=np.float32)
+    mask_bbox_area = max(float(np.prod(point_max - point_min + 1.0)), 1.0)
+    hx, hy, hw, hh = cv2.boundingRect(hull_contour)
+    hull_bbox_area = max(float(hw * hh), 1.0)
+    bbox_fill = mask_bbox_area / hull_bbox_area
+    bbox_fill_penalty = max(0.0, 0.58 - bbox_fill) * 0.9
+
+    coverage_penalty = max(0.0, minimum_coverage - coverage_ratio) * 4.0
+    size_penalty = max(0.0, hull_area_ratio - 2.85) * 0.10
+    score = line_distance_score + coverage_penalty + bbox_fill_penalty + size_penalty
+    return ProjectedCubeGridFit(
+        score=float(score),
+        line_edge_distance_score=float(line_distance_score),
+        coverage_ratio=float(coverage_ratio),
+        hull_area_ratio=float(hull_area_ratio),
+        hull_points_xy=np.asarray(hull_points_xy, dtype=np.float32),
+        line_segments_xy=line_segments_xy,
+    )
+
+
+def _line_edge_distance_scores(
+    edge_distance_image: np.ndarray,
+    line_segments_xy: list[tuple[tuple[float, float], tuple[float, float]]],
+    *,
+    line_thickness_px: int,
+) -> np.ndarray:
+    segments = np.asarray(line_segments_xy, dtype=np.float32).reshape(-1, 2, 2)
+    if len(segments) == 0:
+        return np.empty(0, dtype=np.float32)
+
+    line_radius = max(0.5, float(line_thickness_px) * 0.5 + 0.5)
+    scores = []
+    for segment in segments:
+        length = float(np.linalg.norm(segment[1] - segment[0]))
+        sample_count = max(4, min(12, int(round(length / 8.0))))
+        t = np.linspace(0.0, 1.0, sample_count, dtype=np.float32)
+        points = segment[0][None, :] * (1.0 - t[:, None]) + segment[1][None, :] * t[:, None]
+        distances = _distance_image_values(edge_distance_image, points)
+        adjusted_distances = np.maximum(distances - line_radius, 0.0)
+        scores.append(float(np.mean(np.minimum(adjusted_distances, 12.0)) / 12.0))
+    return np.asarray(scores, dtype=np.float32)
+
+
+def _robust_line_edge_distance_score(
+    line_scores: np.ndarray,
+    line_segments_xy: list[tuple[tuple[float, float], tuple[float, float]]] | None = None,
+) -> float:
+    scores = np.asarray(line_scores, dtype=np.float32).reshape(-1)
+    if len(scores) == 0:
+        return 1.0
+
+    if line_segments_xy is None:
+        return _robust_score_subset(scores, minimum_supported=6)
+
+    groups = _line_direction_groups(line_segments_xy)
+    if not groups:
+        return _robust_score_subset(scores, minimum_supported=6)
+
+    group_scores = []
+    for indexes in groups:
+        group_scores.append(
+            _robust_score_subset(
+                scores[np.asarray(indexes, dtype=np.int32)],
+                minimum_supported=2,
+            )
+        )
+    return float(np.mean(group_scores))
+
+
+def _robust_score_subset(line_scores: np.ndarray, *, minimum_supported: int) -> float:
+    scores = np.asarray(line_scores, dtype=np.float32).reshape(-1)
+    if len(scores) == 0:
+        return 1.0
+
+    supported_target = min(len(scores), max(minimum_supported, int(np.ceil(len(scores) * 0.40))))
+    best_scores = np.sort(scores)[:supported_target]
+    supported_count = int(np.count_nonzero(scores <= CUBE_GRID_FIT_SUPPORTED_LINE_DISTANCE))
+    support_penalty = max(0, supported_target - supported_count) / supported_target * 0.35
+    return float(np.mean(best_scores) + support_penalty)
+
+
+def _line_direction_groups(
+    line_segments_xy: list[tuple[tuple[float, float], tuple[float, float]]],
+) -> list[list[int]]:
+    segments = np.asarray(line_segments_xy, dtype=np.float32).reshape(-1, 2, 2)
+    groups: list[list[int]] = []
+    group_axes: list[np.ndarray] = []
+    for index, segment in enumerate(segments):
+        vector = segment[1] - segment[0]
+        length = float(np.linalg.norm(vector))
+        if length <= 1e-6:
+            continue
+        axis = vector / length
+        if axis[0] < 0.0 or (abs(float(axis[0])) < 1e-6 and axis[1] < 0.0):
+            axis *= -1.0
+
+        matched = False
+        for group_index, group_axis in enumerate(group_axes):
+            if abs(float(axis @ group_axis)) >= 0.985:
+                groups[group_index].append(index)
+                matched = True
+                break
+        if not matched:
+            group_axes.append(axis)
+            groups.append([index])
+    return groups
+
+
+def _sample_line_segment_xy_points(
+    line_segments_xy: list[tuple[tuple[float, float], tuple[float, float]]],
+    *,
+    max_points: int,
+) -> np.ndarray:
+    segments = np.asarray(line_segments_xy, dtype=np.float32).reshape(-1, 2, 2)
+    if len(segments) == 0 or max_points <= 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    lengths = np.linalg.norm(segments[:, 1, :] - segments[:, 0, :], axis=1)
+    total_length = float(lengths.sum())
+    if total_length <= 1e-6:
+        return np.empty((0, 2), dtype=np.float32)
+
+    points = []
+    for segment, length in zip(segments, lengths):
+        sample_count = max(2, int(round(max_points * float(length) / total_length)))
+        t = np.linspace(0.0, 1.0, sample_count, dtype=np.float32)
+        points.append(segment[0][None, :] * (1.0 - t[:, None]) + segment[1][None, :] * t[:, None])
+    sampled = np.concatenate(points, axis=0)
+    if len(sampled) <= max_points:
+        return sampled
+    indexes = np.linspace(0, len(sampled) - 1, max_points, dtype=np.int32)
+    return sampled[indexes]
+
+
+def _distance_image_values(distance_image: np.ndarray, points_xy: np.ndarray) -> np.ndarray:
+    points = np.asarray(points_xy, dtype=np.float32).reshape(-1, 2)
+    if len(points) == 0:
+        return np.empty(0, dtype=np.float32)
+
+    height, width = distance_image.shape[:2]
+    xs = np.clip(np.round(points[:, 0]).astype(np.int32), 0, width - 1)
+    ys = np.clip(np.round(points[:, 1]).astype(np.int32), 0, height - 1)
+    return distance_image[ys, xs].astype(np.float32)
+
+
+def _points_inside_convex_polygon(points_xy: np.ndarray, polygon_xy: np.ndarray) -> np.ndarray:
+    points = np.asarray(points_xy, dtype=np.float32).reshape(-1, 2)
+    polygon = np.asarray(polygon_xy, dtype=np.float32).reshape(-1, 2)
+    if len(points) == 0 or len(polygon) < 3:
+        return np.zeros(len(points), dtype=bool)
+
+    edges = np.roll(polygon, -1, axis=0) - polygon
+    point_vectors = points[:, None, :] - polygon[None, :, :]
+    crosses = edges[None, :, 0] * point_vectors[:, :, 1] - edges[None, :, 1] * point_vectors[:, :, 0]
+    return np.all(crosses >= -1e-4, axis=1) | np.all(crosses <= 1e-4, axis=1)
+
+
+def _point_to_segment_distances(points_xy: np.ndarray, segments_xy: np.ndarray) -> np.ndarray:
+    points = np.asarray(points_xy, dtype=np.float32).reshape(-1, 2)
+    segments = np.asarray(segments_xy, dtype=np.float32).reshape(-1, 2, 2)
+    if len(points) == 0 or len(segments) == 0:
+        return np.empty((len(points), len(segments)), dtype=np.float32)
+
+    start = segments[:, 0, :]
+    end = segments[:, 1, :]
+    segment_vectors = end - start
+    segment_lengths_sq = np.maximum(np.sum(segment_vectors * segment_vectors, axis=1), 1e-6)
+    point_vectors = points[:, None, :] - start[None, :, :]
+    projection_t = np.sum(point_vectors * segment_vectors[None, :, :], axis=2) / segment_lengths_sq[None, :]
+    projection_t = np.clip(projection_t, 0.0, 1.0)
+    closest = start[None, :, :] + projection_t[:, :, None] * segment_vectors[None, :, :]
+    deltas = points[:, None, :] - closest
+    return np.sqrt(np.sum(deltas * deltas, axis=2))
+
+
+def draw_projected_cube_grid_fit(
+    frame: np.ndarray,
+    fit: ProjectedCubeGridFit,
+    *,
+    offset_xy: tuple[int, int],
+) -> None:
+    offset = np.asarray(offset_xy, dtype=np.float32)
+    hull = np.round(fit.hull_points_xy + offset).astype(np.int32).reshape(-1, 1, 2)
+    hull = cv2.convexHull(hull)
+    cv2.polylines(frame, [hull], isClosed=True, color=(0, 240, 255), thickness=2)
+    for start, end in fit.line_segments_xy:
+        start_xy = np.asarray(start, dtype=np.float32) + offset
+        end_xy = np.asarray(end, dtype=np.float32) + offset
+        cv2.line(
+            frame,
+            (int(round(start_xy[0])), int(round(start_xy[1]))),
+            (int(round(end_xy[0])), int(round(end_xy[1]))),
+            (255, 255, 255),
+            2,
+            lineType=cv2.LINE_AA,
+        )
+        cv2.line(
+            frame,
+            (int(round(start_xy[0])), int(round(start_xy[1]))),
+            (int(round(end_xy[0])), int(round(end_xy[1]))),
+            (0, 90, 255),
+            1,
+            lineType=cv2.LINE_AA,
+        )
+
+
 def tensor_to_numpy(value) -> np.ndarray | None:
     if value is None:
         return None
@@ -711,6 +2275,7 @@ def draw_sticker_segments(
     cube_net_state: CubeNetState | None = None,
 ) -> tuple[int, np.ndarray, tuple[int, int, int, int] | None]:
     x1, y1, x2, y2 = roi_xyxy
+    original_frame = frame.copy()
     model_roi = resize_to_square_size(roi, args.sticker_imgsz)
     results = sticker_model.predict(
         source=model_roi,
@@ -740,6 +2305,7 @@ def draw_sticker_segments(
     sticker_color_numbers = []
     classifier_bgr_batches = []
     sticker_nodes = []
+    grid_fit_masks = []
     build_sticker_nodes = args.draw_sticker_graph or cube_net_state is not None
     color_samples = roi_color_samples(roi)
     tracking_min_x: int | None = None
@@ -763,6 +2329,8 @@ def draw_sticker_segments(
             sample_mask = mask_bool
         draw_mask = sample_mask
         graph_mask = mask_bool
+        if getattr(args, "draw_cube_grid_fit", False):
+            grid_fit_masks.append(graph_mask)
 
         ys, xs = np.nonzero(graph_mask)
         mask_min_x = int(xs.min())
@@ -890,7 +2458,30 @@ def draw_sticker_segments(
                 classifier_bgr_batches.append(classifier_bgr_samples)
         count += 1
 
-    frame[:] = overlay
+    if getattr(args, "show_original_underlay", False):
+        alpha = float(np.clip(getattr(args, "mask_opacity", 1.0), 0.0, 1.0))
+        overlay_mask = np.any(overlay != 0, axis=2)
+        frame[:] = original_frame
+        if bool(overlay_mask.any()):
+            blended = (
+                original_frame[overlay_mask].astype(np.float32) * (1.0 - alpha)
+                + overlay[overlay_mask].astype(np.float32) * alpha
+            )
+            frame[overlay_mask] = blended.clip(0, 255).astype(np.uint8)
+    else:
+        frame[:] = overlay
+    if getattr(args, "draw_cube_grid_fit", False) and grid_fit_masks:
+        line_overlay = low_intersection_sticker_lines(
+            grid_fit_masks,
+            roi_shape=(roi_height, roi_width),
+            line_width_px=getattr(args, "empty_space_line_width", EMPTY_SPACE_LINE_WIDTH_PX),
+            angle_bucket_degrees=getattr(
+                args,
+                "basis_angle_bucket_degrees",
+                BASIS_VECTOR_ANGLE_BUCKET_DEGREES,
+            ),
+        )
+        draw_low_intersection_lines(frame, line_overlay, offset_xy=(x1, y1))
     if (args.draw_sticker_graph or cube_net_state is not None) and sticker_nodes:
         graph = direct_sticker_graph(
             sticker_nodes,
@@ -1131,6 +2722,37 @@ def build_parser() -> argparse.ArgumentParser:
         default=12,
         help="Minimum sticker area kept as a graph node",
     )
+    parser.add_argument(
+        "--draw-cube-grid-fit",
+        action="store_true",
+        help="Draw lines that fit per-sticker quadrilateral hull edges",
+    )
+    parser.add_argument(
+        "--edge-line-width",
+        "--empty-space-line-width",
+        dest="empty_space_line_width",
+        type=int,
+        default=EMPTY_SPACE_LINE_WIDTH_PX,
+        help="Pixel width used when drawing each fitted sticker-side line",
+    )
+    parser.add_argument(
+        "--basis-angle-bucket-degrees",
+        type=float,
+        default=BASIS_VECTOR_ANGLE_BUCKET_DEGREES,
+        help="Angle histogram bucket size used to derive the two displayed basis vectors",
+    )
+    parser.add_argument(
+        "--cube-grid-fit-line-thickness",
+        type=int,
+        default=2,
+        help="Line thickness used when scoring fitted cube-grid intersections with stickers",
+    )
+    parser.add_argument(
+        "--cube-grid-fit-min-coverage",
+        type=float,
+        default=0.88,
+        help="Minimum sticker-mask coverage expected inside the fitted cube hull",
+    )
     parser.add_argument("--mask-opacity", type=float, default=1.0)
     parser.add_argument("--rgb-color-plot", type=Path, help="Output PNG path for 3D RGB samples")
     parser.add_argument(
@@ -1228,6 +2850,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--debug-overlay",
         action="store_true",
         help="Draw ROI box, polygon outlines, labels, and FPS",
+    )
+    parser.add_argument(
+        "--show-original-underlay",
+        action="store_true",
+        help="Draw sticker overlays on top of the original image instead of a black background",
     )
     parser.set_defaults(
         show_bbox=True,
