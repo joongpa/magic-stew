@@ -49,6 +49,23 @@ class PieceGraph:
 
 
 @dataclass(frozen=True)
+class StickerShapeFeatures:
+    area_px: float
+    aspect_ratio: float
+    fill_ratio: float
+    solidity: float
+    axes_xy: tuple[tuple[float, float], tuple[float, float]]
+
+
+@dataclass(frozen=True)
+class StickerShapeIndex:
+    long_axis_xy: tuple[float, float]
+    short_axis_xy: tuple[float, float]
+    compactness: float
+    angle_degrees: float
+
+
+@dataclass(frozen=True)
 class _MaskAdjacencyData:
     node: StickerNode
     mask_bbox: tuple[int, int, int, int]
@@ -179,6 +196,93 @@ def build_sticker_adjacency_graph(
     return PieceGraph(
         nodes=graph_nodes,
         edges=_legal_mask_adjacencies(graph_nodes, adjacency_radius_px=adjacency_radius_px),
+    )
+
+
+def sticker_shape_similarity(
+    left: StickerNode | NDArray[np.uint8],
+    right: StickerNode | NDArray[np.uint8],
+) -> float:
+    """Return a 0..1 similarity score for whether two stickers have compatible shapes."""
+    left_features = sticker_shape_features(left.mask if isinstance(left, StickerNode) else left)
+    right_features = sticker_shape_features(right.mask if isinstance(right, StickerNode) else right)
+    if left_features is None or right_features is None:
+        return 0.0
+
+    axis_score = _axis_similarity(left_features.axes_xy, right_features.axes_xy)
+    aspect_score = _ratio_similarity(left_features.aspect_ratio, right_features.aspect_ratio)
+    fill_score = _ratio_similarity(left_features.fill_ratio, right_features.fill_ratio)
+    solidity_score = _ratio_similarity(left_features.solidity, right_features.solidity)
+    area_score = _ratio_similarity(left_features.area_px, right_features.area_px)
+
+    score = (
+        0.45 * axis_score
+        + 0.35 * aspect_score
+        + 0.075 * fill_score
+        + 0.05 * solidity_score
+        + 0.075 * area_score
+    )
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def sticker_shape_index(mask: StickerNode | NDArray[np.uint8]) -> StickerShapeIndex | None:
+    """Return an absolute orientation/compactness descriptor for a sticker mask.
+
+    `compactness` is approximately 0 for line-like masks and 1 for square, filled,
+    compact masks. The axes are canonicalized so the same undirected orientation maps
+    to a stable signed vector.
+    """
+    features = sticker_shape_features(mask.mask if isinstance(mask, StickerNode) else mask)
+    if features is None:
+        return None
+
+    long_axis = _canonical_axis(np.asarray(features.axes_xy[0], dtype=np.float32))
+    short_axis = _canonical_axis(np.asarray(features.axes_xy[1], dtype=np.float32))
+    axis_ratio = 1.0 / max(features.aspect_ratio, 1.0)
+    compactness = float(
+        np.clip(
+            (axis_ratio * features.fill_ratio * features.solidity) ** (1.0 / 3.0),
+            0.0,
+            1.0,
+        )
+    )
+    angle_degrees = float(np.degrees(np.arctan2(long_axis[1], long_axis[0])))
+    return StickerShapeIndex(
+        long_axis_xy=(float(long_axis[0]), float(long_axis[1])),
+        short_axis_xy=(float(short_axis[0]), float(short_axis[1])),
+        compactness=compactness,
+        angle_degrees=angle_degrees,
+    )
+
+
+def sticker_shape_features(mask: NDArray[np.uint8]) -> StickerShapeFeatures | None:
+    binary = (np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    contour = max(contours, key=cv2.contourArea)
+    area_px = float(cv2.contourArea(contour))
+    if area_px <= 1e-6:
+        return None
+
+    hull = cv2.convexHull(contour)
+    hull_area = max(float(cv2.contourArea(hull)), 1e-6)
+    rect = cv2.minAreaRect(contour)
+    (rect_width, rect_height) = rect[1]
+    if rect_width <= 1e-6 or rect_height <= 1e-6:
+        return None
+
+    long_side = max(float(rect_width), float(rect_height))
+    short_side = min(float(rect_width), float(rect_height))
+    rect_area = max(long_side * short_side, 1e-6)
+    axes = _min_area_rect_axes(rect)
+    return StickerShapeFeatures(
+        area_px=area_px,
+        aspect_ratio=long_side / short_side,
+        fill_ratio=min(area_px / rect_area, 1.0),
+        solidity=min(area_px / hull_area, 1.0),
+        axes_xy=axes,
     )
 
 
@@ -572,6 +676,49 @@ def _centroid_distance(left: StickerNode, right: StickerNode) -> float:
     left_xy = np.asarray(left.centroid_xy, dtype=np.float32)
     right_xy = np.asarray(right.centroid_xy, dtype=np.float32)
     return float(np.linalg.norm(left_xy - right_xy))
+
+
+def _min_area_rect_axes(rect) -> tuple[tuple[float, float], tuple[float, float]]:
+    box = cv2.boxPoints(rect).astype(np.float32)
+    edges = np.roll(box, -1, axis=0) - box
+    lengths = np.linalg.norm(edges, axis=1)
+    first_index = int(np.argmax(lengths))
+    first_axis = _normalized_2d(edges[first_index])
+    second_axis = _normalized_2d(edges[(first_index + 1) % 4])
+    return (
+        (float(first_axis[0]), float(first_axis[1])),
+        (float(second_axis[0]), float(second_axis[1])),
+    )
+
+
+def _axis_similarity(
+    left_axes: tuple[tuple[float, float], tuple[float, float]],
+    right_axes: tuple[tuple[float, float], tuple[float, float]],
+) -> float:
+    left = np.asarray(left_axes, dtype=np.float32)
+    right = np.asarray(right_axes, dtype=np.float32)
+    return (
+        abs(float(np.dot(left[0], right[0])))
+        + abs(float(np.dot(left[1], right[1])))
+    ) * 0.5
+
+
+def _ratio_similarity(left: float, right: float) -> float:
+    if left <= 1e-6 or right <= 1e-6:
+        return 0.0
+    return float(np.exp(-abs(np.log(left / right))))
+
+
+def _normalized_2d(vector: NDArray[np.float32]) -> NDArray[np.float32]:
+    norm = max(float(np.linalg.norm(vector)), 1e-6)
+    return vector / norm
+
+
+def _canonical_axis(axis: NDArray[np.float32]) -> NDArray[np.float32]:
+    axis = _normalized_2d(axis)
+    if axis[0] < -1e-6 or (abs(float(axis[0])) <= 1e-6 and axis[1] < 0):
+        axis = -axis
+    return axis
 
 
 

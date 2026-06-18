@@ -15,6 +15,9 @@ from live_recognition.model_utils import (
 )
 from live_recognition.types import CubeCandidate
 
+_resolve_model_path = resolve_model_path
+_resolve_sam3_model_path = resolve_sam3_model_path
+
 
 class CubeDetector(Protocol):
     def detect(self, frame_bgr: NDArray[np.uint8]) -> CubeCandidate | None:

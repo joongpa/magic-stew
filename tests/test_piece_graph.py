@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 
 from live_recognition.piece_graph import (
@@ -7,6 +8,9 @@ from live_recognition.piece_graph import (
     build_piece_graph,
     build_sticker_adjacency_graph,
     draw_piece_graph,
+    sticker_shape_features,
+    sticker_shape_index,
+    sticker_shape_similarity,
 )
 
 
@@ -140,3 +144,64 @@ def test_draw_piece_graph_can_overlay_sticker_node_masks_without_piece_masks():
     output = draw_piece_graph(frame, build_sticker_adjacency_graph([sticker]))
 
     assert np.any(output[10:12, 10:12] != frame[10:12, 10:12])
+
+
+def test_sticker_shape_similarity_scores_matching_shapes_highly():
+    left = rotated_rect_mask((80, 80), (40, 40), (32, 18), 22)
+    right = rotated_rect_mask((80, 80), (42, 38), (30, 17), 24)
+
+    assert sticker_shape_similarity(left, right) > 0.90
+
+
+def test_sticker_shape_similarity_penalizes_different_face_geometry():
+    left = rotated_rect_mask((90, 90), (38, 42), (32, 18), 20)
+    different_axes = rotated_rect_mask((90, 90), (48, 42), (32, 18), -35)
+    different_aspect = rotated_rect_mask((90, 90), (48, 42), (38, 10), 20)
+
+    assert sticker_shape_similarity(left, different_axes) < 0.80
+    assert sticker_shape_similarity(left, different_aspect) < 0.80
+
+
+def test_sticker_shape_features_returns_none_for_empty_mask():
+    assert sticker_shape_features(np.zeros((20, 20), dtype=np.uint8)) is None
+
+
+def test_sticker_shape_index_tracks_absolute_axis_orientation():
+    left = rotated_rect_mask((80, 80), (40, 40), (34, 12), 30)
+    right = rotated_rect_mask((80, 80), (42, 38), (30, 10), 32)
+
+    left_index = sticker_shape_index(left)
+    right_index = sticker_shape_index(right)
+
+    assert left_index is not None
+    assert right_index is not None
+    axis_dot = np.dot(left_index.long_axis_xy, right_index.long_axis_xy)
+    assert axis_dot > 0.99
+    assert 25 <= left_index.angle_degrees <= 35
+
+
+def test_sticker_shape_index_compactness_runs_from_line_like_to_square_like():
+    line_like = rotated_rect_mask((80, 80), (40, 40), (42, 4), 15)
+    rectangle = rotated_rect_mask((80, 80), (40, 40), (32, 18), 15)
+    square_like = rotated_rect_mask((80, 80), (40, 40), (24, 24), 15)
+
+    line_index = sticker_shape_index(line_like)
+    rectangle_index = sticker_shape_index(rectangle)
+    square_index = sticker_shape_index(square_like)
+
+    assert line_index is not None
+    assert rectangle_index is not None
+    assert square_index is not None
+    assert line_index.compactness < rectangle_index.compactness < square_index.compactness
+    assert square_index.compactness > 0.95
+
+
+def test_sticker_shape_index_returns_none_for_empty_mask():
+    assert sticker_shape_index(np.zeros((20, 20), dtype=np.uint8)) is None
+
+
+def rotated_rect_mask(shape, center, size, angle_degrees):
+    mask = np.zeros(shape, dtype=np.uint8)
+    box = cv2.boxPoints((center, size, angle_degrees))
+    cv2.fillConvexPoly(mask, np.round(box).astype(np.int32), 255)
+    return mask

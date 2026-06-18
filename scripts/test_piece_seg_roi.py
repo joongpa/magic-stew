@@ -10,6 +10,7 @@ Pipeline:
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 
@@ -48,15 +49,80 @@ DEFAULT_STICKER_MODEL = (
     ROOT
     / "runs/cube_face_sticker_seg_local/runs/cube_face_sticker_yolo11n_seg/weights/best.pt"
 )
-CLASS_COLORS = {
-    0: (255, 255, 255),  # U_sticker
-    1: (0, 255, 0),      # F_sticker
-    2: (0, 0, 255),      # R_sticker
-}
+DEFAULT_STICKER_MASK_COLOR = (150, 150, 150)
 STICKER_CLASS_NAMES = {"u_sticker", "f_sticker", "r_sticker"}
 STICKER_COLOR_SAMPLE_COUNT = 10
 DENSITY_CLUSTER_EPS_RADIANS = 0.08
 DENSITY_CLUSTER_MIN_POINTS = 4
+
+
+@dataclass
+class RoiTracker:
+    roi_xyxy: tuple[int, int, int, int] | None = None
+    cube_candidate: object | None = None
+    base_side: int | None = None
+
+    def reset(self) -> None:
+        self.roi_xyxy = None
+        self.cube_candidate = None
+        self.base_side = None
+
+    def initialize(
+        self,
+        candidate,
+        frame_width: int,
+        frame_height: int,
+        padding: float,
+    ) -> tuple[int, int, int, int]:
+        self.cube_candidate = candidate
+        self.roi_xyxy = square_roi_from_bbox(
+            candidate.bbox_xyxy,
+            frame_width,
+            frame_height,
+            padding,
+        )
+        x1, y1, x2, y2 = self.roi_xyxy
+        self.base_side = min(x2 - x1, y2 - y1)
+        return self.roi_xyxy
+
+    def observe_tracking_bounds(
+        self,
+        tracking_bounds_xyxy: tuple[int, int, int, int] | None,
+        frame_width: int,
+        frame_height: int,
+        tracking_gain: float = 1.0,
+        tracking_padding: float = 0.0,
+    ) -> None:
+        if self.roi_xyxy is None:
+            return
+        if tracking_bounds_xyxy is None:
+            self.reset()
+            return
+
+        x1, y1, x2, y2 = self.roi_xyxy
+        side = min(x2 - x1, y2 - y1)
+        base_side = self.base_side if self.base_side is not None else side
+        bx1, by1, bx2, by2 = tracking_bounds_xyxy
+        tracking_point_x = (bx1 + bx2) / 2.0
+        tracking_point_y = (by1 + by2) / 2.0
+        observed_side = max(bx2 - bx1, by2 - by1)
+        target_side = max(base_side, observed_side) * (
+            1.0 + max(0.0, float(tracking_padding)) * 2.0
+        )
+        roi_center_x = side / 2.0
+        roi_center_y = side / 2.0
+        gain = max(0.0, float(tracking_gain))
+        dx = (tracking_point_x - roi_center_x) * gain
+        dy = (tracking_point_y - roi_center_y) * gain
+        center_x = (x1 + x2) / 2.0 + dx
+        center_y = (y1 + y2) / 2.0 + dy
+        self.roi_xyxy = square_roi_from_center(
+            center_x,
+            center_y,
+            target_side,
+            frame_width,
+            frame_height,
+        )
 
 
 class ColorDensityClassifier:
@@ -330,6 +396,35 @@ def clipped_square_roi(
     rx2 = max(rx1 + 1, min(frame_width, rx2))
     ry2 = max(ry1 + 1, min(frame_height, ry2))
     return rx1, ry1, rx2, ry2
+
+
+def square_roi_from_bbox(
+    bbox_xyxy: tuple[int, int, int, int],
+    frame_width: int,
+    frame_height: int,
+    padding: float,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = bbox_xyxy
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    side = max(x2 - x1, y2 - y1) * (1.0 + padding * 2.0)
+    return square_roi_from_center(cx, cy, side, frame_width, frame_height)
+
+
+def square_roi_from_center(
+    center_x: float,
+    center_y: float,
+    side: float,
+    frame_width: int,
+    frame_height: int,
+) -> tuple[int, int, int, int]:
+    side_px = int(round(side))
+    side_px = max(1, min(side_px, frame_width, frame_height))
+    x1 = int(round(center_x - side_px / 2.0))
+    y1 = int(round(center_y - side_px / 2.0))
+    x1 = max(0, min(frame_width - side_px, x1))
+    y1 = max(0, min(frame_height - side_px, y1))
+    return x1, y1, x1 + side_px, y1 + side_px
 
 
 def apply_mask_padding(mask: np.ndarray, padding_px: int) -> np.ndarray:
@@ -614,29 +709,30 @@ def draw_sticker_segments(
     args,
     color_classifier: ColorDensityClassifier | None = None,
     cube_net_state: CubeNetState | None = None,
-) -> tuple[int, np.ndarray]:
+) -> tuple[int, np.ndarray, tuple[int, int, int, int] | None]:
     x1, y1, x2, y2 = roi_xyxy
+    model_roi = resize_to_square_size(roi, args.sticker_imgsz)
     results = sticker_model.predict(
-        source=roi,
+        source=model_roi,
         conf=args.sticker_conf,
         imgsz=args.sticker_imgsz,
         verbose=False,
     )
     bgr_batches = []
     if not results:
-        return 0, np.empty((0, 3), dtype=np.uint8)
+        return 0, np.empty((0, 3), dtype=np.uint8), None
 
     result = results[0]
     boxes = result.boxes
     if boxes is None:
-        return 0, np.empty((0, 3), dtype=np.uint8)
+        return 0, np.empty((0, 3), dtype=np.uint8), None
 
     overlay = np.zeros_like(frame)
     roi_height = y2 - y1
     roi_width = x2 - x1
     result_masks = getattr(result, "masks", None)
     if result_masks is None:
-        return 0, np.empty((0, 3), dtype=np.uint8)
+        return 0, np.empty((0, 3), dtype=np.uint8), None
     mask_data = result_masks.data.detach().cpu().numpy()
 
     count = 0
@@ -644,14 +740,19 @@ def draw_sticker_segments(
     sticker_color_numbers = []
     classifier_bgr_batches = []
     sticker_nodes = []
+    build_sticker_nodes = args.draw_sticker_graph or cube_net_state is not None
     color_samples = roi_color_samples(roi)
+    tracking_min_x: int | None = None
+    tracking_min_y: int | None = None
+    tracking_max_x: int | None = None
+    tracking_max_y: int | None = None
     for index in range(len(boxes)):
         class_id = int(boxes.cls[index].item())
         class_name = class_name_for_id(result, sticker_model, class_id)
         if class_name not in STICKER_CLASS_NAMES:
             continue
         piece_type = sticker_piece_type(class_name)
-        color = CLASS_COLORS.get(class_id, (255, 255, 255))
+        color = DEFAULT_STICKER_MASK_COLOR
 
         mask_bool = sticker_mask_bool(mask_data, index, roi_width, roi_height)
         if not mask_bool.any():
@@ -664,11 +765,17 @@ def draw_sticker_segments(
         graph_mask = mask_bool
 
         ys, xs = np.nonzero(graph_mask)
+        mask_min_x = int(xs.min())
+        mask_max_x = int(xs.max()) + 1
+        mask_min_y = int(ys.min())
+        mask_max_y = int(ys.max()) + 1
+        tracking_min_x = mask_min_x if tracking_min_x is None else min(tracking_min_x, mask_min_x)
+        tracking_min_y = mask_min_y if tracking_min_y is None else min(tracking_min_y, mask_min_y)
+        tracking_max_x = mask_max_x if tracking_max_x is None else max(tracking_max_x, mask_max_x)
+        tracking_max_y = mask_max_y if tracking_max_y is None else max(tracking_max_y, mask_max_y)
         label_at = (int(xs.mean()) + x1, int(ys.mean()) + y1)
         confidence = float(boxes.conf[index].item())
         confidence_labels.append((label_at, confidence))
-        full_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-        full_mask[y1:y2, x1:x2] = graph_mask.astype(np.uint8) * 255
 
         if args.debug_overlay:
             contours, _ = cv2.findContours(
@@ -685,7 +792,7 @@ def draw_sticker_segments(
             for points in shifted_contours:
                 if len(points) < 3:
                     continue
-                cv2.polylines(frame, [points], isClosed=True, color=color, thickness=2)
+                cv2.polylines(frame, [points], isClosed=True, color=(220, 220, 220), thickness=2)
 
         sample_ys, sample_xs = sticker_color_sample_points_from_roi(color_samples, sample_mask)
         sample_bgr = sticker_color_samples_at_points(
@@ -698,7 +805,13 @@ def draw_sticker_segments(
             if len(sample_bgr)
             else []
         )
-        if len(sample_bgr) and int(graph_mask.sum()) >= args.graph_min_sticker_area:
+        if (
+            build_sticker_nodes
+            and len(sample_bgr)
+            and int(graph_mask.sum()) >= args.graph_min_sticker_area
+        ):
+            full_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+            full_mask[y1:y2, x1:x2] = graph_mask.astype(np.uint8) * 255
             mean_sample_bgr = (
                 sample_bgr.astype(np.float32)
                 .mean(axis=0)
@@ -838,7 +951,17 @@ def draw_sticker_segments(
             else np.empty((0, 3), dtype=np.uint8)
         )
         color_classifier.observe_frame(classifier_bgr_samples)
-    return count, bgr_samples
+    tracking_bounds_xyxy = (
+        (tracking_min_x, tracking_min_y, tracking_max_x, tracking_max_y)
+        if (
+            tracking_min_x is not None
+            and tracking_min_y is not None
+            and tracking_max_x is not None
+            and tracking_max_y is not None
+        )
+        else None
+    )
+    return count, bgr_samples, tracking_bounds_xyxy
 
 
 def draw_sticker_color_numbers(
@@ -877,16 +1000,16 @@ def process_frame(
     args,
     color_classifier: ColorDensityClassifier | None = None,
     cube_net_state: CubeNetState | None = None,
+    roi_tracker: RoiTracker | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    working_frame = frame_for_processing(frame, args)
-    output = working_frame.copy()
-    roi_xyxy, candidate = roi_for_frame(working_frame, bbox_detector, args)
+    output = frame.copy()
+    roi_xyxy, candidate, roi_source = roi_for_frame(frame, bbox_detector, args, roi_tracker)
     if roi_xyxy is None:
         return output, np.empty((0, 3), dtype=np.uint8)
 
     x1, y1, x2, y2 = roi_xyxy
-    roi = working_frame[y1:y2, x1:x2]
-    segment_count, bgr_samples = draw_sticker_segments(
+    roi = frame[y1:y2, x1:x2]
+    segment_count, bgr_samples, tracking_bounds_xyxy = draw_sticker_segments(
         output,
         roi,
         sticker_model,
@@ -895,9 +1018,22 @@ def process_frame(
         color_classifier,
         cube_net_state,
     )
+    if roi_tracker is not None:
+        height, width = frame.shape[:2]
+        roi_tracker.observe_tracking_bounds(
+            tracking_bounds_xyxy,
+            width,
+            height,
+            tracking_gain=getattr(args, "roi_tracking_gain", 1.4),
+            tracking_padding=getattr(args, "roi_tracking_padding", 0.18),
+        )
+        if roi_tracker.roi_xyxy is not None:
+            roi_xyxy = roi_tracker.roi_xyxy
+            x1, y1, x2, y2 = roi_xyxy
 
     if args.show_bbox or args.debug_overlay:
-        cv2.rectangle(output, (x1, y1), (x2, y2), (40, 220, 40), 2)
+        roi_color = (0, 0, 255) if roi_source == "detector" else (40, 220, 40)
+        cv2.rectangle(output, (x1, y1), (x2, y2), roi_color, 2)
     if args.debug_overlay:
         debug_label = (
             f"cube {candidate.confidence:.2f} stickers {segment_count}"
@@ -917,37 +1053,28 @@ def process_frame(
     return output, bgr_samples
 
 
-def frame_for_processing(frame: np.ndarray, args) -> np.ndarray:
-    if getattr(args, "use_bbox_detector", True):
-        return frame
-
-    height, width = frame.shape[:2]
-    x1, y1, x2, y2 = centered_square_viewport(width, height)
-    return resize_to_square_size(frame[y1:y2, x1:x2], args.sticker_imgsz)
-
-
 def roi_for_frame(
     frame: np.ndarray,
     bbox_detector,
     args,
-) -> tuple[tuple[int, int, int, int] | None, object | None]:
+    roi_tracker: RoiTracker | None = None,
+) -> tuple[tuple[int, int, int, int] | None, object | None, str]:
     height, width = frame.shape[:2]
-    if not getattr(args, "use_bbox_detector", True):
-        return (0, 0, width, height), None
+    if roi_tracker is not None and roi_tracker.roi_xyxy is not None:
+        return roi_tracker.roi_xyxy, roi_tracker.cube_candidate, "tracker"
 
     candidate = bbox_detector.detect(frame)
     if candidate is None:
-        return None, None
-    return clipped_square_roi(candidate.bbox_xyxy, width, height, args.roi_padding), candidate
-
-
-def centered_square_viewport(width: int, height: int) -> tuple[int, int, int, int]:
-    viewport_size = min(width, height)
-    center_x = width // 2
-    center_y = height // 2
-    x1 = max(0, min(width - viewport_size, center_x - viewport_size // 2))
-    y1 = max(0, min(height - viewport_size, center_y - viewport_size // 2))
-    return x1, y1, x1 + viewport_size, y1 + viewport_size
+        if roi_tracker is not None:
+            roi_tracker.reset()
+        return None, None, "none"
+    if roi_tracker is not None:
+        return (
+            roi_tracker.initialize(candidate, width, height, args.roi_padding),
+            candidate,
+            "detector",
+        )
+    return clipped_square_roi(candidate.bbox_xyxy, width, height, args.roi_padding), candidate, "detector"
 
 
 def resize_to_square_size(image: np.ndarray, size: int) -> np.ndarray:
@@ -965,19 +1092,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sticker-conf", type=float, default=0.25)
     parser.add_argument("--bbox-imgsz", type=int, default=640)
     parser.add_argument("--sticker-imgsz", type=int, default=256)
-    parser.add_argument(
-        "--sticker-only",
-        dest="use_bbox_detector",
-        action="store_false",
-        help="Only run the sticker segmentation model on a centered square viewport",
-    )
-    parser.add_argument(
-        "--skip-bbox",
-        dest="use_bbox_detector",
-        action="store_false",
-        help=argparse.SUPPRESS,
-    )
     parser.add_argument("--roi-padding", type=float, default=0.08)
+    parser.add_argument(
+        "--roi-tracking-gain",
+        type=float,
+        default=1.4,
+        help="Multiplier for ROI movement from sticker bounds-center offset; higher follows faster",
+    )
+    parser.add_argument(
+        "--roi-tracking-padding",
+        type=float,
+        default=0.18,
+        help="Extra padding ratio added around tracked sticker bounds when updating the ROI",
+    )
     parser.add_argument(
         "--segmentation-padding-px",
         type=int,
@@ -1106,7 +1233,6 @@ def build_parser() -> argparse.ArgumentParser:
         show_bbox=True,
         show_confidence=True,
         show_sticker_color_classification=True,
-        use_bbox_detector=True,
     )
     return parser
 
@@ -1116,14 +1242,10 @@ def main() -> int:
 
     from ultralytics import YOLO
 
-    bbox_detector = (
-        YOLOCubeDetector(
-            model_name=str(args.bbox_model),
-            confidence_threshold=args.bbox_conf,
-            image_size=args.bbox_imgsz,
-        )
-        if args.use_bbox_detector
-        else None
+    bbox_detector = YOLOCubeDetector(
+        model_name=str(args.bbox_model),
+        confidence_threshold=args.bbox_conf,
+        image_size=args.bbox_imgsz,
     )
     sticker_model = YOLO(str(args.sticker_model))
     source = parse_source(args.source)
@@ -1143,6 +1265,7 @@ def main() -> int:
     color_plot_bgr_batches = []
     color_plot_detected_frames = 0
     cube_net_state = CubeNetState() if args.save_net else None
+    roi_tracker = RoiTracker()
 
     if isinstance(source, str) and Path(source).suffix.lower() in {
         ".png",
@@ -1160,6 +1283,7 @@ def main() -> int:
             args,
             color_classifier,
             cube_net_state,
+            roi_tracker,
         )
         if color_plot_requested:
             if len(bgr_samples) == 0:
@@ -1202,6 +1326,8 @@ def main() -> int:
         return 0
 
     capture = cv2.VideoCapture(source)
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
     if not capture.isOpened():
         raise SystemExit(f"Could not open source: {args.source}")
 
@@ -1217,6 +1343,7 @@ def main() -> int:
             args,
             color_classifier,
             cube_net_state,
+            roi_tracker,
         )
         now = perf_counter()
         fps = 1.0 / max(now - previous, 1e-6)

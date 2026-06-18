@@ -17,9 +17,13 @@ class StubBboxDetector:
         return SimpleNamespace(bbox_xyxy=(5, 5, 25, 25), confidence=0.9)
 
 
-class RaisingBboxDetector:
+class CountingBboxDetector:
+    def __init__(self):
+        self.calls = 0
+
     def detect(self, frame):
-        raise AssertionError("bbox detector should not be called")
+        self.calls += 1
+        return SimpleNamespace(bbox_xyxy=(10, 10, 30, 30), confidence=0.9)
 
 
 class StubBoxes:
@@ -73,7 +77,9 @@ class StubStickerModel:
 
     def predict(self, source, conf, imgsz, verbose):
         mask = np.zeros((1, source.shape[0], source.shape[1]), dtype=np.float32)
-        mask[:, 5:15, 5:15] = 1.0
+        y1, y2 = source.shape[0] // 4, source.shape[0] * 3 // 4
+        x1, x2 = source.shape[1] // 4, source.shape[1] * 3 // 4
+        mask[:, y1:y2, x1:x2] = 1.0
         masks = SimpleNamespace(
             data=SimpleNamespace(
                 detach=lambda: SimpleNamespace(
@@ -152,13 +158,76 @@ class RecordingStickerModel:
         return [SimpleNamespace(masks=masks, boxes=StubBoxes())]
 
 
+class ShiftingStickerModel:
+    names = {0: "U_sticker"}
+
+    def __init__(self, offsets):
+        self.offsets = list(offsets)
+        self.calls = 0
+
+    def predict(self, source, conf, imgsz, verbose):
+        offset_x, offset_y = self.offsets[min(self.calls, len(self.offsets) - 1)]
+        self.calls += 1
+        mask = np.zeros((1, source.shape[0], source.shape[1]), dtype=np.float32)
+        mask[:, 5 + offset_y : 15 + offset_y, 5 + offset_x : 15 + offset_x] = 1.0
+        masks = SimpleNamespace(
+            data=SimpleNamespace(
+                detach=lambda: SimpleNamespace(
+                    cpu=lambda: SimpleNamespace(numpy=lambda: mask)
+                )
+            )
+        )
+        return [SimpleNamespace(masks=masks, boxes=StubBoxes())]
+
+
+class MasklessStickerModel:
+    names = {0: "U_sticker"}
+
+    def predict(self, source, conf, imgsz, verbose):
+        mask = np.zeros((1, source.shape[0], source.shape[1]), dtype=np.float32)
+        masks = SimpleNamespace(
+            data=SimpleNamespace(
+                detach=lambda: SimpleNamespace(
+                    cpu=lambda: SimpleNamespace(numpy=lambda: mask)
+                )
+            )
+        )
+        return [SimpleNamespace(masks=masks, boxes=StubBoxes())]
+
+
+class VariableSizeStickerModel:
+    names = {0: "U_sticker"}
+
+    def __init__(self, sizes):
+        self.sizes = list(sizes)
+        self.calls = 0
+
+    def predict(self, source, conf, imgsz, verbose):
+        size = self.sizes[min(self.calls, len(self.sizes) - 1)]
+        self.calls += 1
+        mask = np.zeros((1, source.shape[0], source.shape[1]), dtype=np.float32)
+        size = min(size, source.shape[0], source.shape[1])
+        y1 = (source.shape[0] - size) // 2
+        x1 = (source.shape[1] - size) // 2
+        mask[:, y1 : y1 + size, x1 : x1 + size] = 1.0
+        masks = SimpleNamespace(
+            data=SimpleNamespace(
+                detach=lambda: SimpleNamespace(
+                    cpu=lambda: SimpleNamespace(numpy=lambda: mask)
+                )
+            )
+        )
+        return [SimpleNamespace(masks=masks, boxes=StubBoxes())]
+
+
 class StubMixedStickerModel:
     names = {0: "U_sticker", 1: "F_sticker", 2: "R_sticker"}
 
     def predict(self, source, conf, imgsz, verbose):
         mask = np.zeros((2, source.shape[0], source.shape[1]), dtype=np.float32)
-        mask[0, 5:15, 5:15] = 1.0
-        mask[1, 5:15, 12:20] = 1.0
+        y1, y2 = source.shape[0] // 4, source.shape[0] * 3 // 4
+        mask[0, y1:y2, source.shape[1] // 4 : source.shape[1] * 3 // 4] = 1.0
+        mask[1, y1:y2, source.shape[1] * 3 // 5 : source.shape[1]] = 1.0
         masks = SimpleNamespace(
             data=SimpleNamespace(
                 detach=lambda: SimpleNamespace(
@@ -173,8 +242,9 @@ def default_args(**overrides):
     values = {
         "sticker_conf": 0.25,
         "sticker_imgsz": 256,
-        "use_bbox_detector": True,
         "roi_padding": 0.0,
+        "roi_tracking_gain": 1.4,
+        "roi_tracking_padding": 0.18,
         "segmentation_padding_px": 0,
         "debug_overlay": False,
         "show_bbox": False,
@@ -211,23 +281,6 @@ def test_process_frame_uses_same_output_when_collecting_plot_samples():
     assert len(bgr_samples) > 1
 
 
-def test_process_frame_can_use_sticker_only_viewport_without_bbox_detector():
-    frame = np.zeros((40, 40, 3), dtype=np.uint8)
-    frame[:, :] = [40, 40, 40]
-    frame[5:15, 5:15] = [0, 0, 220]
-
-    output, bgr_samples = piece_seg_script.process_frame(
-        frame,
-        RaisingBboxDetector(),
-        StubStickerModel(),
-        default_args(use_bbox_detector=False, sticker_imgsz=40),
-    )
-
-    assert bgr_samples.shape == (10, 3)
-    assert (bgr_samples[:, 2] > bgr_samples[:, 0]).all()
-    assert np.any(np.all(output == piece_seg_script.CLASS_COLORS[0], axis=2))
-
-
 def test_process_frame_requires_segmentation_masks():
     frame = np.zeros((40, 40, 3), dtype=np.uint8)
     frame[:, :] = [40, 40, 40]
@@ -258,45 +311,137 @@ def test_process_frame_ignores_pose_only_outputs():
     assert np.array_equal(output, frame)
 
 
-def test_sticker_only_scales_square_viewport_to_model_size():
-    frame = np.zeros((40, 80, 3), dtype=np.uint8)
-    frame[:, :] = [40, 40, 40]
-    frame[8:16, 30:50] = [0, 0, 220]
-    sticker_model = RecordingStickerModel()
+def test_roi_tracker_runs_bbox_once_and_moves_roi_from_sticker_bounds_center():
+    frame = np.zeros((60, 60, 3), dtype=np.uint8)
+    detector = CountingBboxDetector()
+    tracker = piece_seg_script.RoiTracker()
+    sticker_model = ShiftingStickerModel(offsets=[(0, 0), (3, 0)])
+    args = default_args(show_bbox=True, sticker_imgsz=20, roi_tracking_padding=0.0)
 
-    output, bgr_samples = piece_seg_script.process_frame(
+    first_output, _ = piece_seg_script.process_frame(
         frame,
-        RaisingBboxDetector(),
+        detector,
         sticker_model,
-        default_args(use_bbox_detector=False, sticker_imgsz=20),
-    )
-
-    assert sticker_model.source_shape == (20, 20)
-    assert sticker_model.source is not None
-    assert np.any(sticker_model.source[:, :, 2] > sticker_model.source[:, :, 0])
-    assert output.shape == (20, 20, 3)
-    assert bgr_samples.shape == (10, 3)
-    assert (bgr_samples[:, 2] > bgr_samples[:, 0]).all()
-
-
-def test_sticker_only_viewport_uses_same_roi_overlay_flow_as_bbox_mode():
-    frame = np.zeros((40, 80, 3), dtype=np.uint8)
-    args = default_args(use_bbox_detector=False, sticker_imgsz=20, show_bbox=True)
-
-    output, _ = piece_seg_script.process_frame(
-        frame,
-        RaisingBboxDetector(),
-        RecordingStickerModel(),
         args,
+        roi_tracker=tracker,
+    )
+    assert detector.calls == 1
+    assert tracker.roi_xyxy == (10, 10, 30, 30)
+    assert first_output[0, 0].tolist() != [40, 220, 40]
+    assert first_output[10, 10].tolist() == [0, 0, 255]
+
+    second_output, _ = piece_seg_script.process_frame(
+        frame,
+        detector,
+        sticker_model,
+        args,
+        roi_tracker=tracker,
     )
 
-    assert output.shape == (20, 20, 3)
-    assert output[0, 0].tolist() == [40, 220, 40]
-    assert output[19, 19].tolist() == [40, 220, 40]
+    assert detector.calls == 1
+    assert tracker.roi_xyxy == (14, 10, 34, 30)
+    assert second_output[10, 10].tolist() != [40, 220, 40]
+    assert second_output[10, 14].tolist() == [40, 220, 40]
+    assert second_output[10, 14].tolist() != [0, 0, 255]
 
 
-def test_centered_square_viewport_uses_largest_square_from_frame():
-    assert piece_seg_script.centered_square_viewport(640, 480) == (80, 0, 560, 480)
+def test_roi_tracker_reacquires_bbox_after_missing_sticker_mask():
+    frame = np.zeros((60, 60, 3), dtype=np.uint8)
+    detector = CountingBboxDetector()
+    tracker = piece_seg_script.RoiTracker()
+    args = default_args(sticker_imgsz=20, roi_tracking_padding=0.0)
+
+    piece_seg_script.process_frame(
+        frame,
+        detector,
+        ShiftingStickerModel(offsets=[(0, 0)]),
+        args,
+        roi_tracker=tracker,
+    )
+    assert detector.calls == 1
+    assert tracker.roi_xyxy == (10, 10, 30, 30)
+
+    piece_seg_script.process_frame(
+        frame,
+        detector,
+        MasklessStickerModel(),
+        args,
+        roi_tracker=tracker,
+    )
+    assert detector.calls == 1
+    assert tracker.roi_xyxy is None
+
+    piece_seg_script.process_frame(
+        frame,
+        detector,
+        ShiftingStickerModel(offsets=[(0, 0)]),
+        args,
+        roi_tracker=tracker,
+    )
+    assert detector.calls == 2
+    assert tracker.roi_xyxy == (10, 10, 30, 30)
+
+
+def test_roi_tracker_adds_padding_around_tracked_roi():
+    frame = np.zeros((80, 80, 3), dtype=np.uint8)
+    detector = CountingBboxDetector()
+    tracker = piece_seg_script.RoiTracker()
+    args = default_args(
+        sticker_imgsz=20,
+        roi_tracking_gain=1.0,
+        roi_tracking_padding=0.25,
+    )
+
+    piece_seg_script.process_frame(
+        frame,
+        detector,
+        ShiftingStickerModel(offsets=[(0, 0)]),
+        args,
+        roi_tracker=tracker,
+    )
+
+    assert tracker.roi_xyxy == (5, 5, 35, 35)
+    first_side = tracker.roi_xyxy[2] - tracker.roi_xyxy[0]
+
+    piece_seg_script.process_frame(
+        frame,
+        detector,
+        ShiftingStickerModel(offsets=[(0, 0)]),
+        args,
+        roi_tracker=tracker,
+    )
+    second_side = tracker.roi_xyxy[2] - tracker.roi_xyxy[0]
+
+    assert second_side == first_side
+
+
+def test_roi_tracker_padded_roi_can_shrink_after_larger_observed_bounds():
+    frame = np.zeros((90, 90, 3), dtype=np.uint8)
+    detector = CountingBboxDetector()
+    tracker = piece_seg_script.RoiTracker()
+    sticker_model = VariableSizeStickerModel(sizes=[20, 20, 10])
+    args = default_args(
+        sticker_imgsz=20,
+        roi_tracking_gain=1.0,
+        roi_tracking_padding=0.25,
+    )
+
+    piece_seg_script.process_frame(frame, detector, sticker_model, args, roi_tracker=tracker)
+    first_side = tracker.roi_xyxy[2] - tracker.roi_xyxy[0]
+    piece_seg_script.process_frame(frame, detector, sticker_model, args, roi_tracker=tracker)
+    grown_side = tracker.roi_xyxy[2] - tracker.roi_xyxy[0]
+    piece_seg_script.process_frame(frame, detector, sticker_model, args, roi_tracker=tracker)
+    shrunk_side = tracker.roi_xyxy[2] - tracker.roi_xyxy[0]
+
+    assert first_side == 30
+    assert grown_side > first_side
+    assert shrunk_side < grown_side
+
+
+def test_square_roi_from_bbox_keeps_initial_tracking_roi_square_at_frame_edge():
+    roi = piece_seg_script.square_roi_from_bbox((0, 10, 12, 24), 40, 30, 0.0)
+
+    assert roi == (0, 10, 14, 24)
 
 
 def test_resize_to_square_size_scales_viewport_to_model_input_size():
@@ -305,21 +450,6 @@ def test_resize_to_square_size_scales_viewport_to_model_input_size():
     resized = piece_seg_script.resize_to_square_size(image, 20)
 
     assert resized.shape == (20, 20, 3)
-
-
-def test_frame_for_processing_scales_sticker_only_viewbox():
-    frame = np.zeros((40, 80, 3), dtype=np.uint8)
-    frame[:, 0:20] = [220, 0, 0]
-    frame[:, 20:60] = [0, 0, 220]
-    frame[:, 60:80] = [0, 220, 0]
-
-    working_frame = piece_seg_script.frame_for_processing(
-        frame,
-        default_args(use_bbox_detector=False, sticker_imgsz=20),
-    )
-
-    assert working_frame.shape == (20, 20, 3)
-    assert np.all(working_frame[:, :, 2] > working_frame[:, :, 0])
 
 
 def test_sticker_sampling_uses_same_mask_as_rendering():
@@ -403,7 +533,7 @@ def test_process_frame_can_draw_sticker_graph_overlay():
         args,
     )
 
-    assert np.any(np.all(output == piece_seg_script.CLASS_COLORS[0], axis=2))
+    assert np.any(np.all(output == piece_seg_script.DEFAULT_STICKER_MASK_COLOR, axis=2))
 
 
 def test_process_frame_graph_uses_unpadded_mask_when_sampling_is_padded():
@@ -456,20 +586,6 @@ def test_process_frame_does_not_accumulate_cube_net_without_classifier():
     assert net_state.cells == {}
 
 
-def test_parser_exposes_sticker_only_option():
-    args = piece_seg_script.build_parser().parse_args(["--sticker-only"])
-
-    assert args.use_bbox_detector is False
-
-
-def test_parser_keeps_skip_bbox_as_hidden_compatibility_alias():
-    parser = piece_seg_script.build_parser()
-    args = parser.parse_args(["--skip-bbox"])
-
-    assert args.use_bbox_detector is False
-    assert "--skip-bbox" not in parser.format_help()
-
-
 def test_parser_exposes_sticker_graph_options():
     args = piece_seg_script.build_parser().parse_args(
         [
@@ -484,6 +600,18 @@ def test_parser_exposes_sticker_graph_options():
     assert args.draw_sticker_graph is True
     assert args.graph_adjacency_radius == 9
     assert args.graph_min_sticker_area == 5
+
+
+def test_parser_exposes_roi_tracking_gain_option():
+    args = piece_seg_script.build_parser().parse_args(["--roi-tracking-gain", "1.8"])
+
+    assert args.roi_tracking_gain == 1.8
+
+
+def test_parser_exposes_roi_tracking_padding_option():
+    args = piece_seg_script.build_parser().parse_args(["--roi-tracking-padding", "0.25"])
+
+    assert args.roi_tracking_padding == 0.25
 
 
 def test_parser_exposes_cube_net_output_option():

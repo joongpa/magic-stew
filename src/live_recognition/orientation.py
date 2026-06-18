@@ -40,7 +40,7 @@ def all_cube_orientations() -> list[dict[Face, Axis]]:
     axes = list(_AXIS_VECTOR.values())
 
     for x_axis, y_axis in product(axes, axes):
-        if sum(a * b for a, b in zip(x_axis, y_axis, strict=True)) != 0:
+        if sum(a * b for a, b in zip(x_axis, y_axis)) != 0:
             continue
 
         z_axis = _cross(x_axis, y_axis)
@@ -88,4 +88,3 @@ def orientation_hypotheses(
         OrientationHypothesis(face_to_axis=orientations[index], probability=weight / total)
         for index, weight in enumerate(weights)
     ]
-
