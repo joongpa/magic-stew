@@ -21,7 +21,7 @@ from collections import Counter
 from pathlib import Path
 
 
-CLASS_NAMES = ["U_sticker", "F_sticker", "R_sticker"]
+CLASS_NAMES = ["face"]
 MIN_SEGMENT_POINTS = 3
 
 

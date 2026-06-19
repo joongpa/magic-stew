@@ -290,6 +290,61 @@ def save_rgb_samples_plot(
     return saved_paths
 
 
+def save_centroid_basis_coordinate_plot(
+    centroids_xy: NDArray[np.float32],
+    basis_vectors_xy: NDArray[np.float32],
+    output_path: str,
+    *,
+    title: str = "Sticker centroid coordinates by basis pair",
+) -> None:
+    centroids = np.asarray(centroids_xy, dtype=np.float32).reshape(-1, 2)
+    basis_vectors = np.asarray(basis_vectors_xy, dtype=np.float32).reshape(-1, 2)
+    if len(centroids) == 0:
+        raise ValueError("No sticker centroids available for plotting")
+    if len(basis_vectors) < 3:
+        raise ValueError("At least three basis vectors are required for centroid coordinate plots")
+
+    cache_dir = Path(".matplotlib-cache")
+    cache_dir.mkdir(exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(cache_dir))
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    centered = centroids - centroids.mean(axis=0, keepdims=True)
+    basis_pairs = ((0, 1), (0, 2), (1, 2))
+    figure, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=140)
+    for axes_index, (basis_a, basis_b) in enumerate(basis_pairs):
+        pair_basis = basis_vectors[[basis_a, basis_b]].T
+        coordinates = centered @ np.linalg.pinv(pair_basis).T
+        max_extent = max(float(np.abs(coordinates).max()), 1.0)
+        limit = max_extent * 1.12
+        axes_for_pair = axes[axes_index]
+        axes_for_pair.scatter(
+            coordinates[:, 0],
+            coordinates[:, 1],
+            color="#1f77b4",
+            s=28,
+            alpha=0.82,
+            edgecolors="black",
+            linewidths=0.25,
+        )
+        axes_for_pair.axvline(0.0, color="0.72", linewidth=1)
+        axes_for_pair.axhline(0.0, color="0.72", linewidth=1)
+        axes_for_pair.set_xlim(-limit, limit)
+        axes_for_pair.set_ylim(-limit, limit)
+        axes_for_pair.set_aspect("equal", adjustable="box")
+        axes_for_pair.set_xlabel(f"basis {basis_a + 1} coordinate (px)")
+        axes_for_pair.set_ylabel(f"basis {basis_b + 1} coordinate (px)")
+        axes_for_pair.set_title(f"basis {basis_a + 1} / {basis_b + 1}")
+        axes_for_pair.grid(True, color="0.9", linewidth=0.8)
+    figure.suptitle(title)
+    figure.savefig(output_path)
+    plt.close(figure)
+
+
 def save_rgb_samples_interactive_plot(
     bgr_samples: NDArray[np.uint8],
     output_path: str,

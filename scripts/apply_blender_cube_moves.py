@@ -88,20 +88,18 @@ SOLVED_LOCATION_PROP = "synthetic_solved_location"
 SOLVED_ROTATION_PROP = "synthetic_solved_rotation"
 DEFAULT_OUTPUT_DIR = "data/synthetic_cube_dataset"
 DEFAULT_IMAGE_SIZE = 512
-CUBE_HALF_EXTENT = 1.5
-CUBE_GRID_LINES = (-1.5, -0.5, 0.5, 1.5)
-CLASS_NAMES = ["U_sticker", "F_sticker", "R_sticker"]
-CLASS_ID_BY_FACE = {
-    "U": CLASS_NAMES.index("U_sticker"),
-    "F": CLASS_NAMES.index("F_sticker"),
-    "R": CLASS_NAMES.index("R_sticker"),
-}
+CLASS_NAMES = ["face"]
+VISIBLE_FACE_NAMES = ["U", "F", "R"]
+FACE_MASK_VALUE_BY_FACE = {face: index + 1 for index, face in enumerate(VISIBLE_FACE_NAMES)}
+FACE_BY_MASK_VALUE = {mask_value: face for face, mask_value in FACE_MASK_VALUE_BY_FACE.items()}
 MASK_COLOR_BGR_BY_FACE = {
     "U": (255, 255, 255),
     "F": (0, 255, 0),
     "R": (0, 0, 255),
 }
-MIN_VISIBLE_STICKER_AREA_PX = 8
+MIN_VISIBLE_FACE_AREA_PX = 8
+FACE_MASK_CLOSE_KERNEL_RATIO = 0.018
+MIN_FACE_MASK_CLOSE_KERNEL_PX = 3
 
 
 def parse_axis(axis_name: str) -> Vector:
@@ -752,50 +750,31 @@ def camera_relative_face_for_normal(normal: Vector, axes: dict[str, Vector]) -> 
     return None
 
 
-def sticker_grid_index(value: float) -> int:
-    return max(0, min(2, int(math.floor(value + CUBE_HALF_EXTENT))))
+def face_mask_value(face: str) -> int:
+    return FACE_MASK_VALUE_BY_FACE[face]
 
 
-def hit_sticker_row_column(location: Vector, normal: Vector) -> tuple[int, int]:
-    axis_index, _sign = axis_key(normal)
-    free_indexes = [index for index in range(3) if index != axis_index]
-    return sticker_grid_index(location[free_indexes[1]]), sticker_grid_index(location[free_indexes[0]])
+def face_class_id_for_mask_value(mask_value: int) -> int:
+    _ = mask_value
+    return 0
 
 
-def sticker_mask_value(face: str, row: int, column: int) -> int:
-    return 1 + CLASS_ID_BY_FACE[face] * 9 + row * 3 + column
+def face_for_mask_value(mask_value: int) -> str:
+    return FACE_BY_MASK_VALUE[mask_value]
 
 
-def sticker_class_id_for_mask_value(mask_value: int) -> int:
-    return (mask_value - 1) // 9
-
-
-def sticker_face_for_mask_value(mask_value: int) -> str:
-    class_id = sticker_class_id_for_mask_value(mask_value)
-    class_name = CLASS_NAMES[class_id]
-    return class_name.removesuffix("_sticker")
-
-
-def sticker_metadata_for_mask_value(mask_value: int) -> dict[str, object]:
-    zero_based = mask_value - 1
-    class_id = zero_based // 9
-    cell_index = zero_based % 9
-    row = cell_index // 3
-    column = cell_index % 3
+def face_metadata_for_mask_value(mask_value: int) -> dict[str, object]:
     return {
         "mask_value": mask_value,
-        "class_id": class_id,
-        "class": CLASS_NAMES[class_id],
-        "face": CLASS_NAMES[class_id].removesuffix("_sticker"),
-        "row": row,
-        "column": column,
+        "class_id": face_class_id_for_mask_value(mask_value),
+        "class": CLASS_NAMES[0],
+        "face": face_for_mask_value(mask_value),
     }
 
 
-def sticker_mask_value_for_hit(
+def face_mask_value_for_hit(
     hit_object: bpy.types.Object,
     polygon_index: int,
-    location: Vector,
     normal: Vector,
     axes: dict[str, Vector],
     depsgraph: bpy.types.Depsgraph,
@@ -805,8 +784,44 @@ def sticker_mask_value_for_hit(
     face = camera_relative_face_for_normal(normal, axes)
     if face is None:
         return 0
-    row, column = hit_sticker_row_column(location, normal)
-    return sticker_mask_value(face, row, column)
+    return face_mask_value(face)
+
+
+def outer_face_mask_pixels(pixels: bytearray, width: int, height: int) -> bytearray:
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        raise RuntimeError(
+            "OpenCV and NumPy are required to write face segmentation masks. "
+            "Install cv2 and numpy in Blender's Python environment before generating training data."
+        ) from None
+
+    source = np.frombuffer(bytes(pixels), dtype=np.uint8).reshape((height, width))
+    output = np.zeros((height, width), dtype=np.uint8)
+    kernel_size = max(
+        MIN_FACE_MASK_CLOSE_KERNEL_PX,
+        round(min(width, height) * FACE_MASK_CLOSE_KERNEL_RATIO),
+    )
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+
+    for mask_value in sorted(int(value) for value in np.unique(source) if int(value) > 0):
+        binary = (source == mask_value).astype(np.uint8) * 255
+        if int(cv2.countNonZero(binary)) < MIN_VISIBLE_FACE_AREA_PX:
+            continue
+        closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+        contours, hierarchy = cv2.findContours(closed, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if hierarchy is None:
+            continue
+        for contour_index, contour in enumerate(contours):
+            if cv2.contourArea(contour) < MIN_VISIBLE_FACE_AREA_PX:
+                continue
+            parent_index = int(hierarchy[0][contour_index][3])
+            fill_value = 0 if parent_index >= 0 else mask_value
+            cv2.drawContours(output, [contour], -1, fill_value, thickness=-1)
+    return bytearray(output.reshape(-1).tolist())
 
 
 def write_color_mask_png(path: Path, pixels: bytearray, width: int, height: int) -> None:
@@ -815,7 +830,7 @@ def write_color_mask_png(path: Path, pixels: bytearray, width: int, height: int)
         import numpy as np
     except ImportError:
         raise RuntimeError(
-            "OpenCV and NumPy are required to write sticker segmentation masks. "
+            "OpenCV and NumPy are required to write face segmentation masks. "
             "Install cv2 and numpy in Blender's Python environment before generating training data."
         ) from None
 
@@ -825,12 +840,12 @@ def write_color_mask_png(path: Path, pixels: bytearray, width: int, height: int)
         mask_value = int(mask_value)
         if mask_value <= 0:
             continue
-        face = sticker_face_for_mask_value(mask_value)
+        face = face_for_mask_value(mask_value)
         output[source == mask_value] = MASK_COLOR_BGR_BY_FACE[face]
     cv2.imwrite(str(path), output)
 
 
-def render_sticker_mask(path: Path | None, objects: list[bpy.types.Object]) -> tuple[bytearray, dict[str, object]]:
+def render_face_mask(path: Path | None, objects: list[bpy.types.Object]) -> tuple[bytearray, dict[str, object]]:
     visible_normals = visible_world_normals()
     axes = camera_relative_axes(visible_normals)
     camera = get_camera()
@@ -839,28 +854,28 @@ def render_sticker_mask(path: Path | None, objects: list[bpy.types.Object]) -> t
     height = scene.render.resolution_y
     depsgraph = bpy.context.evaluated_depsgraph_get()
     cubie_names = {obj.name for obj in cube_objects()}
-    pixels = bytearray(width * height)
+    raw_pixels = bytearray(width * height)
 
     bpy.context.view_layer.update()
     for y in range(height):
         for x in range(width):
             origin, direction = camera_ray(camera, scene, x, y)
-            hit, location, normal, polygon_index, hit_object, _matrix = scene.ray_cast(
+            hit, _location, normal, polygon_index, hit_object, _matrix = scene.ray_cast(
                 depsgraph,
                 origin,
                 direction,
             )
             if not hit or hit_object is None or hit_object.name not in cubie_names:
                 continue
-            pixels[y * width + x] = sticker_mask_value_for_hit(
+            raw_pixels[y * width + x] = face_mask_value_for_hit(
                 hit_object,
                 polygon_index,
-                location,
                 normal,
                 axes,
                 depsgraph,
             )
 
+    pixels = outer_face_mask_pixels(raw_pixels, width, height)
     if path is not None:
         write_color_mask_png(path, pixels, width, height)
     return pixels, {
@@ -869,7 +884,7 @@ def render_sticker_mask(path: Path | None, objects: list[bpy.types.Object]) -> t
     }
 
 
-def yolo_segments_with_cv2(pixels: bytearray, width: int, height: int) -> tuple[list[str], list[dict[str, object]]]:
+def yolo_face_objects_with_cv2(pixels: bytearray, width: int, height: int) -> tuple[list[str], list[dict[str, object]]]:
     try:
         import cv2
         import numpy as np
@@ -880,14 +895,13 @@ def yolo_segments_with_cv2(pixels: bytearray, width: int, height: int) -> tuple[
         ) from None
 
     mask = np.frombuffer(bytes(pixels), dtype=np.uint8).reshape((height, width))
-    lines = []
-    segments = []
+    face_objects: dict[str, dict[str, object]] = {}
     for mask_value in sorted(int(value) for value in np.unique(mask) if int(value) > 0):
         binary = (mask == mask_value).astype(np.uint8) * 255
         contours, _hierarchy = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for component_index, contour in enumerate(contours):
             area = cv2.contourArea(contour)
-            if area < MIN_VISIBLE_STICKER_AREA_PX:
+            if area < MIN_VISIBLE_FACE_AREA_PX:
                 continue
 
             epsilon = 0.0008 * cv2.arcLength(contour, True)
@@ -895,26 +909,51 @@ def yolo_segments_with_cv2(pixels: bytearray, width: int, height: int) -> tuple[
             if len(approx) < 3:
                 continue
 
-            metadata = sticker_metadata_for_mask_value(mask_value)
-            values = [str(metadata["class_id"])]
+            metadata = face_metadata_for_mask_value(mask_value)
+            face = str(metadata["face"])
+            face_object = face_objects.setdefault(
+                face,
+                {
+                    "class_id": face_class_id_for_mask_value(mask_value),
+                    "class": CLASS_NAMES[0],
+                    "face": face,
+                    "segmentations": [],
+                    "visible_area_px": 0,
+                },
+            )
+            normalized_values = []
             points = []
             for x, y in approx:
                 nx, ny = normalize_point(float(x), float(y), width, height)
-                values.append(f"{nx:.6f}")
-                values.append(f"{ny:.6f}")
+                normalized_values.append(f"{nx:.6f}")
+                normalized_values.append(f"{ny:.6f}")
                 points.append((float(x), float(y)))
-            lines.append(" ".join(values))
-            segments.append({
+            face_object["segmentations"].append({
                 **metadata,
                 "component_index": component_index,
                 "points": points,
+                "normalized_points": normalized_values,
                 "visible_area_px": int(area),
             })
-    return lines, segments
+            face_object["visible_area_px"] = int(face_object["visible_area_px"]) + int(area)
+
+    lines = []
+    objects = []
+    for face in VISIBLE_FACE_NAMES:
+        face_object = face_objects.get(face)
+        if face_object is None:
+            continue
+        values = [str(face_object["class_id"])]
+        for segmentation in face_object["segmentations"]:
+            values.extend(segmentation["normalized_points"])
+            del segmentation["normalized_points"]
+        lines.append(" ".join(values))
+        objects.append(face_object)
+    return lines, objects
 
 
 def write_yolo_segments(path: Path, pixels: bytearray, width: int, height: int) -> tuple[list[str], list[dict[str, object]]]:
-    lines, segments = yolo_segments_with_cv2(pixels, width, height)
+    lines, segments = yolo_face_objects_with_cv2(pixels, width, height)
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
     return lines, segments
 
@@ -967,8 +1006,8 @@ def generate_dataset(
                 max_degrees=max_cube_rotational_blur_degrees,
                 samples=cube_rotational_blur_samples,
             )
-            mask_pixels, face_geometry = render_sticker_mask(mask_path, objects)
-            yolo_lines, stickers = write_yolo_segments(label_path, mask_pixels, width, height)
+            mask_pixels, face_geometry = render_face_mask(mask_path, objects)
+            yolo_lines, face_objects = write_yolo_segments(label_path, mask_pixels, width, height)
         finally:
             restore_hand_objects(hands, hand_states)
 
@@ -983,13 +1022,14 @@ def generate_dataset(
             "cube_rotational_blur": rotational_blur,
             "hands": hand_randomization,
             "face_geometry": face_geometry,
-            "stickers": stickers,
-            "segments": len(yolo_lines),
+            "faces": face_objects,
+            "objects": len(yolo_lines),
+            "segments": sum(len(face_object["segmentations"]) for face_object in face_objects),
         })
         mask_message = f", {mask_path}" if mask_path is not None else ""
         print(
             f"Wrote {image_path}{mask_message}, and {label_path} "
-            f"with {len(yolo_lines)} sticker segments, "
+            f"with {len(yolo_lines)} face objects, "
             f"{background_cubies} background cubies "
             f"and {'rotational blur' if rotational_blur else 'no rotational blur'}"
         )

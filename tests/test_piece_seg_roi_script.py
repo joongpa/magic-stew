@@ -90,6 +90,10 @@ class StubStickerModel:
         return [SimpleNamespace(masks=masks, boxes=StubBoxes())]
 
 
+class StubFaceSegmentationModel(StubStickerModel):
+    names = {0: "face"}
+
+
 class StubPoseStickerModel:
     names = {0: "U_sticker"}
 
@@ -374,6 +378,22 @@ def test_process_frame_can_show_original_image_under_overlay():
     assert np.array_equal(output[15, 15], expected_blend)
 
 
+def test_process_frame_accepts_face_segmentation_class():
+    frame = np.zeros((40, 40, 3), dtype=np.uint8)
+    frame[:, :] = [40, 40, 40]
+    args = default_args(mask_opacity=1.0)
+
+    output, bgr_samples = piece_seg_script.process_frame(
+        frame,
+        StubBboxDetector(),
+        StubFaceSegmentationModel(),
+        args,
+    )
+
+    assert len(bgr_samples) > 0
+    assert np.any(output != frame)
+
+
 def test_roi_tracker_runs_bbox_once_and_moves_roi_from_sticker_bounds_center():
     frame = np.zeros((60, 60, 3), dtype=np.uint8)
     detector = CountingBboxDetector()
@@ -655,6 +675,40 @@ def test_sticker_quad_fit_preserves_skewed_quadrilateral_shape():
     for corner in expected.astype(np.float32):
         distances = np.linalg.norm(quad - corner, axis=1)
         assert float(distances.min()) <= 2.0
+
+
+def test_face_parallelogram_reconciliation_shares_neighbor_side():
+    left = np.asarray(
+        [
+            [10.0, 10.0],
+            [40.0, 12.0],
+            [42.0, 42.0],
+            [12.0, 40.0],
+        ],
+        dtype=np.float32,
+    )
+    right = np.asarray(
+        [
+            [43.0, 12.0],
+            [72.0, 10.0],
+            [74.0, 40.0],
+            [45.0, 42.0],
+        ],
+        dtype=np.float32,
+    )
+
+    reconciled = piece_seg_script._reconcile_shared_face_parallelogram_sides(
+        [left, right],
+        roi_shape=(100, 100),
+    )
+
+    left_edge = piece_seg_script._quad_edge_points(reconciled[0], 1)
+    right_edge = piece_seg_script._quad_edge_points(reconciled[1], 3)
+    assert np.allclose(left_edge[0], right_edge[1])
+    assert np.allclose(left_edge[1], right_edge[0])
+    for quad in reconciled:
+        assert np.allclose(quad[1] - quad[0], quad[2] - quad[3])
+        assert np.allclose(quad[3] - quad[0], quad[2] - quad[1])
 
 
 def test_low_intersection_lines_extend_to_roi_bounds():

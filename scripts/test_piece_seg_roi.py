@@ -49,10 +49,26 @@ from live_recognition.visualization import (  # noqa: E402
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 DEFAULT_STICKER_MODEL = (
     ROOT
-    / "runs/cube_face_sticker_seg_local/runs/cube_face_sticker_yolo11n_seg/weights/best.pt"
+    / "runs/segment/runs/cube_face_seg_local/runs/cube_face_sticker_yolo11n_seg/weights/best.pt"
 )
 DEFAULT_STICKER_MASK_COLOR = (150, 150, 150)
-STICKER_CLASS_NAMES = {"u_sticker", "f_sticker", "r_sticker"}
+FACE_INSTANCE_MASK_COLORS = (
+    (255, 80, 80),
+    (80, 210, 120),
+    (80, 150, 255),
+    (255, 210, 80),
+    (220, 120, 255),
+    (80, 230, 230),
+)
+FACE_PARALLELOGRAM_COLORS = (
+    (255, 255, 255),
+    (40, 255, 255),
+    (255, 180, 40),
+    (120, 255, 120),
+    (255, 120, 255),
+    (120, 180, 255),
+)
+STICKER_CLASS_NAMES = {"face", "sticker", "u_sticker", "f_sticker", "r_sticker"}
 STICKER_COLOR_SAMPLE_COUNT = 10
 DENSITY_CLUSTER_EPS_RADIANS = 0.08
 DENSITY_CLUSTER_MIN_POINTS = 4
@@ -1324,6 +1340,160 @@ def _sticker_mask_quad_points(
     return None
 
 
+def _face_parallelogram_points(
+    mask: np.ndarray,
+    *,
+    roi_shape: tuple[int, int],
+) -> np.ndarray | None:
+    quad = _sticker_mask_quad_points(mask, roi_shape=roi_shape)
+    if quad is None:
+        return None
+    return _parallelogram_from_quad_points(quad)
+
+
+def _parallelogram_from_quad_points(points_xy: np.ndarray) -> np.ndarray:
+    points = _order_quad_points_clockwise(points_xy)
+    center = points.mean(axis=0)
+    horizontal = ((points[1] + points[2]) - (points[0] + points[3])) / 4.0
+    vertical = ((points[2] + points[3]) - (points[0] + points[1])) / 4.0
+    return np.asarray(
+        [
+            center - horizontal - vertical,
+            center + horizontal - vertical,
+            center + horizontal + vertical,
+            center - horizontal + vertical,
+        ],
+        dtype=np.float32,
+    )
+
+
+def _reconcile_shared_face_parallelogram_sides(
+    parallelograms: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+) -> list[np.ndarray]:
+    reconciled = [np.asarray(quad, dtype=np.float32).reshape(4, 2).copy() for quad in parallelograms]
+    if len(reconciled) < 2:
+        return reconciled
+
+    max_shared_edge_distance = max(10.0, min(roi_shape) * 0.12)
+    for left_index, right_index in combinations(range(len(reconciled)), 2):
+        match = _closest_compatible_quad_edges(
+            reconciled[left_index],
+            reconciled[right_index],
+            max_distance=max_shared_edge_distance,
+        )
+        if match is None:
+            continue
+
+        left_edge_index, right_edge_index, right_reversed = match
+        left_start, left_end = _quad_edge_points(reconciled[left_index], left_edge_index)
+        right_start, right_end = _quad_edge_points(reconciled[right_index], right_edge_index)
+        if right_reversed:
+            right_start, right_end = right_end, right_start
+
+        shared_start = (left_start + right_start) / 2.0
+        shared_end = (left_end + right_end) / 2.0
+        _set_parallelogram_edge_points(reconciled[left_index], left_edge_index, shared_start, shared_end)
+        if right_reversed:
+            _set_parallelogram_edge_points(reconciled[right_index], right_edge_index, shared_end, shared_start)
+        else:
+            _set_parallelogram_edge_points(reconciled[right_index], right_edge_index, shared_start, shared_end)
+    return reconciled
+
+
+def _closest_compatible_quad_edges(
+    left_quad: np.ndarray,
+    right_quad: np.ndarray,
+    *,
+    max_distance: float,
+) -> tuple[int, int, bool] | None:
+    best: tuple[float, int, int, bool] | None = None
+    for left_edge_index in range(4):
+        left_start, left_end = _quad_edge_points(left_quad, left_edge_index)
+        left_vector = left_end - left_start
+        left_length = float(np.linalg.norm(left_vector))
+        if left_length <= 1e-6:
+            continue
+        left_unit = left_vector / left_length
+        for right_edge_index in range(4):
+            right_start, right_end = _quad_edge_points(right_quad, right_edge_index)
+            right_vector = right_end - right_start
+            right_length = float(np.linalg.norm(right_vector))
+            if right_length <= 1e-6:
+                continue
+            right_unit = right_vector / right_length
+            if abs(float(left_unit @ right_unit)) < 0.78:
+                continue
+
+            same = float(np.linalg.norm(left_start - right_start) + np.linalg.norm(left_end - right_end))
+            reversed_distance = float(np.linalg.norm(left_start - right_end) + np.linalg.norm(left_end - right_start))
+            distance = min(same, reversed_distance) / 2.0
+            if distance > max_distance:
+                continue
+            right_reversed = reversed_distance < same
+            if best is None or distance < best[0]:
+                best = (distance, left_edge_index, right_edge_index, right_reversed)
+
+    if best is None:
+        return None
+    _distance, left_edge_index, right_edge_index, right_reversed = best
+    return left_edge_index, right_edge_index, right_reversed
+
+
+def _quad_edge_points(quad: np.ndarray, edge_index: int) -> tuple[np.ndarray, np.ndarray]:
+    return quad[edge_index], quad[(edge_index + 1) % 4]
+
+
+def _set_parallelogram_edge_points(
+    quad: np.ndarray,
+    edge_index: int,
+    start_xy: np.ndarray,
+    end_xy: np.ndarray,
+) -> None:
+    original = np.asarray(quad, dtype=np.float32).reshape(4, 2).copy()
+    start_index = edge_index
+    end_index = (edge_index + 1) % 4
+    opposite_end_index = (edge_index + 2) % 4
+    opposite_start_index = (edge_index - 1) % 4
+
+    start = np.asarray(start_xy, dtype=np.float32)
+    end = np.asarray(end_xy, dtype=np.float32)
+    opposite_offset = (
+        (original[opposite_start_index] - original[start_index])
+        + (original[opposite_end_index] - original[end_index])
+    ) / 2.0
+
+    quad[start_index] = start
+    quad[end_index] = end
+    quad[opposite_start_index] = start + opposite_offset
+    quad[opposite_end_index] = end + opposite_offset
+
+
+def draw_face_parallelogram_hulls(
+    frame: np.ndarray,
+    face_masks: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+    offset_xy: tuple[int, int],
+) -> None:
+    parallelograms = [
+        parallelogram
+        for mask in face_masks
+        if (parallelogram := _face_parallelogram_points(mask, roi_shape=roi_shape)) is not None
+    ]
+    parallelograms = _reconcile_shared_face_parallelogram_sides(
+        parallelograms,
+        roi_shape=roi_shape,
+    )
+    offset = np.asarray(offset_xy, dtype=np.float32)
+    for index, quad in enumerate(parallelograms):
+        points = np.round(quad + offset).astype(np.int32).reshape(-1, 1, 2)
+        color = FACE_PARALLELOGRAM_COLORS[index % len(FACE_PARALLELOGRAM_COLORS)]
+        cv2.polylines(frame, [points], isClosed=True, color=(0, 0, 0), thickness=5, lineType=cv2.LINE_AA)
+        cv2.polylines(frame, [points], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
+
+
 def _max_area_quad_from_hull_points(hull_points_xy: np.ndarray) -> np.ndarray | None:
     points = np.asarray(hull_points_xy, dtype=np.float32).reshape(-1, 2)
     if len(points) < 4:
@@ -2040,6 +2210,12 @@ def sticker_piece_type(class_name: str) -> str:
     return class_name.removesuffix("_sticker")
 
 
+def mask_color_for_segment(class_name: str, segment_index: int) -> tuple[int, int, int]:
+    if class_name == "face":
+        return FACE_INSTANCE_MASK_COLORS[segment_index % len(FACE_INSTANCE_MASK_COLORS)]
+    return DEFAULT_STICKER_MASK_COLOR
+
+
 def roi_color_samples(crop_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     reliable_mask = _reliable_color_mask(crop_bgr)
     return crop_bgr, reliable_mask
@@ -2306,6 +2482,7 @@ def draw_sticker_segments(
     classifier_bgr_batches = []
     sticker_nodes = []
     grid_fit_masks = []
+    face_hull_masks = []
     build_sticker_nodes = args.draw_sticker_graph or cube_net_state is not None
     color_samples = roi_color_samples(roi)
     tracking_min_x: int | None = None
@@ -2318,7 +2495,7 @@ def draw_sticker_segments(
         if class_name not in STICKER_CLASS_NAMES:
             continue
         piece_type = sticker_piece_type(class_name)
-        color = DEFAULT_STICKER_MASK_COLOR
+        color = mask_color_for_segment(class_name, count)
 
         mask_bool = sticker_mask_bool(mask_data, index, roi_width, roi_height)
         if not mask_bool.any():
@@ -2329,6 +2506,8 @@ def draw_sticker_segments(
             sample_mask = mask_bool
         draw_mask = sample_mask
         graph_mask = mask_bool
+        if class_name == "face":
+            face_hull_masks.append(graph_mask)
         if getattr(args, "draw_cube_grid_fit", False):
             grid_fit_masks.append(graph_mask)
 
@@ -2416,6 +2595,8 @@ def draw_sticker_segments(
         for sticker_mask, sticker_bgr, cluster_index in display_stickers:
             sticker_color = color
             if (
+                class_name != "face"
+                and
                 color_classifier is not None
                 and color_classifier.ready
                 and getattr(args, "show_sticker_color_classification", True)
@@ -2470,6 +2651,13 @@ def draw_sticker_segments(
             frame[overlay_mask] = blended.clip(0, 255).astype(np.uint8)
     else:
         frame[:] = overlay
+    if face_hull_masks:
+        draw_face_parallelogram_hulls(
+            frame,
+            face_hull_masks,
+            roi_shape=(roi_height, roi_width),
+            offset_xy=(x1, y1),
+        )
     if getattr(args, "draw_cube_grid_fit", False) and grid_fit_masks:
         line_overlay = low_intersection_sticker_lines(
             grid_fit_masks,
