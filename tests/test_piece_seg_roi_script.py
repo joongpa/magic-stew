@@ -42,6 +42,14 @@ class StubMixedBoxes:
         return 2
 
 
+class StubTwoFaceBoxes:
+    cls = [SimpleNamespace(item=lambda: 0), SimpleNamespace(item=lambda: 0)]
+    conf = [SimpleNamespace(item=lambda: 0.9), SimpleNamespace(item=lambda: 0.8)]
+
+    def __len__(self):
+        return 2
+
+
 class StubPoseBoxes:
     cls = [SimpleNamespace(item=lambda: 1)]
     conf = [SimpleNamespace(item=lambda: 0.9)]
@@ -92,6 +100,23 @@ class StubStickerModel:
 
 class StubFaceSegmentationModel(StubStickerModel):
     names = {0: "face"}
+
+
+class StubOverlappingFaceSegmentationModel:
+    names = {0: "face"}
+
+    def predict(self, source, conf, imgsz, verbose):
+        mask = np.zeros((2, source.shape[0], source.shape[1]), dtype=np.float32)
+        mask[0, 40:180, 40:180] = 1.0
+        mask[1, 30:130, 30:130] = 1.0
+        masks = SimpleNamespace(
+            data=SimpleNamespace(
+                detach=lambda: SimpleNamespace(
+                    cpu=lambda: SimpleNamespace(numpy=lambda: mask)
+                )
+            )
+        )
+        return [SimpleNamespace(masks=masks, boxes=StubTwoFaceBoxes())]
 
 
 class StubPoseStickerModel:
@@ -391,7 +416,33 @@ def test_process_frame_accepts_face_segmentation_class():
     )
 
     assert len(bgr_samples) > 0
-    assert np.any(output != frame)
+    assert output.shape[0] == frame.shape[0]
+    assert output.shape[1] > frame.shape[1]
+    assert np.any(output[:, : frame.shape[1]] != frame)
+
+
+def test_draw_sticker_segments_prunes_face_mostly_covered_by_larger_face():
+    frame = np.zeros((256, 256, 3), dtype=np.uint8)
+    roi = np.zeros_like(frame)
+    args = default_args(sticker_imgsz=256, mask_opacity=1.0)
+
+    count, bgr_samples, tracking_bounds, projection_panel = piece_seg_script.draw_sticker_segments(
+        frame,
+        roi,
+        StubOverlappingFaceSegmentationModel(),
+        (0, 0, 256, 256),
+        args,
+    )
+
+    assert count == 1
+    assert len(bgr_samples) > 0
+    assert tracking_bounds == (40, 40, 180, 180)
+    assert projection_panel is not None
+    assert np.array_equal(frame[35, 35], np.asarray([0, 0, 0], dtype=np.uint8))
+    assert np.array_equal(
+        frame[50, 50],
+        np.asarray(piece_seg_script.FACE_INSTANCE_MASK_COLORS[0], dtype=np.uint8),
+    )
 
 
 def test_roi_tracker_runs_bbox_once_and_moves_roi_from_sticker_bounds_center():
@@ -709,6 +760,59 @@ def test_face_parallelogram_reconciliation_shares_neighbor_side():
     for quad in reconciled:
         assert np.allclose(quad[1] - quad[0], quad[2] - quad[3])
         assert np.allclose(quad[3] - quad[0], quad[2] - quad[1])
+
+
+def test_face_projection_uses_image_under_mask_and_blacks_outside_mask():
+    roi = np.zeros((10, 10, 3), dtype=np.uint8)
+    roi[:, :] = [20, 80, 200]
+    mask = np.zeros((10, 10), dtype=bool)
+    mask[:, :5] = True
+    quad = np.asarray(
+        [
+            [0.0, 0.0],
+            [9.0, 0.0],
+            [9.0, 9.0],
+            [0.0, 9.0],
+        ],
+        dtype=np.float32,
+    )
+
+    projection = piece_seg_script.project_masked_face_to_square(
+        roi,
+        mask,
+        quad,
+        square_size=10,
+    )
+
+    assert np.array_equal(projection[5, 2], np.asarray([20, 80, 200], dtype=np.uint8))
+    assert np.array_equal(projection[5, 8], np.asarray([0, 0, 0], dtype=np.uint8))
+
+
+def test_face_projection_panel_draws_three_by_three_grid():
+    roi = np.zeros((30, 30, 3), dtype=np.uint8)
+    roi[:, :] = [20, 80, 200]
+    mask = np.ones((30, 30), dtype=bool)
+
+    panel = piece_seg_script.face_projection_panel(
+        roi,
+        [mask],
+        roi_shape=(30, 30),
+        output_height=80,
+    )
+
+    assert panel is not None
+    padding = 10
+    square_size = 60
+    first_line = padding + int(round((square_size - 1) / 3.0))
+    second_line = padding + int(round((square_size - 1) * 2.0 / 3.0))
+    assert np.array_equal(
+        panel[padding + square_size // 2, first_line],
+        np.asarray(piece_seg_script.PROJECTED_FACE_GRID_COLOR, dtype=np.uint8),
+    )
+    assert np.array_equal(
+        panel[second_line, padding + square_size // 2],
+        np.asarray(piece_seg_script.PROJECTED_FACE_GRID_COLOR, dtype=np.uint8),
+    )
 
 
 def test_low_intersection_lines_extend_to_roi_bounds():

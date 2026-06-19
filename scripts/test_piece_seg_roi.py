@@ -69,6 +69,8 @@ FACE_PARALLELOGRAM_COLORS = (
     (120, 180, 255),
 )
 STICKER_CLASS_NAMES = {"face", "sticker", "u_sticker", "f_sticker", "r_sticker"}
+FACE_COVERAGE_PRUNE_THRESHOLD = 0.8
+PROJECTED_FACE_GRID_COLOR = (255, 255, 255)
 STICKER_COLOR_SAMPLE_COUNT = 10
 DENSITY_CLUSTER_EPS_RADIANS = 0.08
 DENSITY_CLUSTER_MIN_POINTS = 4
@@ -1494,6 +1496,152 @@ def draw_face_parallelogram_hulls(
         cv2.polylines(frame, [points], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
 
 
+def face_parallelograms_for_masks(
+    face_masks: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+) -> list[np.ndarray]:
+    parallelograms = [
+        parallelogram
+        for mask in face_masks
+        if (parallelogram := _face_parallelogram_points(mask, roi_shape=roi_shape)) is not None
+    ]
+    return _reconcile_shared_face_parallelogram_sides(parallelograms, roi_shape=roi_shape)
+
+
+def covered_face_mask_indexes(
+    indexed_face_masks: list[tuple[int, np.ndarray]],
+    *,
+    coverage_threshold: float = FACE_COVERAGE_PRUNE_THRESHOLD,
+) -> set[int]:
+    face_areas = [
+        (index, np.asarray(mask, dtype=bool), int(np.asarray(mask, dtype=bool).sum()))
+        for index, mask in indexed_face_masks
+    ]
+    pruned_indexes: set[int] = set()
+    for index, mask, area in face_areas:
+        if area <= 0:
+            pruned_indexes.add(index)
+            continue
+        for other_index, other_mask, other_area in face_areas:
+            if other_index == index or other_area <= area:
+                continue
+            covered_fraction = float(np.logical_and(mask, other_mask).sum()) / float(area)
+            if covered_fraction >= coverage_threshold:
+                pruned_indexes.add(index)
+                break
+    return pruned_indexes
+
+
+def draw_projected_face_grid(
+    image: np.ndarray,
+    *,
+    color: tuple[int, int, int] = PROJECTED_FACE_GRID_COLOR,
+) -> None:
+    height, width = image.shape[:2]
+    for fraction in (1.0 / 3.0, 2.0 / 3.0):
+        x = int(round((width - 1) * fraction))
+        y = int(round((height - 1) * fraction))
+        cv2.line(image, (x, 0), (x, height - 1), (0, 0, 0), 3, lineType=cv2.LINE_8)
+        cv2.line(image, (0, y), (width - 1, y), (0, 0, 0), 3, lineType=cv2.LINE_8)
+        cv2.line(image, (x, 0), (x, height - 1), color, 1, lineType=cv2.LINE_8)
+        cv2.line(image, (0, y), (width - 1, y), color, 1, lineType=cv2.LINE_8)
+
+
+def face_projection_panel(
+    roi_bgr: np.ndarray,
+    face_masks: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+    output_height: int,
+) -> np.ndarray | None:
+    if not face_masks:
+        return None
+
+    projection_masks = []
+    parallelograms = []
+    for mask in face_masks:
+        parallelogram = _face_parallelogram_points(mask, roi_shape=roi_shape)
+        if parallelogram is None:
+            continue
+        projection_masks.append(mask)
+        parallelograms.append(parallelogram)
+    parallelograms = _reconcile_shared_face_parallelogram_sides(
+        parallelograms,
+        roi_shape=roi_shape,
+    )
+    if not parallelograms:
+        return None
+
+    padding = 10
+    square_size = min(160, max(48, (int(output_height) - padding * (len(parallelograms) + 1)) // len(parallelograms)))
+    panel_width = square_size + padding * 2
+    panel = np.zeros((int(output_height), panel_width, 3), dtype=np.uint8)
+
+    for index, (mask, quad) in enumerate(zip(projection_masks, parallelograms)):
+        projection = project_masked_face_to_square(
+            roi_bgr,
+            mask,
+            quad,
+            square_size=square_size,
+        )
+        draw_projected_face_grid(projection)
+        y1 = padding + index * (square_size + padding)
+        y2 = min(y1 + square_size, panel.shape[0])
+        if y1 >= panel.shape[0]:
+            break
+        panel[y1:y2, padding : padding + square_size] = projection[: y2 - y1]
+        color = FACE_PARALLELOGRAM_COLORS[index % len(FACE_PARALLELOGRAM_COLORS)]
+        cv2.rectangle(
+            panel,
+            (padding, y1),
+            (padding + square_size - 1, y2 - 1),
+            color,
+            2,
+            lineType=cv2.LINE_AA,
+        )
+    return panel
+
+
+def project_masked_face_to_square(
+    roi_bgr: np.ndarray,
+    face_mask: np.ndarray,
+    quad_xy: np.ndarray,
+    *,
+    square_size: int,
+) -> np.ndarray:
+    roi_height, roi_width = roi_bgr.shape[:2]
+    mask = np.asarray(face_mask, dtype=bool)
+    if mask.shape != (roi_height, roi_width):
+        mask = cv2.resize(
+            mask.astype(np.uint8),
+            (roi_width, roi_height),
+            interpolation=cv2.INTER_NEAREST,
+        ) > 0
+
+    masked_roi = np.zeros_like(roi_bgr)
+    masked_roi[mask] = roi_bgr[mask]
+    source = np.asarray(quad_xy, dtype=np.float32).reshape(4, 2)
+    destination = np.asarray(
+        [
+            [0.0, 0.0],
+            [square_size - 1.0, 0.0],
+            [square_size - 1.0, square_size - 1.0],
+            [0.0, square_size - 1.0],
+        ],
+        dtype=np.float32,
+    )
+    transform = cv2.getPerspectiveTransform(source, destination)
+    return cv2.warpPerspective(
+        masked_roi,
+        transform,
+        (square_size, square_size),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+
+
 def _max_area_quad_from_hull_points(hull_points_xy: np.ndarray) -> np.ndarray | None:
     points = np.asarray(hull_points_xy, dtype=np.float32).reshape(-1, 2)
     if len(points) < 4:
@@ -2449,7 +2597,7 @@ def draw_sticker_segments(
     args,
     color_classifier: ColorDensityClassifier | None = None,
     cube_net_state: CubeNetState | None = None,
-) -> tuple[int, np.ndarray, tuple[int, int, int, int] | None]:
+) -> tuple[int, np.ndarray, tuple[int, int, int, int] | None, np.ndarray | None]:
     x1, y1, x2, y2 = roi_xyxy
     original_frame = frame.copy()
     model_roi = resize_to_square_size(roi, args.sticker_imgsz)
@@ -2461,19 +2609,19 @@ def draw_sticker_segments(
     )
     bgr_batches = []
     if not results:
-        return 0, np.empty((0, 3), dtype=np.uint8), None
+        return 0, np.empty((0, 3), dtype=np.uint8), None, None
 
     result = results[0]
     boxes = result.boxes
     if boxes is None:
-        return 0, np.empty((0, 3), dtype=np.uint8), None
+        return 0, np.empty((0, 3), dtype=np.uint8), None, None
 
     overlay = np.zeros_like(frame)
     roi_height = y2 - y1
     roi_width = x2 - x1
     result_masks = getattr(result, "masks", None)
     if result_masks is None:
-        return 0, np.empty((0, 3), dtype=np.uint8), None
+        return 0, np.empty((0, 3), dtype=np.uint8), None, None
     mask_data = result_masks.data.detach().cpu().numpy()
 
     count = 0
@@ -2489,7 +2637,20 @@ def draw_sticker_segments(
     tracking_min_y: int | None = None
     tracking_max_x: int | None = None
     tracking_max_y: int | None = None
+    indexed_face_masks = []
     for index in range(len(boxes)):
+        class_id = int(boxes.cls[index].item())
+        class_name = class_name_for_id(result, sticker_model, class_id)
+        if class_name != "face":
+            continue
+        mask_bool = sticker_mask_bool(mask_data, index, roi_width, roi_height)
+        if mask_bool.any():
+            indexed_face_masks.append((index, mask_bool))
+    pruned_face_indexes = covered_face_mask_indexes(indexed_face_masks)
+
+    for index in range(len(boxes)):
+        if index in pruned_face_indexes:
+            continue
         class_id = int(boxes.cls[index].item())
         class_name = class_name_for_id(result, sticker_model, class_id)
         if class_name not in STICKER_CLASS_NAMES:
@@ -2658,6 +2819,12 @@ def draw_sticker_segments(
             roi_shape=(roi_height, roi_width),
             offset_xy=(x1, y1),
         )
+    projection_panel = face_projection_panel(
+        roi,
+        face_hull_masks,
+        roi_shape=(roi_height, roi_width),
+        output_height=frame.shape[0],
+    )
     if getattr(args, "draw_cube_grid_fit", False) and grid_fit_masks:
         line_overlay = low_intersection_sticker_lines(
             grid_fit_masks,
@@ -2740,7 +2907,7 @@ def draw_sticker_segments(
         )
         else None
     )
-    return count, bgr_samples, tracking_bounds_xyxy
+    return count, bgr_samples, tracking_bounds_xyxy, projection_panel
 
 
 def draw_sticker_color_numbers(
@@ -2788,7 +2955,7 @@ def process_frame(
 
     x1, y1, x2, y2 = roi_xyxy
     roi = frame[y1:y2, x1:x2]
-    segment_count, bgr_samples, tracking_bounds_xyxy = draw_sticker_segments(
+    segment_count, bgr_samples, tracking_bounds_xyxy, projection_panel = draw_sticker_segments(
         output,
         roi,
         sticker_model,
@@ -2829,6 +2996,8 @@ def process_frame(
             2,
             cv2.LINE_AA,
         )
+    if projection_panel is not None:
+        output = np.concatenate([output, projection_panel], axis=1)
     return output, bgr_samples
 
 
