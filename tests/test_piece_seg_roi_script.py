@@ -329,6 +329,31 @@ def projected_cube_sticker_masks(
     return masks
 
 
+def projected_cube_face_masks(*, roi_shape=(120, 120)):
+    cv2 = piece_seg_script.cv2
+    origin = np.asarray([58.0, 58.0], dtype=np.float32)
+    axes = [
+        np.asarray([34.0, -4.0], dtype=np.float32),
+        np.asarray([6.0, 34.0], dtype=np.float32),
+        np.asarray([-30.0, -22.0], dtype=np.float32),
+    ]
+    masks = []
+    for first_axis, second_axis in ((axes[0], axes[1]), (axes[1], axes[2]), (axes[2], axes[0])):
+        points = np.asarray(
+            [
+                origin,
+                origin + first_axis,
+                origin + first_axis + second_axis,
+                origin + second_axis,
+            ],
+            dtype=np.float32,
+        )
+        mask_u8 = np.zeros(roi_shape, dtype=np.uint8)
+        cv2.fillConvexPoly(mask_u8, np.round(points).astype(np.int32), 1)
+        masks.append(mask_u8 > 0)
+    return masks
+
+
 def test_process_frame_uses_same_output_when_collecting_plot_samples():
     frame = np.zeros((40, 40, 3), dtype=np.uint8)
     args = default_args(debug_overlay=True, show_bbox=True)
@@ -443,6 +468,235 @@ def test_draw_sticker_segments_prunes_face_mostly_covered_by_larger_face():
         frame[50, 50],
         np.asarray(piece_seg_script.FACE_INSTANCE_MASK_COLORS[0], dtype=np.uint8),
     )
+
+
+def test_constrained_face_masks_remove_overlap_from_all_faces():
+    first = np.zeros((20, 20), dtype=bool)
+    first[2:14, 2:14] = True
+    second = np.zeros((20, 20), dtype=bool)
+    second[8:18, 8:18] = True
+
+    selected = piece_seg_script.constrained_face_masks_by_index(
+        [(0, first), (1, second)],
+        roi_shape=(20, 20),
+    )
+
+    assert set(selected) == {0, 1}
+    assert not selected[0][9, 9]
+    assert not selected[1][9, 9]
+    assert selected[0][3, 3]
+    assert selected[1][16, 16]
+
+
+def test_constrained_face_masks_keep_valid_cube_corner_triplet():
+    face_masks = projected_cube_face_masks()
+    extra = np.zeros((120, 120), dtype=bool)
+    extra[80:112, 8:40] = True
+
+    selected = piece_seg_script.constrained_face_masks_by_index(
+        [(0, face_masks[0]), (1, face_masks[1]), (2, face_masks[2]), (3, extra)],
+        roi_shape=(120, 120),
+    )
+
+    assert set(selected) == {0, 1, 2}
+    selected_stack = np.stack([selected[index] for index in sorted(selected)], axis=0)
+    assert not np.any(selected_stack.sum(axis=0) > 1)
+
+
+def test_face_quad_fits_make_triplet_share_exact_corner_and_sides():
+    face_masks = projected_cube_face_masks()
+
+    fitted = piece_seg_script.face_quad_fits_for_masks(
+        face_masks,
+        roi_shape=(120, 120),
+    )
+
+    assert len(fitted) == 3
+    quads = [quad for _mask, quad in fitted]
+    edge_indexes_by_face = [[] for _ in range(3)]
+    for left_index, right_index in ((0, 1), (0, 2), (1, 2)):
+        match = piece_seg_script._closest_compatible_quad_edges(
+            quads[left_index],
+            quads[right_index],
+            max_distance=0.01,
+        )
+        assert match is not None
+        left_edge_index, right_edge_index, _right_reversed = match
+        left_start, left_end = piece_seg_script._quad_edge_points(quads[left_index], left_edge_index)
+        right_start, right_end = piece_seg_script._quad_edge_points(quads[right_index], right_edge_index)
+        same = np.linalg.norm(left_start - right_start) + np.linalg.norm(left_end - right_end)
+        reversed_distance = np.linalg.norm(left_start - right_end) + np.linalg.norm(left_end - right_start)
+        assert min(float(same), float(reversed_distance)) <= 0.01
+        edge_indexes_by_face[left_index].append(left_edge_index)
+        edge_indexes_by_face[right_index].append(right_edge_index)
+
+    common_corners = []
+    for face_index, edge_indexes in enumerate(edge_indexes_by_face):
+        corner = piece_seg_script._quad_common_corner_for_adjacent_edges(
+            quads[face_index],
+            edge_indexes[0],
+            edge_indexes[1],
+        )
+        assert corner is not None
+        common_corners.append(corner)
+    assert np.allclose(common_corners[0], common_corners[1])
+    assert np.allclose(common_corners[0], common_corners[2])
+
+
+def test_projected_cube_fit_preserves_projected_basis_lengths():
+    face_masks = projected_cube_face_masks()
+    parallelograms = [
+        piece_seg_script._face_parallelogram_points(mask, roi_shape=(120, 120))
+        for mask in face_masks
+    ]
+    assert all(quad is not None for quad in parallelograms)
+    reconciled = piece_seg_script._reconcile_shared_face_parallelogram_sides(
+        parallelograms,
+        roi_shape=(120, 120),
+    )
+
+    initial_lengths = []
+    for left_index, right_index in ((0, 1), (0, 2), (1, 2)):
+        match = piece_seg_script._closest_compatible_quad_edges(
+            reconciled[left_index],
+            reconciled[right_index],
+            max_distance=20.0,
+        )
+        assert match is not None
+        left_edge_index, _right_edge_index, _right_reversed = match
+        initial_lengths.append(piece_seg_script._quad_edge_length(reconciled[left_index], left_edge_index))
+
+    fitted = piece_seg_script._adjust_face_triplet_quads_for_shared_corner_and_mask_fit(
+        face_masks,
+        reconciled,
+        roi_shape=(120, 120),
+    )
+
+    edge_lengths = []
+    for left_index, right_index in ((0, 1), (0, 2), (1, 2)):
+        match = piece_seg_script._closest_compatible_quad_edges(
+            fitted[left_index],
+            fitted[right_index],
+            max_distance=0.01,
+        )
+        assert match is not None
+        left_edge_index, right_edge_index, _right_reversed = match
+        edge_lengths.append(piece_seg_script._quad_edge_length(fitted[left_index], left_edge_index))
+        edge_lengths.append(piece_seg_script._quad_edge_length(fitted[right_index], right_edge_index))
+
+    assert max(abs(edge_lengths[index] - edge_lengths[index + 1]) for index in range(0, len(edge_lengths), 2)) <= 1e-4
+    fitted_axis_lengths = [edge_lengths[index] for index in range(0, len(edge_lengths), 2)]
+    assert max(fitted_axis_lengths) - min(fitted_axis_lengths) > 1.0
+    initial_ratios = np.asarray(initial_lengths, dtype=np.float32) / float(initial_lengths[0])
+    fitted_ratios = np.asarray(fitted_axis_lengths, dtype=np.float32) / float(fitted_axis_lengths[0])
+    assert np.allclose(fitted_ratios, initial_ratios, atol=0.12)
+
+
+def test_outer_face_corner_slides_toward_center_to_reduce_spillover():
+    cv2 = piece_seg_script.cv2
+    quad = np.asarray(
+        [
+            [10.0, 10.0],
+            [50.0, 10.0],
+            [50.0, 50.0],
+            [10.0, 50.0],
+        ],
+        dtype=np.float32,
+    )
+    mask_u8 = np.zeros((64, 64), dtype=np.uint8)
+    clipped = np.asarray(
+        [
+            [10, 10],
+            [50, 10],
+            [42, 42],
+            [10, 50],
+        ],
+        dtype=np.int32,
+    )
+    cv2.fillConvexPoly(mask_u8, clipped, 1)
+
+    adjusted = piece_seg_script._slide_outer_quad_corner_toward_center_for_mask_fit(
+        quad,
+        mask_u8 > 0,
+        common_index=0,
+        outer_index=2,
+        roi_shape=(64, 64),
+    )
+
+    assert np.linalg.norm(adjusted[2] - adjusted[0]) < np.linalg.norm(quad[2] - quad[0])
+    assert np.allclose(adjusted[0], quad[0])
+    assert np.allclose(adjusted[1], quad[1])
+    assert np.allclose(adjusted[3], quad[3])
+    assert piece_seg_script._quad_fully_covers_mask(
+        adjusted,
+        mask_u8 > 0,
+        roi_shape=(64, 64),
+    )
+
+
+def test_triplet_outer_face_corners_use_same_slide_percentage():
+    cv2 = piece_seg_script.cv2
+    quads = [
+        np.asarray(
+            [
+                [30.0, 30.0],
+                [74.0, 30.0],
+                [74.0, 74.0],
+                [30.0, 74.0],
+            ],
+            dtype=np.float32,
+        ),
+        np.asarray(
+            [
+                [30.0, 30.0],
+                [30.0, 82.0],
+                [-22.0, 82.0],
+                [-22.0, 30.0],
+            ],
+            dtype=np.float32,
+        ),
+        np.asarray(
+            [
+                [30.0, 30.0],
+                [70.0, -10.0],
+                [110.0, 30.0],
+                [70.0, 70.0],
+            ],
+            dtype=np.float32,
+        ),
+    ]
+    masks = []
+    target_scale = 0.82
+    for quad in quads:
+        clipped = piece_seg_script._quad_with_outer_corner_slide(
+            quad,
+            common_index=0,
+            outer_index=2,
+            scale=target_scale,
+        )
+        mask_u8 = np.zeros((120, 120), dtype=np.uint8)
+        cv2.fillConvexPoly(mask_u8, np.round(clipped).astype(np.int32), 1)
+        masks.append(mask_u8 > 0)
+
+    adjusted = piece_seg_script._slide_triplet_outer_quad_corners_with_shared_scale(
+        quads,
+        masks,
+        [0, 0, 0],
+        roi_shape=(120, 120),
+    )
+
+    slide_ratios = [
+        np.linalg.norm(quad[2] - quad[0]) / np.linalg.norm(original[2] - original[0])
+        for quad, original in zip(adjusted, quads)
+    ]
+    assert np.allclose(slide_ratios, slide_ratios[0])
+    assert abs(float(slide_ratios[0]) - target_scale) <= 0.02
+    for quad, mask in zip(adjusted, masks):
+        assert piece_seg_script._quad_fully_covers_mask(
+            quad,
+            mask,
+            roi_shape=(120, 120),
+        )
 
 
 def test_roi_tracker_runs_bbox_once_and_moves_roi_from_sticker_bounds_center():

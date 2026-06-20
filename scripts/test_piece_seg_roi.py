@@ -70,6 +70,9 @@ FACE_PARALLELOGRAM_COLORS = (
 )
 STICKER_CLASS_NAMES = {"face", "sticker", "u_sticker", "f_sticker", "r_sticker"}
 FACE_COVERAGE_PRUNE_THRESHOLD = 0.8
+MAX_FACE_COUNT = 3
+FACE_OUTER_CORNER_MIN_SLIDE_SCALE = 0.72
+FACE_OUTER_CORNER_SLIDE_STEPS = 29
 PROJECTED_FACE_GRID_COLOR = (255, 255, 255)
 STICKER_COLOR_SAMPLE_COUNT = 10
 DENSITY_CLUSTER_EPS_RADIANS = 0.08
@@ -1447,6 +1450,10 @@ def _quad_edge_points(quad: np.ndarray, edge_index: int) -> tuple[np.ndarray, np
     return quad[edge_index], quad[(edge_index + 1) % 4]
 
 
+def _quad_edge_endpoint_indexes(edge_index: int) -> tuple[int, int]:
+    return edge_index, (edge_index + 1) % 4
+
+
 def _set_parallelogram_edge_points(
     quad: np.ndarray,
     edge_index: int,
@@ -1472,6 +1479,448 @@ def _set_parallelogram_edge_points(
     quad[opposite_end_index] = end + opposite_offset
 
 
+def face_quad_fits_for_masks(
+    face_masks: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    fitted = [
+        (np.asarray(mask, dtype=bool), parallelogram)
+        for mask in face_masks
+        if (parallelogram := _face_parallelogram_points(mask, roi_shape=roi_shape)) is not None
+    ]
+    if not fitted:
+        return []
+
+    masks = [mask for mask, _quad in fitted]
+    quads = _reconcile_shared_face_parallelogram_sides(
+        [quad for _mask, quad in fitted],
+        roi_shape=roi_shape,
+    )
+    quads = _adjust_face_triplet_quads_for_shared_corner_and_mask_fit(
+        masks,
+        quads,
+        roi_shape=roi_shape,
+    )
+    return list(zip(masks, quads))
+
+
+def _adjust_face_triplet_quads_for_shared_corner_and_mask_fit(
+    face_masks: list[np.ndarray],
+    quads: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+) -> list[np.ndarray]:
+    adjusted = [np.asarray(quad, dtype=np.float32).reshape(4, 2).copy() for quad in quads]
+    if len(adjusted) != MAX_FACE_COUNT:
+        return adjusted
+
+    max_shared_edge_distance = max(10.0, min(roi_shape) * 0.12)
+    edge_indexes_by_face: list[list[int]] = [[] for _ in range(MAX_FACE_COUNT)]
+    matches_by_pair = {}
+    for left_index, right_index in combinations(range(MAX_FACE_COUNT), 2):
+        match = _closest_compatible_quad_edges(
+            adjusted[left_index],
+            adjusted[right_index],
+            max_distance=max_shared_edge_distance,
+        )
+        if match is None:
+            return adjusted
+        left_edge_index, right_edge_index, right_reversed = match
+        edge_indexes_by_face[left_index].append(left_edge_index)
+        edge_indexes_by_face[right_index].append(right_edge_index)
+        matches_by_pair[(left_index, right_index)] = (left_edge_index, right_edge_index, right_reversed)
+
+    common_corner_indexes = []
+    for face_index, edge_indexes in enumerate(edge_indexes_by_face):
+        if len(edge_indexes) != 2:
+            return adjusted
+        corner_index = _quad_common_corner_index_for_adjacent_edges(edge_indexes[0], edge_indexes[1])
+        if corner_index is None:
+            return adjusted
+        common_corner_indexes.append(corner_index)
+
+    shared_center = np.mean(
+        np.asarray(
+            [
+                adjusted[face_index][corner_index]
+                for face_index, corner_index in enumerate(common_corner_indexes)
+            ],
+            dtype=np.float32,
+        ),
+        axis=0,
+    )
+    for face_index, corner_index in enumerate(common_corner_indexes):
+        adjusted[face_index][corner_index] = shared_center
+
+    adjusted = _fit_projected_cube_quads_from_shared_sides(
+        adjusted,
+        face_masks,
+        edge_indexes_by_face,
+        matches_by_pair,
+        common_corner_indexes,
+        shared_center,
+        roi_shape=roi_shape,
+    )
+
+    return _slide_triplet_outer_quad_corners_with_shared_scale(
+        adjusted,
+        face_masks,
+        common_corner_indexes,
+        roi_shape=roi_shape,
+    )
+
+
+def _fit_projected_cube_quads_from_shared_sides(
+    quads: list[np.ndarray],
+    face_masks: list[np.ndarray],
+    edge_indexes_by_face: list[list[int]],
+    matches_by_pair: dict[tuple[int, int], tuple[int, int, bool]],
+    common_corner_indexes: list[int],
+    shared_center: np.ndarray,
+    *,
+    roi_shape: tuple[int, int],
+) -> list[np.ndarray]:
+    axis_by_face_edge: list[dict[int, np.ndarray]] = [dict() for _ in quads]
+    axis_vectors = []
+    for (left_index, right_index), match in matches_by_pair.items():
+        left_edge_index, right_edge_index, _right_reversed = match
+        left_far = _quad_edge_far_point_from_common_corner(
+            quads[left_index],
+            left_edge_index,
+            common_corner_indexes[left_index],
+        )
+        right_far = _quad_edge_far_point_from_common_corner(
+            quads[right_index],
+            right_edge_index,
+            common_corner_indexes[right_index],
+        )
+        if left_far is None or right_far is None:
+            return quads
+        far_point = (left_far + right_far) / 2.0
+        vector = far_point - shared_center
+        length = float(np.linalg.norm(vector))
+        if length <= 1e-6:
+            return quads
+        axis_vectors.append(vector)
+        axis_by_face_edge[left_index][left_edge_index] = vector
+        axis_by_face_edge[right_index][right_edge_index] = vector
+
+    if len(axis_vectors) != MAX_FACE_COUNT:
+        return quads
+
+    initial_scale = 1.0
+    min_scale = 0.65
+    max_scale = 1.35
+    best_quads = quads
+    best_score = float("-inf")
+    for scale in np.linspace(min_scale, max_scale, 57):
+        candidate_quads = _projected_cube_quads_for_scale(
+            edge_indexes_by_face,
+            axis_by_face_edge,
+            common_corner_indexes,
+            shared_center,
+            float(scale),
+            fallback_quads=quads,
+        )
+        score = _orthogonal_quad_mask_fit_score(
+            candidate_quads,
+            face_masks,
+            roi_shape=roi_shape,
+        )
+        if score > best_score or (
+            score == best_score
+            and abs(float(scale) - initial_scale) < abs(_projected_cube_scale_from_reference(best_quads, quads) - initial_scale)
+        ):
+            best_score = score
+            best_quads = candidate_quads
+    return best_quads
+
+
+def _projected_cube_quads_for_scale(
+    edge_indexes_by_face: list[list[int]],
+    axis_by_face_edge: list[dict[int, np.ndarray]],
+    common_corner_indexes: list[int],
+    shared_center: np.ndarray,
+    scale: float,
+    *,
+    fallback_quads: list[np.ndarray],
+) -> list[np.ndarray]:
+    fitted = []
+    for face_index, edge_indexes in enumerate(edge_indexes_by_face):
+        if len(edge_indexes) != 2:
+            return fallback_quads
+        first_edge, second_edge = edge_indexes
+        first_axis = axis_by_face_edge[face_index].get(first_edge)
+        second_axis = axis_by_face_edge[face_index].get(second_edge)
+        if first_axis is None or second_axis is None:
+            return fallback_quads
+        quad = _quad_from_common_corner_axes(
+            common_corner_index=common_corner_indexes[face_index],
+            first_edge_index=first_edge,
+            first_axis=first_axis * scale,
+            second_edge_index=second_edge,
+            second_axis=second_axis * scale,
+            shared_center=shared_center,
+        )
+        fitted.append(quad)
+    return fitted
+
+
+def _quad_from_common_corner_axes(
+    *,
+    common_corner_index: int,
+    first_edge_index: int,
+    first_axis: np.ndarray,
+    second_edge_index: int,
+    second_axis: np.ndarray,
+    shared_center: np.ndarray,
+) -> np.ndarray:
+    quad = np.zeros((4, 2), dtype=np.float32)
+    first_far_index = _quad_edge_far_index_from_common_corner(first_edge_index, common_corner_index)
+    second_far_index = _quad_edge_far_index_from_common_corner(second_edge_index, common_corner_index)
+    if first_far_index is None or second_far_index is None:
+        return quad
+    outer_index = (common_corner_index + 2) % 4
+    quad[common_corner_index] = shared_center
+    quad[first_far_index] = shared_center + first_axis
+    quad[second_far_index] = shared_center + second_axis
+    quad[outer_index] = shared_center + first_axis + second_axis
+    return quad
+
+
+def _quad_edge_far_point_from_common_corner(
+    quad: np.ndarray,
+    edge_index: int,
+    common_corner_index: int,
+) -> np.ndarray | None:
+    far_index = _quad_edge_far_index_from_common_corner(edge_index, common_corner_index)
+    if far_index is None:
+        return None
+    return quad[far_index]
+
+
+def _projected_cube_scale_from_reference(
+    candidate_quads: list[np.ndarray],
+    reference_quads: list[np.ndarray],
+) -> float:
+    candidate_lengths = [
+        _quad_edge_length(quad, edge_index)
+        for quad in candidate_quads
+        for edge_index in range(4)
+    ]
+    reference_lengths = [
+        _quad_edge_length(quad, edge_index)
+        for quad in reference_quads
+        for edge_index in range(4)
+    ]
+    if not candidate_lengths or not reference_lengths:
+        return 1.0
+    reference_mean = float(np.mean(reference_lengths))
+    if reference_mean <= 1e-6:
+        return 1.0
+    return float(np.mean(candidate_lengths) / reference_mean)
+
+
+def _quad_edge_far_index_from_common_corner(edge_index: int, common_corner_index: int) -> int | None:
+    start_index, end_index = _quad_edge_endpoint_indexes(edge_index)
+    if start_index == common_corner_index:
+        return end_index
+    if end_index == common_corner_index:
+        return start_index
+    return None
+
+def _slide_outer_quad_corner_toward_center_for_mask_fit(
+    quad: np.ndarray,
+    face_mask: np.ndarray,
+    *,
+    common_index: int,
+    outer_index: int,
+    roi_shape: tuple[int, int],
+) -> np.ndarray:
+    quad = np.asarray(quad, dtype=np.float32).reshape(4, 2).copy()
+    center = quad[common_index].copy()
+    original_outer = quad[outer_index].copy()
+    vector = original_outer - center
+    if float(np.linalg.norm(vector)) <= 1e-6:
+        return quad
+
+    best_quad = quad.copy()
+    best_score = _quad_mask_fit_score(best_quad, face_mask, roi_shape=roi_shape)
+    for scale in _outer_corner_slide_scales():
+        candidate = _quad_with_outer_corner_slide(
+            quad,
+            common_index=common_index,
+            outer_index=outer_index,
+            scale=float(scale),
+        )
+        score = _quad_mask_fit_score(candidate, face_mask, roi_shape=roi_shape)
+        if score > best_score:
+            best_score = score
+            best_quad = candidate
+    return best_quad
+
+
+def _slide_triplet_outer_quad_corners_with_shared_scale(
+    quads: list[np.ndarray],
+    face_masks: list[np.ndarray],
+    common_corner_indexes: list[int],
+    *,
+    roi_shape: tuple[int, int],
+) -> list[np.ndarray]:
+    best_quads = [np.asarray(quad, dtype=np.float32).reshape(4, 2).copy() for quad in quads]
+    best_score = _triplet_quad_mask_fit_score(
+        best_quads,
+        face_masks,
+        roi_shape=roi_shape,
+    )
+    for scale in _outer_corner_slide_scales():
+        candidate_quads = [
+            _quad_with_outer_corner_slide(
+                quad,
+                common_index=common_index,
+                outer_index=(common_index + 2) % 4,
+                scale=float(scale),
+            )
+            for quad, common_index in zip(quads, common_corner_indexes)
+        ]
+        score = _triplet_quad_mask_fit_score(
+            candidate_quads,
+            face_masks,
+            roi_shape=roi_shape,
+        )
+        if score > best_score:
+            best_score = score
+            best_quads = candidate_quads
+    return best_quads
+
+
+def _triplet_quad_mask_fit_score(
+    quads: list[np.ndarray],
+    face_masks: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+) -> float:
+    scores = [
+        _quad_mask_fit_score(quad, mask, roi_shape=roi_shape)
+        for quad, mask in zip(quads, face_masks)
+    ]
+    if any(not np.isfinite(score) for score in scores):
+        return float("-inf")
+    return float(sum(scores))
+
+
+def _orthogonal_quad_mask_fit_score(
+    quads: list[np.ndarray],
+    face_masks: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+) -> float:
+    face_scores = [
+        _quad_soft_fit_score(quad, mask, roi_shape=roi_shape)
+        for quad, mask in zip(quads, face_masks)
+    ]
+    if not face_scores:
+        return float("-inf")
+    return float(max(face_scores) * 10.0 + sum(face_scores) * 0.1)
+
+
+def _quad_soft_fit_score(
+    quad: np.ndarray,
+    face_mask: np.ndarray,
+    *,
+    roi_shape: tuple[int, int],
+) -> float:
+    polygon_mask = _quad_polygon_mask(quad, roi_shape=roi_shape)
+    mask = _normalized_bool_mask(face_mask, shape=polygon_mask.shape)
+    overlap = int(np.logical_and(polygon_mask, mask).sum())
+    spillover = int(np.logical_and(polygon_mask, ~mask).sum())
+    missed = int(np.logical_and(mask, ~polygon_mask).sum())
+    mask_area = max(1, int(mask.sum()))
+    polygon_area = max(1, int(polygon_mask.sum()))
+    coverage = float(overlap) / float(mask_area)
+    spillover_ratio = float(spillover) / float(polygon_area)
+    missed_ratio = float(missed) / float(mask_area)
+    return float(coverage * 1000.0 - spillover_ratio * 300.0 - missed_ratio * 900.0)
+
+
+def _quad_edge_length(quad: np.ndarray, edge_index: int) -> float:
+    start, end = _quad_edge_points(quad, edge_index)
+    return float(np.linalg.norm(end - start))
+
+
+def _quad_with_outer_corner_slide(
+    quad: np.ndarray,
+    *,
+    common_index: int,
+    outer_index: int,
+    scale: float,
+) -> np.ndarray:
+    candidate = np.asarray(quad, dtype=np.float32).reshape(4, 2).copy()
+    center = candidate[common_index].copy()
+    vector = candidate[outer_index] - center
+    candidate[outer_index] = center + vector * float(scale)
+    return candidate
+
+
+def _outer_corner_slide_scales() -> np.ndarray:
+    return np.linspace(
+        FACE_OUTER_CORNER_MIN_SLIDE_SCALE,
+        1.0,
+        FACE_OUTER_CORNER_SLIDE_STEPS,
+    )
+
+
+def _quad_mask_fit_score(
+    quad: np.ndarray,
+    face_mask: np.ndarray,
+    *,
+    roi_shape: tuple[int, int],
+) -> float:
+    polygon_mask = _quad_polygon_mask(quad, roi_shape=roi_shape)
+    mask = _normalized_bool_mask(face_mask, shape=polygon_mask.shape)
+    missed = int(np.logical_and(mask, ~polygon_mask).sum())
+    if missed > 0:
+        return float("-inf")
+    overlap = int(np.logical_and(polygon_mask, mask).sum())
+    spillover = int(np.logical_and(polygon_mask, ~mask).sum())
+    return float(overlap - spillover * 3.0)
+
+
+def _quad_fully_covers_mask(
+    quad: np.ndarray,
+    face_mask: np.ndarray,
+    *,
+    roi_shape: tuple[int, int],
+) -> bool:
+    polygon_mask = _quad_polygon_mask(quad, roi_shape=roi_shape)
+    mask = _normalized_bool_mask(face_mask, shape=polygon_mask.shape)
+    return not bool(np.logical_and(mask, ~polygon_mask).any())
+
+
+def _normalized_bool_mask(mask: np.ndarray, *, shape: tuple[int, int]) -> np.ndarray:
+    normalized = np.asarray(mask, dtype=bool)
+    if normalized.shape != shape:
+        normalized = cv2.resize(
+            normalized.astype(np.uint8),
+            (shape[1], shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        ) > 0
+    return normalized
+
+
+def _quad_polygon_mask(
+    quad: np.ndarray,
+    *,
+    roi_shape: tuple[int, int],
+) -> np.ndarray:
+    roi_height, roi_width = roi_shape
+    polygon_mask = np.zeros((roi_height, roi_width), dtype=np.uint8)
+    points = np.round(np.asarray(quad, dtype=np.float32).reshape(4, 2)).astype(np.int32)
+    cv2.fillConvexPoly(polygon_mask, points, 1)
+    return polygon_mask > 0
+
+
 def draw_face_parallelogram_hulls(
     frame: np.ndarray,
     face_masks: list[np.ndarray],
@@ -1479,17 +1928,9 @@ def draw_face_parallelogram_hulls(
     roi_shape: tuple[int, int],
     offset_xy: tuple[int, int],
 ) -> None:
-    parallelograms = [
-        parallelogram
-        for mask in face_masks
-        if (parallelogram := _face_parallelogram_points(mask, roi_shape=roi_shape)) is not None
-    ]
-    parallelograms = _reconcile_shared_face_parallelogram_sides(
-        parallelograms,
-        roi_shape=roi_shape,
-    )
+    fitted = face_quad_fits_for_masks(face_masks, roi_shape=roi_shape)
     offset = np.asarray(offset_xy, dtype=np.float32)
-    for index, quad in enumerate(parallelograms):
+    for index, (_mask, quad) in enumerate(fitted):
         points = np.round(quad + offset).astype(np.int32).reshape(-1, 1, 2)
         color = FACE_PARALLELOGRAM_COLORS[index % len(FACE_PARALLELOGRAM_COLORS)]
         cv2.polylines(frame, [points], isClosed=True, color=(0, 0, 0), thickness=5, lineType=cv2.LINE_AA)
@@ -1533,6 +1974,129 @@ def covered_face_mask_indexes(
     return pruned_indexes
 
 
+def constrained_face_masks_by_index(
+    indexed_face_masks: list[tuple[int, np.ndarray]],
+    *,
+    roi_shape: tuple[int, int],
+) -> dict[int, np.ndarray]:
+    pruned_indexes = covered_face_mask_indexes(indexed_face_masks)
+    candidates = [
+        (index, np.asarray(mask, dtype=bool), int(np.asarray(mask, dtype=bool).sum()))
+        for index, mask in indexed_face_masks
+        if index not in pruned_indexes and bool(np.asarray(mask, dtype=bool).any())
+    ]
+    candidates.sort(key=lambda item: item[2], reverse=True)
+    if len(candidates) >= MAX_FACE_COUNT:
+        selected = _largest_valid_face_triplet(candidates, roi_shape=roi_shape)
+        if not selected:
+            return {}
+    else:
+        selected = candidates[:MAX_FACE_COUNT]
+
+    cleaned = _remove_shared_face_mask_pixels([(index, mask) for index, mask, _area in selected])
+    return {
+        index: mask
+        for index, mask in cleaned
+        if bool(mask.any())
+    }
+
+
+def _largest_valid_face_triplet(
+    candidates: list[tuple[int, np.ndarray, int]],
+    *,
+    roi_shape: tuple[int, int],
+) -> list[tuple[int, np.ndarray, int]]:
+    for triplet in combinations(candidates, MAX_FACE_COUNT):
+        if _face_triplet_constraints_met(
+            [mask for _index, mask, _area in triplet],
+            roi_shape=roi_shape,
+        ):
+            return list(triplet)
+    return []
+
+
+def _face_triplet_constraints_met(
+    face_masks: list[np.ndarray],
+    *,
+    roi_shape: tuple[int, int],
+) -> bool:
+    if len(face_masks) != MAX_FACE_COUNT:
+        return False
+    quads = [
+        _face_parallelogram_points(mask, roi_shape=roi_shape)
+        for mask in face_masks
+    ]
+    if any(quad is None for quad in quads):
+        return False
+
+    max_shared_edge_distance = max(10.0, min(roi_shape) * 0.12)
+    edge_indexes_by_face: list[list[int]] = [[] for _ in range(MAX_FACE_COUNT)]
+    for left_index, right_index in combinations(range(MAX_FACE_COUNT), 2):
+        match = _closest_compatible_quad_edges(
+            quads[left_index],
+            quads[right_index],
+            max_distance=max_shared_edge_distance,
+        )
+        if match is None:
+            return False
+        left_edge_index, right_edge_index, _right_reversed = match
+        edge_indexes_by_face[left_index].append(left_edge_index)
+        edge_indexes_by_face[right_index].append(right_edge_index)
+
+    common_corners = []
+    for face_index, edge_indexes in enumerate(edge_indexes_by_face):
+        if len(edge_indexes) != 2:
+            return False
+        corner = _quad_common_corner_for_adjacent_edges(
+            quads[face_index],
+            edge_indexes[0],
+            edge_indexes[1],
+        )
+        if corner is None:
+            return False
+        common_corners.append(corner)
+
+    center = np.mean(np.asarray(common_corners, dtype=np.float32), axis=0)
+    max_corner_distance = max(12.0, min(roi_shape) * 0.12)
+    return all(float(np.linalg.norm(corner - center)) <= max_corner_distance for corner in common_corners)
+
+
+def _quad_common_corner_for_adjacent_edges(
+    quad: np.ndarray,
+    first_edge_index: int,
+    second_edge_index: int,
+) -> np.ndarray | None:
+    corner_index = _quad_common_corner_index_for_adjacent_edges(first_edge_index, second_edge_index)
+    if corner_index is None:
+        return None
+    return quad[corner_index]
+
+
+def _quad_common_corner_index_for_adjacent_edges(
+    first_edge_index: int,
+    second_edge_index: int,
+) -> int | None:
+    if (first_edge_index + 1) % 4 == second_edge_index:
+        return second_edge_index
+    if (second_edge_index + 1) % 4 == first_edge_index:
+        return first_edge_index
+    return None
+
+
+def _remove_shared_face_mask_pixels(
+    indexed_face_masks: list[tuple[int, np.ndarray]],
+) -> list[tuple[int, np.ndarray]]:
+    if len(indexed_face_masks) < 2:
+        return [(index, np.asarray(mask, dtype=bool).copy()) for index, mask in indexed_face_masks]
+
+    mask_stack = np.stack([np.asarray(mask, dtype=bool) for _index, mask in indexed_face_masks], axis=0)
+    shared_pixels = mask_stack.sum(axis=0) > 1
+    return [
+        (index, np.logical_and(mask_stack[mask_index], ~shared_pixels))
+        for mask_index, (index, _mask) in enumerate(indexed_face_masks)
+    ]
+
+
 def draw_projected_face_grid(
     image: np.ndarray,
     *,
@@ -1558,27 +2122,16 @@ def face_projection_panel(
     if not face_masks:
         return None
 
-    projection_masks = []
-    parallelograms = []
-    for mask in face_masks:
-        parallelogram = _face_parallelogram_points(mask, roi_shape=roi_shape)
-        if parallelogram is None:
-            continue
-        projection_masks.append(mask)
-        parallelograms.append(parallelogram)
-    parallelograms = _reconcile_shared_face_parallelogram_sides(
-        parallelograms,
-        roi_shape=roi_shape,
-    )
-    if not parallelograms:
+    fitted = face_quad_fits_for_masks(face_masks, roi_shape=roi_shape)
+    if not fitted:
         return None
 
     padding = 10
-    square_size = min(160, max(48, (int(output_height) - padding * (len(parallelograms) + 1)) // len(parallelograms)))
+    square_size = min(160, max(48, (int(output_height) - padding * (len(fitted) + 1)) // len(fitted)))
     panel_width = square_size + padding * 2
     panel = np.zeros((int(output_height), panel_width, 3), dtype=np.uint8)
 
-    for index, (mask, quad) in enumerate(zip(projection_masks, parallelograms)):
+    for index, (mask, quad) in enumerate(fitted):
         projection = project_masked_face_to_square(
             roi_bgr,
             mask,
@@ -2646,11 +3199,12 @@ def draw_sticker_segments(
         mask_bool = sticker_mask_bool(mask_data, index, roi_width, roi_height)
         if mask_bool.any():
             indexed_face_masks.append((index, mask_bool))
-    pruned_face_indexes = covered_face_mask_indexes(indexed_face_masks)
+    constrained_face_masks = constrained_face_masks_by_index(
+        indexed_face_masks,
+        roi_shape=(roi_height, roi_width),
+    )
 
     for index in range(len(boxes)):
-        if index in pruned_face_indexes:
-            continue
         class_id = int(boxes.cls[index].item())
         class_name = class_name_for_id(result, sticker_model, class_id)
         if class_name not in STICKER_CLASS_NAMES:
@@ -2659,6 +3213,10 @@ def draw_sticker_segments(
         color = mask_color_for_segment(class_name, count)
 
         mask_bool = sticker_mask_bool(mask_data, index, roi_width, roi_height)
+        if class_name == "face":
+            mask_bool = constrained_face_masks.get(index)
+            if mask_bool is None:
+                continue
         if not mask_bool.any():
             continue
 
