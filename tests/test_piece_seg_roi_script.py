@@ -333,9 +333,9 @@ def projected_cube_face_masks(*, roi_shape=(120, 120)):
     cv2 = piece_seg_script.cv2
     origin = np.asarray([58.0, 58.0], dtype=np.float32)
     axes = [
-        np.asarray([34.0, -4.0], dtype=np.float32),
-        np.asarray([6.0, 34.0], dtype=np.float32),
-        np.asarray([-30.0, -22.0], dtype=np.float32),
+        np.asarray([26.08, 15.99], dtype=np.float32),
+        np.asarray([-27.17, 27.42], dtype=np.float32),
+        np.asarray([-13.47, -24.35], dtype=np.float32),
     ]
     masks = []
     for first_axis, second_axis in ((axes[0], axes[1]), (axes[1], axes[2]), (axes[2], axes[0])):
@@ -543,7 +543,7 @@ def test_face_quad_fits_make_triplet_share_exact_corner_and_sides():
     assert np.allclose(common_corners[0], common_corners[2])
 
 
-def test_projected_cube_fit_preserves_projected_basis_lengths():
+def test_projected_cube_fit_uses_orthographic_cube_basis_lengths():
     face_masks = projected_cube_face_masks()
     parallelograms = [
         piece_seg_script._face_parallelogram_points(mask, roi_shape=(120, 120))
@@ -555,24 +555,14 @@ def test_projected_cube_fit_preserves_projected_basis_lengths():
         roi_shape=(120, 120),
     )
 
-    initial_lengths = []
-    for left_index, right_index in ((0, 1), (0, 2), (1, 2)):
-        match = piece_seg_script._closest_compatible_quad_edges(
-            reconciled[left_index],
-            reconciled[right_index],
-            max_distance=20.0,
-        )
-        assert match is not None
-        left_edge_index, _right_edge_index, _right_reversed = match
-        initial_lengths.append(piece_seg_script._quad_edge_length(reconciled[left_index], left_edge_index))
-
     fitted = piece_seg_script._adjust_face_triplet_quads_for_shared_corner_and_mask_fit(
         face_masks,
         reconciled,
         roi_shape=(120, 120),
     )
 
-    edge_lengths = []
+    edge_indexes_by_face = [[] for _ in range(3)]
+    shared_axis_edges = []
     for left_index, right_index in ((0, 1), (0, 2), (1, 2)):
         match = piece_seg_script._closest_compatible_quad_edges(
             fitted[left_index],
@@ -581,15 +571,146 @@ def test_projected_cube_fit_preserves_projected_basis_lengths():
         )
         assert match is not None
         left_edge_index, right_edge_index, _right_reversed = match
-        edge_lengths.append(piece_seg_script._quad_edge_length(fitted[left_index], left_edge_index))
-        edge_lengths.append(piece_seg_script._quad_edge_length(fitted[right_index], right_edge_index))
+        assert abs(
+            piece_seg_script._quad_edge_length(fitted[left_index], left_edge_index)
+            - piece_seg_script._quad_edge_length(fitted[right_index], right_edge_index)
+        ) <= 1e-4
+        edge_indexes_by_face[left_index].append(left_edge_index)
+        edge_indexes_by_face[right_index].append(right_edge_index)
+        shared_axis_edges.append((left_index, left_edge_index))
 
-    assert max(abs(edge_lengths[index] - edge_lengths[index + 1]) for index in range(0, len(edge_lengths), 2)) <= 1e-4
-    fitted_axis_lengths = [edge_lengths[index] for index in range(0, len(edge_lengths), 2)]
-    assert max(fitted_axis_lengths) - min(fitted_axis_lengths) > 1.0
-    initial_ratios = np.asarray(initial_lengths, dtype=np.float32) / float(initial_lengths[0])
-    fitted_ratios = np.asarray(fitted_axis_lengths, dtype=np.float32) / float(fitted_axis_lengths[0])
-    assert np.allclose(fitted_ratios, initial_ratios, atol=0.12)
+    common_corner_indexes = []
+    for edge_indexes in edge_indexes_by_face:
+        corner_index = piece_seg_script._quad_common_corner_index_for_adjacent_edges(
+            edge_indexes[0],
+            edge_indexes[1],
+        )
+        assert corner_index is not None
+        common_corner_indexes.append(corner_index)
+
+    axis_vectors = []
+    for face_index, edge_index in shared_axis_edges:
+        far_point = piece_seg_script._quad_edge_far_point_from_common_corner(
+            fitted[face_index],
+            edge_index,
+            common_corner_indexes[face_index],
+        )
+        assert far_point is not None
+        axis_vectors.append(far_point - fitted[face_index][common_corner_indexes[face_index]])
+
+    projection_moment = sum(np.outer(vector, vector) for vector in axis_vectors)
+    isotropic_moment = np.eye(2, dtype=np.float32) * (float(np.trace(projection_moment)) / 2.0)
+    assert np.allclose(projection_moment, isotropic_moment, rtol=0.0, atol=1e-2)
+
+
+def test_projected_cube_fit_ignores_masks_after_shared_sides_are_set():
+    face_masks = projected_cube_face_masks()
+    parallelograms = [
+        piece_seg_script._face_parallelogram_points(mask, roi_shape=(120, 120))
+        for mask in face_masks
+    ]
+    assert all(quad is not None for quad in parallelograms)
+    reconciled = piece_seg_script._reconcile_shared_face_parallelogram_sides(
+        parallelograms,
+        roi_shape=(120, 120),
+    )
+    occluded_masks = []
+    for mask in face_masks:
+        occluded = mask.copy()
+        occluded[:60, :60] = False
+        occluded_masks.append(occluded)
+
+    edge_indexes_by_face = [[] for _ in range(3)]
+    matches_by_pair = {}
+    for left_index, right_index in ((0, 1), (0, 2), (1, 2)):
+        match = piece_seg_script._closest_compatible_quad_edges(
+            reconciled[left_index],
+            reconciled[right_index],
+            max_distance=20.0,
+        )
+        assert match is not None
+        left_edge_index, right_edge_index, _right_reversed = match
+        edge_indexes_by_face[left_index].append(left_edge_index)
+        edge_indexes_by_face[right_index].append(right_edge_index)
+        matches_by_pair[(left_index, right_index)] = match
+
+    common_corner_indexes = []
+    for edge_indexes in edge_indexes_by_face:
+        corner_index = piece_seg_script._quad_common_corner_index_for_adjacent_edges(
+            edge_indexes[0],
+            edge_indexes[1],
+        )
+        assert corner_index is not None
+        common_corner_indexes.append(corner_index)
+
+    centered = [quad.copy() for quad in reconciled]
+    shared_center = np.mean(
+        np.asarray(
+            [
+                centered[face_index][corner_index]
+                for face_index, corner_index in enumerate(common_corner_indexes)
+            ],
+            dtype=np.float32,
+        ),
+        axis=0,
+    )
+    for face_index, corner_index in enumerate(common_corner_indexes):
+        centered[face_index][corner_index] = shared_center
+
+    fitted = piece_seg_script._fit_projected_cube_quads_from_shared_sides(
+        centered,
+        face_masks,
+        edge_indexes_by_face,
+        matches_by_pair,
+        common_corner_indexes,
+        shared_center,
+        roi_shape=(120, 120),
+    )
+    fitted_with_occlusion = piece_seg_script._fit_projected_cube_quads_from_shared_sides(
+        centered,
+        occluded_masks,
+        edge_indexes_by_face,
+        matches_by_pair,
+        common_corner_indexes,
+        shared_center,
+        roi_shape=(120, 120),
+    )
+
+    assert all(
+        np.allclose(quad, occluded_quad)
+        for quad, occluded_quad in zip(fitted, fitted_with_occlusion)
+    )
+
+
+def test_orthogonal_fit_score_prefers_one_fully_covered_face_over_compromise():
+    masks = []
+    for bounds in ((10, 10, 42, 42), (10, 10, 30, 42), (10, 10, 42, 28)):
+        mask = np.zeros((64, 64), dtype=bool)
+        x1, y1, x2, y2 = bounds
+        mask[y1:y2, x1:x2] = True
+        masks.append(mask)
+
+    full_face_quad = np.asarray(
+        [[10.0, 10.0], [42.0, 10.0], [42.0, 42.0], [10.0, 42.0]],
+        dtype=np.float32,
+    )
+    compromise_quad = np.asarray(
+        [[10.0, 10.0], [33.0, 10.0], [33.0, 33.0], [10.0, 33.0]],
+        dtype=np.float32,
+    )
+
+    reliable_face_score = piece_seg_script._orthogonal_quad_mask_fit_score(
+        [full_face_quad, full_face_quad, full_face_quad],
+        masks,
+        roi_shape=(64, 64),
+    )
+    compromise_score = piece_seg_script._orthogonal_quad_mask_fit_score(
+        [compromise_quad, compromise_quad, compromise_quad],
+        masks,
+        roi_shape=(64, 64),
+    )
+
+    assert reliable_face_score > compromise_score
 
 
 def test_outer_face_corner_slides_toward_center_to_reduce_spillover():

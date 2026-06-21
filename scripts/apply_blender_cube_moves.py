@@ -66,6 +66,10 @@ BACKGROUND_CUBIE_UP_RANGE = (-6, 6)
 BACKGROUND_CUBIE_SCALE_RANGE = (0.65, 1.05)
 DEFAULT_BACKGROUND_CUBIE_PROBABILITY = 0.0
 DEFAULT_MAX_BACKGROUND_CUBIES = 3
+FALSE_CUBIE_COLLECTION_NAME = "SyntheticFalseCubies"
+FALSE_CUBIE_PREFIX = "SyntheticFalseCubie"
+FALSE_CUBIE_COLOR_MATERIAL_NAMES = ("White", "Yellow", "Red", "Orange", "Blue", "Green")
+DEFAULT_FALSE_CUBIE_PROBABILITY = 1.0
 DEFAULT_CUBE_ROTATIONAL_BLUR_PROBABILITY = 0.0
 DEFAULT_MAX_CUBE_ROTATIONAL_BLUR_DEGREES = 8.0
 DEFAULT_CUBE_ROTATIONAL_BLUR_SAMPLES = 7
@@ -327,10 +331,24 @@ def clear_background_cubies() -> None:
             bpy.data.objects.remove(obj, do_unlink=True)
 
 
+def clear_false_cubies() -> None:
+    for obj in list(bpy.data.objects):
+        if obj.name.startswith(FALSE_CUBIE_PREFIX):
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+
 def background_cubie_collection() -> bpy.types.Collection:
     collection = bpy.data.collections.get(BACKGROUND_CUBIE_COLLECTION_NAME)
     if collection is None:
         collection = bpy.data.collections.new(BACKGROUND_CUBIE_COLLECTION_NAME)
+        bpy.context.scene.collection.children.link(collection)
+    return collection
+
+
+def false_cubie_collection() -> bpy.types.Collection:
+    collection = bpy.data.collections.get(FALSE_CUBIE_COLLECTION_NAME)
+    if collection is None:
+        collection = bpy.data.collections.new(FALSE_CUBIE_COLLECTION_NAME)
         bpy.context.scene.collection.children.link(collection)
     return collection
 
@@ -379,6 +397,125 @@ def randomize_background_cubies(
 
     bpy.context.view_layer.update()
     return count
+
+
+def camera_visible_face_labels(axes: dict[str, Vector], visible_normals: list[Vector]) -> set[str]:
+    visible_keys = {axis_key(normal) for normal in visible_normals}
+    return {
+        face
+        for face, axis in axes.items()
+        if axis_key(axis) in visible_keys
+    }
+
+
+def cubie_outer_face_labels(obj: bpy.types.Object, axes: dict[str, Vector]) -> set[str]:
+    return {
+        face
+        for face, axis in axes.items()
+        if round(obj.location.dot(axis)) == 1
+    }
+
+
+def false_cubie_candidates(
+    objects: list[bpy.types.Object],
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    visible_normals = visible_world_normals()
+    axes = camera_relative_axes(visible_normals)
+    visible_faces = camera_visible_face_labels(axes, visible_normals)
+    candidates = []
+
+    for obj in objects:
+        cubie_faces = cubie_outer_face_labels(obj, axes)
+        visible_cubie_faces = cubie_faces & visible_faces
+        hidden_cubie_faces = cubie_faces - visible_faces
+        if not visible_cubie_faces or not hidden_cubie_faces:
+            continue
+        for face in sorted(hidden_cubie_faces):
+            candidates.append({
+                "target": obj,
+                "face": face,
+                "axis": axes[face],
+                "target_faces": sorted(cubie_faces),
+                "target_visible_faces": sorted(visible_cubie_faces),
+            })
+
+    return candidates, {
+        "visible_normals": [[normal.x, normal.y, normal.z] for normal in visible_normals],
+        "axes": {name: [axis.x, axis.y, axis.z] for name, axis in axes.items()},
+        "visible_faces": sorted(visible_faces),
+        "candidate_count": len(candidates),
+    }
+
+
+def random_false_cubie_material() -> bpy.types.Material:
+    missing = [
+        name
+        for name in FALSE_CUBIE_COLOR_MATERIAL_NAMES
+        if bpy.data.materials.get(name) is None
+    ]
+    if missing:
+        raise ValueError(
+            "Missing false cubie color materials in Blender file: "
+            + ", ".join(missing)
+        )
+    return bpy.data.materials[random.choice(FALSE_CUBIE_COLOR_MATERIAL_NAMES)]
+
+
+def set_cubie_solid_material(obj: bpy.types.Object, material: bpy.types.Material) -> None:
+    obj.data.materials.clear()
+    obj.data.materials.append(material)
+    for polygon in obj.data.polygons:
+        polygon.material_index = 0
+
+
+def randomize_false_cubie(
+    source_objects: list[bpy.types.Object],
+    probability: float,
+) -> dict[str, object] | None:
+    clear_false_cubies()
+    if probability <= 0.0 or random.random() >= probability:
+        return None
+
+    candidates, geometry = false_cubie_candidates(source_objects)
+    if not candidates:
+        return {
+            **geometry,
+            "placed": False,
+            "reason": "no_candidate_faces",
+        }
+
+    source = random.choice(source_objects)
+    candidate = random.choice(candidates)
+    target = candidate["target"]
+    face = str(candidate["face"])
+    axis = candidate["axis"]
+    material = random_false_cubie_material()
+
+    cubie = source.copy()
+    cubie.data = source.data.copy()
+    cubie.animation_data_clear()
+    cubie.name = f"{FALSE_CUBIE_PREFIX}.000"
+    cubie.location = target.location + axis
+    cubie.rotation_mode = "QUATERNION"
+    cubie.rotation_quaternion = source.rotation_quaternion.copy()
+    cubie.scale = (1.0, 1.0, 1.0)
+    set_cubie_solid_material(cubie, material)
+
+    false_cubie_collection().objects.link(cubie)
+    bpy.context.view_layer.update()
+
+    return {
+        **geometry,
+        "placed": True,
+        "name": cubie.name,
+        "source": source.name,
+        "target": target.name,
+        "color": material.name,
+        "face": face,
+        "target_faces": candidate["target_faces"],
+        "target_visible_faces": candidate["target_visible_faces"],
+        "location": [cubie.location.x, cubie.location.y, cubie.location.z],
+    }
 
 
 def hand_objects() -> dict[str, bpy.types.Object]:
@@ -477,8 +614,10 @@ def randomize_scene(
     scramble_length: int = DEFAULT_SCRAMBLE_LENGTH,
     background_cubie_probability: float = DEFAULT_BACKGROUND_CUBIE_PROBABILITY,
     max_background_cubies: int = DEFAULT_MAX_BACKGROUND_CUBIES,
-) -> tuple[list[str], int, dict[str, object]]:
+    false_cubie_probability: float = DEFAULT_FALSE_CUBIE_PROBABILITY,
+) -> tuple[list[str], int, dict[str, object], dict[str, object] | None]:
     clear_background_cubies()
+    clear_false_cubies()
     objects = cube_objects()
     reset_cube(objects)
 
@@ -500,7 +639,11 @@ def randomize_scene(
         probability=background_cubie_probability,
         max_count=max_background_cubies,
     )
-    return moves, background_cubies, camera_randomization
+    false_cubie = randomize_false_cubie(
+        objects,
+        probability=false_cubie_probability,
+    )
+    return moves, background_cubies, camera_randomization, false_cubie
 
 
 def configure_render(width: int, height: int) -> None:
@@ -853,7 +996,7 @@ def render_face_mask(path: Path | None, objects: list[bpy.types.Object]) -> tupl
     width = scene.render.resolution_x
     height = scene.render.resolution_y
     depsgraph = bpy.context.evaluated_depsgraph_get()
-    cubie_names = {obj.name for obj in cube_objects()}
+    cubie_names = {obj.name for obj in objects}
     raw_pixels = bytearray(width * height)
 
     bpy.context.view_layer.update()
@@ -966,6 +1109,7 @@ def generate_dataset(
     height: int,
     background_cubie_probability: float,
     max_background_cubies: int,
+    false_cubie_probability: float,
     cube_rotational_blur_probability: float,
     max_cube_rotational_blur_degrees: float,
     cube_rotational_blur_samples: int,
@@ -983,14 +1127,19 @@ def generate_dataset(
 
     metadata = []
     for index in range(count):
-        moves, background_cubies, camera_randomization = randomize_scene(
+        moves, background_cubies, camera_randomization, false_cubie = randomize_scene(
             scramble_length,
             background_cubie_probability=background_cubie_probability,
             max_background_cubies=max_background_cubies,
+            false_cubie_probability=false_cubie_probability,
         )
         objects = cube_objects()
+        render_objects = list(objects)
+        if false_cubie is not None and false_cubie.get("placed"):
+            if false_cubie_object := bpy.data.objects.get(str(false_cubie["name"])):
+                render_objects.append(false_cubie_object)
 
-        stem = f"{(index):06d}"
+        stem = f"{(index + 1000):06d}"
         image_path = images_dir / f"{stem}.png"
         mask_path = masks_dir / f"{stem}.png" if masks_dir is not None else None
         label_path = labels_dir / f"{stem}.txt"
@@ -1001,7 +1150,7 @@ def generate_dataset(
         try:
             rotational_blur = render_cube_rotational_blur_png(
                 image_path,
-                objects,
+                render_objects,
                 probability=cube_rotational_blur_probability,
                 max_degrees=max_cube_rotational_blur_degrees,
                 samples=cube_rotational_blur_samples,
@@ -1019,6 +1168,7 @@ def generate_dataset(
             "cubie_labels": {obj.name: obj.pass_index for obj in objects},
             "camera": camera_randomization,
             "background_cubies": background_cubies,
+            "false_cubie": false_cubie,
             "cube_rotational_blur": rotational_blur,
             "hands": hand_randomization,
             "face_geometry": face_geometry,
@@ -1031,6 +1181,7 @@ def generate_dataset(
             f"Wrote {image_path}{mask_message}, and {label_path} "
             f"with {len(yolo_lines)} face objects, "
             f"{background_cubies} background cubies "
+            f"{'with' if false_cubie and false_cubie.get('placed') else 'without'} false cubie "
             f"and {'rotational blur' if rotational_blur else 'no rotational blur'}"
         )
 
@@ -1066,6 +1217,15 @@ def cli_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_MAX_BACKGROUND_CUBIES,
         help="Maximum number of unlabeled background cubie distractors when enabled.",
+    )
+    parser.add_argument(
+        "--false-cubie-probability",
+        type=float,
+        default=DEFAULT_FALSE_CUBIE_PROBABILITY,
+        help=(
+            "Probability of adding one unlabeled cubie attached to a hidden exterior "
+            "face of a partially visible cubie."
+        ),
     )
     parser.add_argument(
         "--cube-rotational-blur-probability",
@@ -1110,6 +1270,7 @@ def main() -> None:
         height=args.height,
         background_cubie_probability=args.background_cubie_probability,
         max_background_cubies=args.max_background_cubies,
+        false_cubie_probability=args.false_cubie_probability,
         cube_rotational_blur_probability=args.cube_rotational_blur_probability,
         max_cube_rotational_blur_degrees=args.max_cube_rotational_blur_degrees,
         cube_rotational_blur_samples=args.cube_rotational_blur_samples,

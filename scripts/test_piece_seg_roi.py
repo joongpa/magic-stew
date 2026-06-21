@@ -1582,7 +1582,7 @@ def _fit_projected_cube_quads_from_shared_sides(
     roi_shape: tuple[int, int],
 ) -> list[np.ndarray]:
     axis_by_face_edge: list[dict[int, np.ndarray]] = [dict() for _ in quads]
-    axis_vectors = []
+    axis_records = []
     for (left_index, right_index), match in matches_by_pair.items():
         left_edge_index, right_edge_index, _right_reversed = match
         left_far = _quad_edge_far_point_from_common_corner(
@@ -1602,39 +1602,84 @@ def _fit_projected_cube_quads_from_shared_sides(
         length = float(np.linalg.norm(vector))
         if length <= 1e-6:
             return quads
-        axis_vectors.append(vector)
-        axis_by_face_edge[left_index][left_edge_index] = vector
-        axis_by_face_edge[right_index][right_edge_index] = vector
+        axis_records.append((left_index, left_edge_index, right_index, right_edge_index, vector, length))
 
-    if len(axis_vectors) != MAX_FACE_COUNT:
+    if len(axis_records) != MAX_FACE_COUNT:
         return quads
 
-    initial_scale = 1.0
-    min_scale = 0.65
-    max_scale = 1.35
-    best_quads = quads
-    best_score = float("-inf")
-    for scale in np.linspace(min_scale, max_scale, 57):
-        candidate_quads = _projected_cube_quads_for_scale(
-            edge_indexes_by_face,
-            axis_by_face_edge,
-            common_corner_indexes,
-            shared_center,
-            float(scale),
-            fallback_quads=quads,
-        )
-        score = _orthogonal_quad_mask_fit_score(
-            candidate_quads,
-            face_masks,
-            roi_shape=roi_shape,
-        )
-        if score > best_score or (
-            score == best_score
-            and abs(float(scale) - initial_scale) < abs(_projected_cube_scale_from_reference(best_quads, quads) - initial_scale)
-        ):
-            best_score = score
-            best_quads = candidate_quads
-    return best_quads
+    basis_vectors = _orthographic_projected_cube_basis_vectors(
+        [record[4] for record in axis_records],
+    )
+    if basis_vectors is None:
+        return quads
+
+    for record, basis_vector in zip(axis_records, basis_vectors):
+        left_index, left_edge_index, right_index, right_edge_index, _vector, _length = record
+        axis_by_face_edge[left_index][left_edge_index] = basis_vector
+        axis_by_face_edge[right_index][right_edge_index] = basis_vector
+
+    observed_axis_vectors = [record[4] for record in axis_records]
+    scale = _projected_cube_anchor_scale(basis_vectors, observed_axis_vectors)
+    return _projected_cube_quads_for_scale(
+        edge_indexes_by_face,
+        axis_by_face_edge,
+        common_corner_indexes,
+        shared_center,
+        scale,
+        fallback_quads=quads,
+    )
+
+
+def _projected_cube_anchor_scale(
+    basis_vectors: list[np.ndarray],
+    observed_axis_vectors: list[np.ndarray],
+) -> float:
+    numerator = 0.0
+    denominator = 0.0
+    for basis_vector, observed_vector in zip(basis_vectors, observed_axis_vectors):
+        basis_vector = np.asarray(basis_vector, dtype=np.float32).reshape(2)
+        observed_vector = np.asarray(observed_vector, dtype=np.float32).reshape(2)
+        numerator += float(np.dot(basis_vector, observed_vector))
+        denominator += float(np.dot(basis_vector, basis_vector))
+    if denominator <= 1e-6:
+        return 1.0
+    return max(1.0, numerator / denominator)
+
+
+def _orthographic_projected_cube_basis_vectors(axis_vectors: list[np.ndarray]) -> list[np.ndarray] | None:
+    unit_vectors = []
+    angles = []
+    for vector in axis_vectors:
+        vector = np.asarray(vector, dtype=np.float32).reshape(2)
+        length = float(np.linalg.norm(vector))
+        if length <= 1e-6:
+            return None
+        unit_vector = vector / length
+        unit_vectors.append(unit_vector)
+        angles.append(float(np.arctan2(unit_vector[1], unit_vector[0])))
+
+    constraints = np.vstack(
+        [
+            np.cos(np.asarray(angles, dtype=np.float32) * 2.0),
+            np.sin(np.asarray(angles, dtype=np.float32) * 2.0),
+        ],
+    )
+    _u, _s, vh = np.linalg.svd(constraints)
+    squared_lengths = vh[-1].astype(np.float32)
+    if np.all(squared_lengths < 0):
+        squared_lengths = -squared_lengths
+    if np.any(squared_lengths <= 1e-5):
+        return None
+
+    lengths = np.sqrt(squared_lengths)
+    median_length = float(np.median(lengths))
+    if median_length <= 1e-6:
+        return None
+    lengths = lengths / median_length
+    return [
+        np.asarray(unit_vector * length, dtype=np.float32)
+        for unit_vector, length in zip(unit_vectors, lengths)
+    ]
 
 
 def _projected_cube_quads_for_scale(
@@ -1698,28 +1743,6 @@ def _quad_edge_far_point_from_common_corner(
     if far_index is None:
         return None
     return quad[far_index]
-
-
-def _projected_cube_scale_from_reference(
-    candidate_quads: list[np.ndarray],
-    reference_quads: list[np.ndarray],
-) -> float:
-    candidate_lengths = [
-        _quad_edge_length(quad, edge_index)
-        for quad in candidate_quads
-        for edge_index in range(4)
-    ]
-    reference_lengths = [
-        _quad_edge_length(quad, edge_index)
-        for quad in reference_quads
-        for edge_index in range(4)
-    ]
-    if not candidate_lengths or not reference_lengths:
-        return 1.0
-    reference_mean = float(np.mean(reference_lengths))
-    if reference_mean <= 1e-6:
-        return 1.0
-    return float(np.mean(candidate_lengths) / reference_mean)
 
 
 def _quad_edge_far_index_from_common_corner(edge_index: int, common_corner_index: int) -> int | None:
@@ -1822,7 +1845,7 @@ def _orthogonal_quad_mask_fit_score(
     ]
     if not face_scores:
         return float("-inf")
-    return float(max(face_scores) * 10.0 + sum(face_scores) * 0.1)
+    return float(max(face_scores) * 20.0 + sum(face_scores) * 0.02)
 
 
 def _quad_soft_fit_score(
@@ -1841,7 +1864,9 @@ def _quad_soft_fit_score(
     coverage = float(overlap) / float(mask_area)
     spillover_ratio = float(spillover) / float(polygon_area)
     missed_ratio = float(missed) / float(mask_area)
-    return float(coverage * 1000.0 - spillover_ratio * 300.0 - missed_ratio * 900.0)
+    full_coverage_bonus = 5000.0 if missed == 0 else 0.0
+    missed_penalty = missed_ratio * 5000.0 + missed
+    return float(full_coverage_bonus + coverage * 1000.0 - spillover_ratio * 700.0 - missed_penalty)
 
 
 def _quad_edge_length(quad: np.ndarray, edge_index: int) -> float:
