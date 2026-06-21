@@ -28,6 +28,7 @@ import tempfile
 import urllib.request
 
 import bpy
+from bpy_extras.object_utils import world_to_camera_view
 from mathutils import Matrix, Quaternion, Vector
 
 import site
@@ -92,18 +93,13 @@ SOLVED_LOCATION_PROP = "synthetic_solved_location"
 SOLVED_ROTATION_PROP = "synthetic_solved_rotation"
 DEFAULT_OUTPUT_DIR = "data/synthetic_cube_dataset"
 DEFAULT_IMAGE_SIZE = 512
-CLASS_NAMES = ["face"]
-VISIBLE_FACE_NAMES = ["U", "F", "R"]
-FACE_MASK_VALUE_BY_FACE = {face: index + 1 for index, face in enumerate(VISIBLE_FACE_NAMES)}
-FACE_BY_MASK_VALUE = {mask_value: face for face, mask_value in FACE_MASK_VALUE_BY_FACE.items()}
-MASK_COLOR_BGR_BY_FACE = {
-    "U": (255, 255, 255),
-    "F": (0, 255, 0),
-    "R": (0, 0, 255),
-}
-MIN_VISIBLE_FACE_AREA_PX = 8
-FACE_MASK_CLOSE_KERNEL_RATIO = 0.018
-MIN_FACE_MASK_CLOSE_KERNEL_PX = 3
+CLASS_NAMES = ["Corner", "edge"]
+CORNER_CLASS_ID = 0
+EDGE_CLASS_ID = 1
+KEYPOINT_BBOX_RADIUS_RATIO = 0.018
+MIN_KEYPOINT_BBOX_RADIUS_PX = 4
+POINT_VISIBILITY_LABELED_OCCLUDED = 1
+POINT_VISIBILITY_VISIBLE = 2
 
 
 def parse_axis(axis_name: str) -> Vector:
@@ -761,38 +757,127 @@ def render_cube_rotational_blur_png(
     }
 
 
-def camera_frame_bounds(camera: bpy.types.Object, scene: bpy.types.Scene) -> tuple[float, float, float, float, float]:
-    frame = camera.data.view_frame(scene=scene)
-    xs = [corner.x for corner in frame]
-    ys = [corner.y for corner in frame]
-    zs = [corner.z for corner in frame]
-    return min(xs), max(xs), min(ys), max(ys), sum(zs) / len(zs)
-
-
-def camera_ray(camera: bpy.types.Object, scene: bpy.types.Scene, x: int, y: int) -> tuple[Vector, Vector]:
-    width = scene.render.resolution_x
-    height = scene.render.resolution_y
-    left, right, bottom, top, frame_z = camera_frame_bounds(camera, scene)
-    u = (x + 0.5) / width
-    v = 1.0 - ((y + 0.5) / height)
-    frame_x = left + u * (right - left)
-    frame_y = bottom + v * (top - bottom)
-    camera_matrix = camera.matrix_world
-
-    if camera.data.type == "ORTHO":
-        origin = camera_matrix @ Vector((frame_x, frame_y, 0.0))
-        direction = (camera_matrix.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
-        return origin, direction
-
-    origin = camera_matrix.translation
-    direction = (camera_matrix.to_3x3() @ Vector((frame_x, frame_y, frame_z))).normalized()
-    return origin, direction
-
-
 def normalize_point(x: float, y: float, width: int, height: int) -> tuple[float, float]:
     return (
         max(0.0, min(x / width, 1.0)),
         max(0.0, min(y / height, 1.0)),
+    )
+
+
+def project_world_point(point: Vector, camera: bpy.types.Object, scene: bpy.types.Scene) -> tuple[float, float] | None:
+    co = world_to_camera_view(scene, camera, point)
+    if co.z < 0.0:
+        return None
+    width = scene.render.resolution_x
+    height = scene.render.resolution_y
+    x = co.x * width
+    y = (1.0 - co.y) * height
+    if x < 0.0 or x >= width or y < 0.0 or y >= height:
+        return None
+    return x, y
+
+
+def corner_keypoint_specs() -> list[dict[str, object]]:
+    specs = []
+    for x in (-1.5, 1.5):
+        for y in (-1.5, 1.5):
+            for z in (-1.5, 1.5):
+                point = Vector((x, y, z))
+                specs.append({
+                    "class_id": CORNER_CLASS_ID,
+                    "class": CLASS_NAMES[CORNER_CLASS_ID],
+                    "name": f"corner_{x:+.1f}_{y:+.1f}_{z:+.1f}",
+                    "point": point,
+                    "normals": [
+                        Vector((math.copysign(1.0, x), 0.0, 0.0)),
+                        Vector((0.0, math.copysign(1.0, y), 0.0)),
+                        Vector((0.0, 0.0, math.copysign(1.0, z))),
+                    ],
+                })
+    return specs
+
+
+def edge_keypoint_specs() -> list[dict[str, object]]:
+    specs = []
+    for zero_axis in range(3):
+        varying = [axis for axis in range(3) if axis != zero_axis]
+        for first in (-1.5, 1.5):
+            for second in (-1.5, 1.5):
+                coords = [0.0, 0.0, 0.0]
+                coords[varying[0]] = first
+                coords[varying[1]] = second
+                point = Vector(coords)
+                normals = []
+                for axis_index in varying:
+                    normal = [0.0, 0.0, 0.0]
+                    normal[axis_index] = math.copysign(1.0, coords[axis_index])
+                    normals.append(Vector(normal))
+                specs.append({
+                    "class_id": EDGE_CLASS_ID,
+                    "class": CLASS_NAMES[EDGE_CLASS_ID],
+                    "name": f"edge_{coords[0]:+.1f}_{coords[1]:+.1f}_{coords[2]:+.1f}",
+                    "point": point,
+                    "normals": normals,
+                })
+    return specs
+
+
+def cube_pose_keypoint_specs() -> list[dict[str, object]]:
+    return corner_keypoint_specs() + edge_keypoint_specs()
+
+
+def point_faces_camera(point: Vector, normals: list[Vector], camera_location: Vector) -> bool:
+    toward_camera = camera_location - point
+    return any(normal.dot(toward_camera) > 0.0 for normal in normals)
+
+
+def ray_to_point(camera: bpy.types.Object, point: Vector) -> tuple[Vector, Vector, float]:
+    origin = camera.matrix_world.translation
+    offset = point - origin
+    distance = offset.length
+    return origin, offset.normalized(), distance
+
+
+def hand_occludes_point(
+    point: Vector,
+    hand_names: set[str],
+    depsgraph: bpy.types.Depsgraph,
+    distance_tolerance: float = 0.02,
+) -> bool:
+    if not hand_names:
+        return False
+    scene = bpy.context.scene
+    camera = get_camera()
+    origin, direction, point_distance = ray_to_point(camera, point)
+    hit, location, _normal, _polygon_index, hit_object, _matrix = scene.ray_cast(
+        depsgraph,
+        origin,
+        direction,
+        distance=point_distance + distance_tolerance,
+    )
+    if not hit or hit_object is None:
+        return False
+    if hit_object.name not in hand_names:
+        return False
+    return (location - origin).length < point_distance - distance_tolerance
+
+
+def yolo_pose_line(
+    class_id: int,
+    x: float,
+    y: float,
+    visibility: int,
+    width: int,
+    height: int,
+) -> str:
+    radius = max(MIN_KEYPOINT_BBOX_RADIUS_PX, round(min(width, height) * KEYPOINT_BBOX_RADIUS_RATIO))
+    x_center, y_center = normalize_point(x, y, width, height)
+    bbox_width = min((radius * 2.0) / width, 1.0)
+    bbox_height = min((radius * 2.0) / height, 1.0)
+    kpt_x, kpt_y = normalize_point(x, y, width, height)
+    return (
+        f"{class_id} {x_center:.6f} {y_center:.6f} {bbox_width:.6f} {bbox_height:.6f} "
+        f"{kpt_x:.6f} {kpt_y:.6f} {visibility}"
     )
 
 
@@ -867,238 +952,104 @@ def camera_relative_axes(visible_normals: list[Vector]) -> dict[str, Vector]:
     }
 
 
-def material_pass_index_for_hit(
-    hit_object: bpy.types.Object,
-    polygon_index: int,
-    depsgraph: bpy.types.Depsgraph,
-) -> int:
-    actual_hit_object = hit_object.evaluated_get(depsgraph)
-    if polygon_index < 0 or polygon_index >= len(actual_hit_object.data.polygons):
-        return 0
-    material_index = actual_hit_object.data.polygons[polygon_index].material_index
-    if material_index < 0 or material_index >= len(actual_hit_object.material_slots):
-        return 0
-
-    material = actual_hit_object.material_slots[material_index].material
-    if material is None:
-        return 0
-    return int(material.pass_index)
-
-
-def camera_relative_face_for_normal(normal: Vector, axes: dict[str, Vector]) -> str | None:
-    normal_key = axis_key(normal)
-    for face in ("U", "F", "R"):
-        if axis_key(axes[face]) == normal_key:
-            return face
-    return None
-
-
-def face_mask_value(face: str) -> int:
-    return FACE_MASK_VALUE_BY_FACE[face]
-
-
-def face_class_id_for_mask_value(mask_value: int) -> int:
-    _ = mask_value
-    return 0
-
-
-def face_for_mask_value(mask_value: int) -> str:
-    return FACE_BY_MASK_VALUE[mask_value]
-
-
-def face_metadata_for_mask_value(mask_value: int) -> dict[str, object]:
-    return {
-        "mask_value": mask_value,
-        "class_id": face_class_id_for_mask_value(mask_value),
-        "class": CLASS_NAMES[0],
-        "face": face_for_mask_value(mask_value),
-    }
-
-
-def face_mask_value_for_hit(
-    hit_object: bpy.types.Object,
-    polygon_index: int,
-    normal: Vector,
-    axes: dict[str, Vector],
-    depsgraph: bpy.types.Depsgraph,
-) -> int:
-    if material_pass_index_for_hit(hit_object, polygon_index, depsgraph) <= 0:
-        return 0
-    face = camera_relative_face_for_normal(normal, axes)
-    if face is None:
-        return 0
-    return face_mask_value(face)
-
-
-def outer_face_mask_pixels(pixels: bytearray, width: int, height: int) -> bytearray:
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
-        raise RuntimeError(
-            "OpenCV and NumPy are required to write face segmentation masks. "
-            "Install cv2 and numpy in Blender's Python environment before generating training data."
-        ) from None
-
-    source = np.frombuffer(bytes(pixels), dtype=np.uint8).reshape((height, width))
-    output = np.zeros((height, width), dtype=np.uint8)
-    kernel_size = max(
-        MIN_FACE_MASK_CLOSE_KERNEL_PX,
-        round(min(width, height) * FACE_MASK_CLOSE_KERNEL_RATIO),
-    )
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-
-    for mask_value in sorted(int(value) for value in np.unique(source) if int(value) > 0):
-        binary = (source == mask_value).astype(np.uint8) * 255
-        if int(cv2.countNonZero(binary)) < MIN_VISIBLE_FACE_AREA_PX:
-            continue
-        closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
-        contours, hierarchy = cv2.findContours(closed, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-        if hierarchy is None:
-            continue
-        for contour_index, contour in enumerate(contours):
-            if cv2.contourArea(contour) < MIN_VISIBLE_FACE_AREA_PX:
-                continue
-            parent_index = int(hierarchy[0][contour_index][3])
-            fill_value = 0 if parent_index >= 0 else mask_value
-            cv2.drawContours(output, [contour], -1, fill_value, thickness=-1)
-    return bytearray(output.reshape(-1).tolist())
-
-
-def write_color_mask_png(path: Path, pixels: bytearray, width: int, height: int) -> None:
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
-        raise RuntimeError(
-            "OpenCV and NumPy are required to write face segmentation masks. "
-            "Install cv2 and numpy in Blender's Python environment before generating training data."
-        ) from None
-
-    source = np.frombuffer(bytes(pixels), dtype=np.uint8).reshape((height, width))
-    output = np.zeros((height, width, 3), dtype=np.uint8)
-    for mask_value in np.unique(source):
-        mask_value = int(mask_value)
-        if mask_value <= 0:
-            continue
-        face = face_for_mask_value(mask_value)
-        output[source == mask_value] = MASK_COLOR_BGR_BY_FACE[face]
-    cv2.imwrite(str(path), output)
-
-
-def render_face_mask(path: Path | None, objects: list[bpy.types.Object]) -> tuple[bytearray, dict[str, object]]:
-    visible_normals = visible_world_normals()
-    axes = camera_relative_axes(visible_normals)
-    camera = get_camera()
+def render_pose_keypoints(path: Path | None) -> tuple[list[str], list[dict[str, object]], dict[str, object]]:
     scene = bpy.context.scene
+    camera = get_camera()
     width = scene.render.resolution_x
     height = scene.render.resolution_y
     depsgraph = bpy.context.evaluated_depsgraph_get()
-    cubie_names = {obj.name for obj in objects}
-    raw_pixels = bytearray(width * height)
+    visible_hand_names = {
+        obj.name
+        for obj in hand_objects().values()
+        if not obj.hide_get() and not obj.hide_viewport and not obj.hide_render
+    }
+    lines = []
+    pose_objects = []
 
     bpy.context.view_layer.update()
-    for y in range(height):
-        for x in range(width):
-            origin, direction = camera_ray(camera, scene, x, y)
-            hit, _location, normal, polygon_index, hit_object, _matrix = scene.ray_cast(
-                depsgraph,
-                origin,
-                direction,
-            )
-            if not hit or hit_object is None or hit_object.name not in cubie_names:
-                continue
-            raw_pixels[y * width + x] = face_mask_value_for_hit(
-                hit_object,
-                polygon_index,
-                normal,
-                axes,
-                depsgraph,
-            )
+    for spec in cube_pose_keypoint_specs():
+        point = spec["point"]
+        if not isinstance(point, Vector):
+            continue
+        normals = spec["normals"]
+        if not isinstance(normals, list) or not point_faces_camera(point, normals, camera.location):
+            continue
+        projected = project_world_point(point, camera, scene)
+        if projected is None:
+            continue
 
-    pixels = outer_face_mask_pixels(raw_pixels, width, height)
+        x, y = projected
+        hand_occluded = hand_occludes_point(point, visible_hand_names, depsgraph)
+        visibility = POINT_VISIBILITY_LABELED_OCCLUDED if hand_occluded else POINT_VISIBILITY_VISIBLE
+        class_id = int(spec["class_id"])
+        lines.append(yolo_pose_line(class_id, x, y, visibility, width, height))
+        pose_objects.append({
+            "class_id": class_id,
+            "class": spec["class"],
+            "name": spec["name"],
+            "world_point": [point.x, point.y, point.z],
+            "pixel_point": [x, y],
+            "normalized_point": list(normalize_point(x, y, width, height)),
+            "visibility": visibility,
+            "hand_occluded": hand_occluded,
+        })
+
     if path is not None:
-        write_color_mask_png(path, pixels, width, height)
-    return pixels, {
-        "visible_normals": [[normal.x, normal.y, normal.z] for normal in visible_normals],
-        "axes": {name: [axis.x, axis.y, axis.z] for name, axis in axes.items()},
+        write_pose_keypoint_mask(path, pose_objects, width, height)
+
+    return lines, pose_objects, {
+        "keypoint_shape": [1, 3],
+        "visible_hands": sorted(visible_hand_names),
+        "candidates": len(cube_pose_keypoint_specs()),
     }
 
 
-def yolo_face_objects_with_cv2(pixels: bytearray, width: int, height: int) -> tuple[list[str], list[dict[str, object]]]:
+def write_pose_keypoint_mask(
+    path: Path,
+    pose_objects: list[dict[str, object]],
+    width: int,
+    height: int,
+) -> None:
     try:
         import cv2
         import numpy as np
     except ImportError:
         raise RuntimeError(
-            "OpenCV and NumPy are required to write non-rectangular YOLO segmentation labels. "
+            "OpenCV and NumPy are required to write keypoint visualization masks. "
             "Install cv2 and numpy in Blender's Python environment before generating training data."
         ) from None
 
-    mask = np.frombuffer(bytes(pixels), dtype=np.uint8).reshape((height, width))
-    face_objects: dict[str, dict[str, object]] = {}
-    for mask_value in sorted(int(value) for value in np.unique(mask) if int(value) > 0):
-        binary = (mask == mask_value).astype(np.uint8) * 255
-        contours, _hierarchy = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for component_index, contour in enumerate(contours):
-            area = cv2.contourArea(contour)
-            if area < MIN_VISIBLE_FACE_AREA_PX:
-                continue
+    output = np.zeros((height, width, 3), dtype=np.uint8)
+    colors = {
+        CORNER_CLASS_ID: (255, 255, 255),
+        EDGE_CLASS_ID: (0, 255, 255),
+    }
+    for pose_object in pose_objects:
+        x, y = pose_object["pixel_point"]
+        visibility = int(pose_object["visibility"])
+        class_id = int(pose_object["class_id"])
+        color = colors.get(class_id, (128, 128, 128))
+        if visibility == POINT_VISIBILITY_LABELED_OCCLUDED:
+            color = (0, 0, 255)
+        center = (round(float(x)), round(float(y)))
+        cv2.circle(output, center, 5, color, thickness=-1, lineType=cv2.LINE_AA)
+        cv2.circle(output, center, 7, (0, 0, 0), thickness=1, lineType=cv2.LINE_AA)
+        cv2.putText(
+            output,
+            f"{pose_object['class']}:{visibility}",
+            (center[0] + 8, center[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
 
-            epsilon = 0.0008 * cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
-            if len(approx) < 3:
-                continue
-
-            metadata = face_metadata_for_mask_value(mask_value)
-            face = str(metadata["face"])
-            face_object = face_objects.setdefault(
-                face,
-                {
-                    "class_id": face_class_id_for_mask_value(mask_value),
-                    "class": CLASS_NAMES[0],
-                    "face": face,
-                    "segmentations": [],
-                    "visible_area_px": 0,
-                },
-            )
-            normalized_values = []
-            points = []
-            for x, y in approx:
-                nx, ny = normalize_point(float(x), float(y), width, height)
-                normalized_values.append(f"{nx:.6f}")
-                normalized_values.append(f"{ny:.6f}")
-                points.append((float(x), float(y)))
-            face_object["segmentations"].append({
-                **metadata,
-                "component_index": component_index,
-                "points": points,
-                "normalized_points": normalized_values,
-                "visible_area_px": int(area),
-            })
-            face_object["visible_area_px"] = int(face_object["visible_area_px"]) + int(area)
-
-    lines = []
-    objects = []
-    for face in VISIBLE_FACE_NAMES:
-        face_object = face_objects.get(face)
-        if face_object is None:
-            continue
-        values = [str(face_object["class_id"])]
-        for segmentation in face_object["segmentations"]:
-            values.extend(segmentation["normalized_points"])
-            del segmentation["normalized_points"]
-        lines.append(" ".join(values))
-        objects.append(face_object)
-    return lines, objects
+    cv2.imwrite(str(path), output)
 
 
-def write_yolo_segments(path: Path, pixels: bytearray, width: int, height: int) -> tuple[list[str], list[dict[str, object]]]:
-    lines, segments = yolo_face_objects_with_cv2(pixels, width, height)
+def write_yolo_pose(path: Path, lines: list[str]) -> None:
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-    return lines, segments
 
 
 def generate_dataset(
@@ -1139,7 +1090,7 @@ def generate_dataset(
             if false_cubie_object := bpy.data.objects.get(str(false_cubie["name"])):
                 render_objects.append(false_cubie_object)
 
-        stem = f"{(index + 1000):06d}"
+        stem = f"{(index):06d}"
         image_path = images_dir / f"{stem}.png"
         mask_path = masks_dir / f"{stem}.png" if masks_dir is not None else None
         label_path = labels_dir / f"{stem}.txt"
@@ -1155,8 +1106,8 @@ def generate_dataset(
                 max_degrees=max_cube_rotational_blur_degrees,
                 samples=cube_rotational_blur_samples,
             )
-            mask_pixels, face_geometry = render_face_mask(mask_path, objects)
-            yolo_lines, face_objects = write_yolo_segments(label_path, mask_pixels, width, height)
+            yolo_lines, pose_objects, pose_geometry = render_pose_keypoints(mask_path)
+            write_yolo_pose(label_path, yolo_lines)
         finally:
             restore_hand_objects(hands, hand_states)
 
@@ -1171,15 +1122,14 @@ def generate_dataset(
             "false_cubie": false_cubie,
             "cube_rotational_blur": rotational_blur,
             "hands": hand_randomization,
-            "face_geometry": face_geometry,
-            "faces": face_objects,
+            "pose_geometry": pose_geometry,
+            "keypoints": pose_objects,
             "objects": len(yolo_lines),
-            "segments": sum(len(face_object["segmentations"]) for face_object in face_objects),
         })
         mask_message = f", {mask_path}" if mask_path is not None else ""
         print(
             f"Wrote {image_path}{mask_message}, and {label_path} "
-            f"with {len(yolo_lines)} face objects, "
+            f"with {len(yolo_lines)} pose keypoint objects, "
             f"{background_cubies} background cubies "
             f"{'with' if false_cubie and false_cubie.get('placed') else 'without'} false cubie "
             f"and {'rotational blur' if rotational_blur else 'no rotational blur'}"
@@ -1192,6 +1142,7 @@ def generate_dataset(
         "path: " + str(output_dir.resolve()) + "\n"
         "train: images\n"
         "val: images\n"
+        "kpt_shape: [1, 3]\n"
         "names:\n"
         + "".join(f"  {index}: {name}\n" for index, name in enumerate(CLASS_NAMES)),
         encoding="utf-8",
