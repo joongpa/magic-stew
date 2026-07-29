@@ -93,11 +93,30 @@ SOLVED_LOCATION_PROP = "synthetic_solved_location"
 SOLVED_ROTATION_PROP = "synthetic_solved_rotation"
 DEFAULT_OUTPUT_DIR = "data/synthetic_cube_dataset"
 DEFAULT_IMAGE_SIZE = 512
-CLASS_NAMES = ["Corner", "edge"]
+CLASS_NAMES = ["corner", "edge"]
 CORNER_CLASS_ID = 0
 EDGE_CLASS_ID = 1
+CUBE_KEYPOINT_NAMES = (
+    "UBL", "UBR", "UFR", "UFL",
+    "DBL", "DBR", "DFR", "DFL",
+    "UBl", "UbR", "UFr", "UfL",
+    "UBr", "UfR", "UFl", "UbL",
+    "DBl", "DbR", "DFr", "DfL",
+    "DBr", "DfR", "DFl", "DbL",
+    "uBL", "uBR", "uFR", "uFL",
+    "dBL", "dBR", "dFR", "dFL",
+    "Ubl", "Ubr", "Ufr", "Ufl",
+    "Dbl", "Dbr", "Dfr", "Dfl",
+    "uBl", "ubR", "uFr", "ufL",
+    "dBl", "dbR", "dFr", "dfL",
+    "uBr", "ufR", "uFl", "ubL",
+    "dBr", "dfR", "dFl", "dbL",
+)
+KEYPOINT_COUNT = len(CUBE_KEYPOINT_NAMES)
+POSE_KEYPOINT_COUNT = 7
 KEYPOINT_BBOX_RADIUS_RATIO = 0.018
 MIN_KEYPOINT_BBOX_RADIUS_PX = 4
+POINT_VISIBILITY_UNLABELED = 0
 POINT_VISIBILITY_LABELED_OCCLUDED = 1
 POINT_VISIBILITY_VISIBLE = 2
 
@@ -777,53 +796,145 @@ def project_world_point(point: Vector, camera: bpy.types.Object, scene: bpy.type
     return x, y
 
 
-def corner_keypoint_specs() -> list[dict[str, object]]:
-    specs = []
-    for x in (-1.5, 1.5):
-        for y in (-1.5, 1.5):
-            for z in (-1.5, 1.5):
-                point = Vector((x, y, z))
-                specs.append({
-                    "class_id": CORNER_CLASS_ID,
-                    "class": CLASS_NAMES[CORNER_CLASS_ID],
-                    "name": f"corner_{x:+.1f}_{y:+.1f}_{z:+.1f}",
-                    "point": point,
-                    "normals": [
-                        Vector((math.copysign(1.0, x), 0.0, 0.0)),
-                        Vector((0.0, math.copysign(1.0, y), 0.0)),
-                        Vector((0.0, 0.0, math.copysign(1.0, z))),
-                    ],
-                })
-    return specs
+def cube_keypoint_coordinate(letter: str) -> tuple[int, float, Vector | None]:
+    mapping = {
+        "R": (0, 1.5, Vector((1.0, 0.0, 0.0))),
+        "r": (0, 0.5, None),
+        "L": (0, -1.5, Vector((-1.0, 0.0, 0.0))),
+        "l": (0, -0.5, None),
+        "B": (1, 1.5, Vector((0.0, 1.0, 0.0))),
+        "b": (1, 0.5, None),
+        "F": (1, -1.5, Vector((0.0, -1.0, 0.0))),
+        "f": (1, -0.5, None),
+        "U": (2, 1.5, Vector((0.0, 0.0, 1.0))),
+        "u": (2, 0.5, None),
+        "D": (2, -1.5, Vector((0.0, 0.0, -1.0))),
+        "d": (2, -0.5, None),
+    }
+    if letter not in mapping:
+        raise ValueError(f"Unsupported cube keypoint letter: {letter!r}")
+    return mapping[letter]
 
 
-def edge_keypoint_specs() -> list[dict[str, object]]:
-    specs = []
-    for zero_axis in range(3):
-        varying = [axis for axis in range(3) if axis != zero_axis]
-        for first in (-1.5, 1.5):
-            for second in (-1.5, 1.5):
-                coords = [0.0, 0.0, 0.0]
-                coords[varying[0]] = first
-                coords[varying[1]] = second
-                point = Vector(coords)
-                normals = []
-                for axis_index in varying:
-                    normal = [0.0, 0.0, 0.0]
-                    normal[axis_index] = math.copysign(1.0, coords[axis_index])
-                    normals.append(Vector(normal))
-                specs.append({
-                    "class_id": EDGE_CLASS_ID,
-                    "class": CLASS_NAMES[EDGE_CLASS_ID],
-                    "name": f"edge_{coords[0]:+.1f}_{coords[1]:+.1f}_{coords[2]:+.1f}",
-                    "point": point,
-                    "normals": normals,
-                })
-    return specs
+def cube_keypoint_spec(name: str) -> dict[str, object]:
+    coords: list[float | None] = [None, None, None]
+    normals = []
+    for letter in name:
+        axis_index, value, normal = cube_keypoint_coordinate(letter)
+        if coords[axis_index] is not None:
+            raise ValueError(f"Duplicate axis in cube keypoint name: {name}")
+        coords[axis_index] = value
+        if normal is not None:
+            normals.append(normal)
+    if any(value is None for value in coords):
+        raise ValueError(f"Cube keypoint name does not cover all axes: {name}")
+    return {
+        "name": name,
+        "point": Vector((float(coords[0]), float(coords[1]), float(coords[2]))),
+        "normals": normals,
+    }
+
+
+def cube_keypoint_coord_key(name: str) -> tuple[float, float, float]:
+    coords: list[float | None] = [None, None, None]
+    for letter in name:
+        axis_index, value, _normal = cube_keypoint_coordinate(letter)
+        if coords[axis_index] is not None:
+            raise ValueError(f"Duplicate axis in cube keypoint name: {name}")
+        coords[axis_index] = value
+    if any(value is None for value in coords):
+        raise ValueError(f"Cube keypoint name does not cover all axes: {name}")
+    return float(coords[0]), float(coords[1]), float(coords[2])
+
+
+def canonical_cube_keypoint_name(name: str) -> str:
+    names_by_coord = {
+        cube_keypoint_coord_key(keypoint_name): keypoint_name
+        for keypoint_name in CUBE_KEYPOINT_NAMES
+    }
+    return names_by_coord[cube_keypoint_coord_key(name)]
 
 
 def cube_pose_keypoint_specs() -> list[dict[str, object]]:
-    return corner_keypoint_specs() + edge_keypoint_specs()
+    return [cube_keypoint_spec(name) for name in CUBE_KEYPOINT_NAMES]
+
+
+def lowercase_letter(letter: str) -> str:
+    return letter.lower()
+
+
+def corner_piece_keypoint_names(corner_name: str) -> tuple[str, list[str], list[str]]:
+    if len(corner_name) != 3 or not corner_name.isupper():
+        raise ValueError(f"Corner keypoint name must contain three outer faces: {corner_name}")
+    edge_facing = [
+        canonical_cube_keypoint_name(
+            corner_name[:index] + lowercase_letter(corner_name[index]) + corner_name[index + 1 :]
+        )
+        for index in range(3)
+    ]
+    center_facing = []
+    for first_index, second_index in ((0, 1), (1, 2), (0, 2)):
+        letters = list(corner_name)
+        letters[first_index] = lowercase_letter(letters[first_index])
+        letters[second_index] = lowercase_letter(letters[second_index])
+        center_facing.append(canonical_cube_keypoint_name("".join(letters)))
+    return canonical_cube_keypoint_name(corner_name), edge_facing, center_facing
+
+
+def corner_keypoint_name_for_faces(corner_name: str, uppercase_faces: set[str]) -> str:
+    letters = [
+        face if face in uppercase_faces else lowercase_letter(face)
+        for face in corner_name
+    ]
+    return canonical_cube_keypoint_name("".join(letters))
+
+
+def edge_piece_keypoint_names(outer_faces: tuple[str, str], free_faces: tuple[str, str]) -> tuple[list[str], list[list[str]]]:
+    first_outer, second_outer = outer_faces
+    edge_line = [
+        canonical_cube_keypoint_name(
+            "".join(sorted((first_outer, second_outer, lowercase_letter(free_face)), key=axis_sort_key))
+        )
+        for free_face in free_faces
+    ]
+    center_sides = []
+    for lowered_index in range(2):
+        center_side = []
+        for free_face in free_faces:
+            letters = [first_outer, second_outer, lowercase_letter(free_face)]
+            letters[lowered_index] = lowercase_letter(letters[lowered_index])
+            center_side.append(canonical_cube_keypoint_name("".join(sorted(letters, key=axis_sort_key))))
+        center_sides.append(center_side)
+    return edge_line, center_sides
+
+
+def axis_sort_key(letter: str) -> int:
+    return {"R": 0, "r": 0, "L": 0, "l": 0, "B": 1, "b": 1, "F": 1, "f": 1, "U": 2, "u": 2, "D": 2, "d": 2}[letter]
+
+
+def edge_piece_name_specs() -> list[dict[str, object]]:
+    return [
+        {
+            "name": "".join(outer_faces),
+            "edge_line": edge_line,
+            "center_sides": center_sides,
+        }
+        for outer_faces, free_faces in (
+            (("U", "B"), ("L", "R")),
+            (("U", "R"), ("B", "F")),
+            (("U", "F"), ("L", "R")),
+            (("U", "L"), ("B", "F")),
+            (("D", "B"), ("L", "R")),
+            (("D", "R"), ("B", "F")),
+            (("D", "F"), ("L", "R")),
+            (("D", "L"), ("B", "F")),
+            (("B", "L"), ("U", "D")),
+            (("B", "R"), ("U", "D")),
+            (("F", "R"), ("U", "D")),
+            (("F", "L"), ("U", "D")),
+        )
+        for edge_line, center_sides in [edge_piece_keypoint_names(outer_faces, free_faces)]
+    ]
 
 
 def point_faces_camera(point: Vector, normals: list[Vector], camera_location: Vector) -> bool:
@@ -864,21 +975,147 @@ def hand_occludes_point(
 
 def yolo_pose_line(
     class_id: int,
-    x: float,
-    y: float,
-    visibility: int,
+    x_center: float,
+    y_center: float,
+    bbox_width: float,
+    bbox_height: float,
+    keypoints: list[tuple[float, float, int]],
     width: int,
     height: int,
 ) -> str:
+    normalized_x_center, normalized_y_center = normalize_point(x_center, y_center, width, height)
+    values = [
+        str(class_id),
+        f"{normalized_x_center:.6f}",
+        f"{normalized_y_center:.6f}",
+        f"{bbox_width / width:.6f}",
+        f"{bbox_height / height:.6f}",
+    ]
+    for keypoint_x, keypoint_y, visibility in keypoints:
+        if visibility == POINT_VISIBILITY_UNLABELED:
+            values.extend(["0.000000", "0.000000", str(visibility)])
+            continue
+        kpt_x, kpt_y = normalize_point(keypoint_x, keypoint_y, width, height)
+        values.extend([f"{kpt_x:.6f}", f"{kpt_y:.6f}", str(visibility)])
+    return " ".join(values)
+
+
+def keypoint_bbox(
+    projected_keypoints: list[tuple[float, float, int]],
+    width: int,
+    height: int,
+) -> tuple[float, float, float, float] | None:
+    labeled_points = [
+        (x, y)
+        for x, y, visibility in projected_keypoints
+        if visibility != POINT_VISIBILITY_UNLABELED
+    ]
+    if not labeled_points:
+        return None
+
     radius = max(MIN_KEYPOINT_BBOX_RADIUS_PX, round(min(width, height) * KEYPOINT_BBOX_RADIUS_RATIO))
-    x_center, y_center = normalize_point(x, y, width, height)
-    bbox_width = min((radius * 2.0) / width, 1.0)
-    bbox_height = min((radius * 2.0) / height, 1.0)
-    kpt_x, kpt_y = normalize_point(x, y, width, height)
-    return (
-        f"{class_id} {x_center:.6f} {y_center:.6f} {bbox_width:.6f} {bbox_height:.6f} "
-        f"{kpt_x:.6f} {kpt_y:.6f} {visibility}"
+    xs = [point[0] for point in labeled_points]
+    ys = [point[1] for point in labeled_points]
+    x1 = max(0.0, min(xs) - radius)
+    y1 = max(0.0, min(ys) - radius)
+    x2 = min(float(width), max(xs) + radius)
+    y2 = min(float(height), max(ys) + radius)
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0, max(1.0, x2 - x1), max(1.0, y2 - y1)
+
+
+def left_to_right_key(point: tuple[float, float, int]) -> tuple[float, float]:
+    return point[0], point[1]
+
+
+def clockwise_keypoints(
+    center: tuple[float, float, int],
+    keypoints: list[tuple[str, tuple[float, float, int]]],
+) -> list[tuple[str, tuple[float, float, int]]]:
+    center_x, center_y, _visibility = center
+    ordered = sorted(
+        keypoints,
+        key=lambda item: math.atan2(item[1][1] - center_y, item[1][0] - center_x),
     )
+    if not ordered:
+        return ordered
+    start_index = min(range(len(ordered)), key=lambda index: left_to_right_key(ordered[index][1]))
+    return ordered[start_index:] + ordered[:start_index]
+
+
+def rotate_sequence_to_start(values: list[str], start_value: str) -> list[str]:
+    if start_value not in values:
+        return values
+    start_index = values.index(start_value)
+    return values[start_index:] + values[:start_index]
+
+
+def unlabeled_pose_keypoint() -> tuple[float, float, int]:
+    return 0.0, 0.0, POINT_VISIBILITY_UNLABELED
+
+
+def projected_piece_keypoint(
+    name: str,
+    projected_by_name: dict[str, tuple[float, float, int]],
+) -> tuple[float, float, int]:
+    return projected_by_name.get(name, unlabeled_pose_keypoint())
+
+
+def pose_object_from_keypoints(
+    *,
+    class_id: int,
+    name: str,
+    keypoint_names: list[str],
+    projected_by_name: dict[str, tuple[float, float, int]],
+    metadata_by_name: dict[str, dict[str, object]],
+    width: int,
+    height: int,
+) -> tuple[str | None, dict[str, object] | None]:
+    projected_keypoints = [
+        projected_piece_keypoint(keypoint_name, projected_by_name)
+        for keypoint_name in keypoint_names
+    ]
+    while len(projected_keypoints) < POSE_KEYPOINT_COUNT:
+        projected_keypoints.append(unlabeled_pose_keypoint())
+
+    bbox = keypoint_bbox(projected_keypoints, width, height)
+    if bbox is None:
+        return None, None
+
+    x_center, y_center, bbox_width, bbox_height = bbox
+    line = yolo_pose_line(
+        class_id,
+        x_center,
+        y_center,
+        bbox_width,
+        bbox_height,
+        projected_keypoints,
+        width,
+        height,
+    )
+    keypoint_metadata = []
+    for index, keypoint_name in enumerate(keypoint_names):
+        source = metadata_by_name.get(keypoint_name)
+        if source is None:
+            continue
+        keypoint_metadata.append({
+            **source,
+            "index": index,
+            "label": str(index + 1),
+            "name": str(index + 1),
+        })
+    return line, {
+        "class_id": class_id,
+        "class": CLASS_NAMES[class_id],
+        "name": name,
+        "bbox_xyxy": [
+            x_center - bbox_width / 2.0,
+            y_center - bbox_height / 2.0,
+            x_center + bbox_width / 2.0,
+            y_center + bbox_height / 2.0,
+        ],
+        "keypoint_labels": [str(index + 1) for index in range(len(keypoint_names))],
+        "keypoints": keypoint_metadata,
+    }
 
 
 def axis_vector(axis_index: int, sign: float = 1.0) -> Vector:
@@ -967,40 +1204,116 @@ def render_pose_keypoints(path: Path | None) -> tuple[list[str], list[dict[str, 
     pose_objects = []
 
     bpy.context.view_layer.update()
-    for spec in cube_pose_keypoint_specs():
+    projected_by_name: dict[str, tuple[float, float, int]] = {}
+    metadata_by_name: dict[str, dict[str, object]] = {}
+    for index, spec in enumerate(cube_pose_keypoint_specs()):
         point = spec["point"]
         if not isinstance(point, Vector):
             continue
+        name = str(spec["name"])
         normals = spec["normals"]
-        if not isinstance(normals, list) or not point_faces_camera(point, normals, camera.location):
-            continue
         projected = project_world_point(point, camera, scene)
+        hand_occluded = False
         if projected is None:
-            continue
+            x, y = 0.0, 0.0
+            visibility = POINT_VISIBILITY_UNLABELED
+        elif not isinstance(normals, list) or not point_faces_camera(point, normals, camera.location):
+            x, y = projected
+            visibility = POINT_VISIBILITY_UNLABELED
+        else:
+            x, y = projected
+            hand_occluded = hand_occludes_point(point, visible_hand_names, depsgraph)
+            visibility = POINT_VISIBILITY_LABELED_OCCLUDED if hand_occluded else POINT_VISIBILITY_VISIBLE
 
-        x, y = projected
-        hand_occluded = hand_occludes_point(point, visible_hand_names, depsgraph)
-        visibility = POINT_VISIBILITY_LABELED_OCCLUDED if hand_occluded else POINT_VISIBILITY_VISIBLE
-        class_id = int(spec["class_id"])
-        lines.append(yolo_pose_line(class_id, x, y, visibility, width, height))
-        pose_objects.append({
-            "class_id": class_id,
-            "class": spec["class"],
-            "name": spec["name"],
+        projected_by_name[name] = (x, y, visibility)
+        metadata_by_name[name] = {
+            "index": index,
+            "name": name,
             "world_point": [point.x, point.y, point.z],
             "pixel_point": [x, y],
             "normalized_point": list(normalize_point(x, y, width, height)),
             "visibility": visibility,
             "hand_occluded": hand_occluded,
-        })
+        }
+
+    for piece_index, corner_name in enumerate([name for name in CUBE_KEYPOINT_NAMES if name.isupper()], start=1):
+        main_name = canonical_cube_keypoint_name(corner_name)
+        main_keypoint = projected_piece_keypoint(main_name, projected_by_name)
+        ordered_faces = [
+            face
+            for face, _point in clockwise_keypoints(
+                main_keypoint,
+                [
+                    (
+                        face,
+                        projected_piece_keypoint(
+                            corner_keypoint_name_for_faces(corner_name, {face}),
+                            projected_by_name,
+                        ),
+                    )
+                    for face in corner_name
+                ],
+            )
+        ]
+        ordered_faces = rotate_sequence_to_start(ordered_faces, corner_name[0])
+        ordered_edge_facing = [
+            corner_keypoint_name_for_faces(corner_name, {ordered_faces[index - 1], face})
+            for index, face in enumerate(ordered_faces)
+        ]
+        ordered_center_facing = [
+            corner_keypoint_name_for_faces(corner_name, {face})
+            for face in ordered_faces
+        ]
+        line, pose_object = pose_object_from_keypoints(
+            class_id=CORNER_CLASS_ID,
+            name=f"corner_{piece_index}",
+            keypoint_names=[main_name, *ordered_edge_facing, *ordered_center_facing],
+            projected_by_name=projected_by_name,
+            metadata_by_name=metadata_by_name,
+            width=width,
+            height=height,
+        )
+        if line is not None and pose_object is not None:
+            lines.append(line)
+            pose_objects.append(pose_object)
+
+    for piece_index, edge_spec in enumerate(edge_piece_name_specs(), start=1):
+        edge_line_with_source_indexes = sorted(
+            [
+                (source_index, str(name), projected_piece_keypoint(str(name), projected_by_name))
+                for source_index, name in enumerate(edge_spec["edge_line"])
+            ],
+            key=lambda item: left_to_right_key(item[2]),
+        )
+        edge_line_names = [name for _source_index, name, _point in edge_line_with_source_indexes]
+        edge_line_source_indexes = [source_index for source_index, _name, _point in edge_line_with_source_indexes]
+        center_side_names = [
+            str(center_side[source_index])
+            for center_side in edge_spec["center_sides"]
+            for source_index in edge_line_source_indexes
+        ]
+        line, pose_object = pose_object_from_keypoints(
+            class_id=EDGE_CLASS_ID,
+            name=f"edge_{piece_index}",
+            keypoint_names=[*edge_line_names, *center_side_names],
+            projected_by_name=projected_by_name,
+            metadata_by_name=metadata_by_name,
+            width=width,
+            height=height,
+        )
+        if line is not None and pose_object is not None:
+            lines.append(line)
+            pose_objects.append(pose_object)
 
     if path is not None:
         write_pose_keypoint_mask(path, pose_objects, width, height)
 
     return lines, pose_objects, {
-        "keypoint_shape": [1, 3],
+        "keypoint_shape": [POSE_KEYPOINT_COUNT, 3],
+        "source_keypoints": KEYPOINT_COUNT,
         "visible_hands": sorted(visible_hand_names),
-        "candidates": len(cube_pose_keypoint_specs()),
+        "candidates": len(CUBE_KEYPOINT_NAMES),
+        "piece_candidates": 20,
     }
 
 
@@ -1020,30 +1333,74 @@ def write_pose_keypoint_mask(
         ) from None
 
     output = np.zeros((height, width, 3), dtype=np.uint8)
-    colors = {
+    fill_colors = {
+        CORNER_CLASS_ID: (90, 90, 90),
+        EDGE_CLASS_ID: (0, 95, 95),
+    }
+    point_colors = {
         CORNER_CLASS_ID: (255, 255, 255),
         EDGE_CLASS_ID: (0, 255, 255),
     }
     for pose_object in pose_objects:
-        x, y = pose_object["pixel_point"]
-        visibility = int(pose_object["visibility"])
         class_id = int(pose_object["class_id"])
-        color = colors.get(class_id, (128, 128, 128))
-        if visibility == POINT_VISIBILITY_LABELED_OCCLUDED:
-            color = (0, 0, 255)
-        center = (round(float(x)), round(float(y)))
-        cv2.circle(output, center, 5, color, thickness=-1, lineType=cv2.LINE_AA)
-        cv2.circle(output, center, 7, (0, 0, 0), thickness=1, lineType=cv2.LINE_AA)
-        cv2.putText(
-            output,
-            f"{pose_object['class']}:{visibility}",
-            (center[0] + 8, center[1] - 8),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.38,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
+        fill_color = fill_colors.get(class_id, (90, 90, 90))
+        outline_color = point_colors.get(class_id, (255, 255, 255))
+        labeled_points = [
+            keypoint["pixel_point"]
+            for keypoint in pose_object["keypoints"]
+            if int(keypoint["visibility"]) != POINT_VISIBILITY_UNLABELED
+        ]
+        if len(labeled_points) >= 3:
+            points = np.asarray(labeled_points, dtype=np.float32)
+            hull = cv2.convexHull(np.round(points).astype(np.int32))
+            cv2.fillConvexPoly(output, hull, fill_color, lineType=cv2.LINE_AA)
+            cv2.polylines(output, [hull], isClosed=True, color=outline_color, thickness=1, lineType=cv2.LINE_AA)
+        elif len(labeled_points) == 2:
+            start = tuple(np.round(labeled_points[0]).astype(np.int32))
+            end = tuple(np.round(labeled_points[1]).astype(np.int32))
+            cv2.line(output, start, end, fill_color, thickness=9, lineType=cv2.LINE_AA)
+            cv2.line(output, start, end, outline_color, thickness=2, lineType=cv2.LINE_AA)
+
+        label_anchor = None
+        if labeled_points:
+            label_anchor = np.asarray(labeled_points, dtype=np.float32).mean(axis=0)
+
+        for keypoint in pose_object["keypoints"]:
+            visibility = int(keypoint["visibility"])
+            if visibility == POINT_VISIBILITY_UNLABELED:
+                continue
+            x, y = keypoint["pixel_point"]
+            draw_color = outline_color
+            if visibility == POINT_VISIBILITY_LABELED_OCCLUDED:
+                draw_color = (0, 0, 255)
+            center = (round(float(x)), round(float(y)))
+            cv2.circle(output, center, 5, draw_color, thickness=-1, lineType=cv2.LINE_AA)
+            cv2.circle(output, center, 7, (0, 0, 0), thickness=1, lineType=cv2.LINE_AA)
+            label = str(keypoint.get("label", int(keypoint["index"]) + 1))
+            text_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            label_point = np.asarray([float(x), float(y)], dtype=np.float32)
+            if label_anchor is not None:
+                label_point = (label_point * 0.65) + (label_anchor * 0.35)
+            text_x = int(round(float(label_point[0]) - text_size[0] / 2))
+            text_y = int(round(float(label_point[1]) + text_size[1] / 2))
+            pad = 2
+            cv2.rectangle(
+                output,
+                (text_x - pad, text_y - text_size[1] - pad),
+                (text_x + text_size[0] + pad, text_y + baseline + pad),
+                (0, 0, 0),
+                thickness=-1,
+            )
+            cv2.putText(
+                output,
+                label,
+                (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                draw_color,
+                1,
+                cv2.LINE_AA,
+            )
 
     cv2.imwrite(str(path), output)
 
@@ -1142,7 +1499,7 @@ def generate_dataset(
         "path: " + str(output_dir.resolve()) + "\n"
         "train: images\n"
         "val: images\n"
-        "kpt_shape: [1, 3]\n"
+        f"kpt_shape: [{POSE_KEYPOINT_COUNT}, 3]\n"
         "names:\n"
         + "".join(f"  {index}: {name}\n" for index, name in enumerate(CLASS_NAMES)),
         encoding="utf-8",

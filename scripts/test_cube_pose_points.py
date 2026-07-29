@@ -1,8 +1,10 @@
-"""Display YOLO cube-pose Corner and edge keypoints on a centered viewport."""
+"""Display YOLO piece-wise cube pose keypoints."""
 
 from __future__ import annotations
 
 import argparse
+import __main__
+import importlib.util
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,15 +24,36 @@ from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 DEFAULT_CUBE_POSE_MODEL = (
     ROOT
-    / "runs/cube_corner_edge_pose_local/runs/cube_corner_edge_yolo11n_pose/weights/best.pt"
+    / "runs/pose/runs/full_piece_pose_local/runs/cube_piece_keypoint_yolo11n_pose/weights/best.pt"
 )
 DEFAULT_VIEW_SIZE = 256
-CORNER_CLASS_NAME = "corner"
-EDGE_CLASS_NAME = "edge"
-CLASS_COLORS = {
-    CORNER_CLASS_NAME: (255, 255, 255),
-    EDGE_CLASS_NAME: (0, 255, 255),
+POSE_OBJECT_CONFIDENCE = 0.001
+POSE_CLASS_NAMES = {"corner", "edge"}
+KEYPOINT_COLORS = {
+    "corner": (255, 255, 255),
+    "edge": (0, 255, 255),
+    "center": (255, 120, 255),
 }
+PIECE_LINE_COLOR = (40, 220, 40)
+
+
+def register_training_checkpoint_classes() -> None:
+    """Expose custom training classes where torch expects them during checkpoint loading."""
+    training_path = ROOT / "scripts" / "train_yolo11n_piece_seg_local.py"
+    spec = importlib.util.spec_from_file_location("cube_pose_training_checkpoint_classes", training_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load training classes from {training_path}")
+    training = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = training
+    spec.loader.exec_module(training)
+
+    for name in (
+        "PerAnchorKeypointLoss",
+        "CubeSymmetricPoseLoss",
+        "CubeSymmetricPoseModel",
+        "CubeSymmetricPoseTrainer",
+    ):
+        setattr(__main__, name, getattr(training, name))
 
 
 @dataclass
@@ -70,7 +93,10 @@ class RoiTracker:
         tracking_gain: float = 1.0,
         tracking_padding: float = 0.0,
     ) -> None:
-        if self.roi_xyxy is None or tracking_bounds_xyxy is None:
+        if self.roi_xyxy is None:
+            return
+        if tracking_bounds_xyxy is None:
+            self.reset()
             return
 
         x1, y1, x2, y2 = self.roi_xyxy
@@ -79,15 +105,17 @@ class RoiTracker:
         bx1, by1, bx2, by2 = tracking_bounds_xyxy
         tracking_point_x = (bx1 + bx2) / 2.0
         tracking_point_y = (by1 + by2) / 2.0
-        roi_center_x = (x1 + x2) / 2.0
-        roi_center_y = (y1 + y2) / 2.0
         observed_side = max(bx2 - bx1, by2 - by1)
         target_side = max(base_side, observed_side) * (
             1.0 + max(0.0, float(tracking_padding)) * 2.0
         )
+        roi_center_x = side / 2.0
+        roi_center_y = side / 2.0
         gain = max(0.0, float(tracking_gain))
-        center_x = roi_center_x + (tracking_point_x - roi_center_x) * gain
-        center_y = roi_center_y + (tracking_point_y - roi_center_y) * gain
+        dx = (tracking_point_x - roi_center_x) * gain
+        dy = (tracking_point_y - roi_center_y) * gain
+        center_x = (x1 + x2) / 2.0 + dx
+        center_y = (y1 + y2) / 2.0 + dy
         self.roi_xyxy = square_roi_from_center(
             center_x,
             center_y,
@@ -160,7 +188,18 @@ def tensor_to_numpy(value) -> np.ndarray | None:
 
 def class_name_for_id(result, model, class_id: int) -> str:
     names = getattr(result, "names", None) or getattr(model, "names", {}) or {}
-    return str(names.get(class_id, class_id)).lower()
+    name = str(names.get(class_id, class_id)).lower()
+    return name.removesuffix("_sticker")
+
+
+def keypoint_kind(class_name: str, index: int) -> str:
+    if class_name == "corner" and index == 0:
+        return "corner"
+    if class_name == "edge" and index < 2:
+        return "edge"
+    if class_name == "corner" and index < 4:
+        return "edge"
+    return "center"
 
 
 def result_boxes(result) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -205,6 +244,33 @@ def result_keypoints(result, size: int) -> tuple[np.ndarray | None, np.ndarray |
     return None, None
 
 
+def piece_detection_indexes(
+    result,
+    model,
+    classes: np.ndarray | None,
+    detection_count: int,
+) -> list[tuple[int, str]]:
+    indexes = []
+    for detection_index in range(detection_count):
+        class_id = (
+            int(classes[detection_index])
+            if classes is not None and detection_index < len(classes)
+            else -1
+        )
+        class_name = class_name_for_id(result, model, class_id)
+        if class_name in POSE_CLASS_NAMES:
+            indexes.append((detection_index, class_name))
+    return indexes
+
+
+def piece_line_indexes(class_name: str) -> tuple[tuple[int, int], ...]:
+    if class_name == "corner":
+        return ((0, 1), (0, 2), (0, 3))
+    if class_name == "edge":
+        return ((0, 1),)
+    return ()
+
+
 def draw_keypoints(
     frame: np.ndarray,
     result,
@@ -212,7 +278,7 @@ def draw_keypoints(
     xy: np.ndarray | None,
     keypoint_conf: np.ndarray | None,
     *,
-    corners_only: bool,
+    confidence_threshold: float,
     offset_xy: tuple[int, int] = (0, 0),
     scale_xy: tuple[float, float] = (1.0, 1.0),
 ) -> tuple[np.ndarray, tuple[int, int, int, int] | None, int]:
@@ -221,8 +287,18 @@ def draw_keypoints(
         cv2.putText(output, "no cube pose", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
         return output, None, 0
 
-    classes, box_conf = result_boxes(result)
+    classes, _box_conf = result_boxes(result)
     points_by_detection = np.asarray(xy, dtype=np.float32)
+    detection_indexes = piece_detection_indexes(
+        result,
+        model,
+        classes,
+        len(points_by_detection),
+    )
+    if not detection_indexes:
+        cv2.putText(output, "no cube pieces", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
+        return output, None, 0
+
     scores_by_detection = (
         None
         if keypoint_conf is None or len(keypoint_conf) == 0
@@ -235,55 +311,60 @@ def draw_keypoints(
     tracking_max_y: int | None = None
     offset_x, offset_y = offset_xy
     scale_x, scale_y = scale_xy
-    for detection_index, points in enumerate(points_by_detection):
-        class_id = (
-            int(classes[detection_index])
-            if classes is not None and detection_index < len(classes)
-            else -1
-        )
-        class_name = class_name_for_id(result, model, class_id)
-        if class_name not in {CORNER_CLASS_NAME, EDGE_CLASS_NAME}:
-            continue
-        if corners_only and class_name != CORNER_CLASS_NAME:
-            continue
+    for detection_index, class_name in detection_indexes:
+        points = points_by_detection[detection_index]
         if len(points) == 0:
             continue
-
-        point = points[0]
-        x = int(round(offset_x + float(point[0]) * scale_x))
-        y = int(round(offset_y + float(point[1]) * scale_y))
-        if not (0 <= x < output.shape[1] and 0 <= y < output.shape[0]):
-            continue
-
-        keypoint_score = (
+        detection_scores = (
             None
             if scores_by_detection is None
             or detection_index >= len(scores_by_detection)
-            or len(np.asarray(scores_by_detection[detection_index]).reshape(-1)) == 0
-            else float(np.asarray(scores_by_detection[detection_index]).reshape(-1)[0])
+            else np.asarray(scores_by_detection[detection_index], dtype=np.float32).reshape(-1)
         )
-        detection_score = (
-            None
-            if box_conf is None or detection_index >= len(box_conf)
-            else float(box_conf[detection_index])
-        )
-        color = CLASS_COLORS.get(class_name, (255, 255, 255))
-        if keypoint_score is not None and keypoint_score < 0.35:
-            color = (120, 120, 120)
+        image_points: list[tuple[int, int] | None] = []
+        for keypoint_index, point in enumerate(points):
+            keypoint_score = (
+                None
+                if detection_scores is None or keypoint_index >= len(detection_scores)
+                else float(detection_scores[keypoint_index])
+            )
+            if keypoint_score is not None and keypoint_score < confidence_threshold:
+                image_points.append(None)
+                continue
 
-        cv2.circle(output, (x, y), 4, color, -1, lineType=cv2.LINE_AA)
-        cv2.circle(output, (x, y), 5, (0, 0, 0), 1, lineType=cv2.LINE_AA)
-        label = "C" if class_name == CORNER_CLASS_NAME else "E"
-        if detection_score is not None:
-            label = f"{label} {detection_score:.2f}"
-        cv2.putText(output, label, (x + 6, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.34, color, 1, cv2.LINE_AA)
-        tracking_min_x = x if tracking_min_x is None else min(tracking_min_x, x)
-        tracking_min_y = y if tracking_min_y is None else min(tracking_min_y, y)
-        tracking_max_x = x if tracking_max_x is None else max(tracking_max_x, x)
-        tracking_max_y = y if tracking_max_y is None else max(tracking_max_y, y)
-        drawn += 1
+            roi_x = int(round(float(point[0]) * scale_x))
+            roi_y = int(round(float(point[1]) * scale_y))
+            x = offset_x + roi_x
+            y = offset_y + roi_y
+            if not (0 <= x < output.shape[1] and 0 <= y < output.shape[0]):
+                image_points.append(None)
+                continue
+            image_points.append((x, y))
+
+            tracking_min_x = roi_x if tracking_min_x is None else min(tracking_min_x, roi_x)
+            tracking_min_y = roi_y if tracking_min_y is None else min(tracking_min_y, roi_y)
+            tracking_max_x = roi_x if tracking_max_x is None else max(tracking_max_x, roi_x)
+            tracking_max_y = roi_y if tracking_max_y is None else max(tracking_max_y, roi_y)
+            drawn += 1
+
+        for start_index, end_index in piece_line_indexes(class_name):
+            if start_index >= len(image_points) or end_index >= len(image_points):
+                continue
+            start = image_points[start_index]
+            end = image_points[end_index]
+            if start is None or end is None:
+                continue
+            cv2.line(output, start, end, (0, 0, 0), 4, lineType=cv2.LINE_AA)
+            cv2.line(output, start, end, PIECE_LINE_COLOR, 2, lineType=cv2.LINE_AA)
+
+        for keypoint_index, image_point in enumerate(image_points):
+            if image_point is None:
+                continue
+            color = KEYPOINT_COLORS.get(keypoint_kind(class_name, keypoint_index), (255, 255, 255))
+            cv2.circle(output, image_point, 4, color, -1, lineType=cv2.LINE_AA)
+            cv2.circle(output, image_point, 5, (0, 0, 0), 1, lineType=cv2.LINE_AA)
     if drawn == 0:
-        cv2.putText(output, "no corner/edge points", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(output, "no cube points", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
     tracking_bounds = (
         (tracking_min_x, tracking_min_y, tracking_max_x, tracking_max_y)
         if (
@@ -309,6 +390,7 @@ def roi_for_frame(
 
     candidate = bbox_detector.detect(frame)
     if candidate is None:
+        roi_tracker.reset()
         return None, None, "none"
     return (
         roi_tracker.initialize(candidate, width, height, args.roi_padding),
@@ -333,7 +415,7 @@ def process_frame(
     x1, y1, x2, y2 = roi_xyxy
     roi = frame[y1:y2, x1:x2]
     model_roi = resize_to_square_size(roi, args.view_size)
-    results = model.predict(source=model_roi, conf=args.conf, imgsz=args.imgsz, verbose=False)
+    results = model.predict(source=model_roi, conf=POSE_OBJECT_CONFIDENCE, imgsz=args.imgsz, verbose=False)
     result = results[0] if results else None
     xy, conf = result_keypoints(result, args.view_size) if result is not None else (None, None)
     scale_x = (x2 - x1) / float(model_roi.shape[1])
@@ -344,7 +426,7 @@ def process_frame(
         model,
         xy,
         conf,
-        corners_only=args.corners_only,
+        confidence_threshold=args.conf,
         offset_xy=(x1, y1),
         scale_xy=(scale_x, scale_y),
     )
@@ -378,7 +460,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bbox-model", type=Path, default=DEFAULT_BBOX_MODEL)
     parser.add_argument("--bbox-conf", type=float, default=0.25)
     parser.add_argument("--bbox-imgsz", type=int, default=640)
-    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--conf", type=float, default=0.05)
     parser.add_argument("--imgsz", type=int, default=DEFAULT_VIEW_SIZE)
     parser.add_argument("--view-size", type=int, default=DEFAULT_VIEW_SIZE)
     parser.add_argument("--roi-padding", type=float, default=0.08)
@@ -395,7 +477,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Extra padding ratio added around tracked point bounds when updating the ROI",
     )
     parser.add_argument("--save", type=Path, help="Save one annotated frame/image")
-    parser.add_argument("--corners-only", action="store_true", help="Draw only Corner keypoints")
     parser.add_argument("--debug-overlay", action="store_true")
     parser.add_argument("--no-display", dest="display", action="store_false")
     parser.set_defaults(display=True)
@@ -412,6 +493,7 @@ def main() -> int:
         confidence_threshold=args.bbox_conf,
         image_size=args.bbox_imgsz,
     )
+    register_training_checkpoint_classes()
     model = YOLO(str(args.model))
     source = parse_source(args.source)
     roi_tracker = RoiTracker()
