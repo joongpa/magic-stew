@@ -80,6 +80,14 @@ class TensorLike:
         return self.data
 
 
+class StubCornerPoseBoxes:
+    cls = TensorLike(np.array([0], dtype=np.float32))
+    conf = TensorLike(np.array([0.9], dtype=np.float32))
+
+    def __len__(self):
+        return 1
+
+
 class StubStickerModel:
     names = {0: "U_sticker", 1: "F_sticker", 2: "R_sticker"}
 
@@ -163,6 +171,43 @@ class StubVisibleFacePoseModel:
                 boxes=StubFacePoseBoxes(),
             )
         ]
+
+
+class StubCornerPoseModel:
+    names = {0: "corner"}
+
+    def __init__(self, point_xy=(192.0, 128.0)):
+        self.point_xy = point_xy
+
+    def predict(self, source, conf, imgsz, verbose):
+        keypoints = np.asarray([[self.point_xy]], dtype=np.float32)
+        keypoint_conf = np.asarray([[0.9]], dtype=np.float32)
+        return [
+            SimpleNamespace(
+                keypoints=SimpleNamespace(
+                    xy=TensorLike(keypoints),
+                    conf=TensorLike(keypoint_conf),
+                ),
+                boxes=StubCornerPoseBoxes(),
+            )
+        ]
+
+
+class StubNoPoseModel:
+    names = {0: "corner"}
+
+    def predict(self, source, conf, imgsz, verbose):
+        return []
+
+
+class StubPoseSolver:
+    def solve(self, image_points, image_size, *, edge_points=None):
+        return None
+
+
+class RaisingPoseSolver:
+    def solve(self, image_points, image_size, *, edge_points=None):
+        raise AssertionError("PnP solver should not run")
 
 
 class RecordingStickerModel:
@@ -271,6 +316,7 @@ def default_args(**overrides):
     values = {
         "sticker_conf": 0.25,
         "sticker_imgsz": 256,
+        "enable_sticker_segmentation": True,
         "roi_padding": 0.0,
         "roi_tracking_gain": 1.4,
         "roi_tracking_padding": 0.18,
@@ -281,77 +327,9 @@ def default_args(**overrides):
         "show_original_underlay": False,
         "mask_opacity": 1.0,
         "color_plot_samples_per_frame": 800,
-        "draw_sticker_graph": False,
-        "graph_adjacency_radius": 6,
-        "graph_min_sticker_area": 12,
-        "draw_cube_grid_fit": False,
-        "cube_grid_fit_line_thickness": 2,
-        "cube_grid_fit_min_coverage": 0.88,
-        "empty_space_line_width": 5,
-        "basis_angle_bucket_degrees": 5.0,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
-
-
-def projected_cube_sticker_masks(
-    *,
-    roi_shape=(140, 140),
-    origin=(54.0, 61.0),
-    axes=((48.0, -18.0), (12.0, 46.0), (-42.0, -22.0)),
-    inset=0.18,
-):
-    masks = []
-    origin = np.asarray(origin, dtype=np.float32)
-    axes = np.asarray(axes, dtype=np.float32)
-    for first_index, second_index in ((0, 1), (1, 2), (2, 0)):
-        first_axis = axes[first_index]
-        second_axis = axes[second_index]
-        for row in range(3):
-            for column in range(3):
-                low_u = (column + inset) / 3.0
-                high_u = (column + 1.0 - inset) / 3.0
-                low_v = (row + inset) / 3.0
-                high_v = (row + 1.0 - inset) / 3.0
-                points = np.asarray(
-                    [
-                        origin + first_axis * low_u + second_axis * low_v,
-                        origin + first_axis * high_u + second_axis * low_v,
-                        origin + first_axis * high_u + second_axis * high_v,
-                        origin + first_axis * low_u + second_axis * high_v,
-                    ],
-                    dtype=np.float32,
-                )
-                mask_u8 = np.zeros(roi_shape, dtype=np.uint8)
-                cv2 = piece_seg_script.cv2
-                cv2.fillConvexPoly(mask_u8, np.round(points).astype(np.int32), 1)
-                masks.append(mask_u8 > 0)
-    return masks
-
-
-def projected_cube_face_masks(*, roi_shape=(120, 120)):
-    cv2 = piece_seg_script.cv2
-    origin = np.asarray([58.0, 58.0], dtype=np.float32)
-    axes = [
-        np.asarray([26.08, 15.99], dtype=np.float32),
-        np.asarray([-27.17, 27.42], dtype=np.float32),
-        np.asarray([-13.47, -24.35], dtype=np.float32),
-    ]
-    masks = []
-    for first_axis, second_axis in ((axes[0], axes[1]), (axes[1], axes[2]), (axes[2], axes[0])):
-        points = np.asarray(
-            [
-                origin,
-                origin + first_axis,
-                origin + first_axis + second_axis,
-                origin + second_axis,
-            ],
-            dtype=np.float32,
-        )
-        mask_u8 = np.zeros(roi_shape, dtype=np.uint8)
-        cv2.fillConvexPoly(mask_u8, np.round(points).astype(np.int32), 1)
-        masks.append(mask_u8 > 0)
-    return masks
 
 
 def test_process_frame_uses_same_output_when_collecting_plot_samples():
@@ -374,6 +352,27 @@ def test_process_frame_uses_same_output_when_collecting_plot_samples():
     assert np.array_equal(output, plot_output)
     assert np.array_equal(bgr_samples, plot_bgr_samples)
     assert len(bgr_samples) > 1
+
+
+def test_process_frame_skips_sticker_segmentation_by_default():
+    frame = np.zeros((40, 40, 3), dtype=np.uint8)
+    args = SimpleNamespace(
+        roi_padding=0.0,
+        roi_tracking_gain=1.4,
+        roi_tracking_padding=0.18,
+        debug_overlay=False,
+        show_bbox=False,
+    )
+
+    output, bgr_samples = piece_seg_script.process_frame(
+        frame,
+        StubBboxDetector(),
+        StubStickerModel(),
+        args,
+    )
+
+    assert bgr_samples.shape == (0, 3)
+    assert np.array_equal(output, frame)
 
 
 def test_process_frame_requires_segmentation_masks():
@@ -441,383 +440,8 @@ def test_process_frame_accepts_face_segmentation_class():
     )
 
     assert len(bgr_samples) > 0
-    assert output.shape[0] == frame.shape[0]
-    assert output.shape[1] > frame.shape[1]
-    assert np.any(output[:, : frame.shape[1]] != frame)
-
-
-def test_draw_sticker_segments_prunes_face_mostly_covered_by_larger_face():
-    frame = np.zeros((256, 256, 3), dtype=np.uint8)
-    roi = np.zeros_like(frame)
-    args = default_args(sticker_imgsz=256, mask_opacity=1.0)
-
-    count, bgr_samples, tracking_bounds, projection_panel = piece_seg_script.draw_sticker_segments(
-        frame,
-        roi,
-        StubOverlappingFaceSegmentationModel(),
-        (0, 0, 256, 256),
-        args,
-    )
-
-    assert count == 1
-    assert len(bgr_samples) > 0
-    assert tracking_bounds == (40, 40, 180, 180)
-    assert projection_panel is not None
-    assert np.array_equal(frame[35, 35], np.asarray([0, 0, 0], dtype=np.uint8))
-    assert np.array_equal(
-        frame[50, 50],
-        np.asarray(piece_seg_script.FACE_INSTANCE_MASK_COLORS[0], dtype=np.uint8),
-    )
-
-
-def test_constrained_face_masks_remove_overlap_from_all_faces():
-    first = np.zeros((20, 20), dtype=bool)
-    first[2:14, 2:14] = True
-    second = np.zeros((20, 20), dtype=bool)
-    second[8:18, 8:18] = True
-
-    selected = piece_seg_script.constrained_face_masks_by_index(
-        [(0, first), (1, second)],
-        roi_shape=(20, 20),
-    )
-
-    assert set(selected) == {0, 1}
-    assert not selected[0][9, 9]
-    assert not selected[1][9, 9]
-    assert selected[0][3, 3]
-    assert selected[1][16, 16]
-
-
-def test_constrained_face_masks_keep_valid_cube_corner_triplet():
-    face_masks = projected_cube_face_masks()
-    extra = np.zeros((120, 120), dtype=bool)
-    extra[80:112, 8:40] = True
-
-    selected = piece_seg_script.constrained_face_masks_by_index(
-        [(0, face_masks[0]), (1, face_masks[1]), (2, face_masks[2]), (3, extra)],
-        roi_shape=(120, 120),
-    )
-
-    assert set(selected) == {0, 1, 2}
-    selected_stack = np.stack([selected[index] for index in sorted(selected)], axis=0)
-    assert not np.any(selected_stack.sum(axis=0) > 1)
-
-
-def test_face_quad_fits_make_triplet_share_exact_corner_and_sides():
-    face_masks = projected_cube_face_masks()
-
-    fitted = piece_seg_script.face_quad_fits_for_masks(
-        face_masks,
-        roi_shape=(120, 120),
-    )
-
-    assert len(fitted) == 3
-    quads = [quad for _mask, quad in fitted]
-    edge_indexes_by_face = [[] for _ in range(3)]
-    for left_index, right_index in ((0, 1), (0, 2), (1, 2)):
-        match = piece_seg_script._closest_compatible_quad_edges(
-            quads[left_index],
-            quads[right_index],
-            max_distance=0.01,
-        )
-        assert match is not None
-        left_edge_index, right_edge_index, _right_reversed = match
-        left_start, left_end = piece_seg_script._quad_edge_points(quads[left_index], left_edge_index)
-        right_start, right_end = piece_seg_script._quad_edge_points(quads[right_index], right_edge_index)
-        same = np.linalg.norm(left_start - right_start) + np.linalg.norm(left_end - right_end)
-        reversed_distance = np.linalg.norm(left_start - right_end) + np.linalg.norm(left_end - right_start)
-        assert min(float(same), float(reversed_distance)) <= 0.01
-        edge_indexes_by_face[left_index].append(left_edge_index)
-        edge_indexes_by_face[right_index].append(right_edge_index)
-
-    common_corners = []
-    for face_index, edge_indexes in enumerate(edge_indexes_by_face):
-        corner = piece_seg_script._quad_common_corner_for_adjacent_edges(
-            quads[face_index],
-            edge_indexes[0],
-            edge_indexes[1],
-        )
-        assert corner is not None
-        common_corners.append(corner)
-    assert np.allclose(common_corners[0], common_corners[1])
-    assert np.allclose(common_corners[0], common_corners[2])
-
-
-def test_projected_cube_fit_uses_orthographic_cube_basis_lengths():
-    face_masks = projected_cube_face_masks()
-    parallelograms = [
-        piece_seg_script._face_parallelogram_points(mask, roi_shape=(120, 120))
-        for mask in face_masks
-    ]
-    assert all(quad is not None for quad in parallelograms)
-    reconciled = piece_seg_script._reconcile_shared_face_parallelogram_sides(
-        parallelograms,
-        roi_shape=(120, 120),
-    )
-
-    fitted = piece_seg_script._adjust_face_triplet_quads_for_shared_corner_and_mask_fit(
-        face_masks,
-        reconciled,
-        roi_shape=(120, 120),
-    )
-
-    edge_indexes_by_face = [[] for _ in range(3)]
-    shared_axis_edges = []
-    for left_index, right_index in ((0, 1), (0, 2), (1, 2)):
-        match = piece_seg_script._closest_compatible_quad_edges(
-            fitted[left_index],
-            fitted[right_index],
-            max_distance=0.01,
-        )
-        assert match is not None
-        left_edge_index, right_edge_index, _right_reversed = match
-        assert abs(
-            piece_seg_script._quad_edge_length(fitted[left_index], left_edge_index)
-            - piece_seg_script._quad_edge_length(fitted[right_index], right_edge_index)
-        ) <= 1e-4
-        edge_indexes_by_face[left_index].append(left_edge_index)
-        edge_indexes_by_face[right_index].append(right_edge_index)
-        shared_axis_edges.append((left_index, left_edge_index))
-
-    common_corner_indexes = []
-    for edge_indexes in edge_indexes_by_face:
-        corner_index = piece_seg_script._quad_common_corner_index_for_adjacent_edges(
-            edge_indexes[0],
-            edge_indexes[1],
-        )
-        assert corner_index is not None
-        common_corner_indexes.append(corner_index)
-
-    axis_vectors = []
-    for face_index, edge_index in shared_axis_edges:
-        far_point = piece_seg_script._quad_edge_far_point_from_common_corner(
-            fitted[face_index],
-            edge_index,
-            common_corner_indexes[face_index],
-        )
-        assert far_point is not None
-        axis_vectors.append(far_point - fitted[face_index][common_corner_indexes[face_index]])
-
-    projection_moment = sum(np.outer(vector, vector) for vector in axis_vectors)
-    isotropic_moment = np.eye(2, dtype=np.float32) * (float(np.trace(projection_moment)) / 2.0)
-    assert np.allclose(projection_moment, isotropic_moment, rtol=0.0, atol=1e-2)
-
-
-def test_projected_cube_fit_ignores_masks_after_shared_sides_are_set():
-    face_masks = projected_cube_face_masks()
-    parallelograms = [
-        piece_seg_script._face_parallelogram_points(mask, roi_shape=(120, 120))
-        for mask in face_masks
-    ]
-    assert all(quad is not None for quad in parallelograms)
-    reconciled = piece_seg_script._reconcile_shared_face_parallelogram_sides(
-        parallelograms,
-        roi_shape=(120, 120),
-    )
-    occluded_masks = []
-    for mask in face_masks:
-        occluded = mask.copy()
-        occluded[:60, :60] = False
-        occluded_masks.append(occluded)
-
-    edge_indexes_by_face = [[] for _ in range(3)]
-    matches_by_pair = {}
-    for left_index, right_index in ((0, 1), (0, 2), (1, 2)):
-        match = piece_seg_script._closest_compatible_quad_edges(
-            reconciled[left_index],
-            reconciled[right_index],
-            max_distance=20.0,
-        )
-        assert match is not None
-        left_edge_index, right_edge_index, _right_reversed = match
-        edge_indexes_by_face[left_index].append(left_edge_index)
-        edge_indexes_by_face[right_index].append(right_edge_index)
-        matches_by_pair[(left_index, right_index)] = match
-
-    common_corner_indexes = []
-    for edge_indexes in edge_indexes_by_face:
-        corner_index = piece_seg_script._quad_common_corner_index_for_adjacent_edges(
-            edge_indexes[0],
-            edge_indexes[1],
-        )
-        assert corner_index is not None
-        common_corner_indexes.append(corner_index)
-
-    centered = [quad.copy() for quad in reconciled]
-    shared_center = np.mean(
-        np.asarray(
-            [
-                centered[face_index][corner_index]
-                for face_index, corner_index in enumerate(common_corner_indexes)
-            ],
-            dtype=np.float32,
-        ),
-        axis=0,
-    )
-    for face_index, corner_index in enumerate(common_corner_indexes):
-        centered[face_index][corner_index] = shared_center
-
-    fitted = piece_seg_script._fit_projected_cube_quads_from_shared_sides(
-        centered,
-        face_masks,
-        edge_indexes_by_face,
-        matches_by_pair,
-        common_corner_indexes,
-        shared_center,
-        roi_shape=(120, 120),
-    )
-    fitted_with_occlusion = piece_seg_script._fit_projected_cube_quads_from_shared_sides(
-        centered,
-        occluded_masks,
-        edge_indexes_by_face,
-        matches_by_pair,
-        common_corner_indexes,
-        shared_center,
-        roi_shape=(120, 120),
-    )
-
-    assert all(
-        np.allclose(quad, occluded_quad)
-        for quad, occluded_quad in zip(fitted, fitted_with_occlusion)
-    )
-
-
-def test_orthogonal_fit_score_prefers_one_fully_covered_face_over_compromise():
-    masks = []
-    for bounds in ((10, 10, 42, 42), (10, 10, 30, 42), (10, 10, 42, 28)):
-        mask = np.zeros((64, 64), dtype=bool)
-        x1, y1, x2, y2 = bounds
-        mask[y1:y2, x1:x2] = True
-        masks.append(mask)
-
-    full_face_quad = np.asarray(
-        [[10.0, 10.0], [42.0, 10.0], [42.0, 42.0], [10.0, 42.0]],
-        dtype=np.float32,
-    )
-    compromise_quad = np.asarray(
-        [[10.0, 10.0], [33.0, 10.0], [33.0, 33.0], [10.0, 33.0]],
-        dtype=np.float32,
-    )
-
-    reliable_face_score = piece_seg_script._orthogonal_quad_mask_fit_score(
-        [full_face_quad, full_face_quad, full_face_quad],
-        masks,
-        roi_shape=(64, 64),
-    )
-    compromise_score = piece_seg_script._orthogonal_quad_mask_fit_score(
-        [compromise_quad, compromise_quad, compromise_quad],
-        masks,
-        roi_shape=(64, 64),
-    )
-
-    assert reliable_face_score > compromise_score
-
-
-def test_outer_face_corner_slides_toward_center_to_reduce_spillover():
-    cv2 = piece_seg_script.cv2
-    quad = np.asarray(
-        [
-            [10.0, 10.0],
-            [50.0, 10.0],
-            [50.0, 50.0],
-            [10.0, 50.0],
-        ],
-        dtype=np.float32,
-    )
-    mask_u8 = np.zeros((64, 64), dtype=np.uint8)
-    clipped = np.asarray(
-        [
-            [10, 10],
-            [50, 10],
-            [42, 42],
-            [10, 50],
-        ],
-        dtype=np.int32,
-    )
-    cv2.fillConvexPoly(mask_u8, clipped, 1)
-
-    adjusted = piece_seg_script._slide_outer_quad_corner_toward_center_for_mask_fit(
-        quad,
-        mask_u8 > 0,
-        common_index=0,
-        outer_index=2,
-        roi_shape=(64, 64),
-    )
-
-    assert np.linalg.norm(adjusted[2] - adjusted[0]) < np.linalg.norm(quad[2] - quad[0])
-    assert np.allclose(adjusted[0], quad[0])
-    assert np.allclose(adjusted[1], quad[1])
-    assert np.allclose(adjusted[3], quad[3])
-    assert piece_seg_script._quad_fully_covers_mask(
-        adjusted,
-        mask_u8 > 0,
-        roi_shape=(64, 64),
-    )
-
-
-def test_triplet_outer_face_corners_use_same_slide_percentage():
-    cv2 = piece_seg_script.cv2
-    quads = [
-        np.asarray(
-            [
-                [30.0, 30.0],
-                [74.0, 30.0],
-                [74.0, 74.0],
-                [30.0, 74.0],
-            ],
-            dtype=np.float32,
-        ),
-        np.asarray(
-            [
-                [30.0, 30.0],
-                [30.0, 82.0],
-                [-22.0, 82.0],
-                [-22.0, 30.0],
-            ],
-            dtype=np.float32,
-        ),
-        np.asarray(
-            [
-                [30.0, 30.0],
-                [70.0, -10.0],
-                [110.0, 30.0],
-                [70.0, 70.0],
-            ],
-            dtype=np.float32,
-        ),
-    ]
-    masks = []
-    target_scale = 0.82
-    for quad in quads:
-        clipped = piece_seg_script._quad_with_outer_corner_slide(
-            quad,
-            common_index=0,
-            outer_index=2,
-            scale=target_scale,
-        )
-        mask_u8 = np.zeros((120, 120), dtype=np.uint8)
-        cv2.fillConvexPoly(mask_u8, np.round(clipped).astype(np.int32), 1)
-        masks.append(mask_u8 > 0)
-
-    adjusted = piece_seg_script._slide_triplet_outer_quad_corners_with_shared_scale(
-        quads,
-        masks,
-        [0, 0, 0],
-        roi_shape=(120, 120),
-    )
-
-    slide_ratios = [
-        np.linalg.norm(quad[2] - quad[0]) / np.linalg.norm(original[2] - original[0])
-        for quad, original in zip(adjusted, quads)
-    ]
-    assert np.allclose(slide_ratios, slide_ratios[0])
-    assert abs(float(slide_ratios[0]) - target_scale) <= 0.02
-    for quad, mask in zip(adjusted, masks):
-        assert piece_seg_script._quad_fully_covers_mask(
-            quad,
-            mask,
-            roi_shape=(120, 120),
-        )
+    assert output.shape == frame.shape
+    assert np.any(output != frame)
 
 
 def test_roi_tracker_runs_bbox_once_and_moves_roi_from_sticker_bounds_center():
@@ -852,6 +476,45 @@ def test_roi_tracker_runs_bbox_once_and_moves_roi_from_sticker_bounds_center():
     assert second_output[10, 10].tolist() != [40, 220, 40]
     assert second_output[10, 14].tolist() == [40, 220, 40]
     assert second_output[10, 14].tolist() != [0, 0, 255]
+
+
+def test_roi_tracker_runs_bbox_once_and_moves_roi_from_pose_keypoint_bounds():
+    frame = np.zeros((60, 60, 3), dtype=np.uint8)
+    detector = CountingBboxDetector()
+    tracker = piece_seg_script.RoiTracker()
+    args = default_args(
+        enable_sticker_segmentation=False,
+        show_bbox=True,
+        roi_tracking_padding=0.0,
+    )
+
+    first_output, _ = piece_seg_script.process_frame(
+        frame,
+        detector,
+        None,
+        args,
+        roi_tracker=tracker,
+        pose_model=StubCornerPoseModel(point_xy=(192.0, 128.0)),
+        pose_solver=StubPoseSolver(),
+    )
+
+    assert detector.calls == 1
+    assert tracker.roi_xyxy == (17, 10, 37, 30)
+    assert first_output[10, 17].tolist() == [0, 0, 255]
+
+    second_output, _ = piece_seg_script.process_frame(
+        frame,
+        detector,
+        None,
+        args,
+        roi_tracker=tracker,
+        pose_model=StubCornerPoseModel(point_xy=(128.0, 128.0)),
+        pose_solver=StubPoseSolver(),
+    )
+
+    assert detector.calls == 1
+    assert tracker.roi_xyxy == (17, 10, 37, 30)
+    assert second_output[10, 17].tolist() == [40, 220, 40]
 
 
 def test_roi_tracker_reacquires_bbox_after_missing_sticker_mask():
@@ -889,6 +552,49 @@ def test_roi_tracker_reacquires_bbox_after_missing_sticker_mask():
     )
     assert detector.calls == 2
     assert tracker.roi_xyxy == (10, 10, 30, 30)
+
+
+def test_roi_tracker_reacquires_bbox_after_missing_pose_keypoints():
+    frame = np.zeros((60, 60, 3), dtype=np.uint8)
+    detector = CountingBboxDetector()
+    tracker = piece_seg_script.RoiTracker()
+    args = default_args(enable_sticker_segmentation=False, roi_tracking_padding=0.0)
+
+    piece_seg_script.process_frame(
+        frame,
+        detector,
+        None,
+        args,
+        roi_tracker=tracker,
+        pose_model=StubCornerPoseModel(),
+        pose_solver=StubPoseSolver(),
+    )
+    assert detector.calls == 1
+    assert tracker.roi_xyxy is not None
+
+    piece_seg_script.process_frame(
+        frame,
+        detector,
+        None,
+        args,
+        roi_tracker=tracker,
+        pose_model=StubNoPoseModel(),
+        pose_solver=StubPoseSolver(),
+    )
+    assert detector.calls == 1
+    assert tracker.roi_xyxy is None
+
+    piece_seg_script.process_frame(
+        frame,
+        detector,
+        None,
+        args,
+        roi_tracker=tracker,
+        pose_model=StubCornerPoseModel(),
+        pose_solver=StubPoseSolver(),
+    )
+    assert detector.calls == 2
+    assert tracker.roi_xyxy is not None
 
 
 def test_roi_tracker_adds_padding_around_tracked_roi():
@@ -961,568 +667,399 @@ def test_resize_to_square_size_scales_viewport_to_model_input_size():
     assert resized.shape == (20, 20, 3)
 
 
-def test_low_intersection_lines_draw_four_side_lines_per_sticker_quad():
-    left_mask = np.zeros((40, 40), dtype=bool)
-    right_mask = np.zeros((40, 40), dtype=bool)
-    left_mask[10:30, 8:16] = True
-    right_mask[10:30, 24:32] = True
+def test_pose_keypoints_draw_even_when_pnp_pose_estimation_is_disabled(monkeypatch):
+    monkeypatch.setattr(piece_seg_script, "ENABLE_POSE_ESTIMATION", False)
+    frame = np.zeros((24, 24, 3), dtype=np.uint8)
+    roi = frame[2:22, 2:22]
 
-    overlay = piece_seg_script.low_intersection_sticker_lines(
-        [left_mask, right_mask],
-        roi_shape=(40, 40),
-        line_width_px=5,
-    )
-    lines = overlay.lines
-
-    assert len(overlay.sampled_points_xy) == 8
-    assert len(overlay.quad_edge_segments_xy) == 8
-    assert len(lines) == 8
-    point_indexes = np.round(overlay.sampled_points_xy).astype(np.int32)
-    assert left_mask[
-        point_indexes[:, 1],
-        point_indexes[:, 0],
-    ].any()
-    assert right_mask[
-        point_indexes[:, 1],
-        point_indexes[:, 0],
-    ].any()
-    assert all(line.length_px > 30 for line in lines)
-
-
-def test_low_intersection_lines_are_deterministic_for_same_mask():
-    mask = np.zeros((60, 60), dtype=bool)
-    mask[8:22, 8:52] = True
-    mask[38:52, 8:52] = True
-    mask[8:52, 8:16] = True
-
-    first_overlay = piece_seg_script.low_intersection_sticker_lines(
-        [mask],
-        roi_shape=(60, 60),
-        line_width_px=5,
-    )
-    second_overlay = piece_seg_script.low_intersection_sticker_lines(
-        [mask],
-        roi_shape=(60, 60),
-        line_width_px=5,
-    )
-
-    assert np.array_equal(first_overlay.sampled_points_xy, second_overlay.sampled_points_xy)
-    assert [(line.start_xy, line.end_xy) for line in first_overlay.lines] == [
-        (line.start_xy, line.end_xy) for line in second_overlay.lines
-    ]
-
-
-def test_low_intersection_line_angles_come_from_quad_sides():
-    mask = np.zeros((50, 50), dtype=bool)
-    mask[20:28, 8:42] = True
-
-    overlay = piece_seg_script.low_intersection_sticker_lines(
-        [mask],
-        roi_shape=(50, 50),
-        line_width_px=3,
-    )
-
-    assert overlay.lines
-    side_angles = []
-    for start, end in overlay.quad_edge_segments_xy:
-        delta = end - start
-        side_angles.append(float(np.degrees(np.arctan2(delta[1], delta[0])) % 180.0))
-
-    assert all(
-        min(
-            abs(((line.angle_degrees - side_angle + 90.0) % 180.0) - 90.0)
-            for side_angle in side_angles
-        ) <= 1e-3
-        for line in overlay.lines
-    )
-
-
-def test_basis_vectors_average_angles_around_two_histogram_peaks():
-    lines = [
-        piece_seg_script.LowIntersectionLine(
-            score=0.0,
-            intersection_px=0,
-            length_px=10,
-            angle_degrees=angle,
-            start_xy=(0.0, 0.0),
-            end_xy=(1.0, 0.0),
-        )
-        for angle in [2.0, 7.0, 12.0, 48.0, 53.0, 58.0, 120.0]
-    ]
-
-    vectors = piece_seg_script._basis_vectors_from_line_angle_histogram(
-        lines,
-        bucket_degrees=5.0,
-    )
-    angles = sorted(float(np.degrees(np.arctan2(vector[1], vector[0])) % 180.0) for vector in vectors)
-
-    assert len(angles) == 2
-    assert abs(angles[0] - 7.0) < 0.5
-    assert abs(angles[1] - 53.0) < 0.5
-
-
-def test_overlay_points_come_from_sticker_quads():
-    left_mask = np.zeros((50, 50), dtype=bool)
-    right_mask = np.zeros((50, 50), dtype=bool)
-    left_mask[12:38, 8:16] = True
-    right_mask[12:38, 34:42] = True
-
-    overlay = piece_seg_script.low_intersection_sticker_lines(
-        [left_mask, right_mask],
-        roi_shape=(50, 50),
-        line_width_px=5,
-    )
-
-    points = overlay.sampled_points_xy
-    assert len(points) == 8
-    edge_mask = piece_seg_script._sticker_edge_mask([left_mask, right_mask], roi_shape=(50, 50))
-    assert edge_mask is not None
-    indexes = np.round(points).astype(np.int32)
-    assert edge_mask[indexes[:, 1], indexes[:, 0]].all()
-
-
-def test_sticker_quad_fit_preserves_skewed_quadrilateral_shape():
-    mask = np.zeros((50, 50), dtype=np.uint8)
-    expected = np.asarray(
-        [
-            [10, 12],
-            [36, 8],
-            [32, 34],
-            [7, 28],
-        ],
-        dtype=np.int32,
-    )
-    piece_seg_script.cv2.fillConvexPoly(mask, expected, 1)
-
-    quad = piece_seg_script._sticker_mask_quad_points(mask > 0, roi_shape=(50, 50))
-
-    assert quad is not None
-    assert len(quad) == 4
-    for corner in expected.astype(np.float32):
-        distances = np.linalg.norm(quad - corner, axis=1)
-        assert float(distances.min()) <= 2.0
-
-
-def test_face_parallelogram_reconciliation_shares_neighbor_side():
-    left = np.asarray(
-        [
-            [10.0, 10.0],
-            [40.0, 12.0],
-            [42.0, 42.0],
-            [12.0, 40.0],
-        ],
-        dtype=np.float32,
-    )
-    right = np.asarray(
-        [
-            [43.0, 12.0],
-            [72.0, 10.0],
-            [74.0, 40.0],
-            [45.0, 42.0],
-        ],
-        dtype=np.float32,
-    )
-
-    reconciled = piece_seg_script._reconcile_shared_face_parallelogram_sides(
-        [left, right],
-        roi_shape=(100, 100),
-    )
-
-    left_edge = piece_seg_script._quad_edge_points(reconciled[0], 1)
-    right_edge = piece_seg_script._quad_edge_points(reconciled[1], 3)
-    assert np.allclose(left_edge[0], right_edge[1])
-    assert np.allclose(left_edge[1], right_edge[0])
-    for quad in reconciled:
-        assert np.allclose(quad[1] - quad[0], quad[2] - quad[3])
-        assert np.allclose(quad[3] - quad[0], quad[2] - quad[1])
-
-
-def test_face_projection_uses_image_under_mask_and_blacks_outside_mask():
-    roi = np.zeros((10, 10, 3), dtype=np.uint8)
-    roi[:, :] = [20, 80, 200]
-    mask = np.zeros((10, 10), dtype=bool)
-    mask[:, :5] = True
-    quad = np.asarray(
-        [
-            [0.0, 0.0],
-            [9.0, 0.0],
-            [9.0, 9.0],
-            [0.0, 9.0],
-        ],
-        dtype=np.float32,
-    )
-
-    projection = piece_seg_script.project_masked_face_to_square(
-        roi,
-        mask,
-        quad,
-        square_size=10,
-    )
-
-    assert np.array_equal(projection[5, 2], np.asarray([20, 80, 200], dtype=np.uint8))
-    assert np.array_equal(projection[5, 8], np.asarray([0, 0, 0], dtype=np.uint8))
-
-
-def test_face_projection_panel_draws_three_by_three_grid():
-    roi = np.zeros((30, 30, 3), dtype=np.uint8)
-    roi[:, :] = [20, 80, 200]
-    mask = np.ones((30, 30), dtype=bool)
-
-    panel = piece_seg_script.face_projection_panel(
-        roi,
-        [mask],
-        roi_shape=(30, 30),
-        output_height=80,
-    )
-
-    assert panel is not None
-    padding = 10
-    square_size = 60
-    first_line = padding + int(round((square_size - 1) / 3.0))
-    second_line = padding + int(round((square_size - 1) * 2.0 / 3.0))
-    assert np.array_equal(
-        panel[padding + square_size // 2, first_line],
-        np.asarray(piece_seg_script.PROJECTED_FACE_GRID_COLOR, dtype=np.uint8),
-    )
-    assert np.array_equal(
-        panel[second_line, padding + square_size // 2],
-        np.asarray(piece_seg_script.PROJECTED_FACE_GRID_COLOR, dtype=np.uint8),
-    )
-
-
-def test_low_intersection_lines_extend_to_roi_bounds():
-    mask = np.zeros((50, 50), dtype=bool)
-    mask[12:38, 12:18] = True
-    mask[12:38, 32:38] = True
-
-    overlay = piece_seg_script.low_intersection_sticker_lines(
-        [mask],
-        roi_shape=(50, 50),
-        line_width_px=6,
-    )
-    lines = overlay.lines
-
-    assert lines
-    assert any(line.length_px > 45 for line in lines)
-    assert all(0 <= line.start_xy[0] <= 49 and 0 <= line.end_xy[0] <= 49 for line in lines)
-    assert all(0 <= line.start_xy[1] <= 49 and 0 <= line.end_xy[1] <= 49 for line in lines)
-
-
-def test_draw_low_intersection_lines_uses_inclusion_width():
-    frame = np.zeros((50, 50, 3), dtype=np.uint8)
-    overlay = piece_seg_script.EmptySpaceLineOverlay(
-        lines=[
-            piece_seg_script.LowIntersectionLine(
-                score=0.1,
-                intersection_px=0,
-                length_px=20,
-                angle_degrees=0.0,
-                start_xy=(10.0, 35.0),
-                end_xy=(40.0, 35.0),
-            )
-        ],
-        sampled_points_xy=np.empty((0, 2), dtype=np.float32),
-        line_width_px=7,
-    )
-
-    piece_seg_script.draw_low_intersection_lines(
+    point_count, pnp_result, tracking_bounds = piece_seg_script.draw_pose_estimate(
         frame,
-        overlay,
-        offset_xy=(0, 0),
+        roi,
+        (2, 2, 22, 22),
+        StubCornerPoseModel(point_xy=(128.0, 128.0)),
+        RaisingPoseSolver(),
+        default_args(enable_sticker_segmentation=False),
     )
 
-    yellow_pixels = (
-        (frame[:, :, 0] < 80)
-        & (frame[:, :, 1] > 100)
-        & (frame[:, :, 2] > 100)
-    )
-    ys = np.flatnonzero(np.any(yellow_pixels[:, 20:30], axis=1))
-    assert ys[-1] - ys[0] + 1 >= 7
+    assert point_count == 1
+    assert pnp_result is None
+    assert tracking_bounds is not None
+    assert np.any(frame != 0)
 
 
-def test_draw_low_intersection_lines_draws_fitted_quad_edges():
-    frame = np.zeros((40, 40, 3), dtype=np.uint8)
-    overlay = piece_seg_script.EmptySpaceLineOverlay(
-        lines=[],
-        sampled_points_xy=np.empty((0, 2), dtype=np.float32),
-        quad_edge_segments_xy=np.asarray(
-            [
-                [[8.0, 12.0], [30.0, 12.0]],
-                [[30.0, 12.0], [30.0, 28.0]],
-            ],
-            dtype=np.float32,
-        ),
-    )
-
-    piece_seg_script.draw_low_intersection_lines(frame, overlay, offset_xy=(0, 0))
-
-    magenta_pixels = (
-        (frame[:, :, 0] > 100)
-        & (frame[:, :, 1] < 80)
-        & (frame[:, :, 2] > 100)
-    )
-    assert magenta_pixels.any()
-
-
-def test_draw_low_intersection_lines_draws_basis_vectors_at_center():
-    frame = np.zeros((60, 60, 3), dtype=np.uint8)
-    overlay = piece_seg_script.EmptySpaceLineOverlay(
-        lines=[],
-        sampled_points_xy=np.empty((0, 2), dtype=np.float32),
-        basis_vectors_xy=np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
-        basis_center_xy=(30.0, 30.0),
-    )
-
-    piece_seg_script.draw_low_intersection_lines(frame, overlay, offset_xy=(0, 0))
-
-    blue_pixels = (
-        (frame[:, :, 0] > 100)
-        & (frame[:, :, 1] < 80)
-        & (frame[:, :, 2] < 80)
-    )
-    red_pixels = (
-        (frame[:, :, 0] < 80)
-        & (frame[:, :, 1] < 80)
-        & (frame[:, :, 2] > 100)
-    )
-    assert blue_pixels.any()
-    assert red_pixels.any()
-
-
-def test_form_fit_area_does_not_include_convex_hull_corner():
-    mask = np.zeros((80, 80), dtype=bool)
-    mask[10:25, 10:65] = True
-    mask[10:65, 10:25] = True
-
-    form_mask = piece_seg_script._form_fit_sticker_area_mask(mask)
-
-    assert form_mask is not None
-    assert not form_mask[62, 62]
-    assert form_mask[18, 56]
-    assert form_mask[56, 18]
-
-
-def test_projected_cube_grid_fit_covers_stickers_and_follows_edges():
-    masks = projected_cube_sticker_masks()
-
-    fit = piece_seg_script.fit_projected_cube_grid(
-        masks,
-        roi_shape=(140, 140),
-        line_thickness_px=1,
-        minimum_coverage=0.9,
-    )
-
-    assert fit is not None
-    assert fit.coverage_ratio >= 0.9
-    assert fit.line_edge_distance_score < 0.2
-
-
-def test_projected_cube_grid_edge_score_prefers_lines_near_sticker_edges():
-    masks = projected_cube_sticker_masks()
-    union_mask = piece_seg_script._union_sticker_mask(masks, (140, 140))
-    assert union_mask is not None
-    coverage_points = piece_seg_script._sample_mask_xy_points(union_mask, max_points=160)
-    edge_distance_image = piece_seg_script._sticker_edge_distance_image(
-        masks,
-        roi_shape=(140, 140),
-    )
-    assert edge_distance_image is not None
-    axes = np.asarray(
-        [
-            [48.0, -18.0],
-            [12.0, 46.0],
-            [-42.0, -22.0],
-        ],
-        dtype=np.float32,
-    )
-    origin = np.asarray((54.0, 61.0), dtype=np.float32)
-    hull, lines = piece_seg_script._projected_cube_grid_geometry(axes)
-    aligned_hull = hull + origin
-    aligned_lines = [
-        (
-            tuple((np.asarray(start, dtype=np.float32) + origin).tolist()),
-            tuple((np.asarray(end, dtype=np.float32) + origin).tolist()),
-        )
-        for start, end in lines
-    ]
-    shifted_lines = [
-        (
-            tuple((np.asarray(start, dtype=np.float32) + origin + (20.0, -16.0)).tolist()),
-            tuple((np.asarray(end, dtype=np.float32) + origin + (20.0, -16.0)).tolist()),
-        )
-        for start, end in lines
-    ]
-
-    aligned = piece_seg_script._score_projected_cube_grid_from_edge_distance(
-        edge_distance_image,
-        coverage_points_xy=coverage_points,
-        mask_area=float(union_mask.sum()),
-        hull_points_xy=aligned_hull,
-        line_segments_xy=aligned_lines,
-        line_thickness_px=1,
-        minimum_coverage=0.9,
-    )
-    shifted = piece_seg_script._score_projected_cube_grid_from_edge_distance(
-        edge_distance_image,
-        coverage_points_xy=coverage_points,
-        mask_area=float(union_mask.sum()),
-        hull_points_xy=aligned_hull,
-        line_segments_xy=shifted_lines,
-        line_thickness_px=1,
-        minimum_coverage=0.9,
-    )
-
-    assert aligned.line_edge_distance_score < shifted.line_edge_distance_score
-    assert aligned.score < shifted.score
-
-
-def test_projected_cube_grid_line_score_overlooks_unsupported_empty_lines():
-    enough_good_lines = np.asarray(
-        [0.01, 0.02, 0.01, 0.03, 0.02, 0.01, 0.04, 0.02, 0.95, 0.98, 1.0],
-        dtype=np.float32,
-    )
-    too_few_good_lines = np.asarray(
-        [0.01, 0.02, 0.95, 0.98, 1.0, 0.99, 0.97, 0.96, 0.94, 0.93, 0.92],
-        dtype=np.float32,
-    )
-
-    enough_score = piece_seg_script._robust_line_edge_distance_score(enough_good_lines)
-    sparse_score = piece_seg_script._robust_line_edge_distance_score(too_few_good_lines)
-
-    assert enough_score < 0.05
-    assert sparse_score > enough_score + 0.15
-
-
-def test_projected_cube_candidates_are_limited_by_observed_edge_directions():
-    masks = projected_cube_sticker_masks()
-    edge_mask = piece_seg_script._sticker_edge_mask(masks, roi_shape=(140, 140))
-    assert edge_mask is not None
-
-    directions = piece_seg_script._dominant_edge_direction_angles(edge_mask)
-    filtered = piece_seg_script._projected_cube_axis_candidates_for_edge_directions(directions)
-    all_candidates = piece_seg_script._projected_cube_axis_candidates()
-
-    assert len(directions) == 3
-    assert 0 < len(filtered) < len(all_candidates)
-    assert all(
-        piece_seg_script._candidate_direction_alignment_cost(candidate, directions)
-        <= piece_seg_script.CUBE_GRID_FIT_DIRECTION_TOLERANCE_RADIANS
-        for candidate in filtered
-    )
-
-
-def test_projected_cube_axis_candidates_are_possible_cube_projections():
-    candidates = piece_seg_script._projected_cube_axis_candidates()
-
-    assert candidates
-    assert all(
-        piece_seg_script._cube_projected_axes_are_possible(candidate)
-        for candidate in candidates
-    )
-    assert all(
-        piece_seg_script._projected_cube_silhouette_is_hexagonal(candidate)
-        for candidate in candidates
-    )
-
-
-def test_projected_cube_axis_validator_rejects_impossible_grid():
-    impossible_axes = np.asarray(
-        [
-            [1.0, 0.0],
-            [0.8, 0.2],
-            [-0.2, 0.9],
-        ],
-        dtype=np.float32,
-    )
-
-    assert not piece_seg_script._cube_projected_axes_are_possible(impossible_axes)
-
-
-def test_projected_cube_axis_validator_rejects_rectangle_silhouette():
-    rectangle_axes = np.asarray(
-        [
-            [1.0, 0.0],
-            [0.0, 0.72],
-            [-1.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-
-    assert not piece_seg_script._projected_cube_silhouette_is_hexagonal(rectangle_axes)
-    assert not piece_seg_script._cube_projected_axes_are_possible(rectangle_axes)
-
-
-def test_projected_cube_grid_score_penalizes_missing_sticker_coverage():
-    masks = projected_cube_sticker_masks()
-    union_mask = piece_seg_script._union_sticker_mask(masks, (140, 140))
-    assert union_mask is not None
-    axes = np.asarray(
-        [
-            [48.0, -18.0],
-            [12.0, 46.0],
-            [-42.0, -22.0],
-        ],
-        dtype=np.float32,
-    )
-    hull, lines = piece_seg_script._projected_cube_grid_geometry(axes)
-    displacement = np.asarray((104.0, 108.0), dtype=np.float32)
-    misplaced_hull = hull + displacement
-    misplaced_lines = [
-        (
-            tuple((np.asarray(start, dtype=np.float32) + displacement).tolist()),
-            tuple((np.asarray(end, dtype=np.float32) + displacement).tolist()),
-        )
-        for start, end in lines
-    ]
-
-    score = piece_seg_script._score_projected_cube_grid(
-        union_mask,
-        mask_area=float(union_mask.sum()),
-        hull_points_xy=misplaced_hull,
-        line_segments_xy=misplaced_lines,
-        line_thickness_px=1,
-        minimum_coverage=0.9,
-    )
-
-    assert score.coverage_ratio < 0.25
-    assert score.score > 2.5
-
-
-def test_parser_exposes_projected_cube_grid_fit_options():
-    args = piece_seg_script.build_parser().parse_args(
-        [
-            "--draw-cube-grid-fit",
-            "--cube-grid-fit-line-thickness",
-            "3",
-            "--cube-grid-fit-min-coverage",
-            "0.92",
-        ]
-    )
-
-    assert args.draw_cube_grid_fit is True
-    assert args.cube_grid_fit_line_thickness == 3
-    assert args.cube_grid_fit_min_coverage == 0.92
-
-
-def test_parser_exposes_low_intersection_line_options():
-    args = piece_seg_script.build_parser().parse_args(
-        [
-            "--empty-space-line-width",
-            "6",
-            "--basis-angle-bucket-degrees",
-            "10",
-        ]
-    )
-
-    assert args.empty_space_line_width == 6
-    assert args.basis_angle_bucket_degrees == 10
-
-
-def test_parser_defaults_low_intersection_line_options():
+def test_pose_pnp_options_are_named_constants_not_parser_arguments():
     args = piece_seg_script.build_parser().parse_args([])
 
-    assert args.empty_space_line_width == 5
-    assert args.basis_angle_bucket_degrees == 5.0
+    assert not hasattr(args, "pose_model")
+    assert not hasattr(args, "pose_imgsz")
+    assert not hasattr(args, "pose_keypoint_conf")
+    assert not hasattr(args, "pnp_bootstrap_frames")
+    assert not hasattr(args, "pnp_focal_steps")
+    assert not hasattr(args, "pnp_corner_limit")
+    assert not hasattr(args, "pnp_inlier_threshold")
+    assert not hasattr(args, "draw_pose_keypoints")
+    assert not hasattr(args, "draw_pnp_cube")
+
+    assert piece_seg_script.POSE_IMAGE_SIZE == 256
+    assert piece_seg_script.POSE_OBJECT_CONFIDENCE == 0.5
+    assert piece_seg_script.POSE_KEYPOINT_CONFIDENCE == 0.1
+    assert piece_seg_script.PNP_BOOTSTRAP_FRAME_COUNT == 12
+    assert piece_seg_script.PNP_FOCAL_SCALE_STEPS == 5
+    assert piece_seg_script.PNP_HYPOTHESIS_POINT_COUNT == 3
+    assert piece_seg_script.PNP_HYPOTHESIS_ATTEMPT_LIMIT == 3
+    assert piece_seg_script.PNP_CORNER_DETECTION_LIMIT == 8
+    assert piece_seg_script.PNP_EDGE_DETECTION_LIMIT == 12
+    assert piece_seg_script.PNP_INLIER_THRESHOLD_PX == 10.0
+    assert piece_seg_script.PNP_TEMPORAL_TRACKING_ENABLED is True
+    assert piece_seg_script.PNP_TEMPORAL_MAX_CORNER_SHIFT_PX == 18.0
+
+
+def test_cube_corner_geometry_uses_55mm_cube_size():
+    assert piece_seg_script.CUBE_SIZE_MM == 55.0
+    np.testing.assert_allclose(
+        piece_seg_script.CUBE_CORNER_POINTS_MM.max(axis=0),
+        np.array([27.5, 27.5, 27.5]),
+    )
+    np.testing.assert_allclose(
+        piece_seg_script.CUBE_CORNER_POINTS_MM.min(axis=0),
+        np.array([-27.5, -27.5, -27.5]),
+    )
+
+
+def test_cube_correspondence_triples_are_filtered_by_orientation_symmetry():
+    assert len(piece_seg_script.CUBE_ORIENTATION_CORNER_PERMUTATIONS) == 24
+    assert len(piece_seg_script.CUBE_CORNER_CORRESPONDENCE_TRIPLES) == 14
+    assert all(len(set(triple)) == 3 for triple in piece_seg_script.CUBE_CORNER_CORRESPONDENCE_TRIPLES)
+
+
+def test_visible_cube_masks_allow_only_camera_facing_surface_at_identity_pose():
+    visible_corners, visible_edges = piece_seg_script.visible_cube_corner_and_edge_masks(
+        np.zeros((3, 1), dtype=np.float64),
+        np.array([[0.0], [0.0], [180.0]], dtype=np.float64),
+    )
+
+    assert set(np.flatnonzero(visible_corners)) == {4, 5, 6, 7}
+    assert set(np.flatnonzero(visible_edges)) == {4, 5, 6, 7}
+
+
+def test_corner_score_rejects_back_side_corner_assignments():
+    projected = np.asarray(
+        [
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 10.0],
+            [0.0, 10.0],
+            [20.0, 20.0],
+            [30.0, 20.0],
+            [30.0, 30.0],
+            [20.0, 30.0],
+        ],
+        dtype=np.float32,
+    )
+    visible_corners = np.asarray([False, False, False, False, True, True, True, True])
+
+    hidden_error, hidden_count = piece_seg_script.robust_projected_corner_score(
+        np.asarray([[0.0, 0.0]], dtype=np.float32),
+        projected,
+        allowed_corner_mask=visible_corners,
+        inlier_threshold=1.0,
+    )
+    visible_error, visible_count = piece_seg_script.robust_projected_corner_score(
+        np.asarray([[20.0, 20.0]], dtype=np.float32),
+        projected,
+        allowed_corner_mask=visible_corners,
+        inlier_threshold=1.0,
+    )
+
+    assert hidden_count == 0
+    assert np.isinf(hidden_error)
+    assert visible_count == 1
+    assert visible_error == 0.0
+
+
+def test_collect_corner_image_points_keeps_highest_confidence_corners_first():
+    result = SimpleNamespace(
+        keypoints=None,
+        boxes=SimpleNamespace(cls=TensorLike(np.array([0, 0, 0, 0], dtype=np.float32))),
+    )
+    pose_model = SimpleNamespace(names={0: "corner"})
+    xy = np.asarray(
+        [
+            [[1.0, 1.0]],
+            [[2.0, 2.0]],
+            [[3.0, 3.0]],
+            [[4.0, 4.0]],
+        ],
+        dtype=np.float32,
+    )
+    conf = np.asarray([[0.2], [0.9], [0.4], [0.8]], dtype=np.float32)
+
+    points = piece_seg_script.collect_corner_image_points(
+        result,
+        pose_model,
+        xy,
+        conf,
+        confidence_threshold=0.1,
+        offset_xy=(0, 0),
+        scale_xy=(1.0, 1.0),
+        point_limit=3,
+    )
+
+    np.testing.assert_allclose(
+        points,
+        np.asarray([[2.0, 2.0], [4.0, 4.0], [3.0, 3.0]], dtype=np.float32),
+    )
+
+
+def test_pnp_hypothesis_point_sets_are_capped_to_three_attempts():
+    points = np.asarray(
+        [[float(index), float(index)] for index in range(8)],
+        dtype=np.float32,
+    )
+
+    point_sets = piece_seg_script.pnp_hypothesis_point_sets(points)
+
+    assert len(point_sets) == 3
+    np.testing.assert_allclose(point_sets[0], points[[0, 1, 2]])
+    np.testing.assert_allclose(point_sets[1], points[[0, 1, 3]])
+    np.testing.assert_allclose(point_sets[2], points[[0, 1, 4]])
+
+
+def test_solve_best_corner_pnp_recovers_low_error_from_three_unlabeled_corners():
+    camera_matrix = piece_seg_script.default_camera_matrix((640, 480), focal_scale=1.1)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    corner_indexes = [0, 2, 5]
+    object_points = piece_seg_script.CUBE_CORNER_POINTS_MM[corner_indexes]
+    rvec = np.array([[0.25], [-0.15], [0.12]], dtype=np.float64)
+    tvec = np.array([[5.0], [-3.0], [180.0]], dtype=np.float64)
+    projected, _ = piece_seg_script.cv2.projectPoints(
+        object_points,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    image_points = projected.reshape(-1, 2)[[2, 0, 1]]
+
+    result = piece_seg_script.solve_best_corner_pnp(image_points, [camera_matrix])
+
+    assert result is not None
+    assert result.error < 1e-3
+    assert len(result.corner_names) == 3
+    assert len(set(result.corner_names)) == 3
+
+
+def test_solve_best_corner_pnp_scores_edge_keypoints_without_fitting_to_them():
+    camera_matrix = piece_seg_script.default_camera_matrix((640, 480), focal_scale=1.1)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    rvec = np.array([[0.25], [-0.15], [0.12]], dtype=np.float64)
+    tvec = np.array([[5.0], [-3.0], [180.0]], dtype=np.float64)
+    projected, _ = piece_seg_script.cv2.projectPoints(
+        piece_seg_script.CUBE_CORNER_POINTS_MM,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    projected = projected.reshape(-1, 2)
+    image_points = projected[[0, 2, 5]]
+
+    corner_only_result = piece_seg_script.solve_best_corner_pnp(image_points, [camera_matrix])
+    assert corner_only_result is not None
+    edge_start, edge_end = piece_seg_script.CUBE_CORNER_EDGES[0]
+    edge_points = np.asarray(
+        [
+            (
+                corner_only_result.projected_corners[edge_start]
+                + corner_only_result.projected_corners[edge_end]
+            )
+            * 0.5
+        ],
+        dtype=np.float32,
+    )
+
+    result = piece_seg_script.solve_best_corner_pnp(
+        image_points,
+        [camera_matrix],
+        scoring_edge_points=edge_points,
+        inlier_threshold=2.0,
+    )
+
+    assert result is not None
+    assert len(result.image_points) == 3
+    assert result.corner_inlier_count == 3
+    assert result.edge_inlier_count == 1
+    assert result.inlier_count == 4
+
+
+def test_projected_edge_score_accepts_points_on_same_projected_edge_segment():
+    projected = np.asarray(
+        [
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 10.0],
+            [0.0, 10.0],
+            [0.0, 20.0],
+            [10.0, 20.0],
+            [10.0, 30.0],
+            [0.0, 30.0],
+        ],
+        dtype=np.float32,
+    )
+
+    midpoint_error, midpoint_count = piece_seg_script.robust_projected_edge_score(
+        np.asarray([[5.0, 0.0]], dtype=np.float32),
+        projected,
+        inlier_threshold=1.0,
+    )
+    same_line_error, same_line_count = piece_seg_script.robust_projected_edge_score(
+        np.asarray([[2.0, 0.0]], dtype=np.float32),
+        projected,
+        inlier_threshold=1.0,
+    )
+
+    assert midpoint_error == 0.0
+    assert midpoint_count == 1
+    assert same_line_error == 0.0
+    assert same_line_count == 1
+
+
+def test_solve_best_corner_pnp_rejects_when_an_observed_corner_does_not_fit():
+    camera_matrix = piece_seg_script.default_camera_matrix((640, 480), focal_scale=1.1)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    corner_indexes = [0, 2, 5]
+    object_points = piece_seg_script.CUBE_CORNER_POINTS_MM[corner_indexes]
+    rvec = np.array([[0.25], [-0.15], [0.12]], dtype=np.float64)
+    tvec = np.array([[5.0], [-3.0], [180.0]], dtype=np.float64)
+    projected, _ = piece_seg_script.cv2.projectPoints(
+        object_points,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    good_points = projected.reshape(-1, 2)[[2, 0, 1]]
+    image_points = np.vstack([good_points, np.array([[2000.0, -1500.0]], dtype=np.float32)])
+
+    result = piece_seg_script.solve_best_corner_pnp(
+        image_points,
+        [camera_matrix],
+        inlier_threshold=2.0,
+    )
+
+    assert result is None
+
+
+def test_solve_best_corner_pnp_fits_three_corners_but_scores_all_observed_corners():
+    camera_matrix = piece_seg_script.default_camera_matrix((640, 480), focal_scale=1.1)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    corner_indexes = [0, 2, 5, 7]
+    object_points = piece_seg_script.CUBE_CORNER_POINTS_MM[corner_indexes]
+    rvec = np.array([[0.25], [-0.15], [0.12]], dtype=np.float64)
+    tvec = np.array([[5.0], [-3.0], [180.0]], dtype=np.float64)
+    projected, _ = piece_seg_script.cv2.projectPoints(
+        object_points,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    image_points = projected.reshape(-1, 2)[[2, 0, 3, 1]]
+
+    result = piece_seg_script.solve_best_corner_pnp(
+        image_points,
+        [camera_matrix],
+        inlier_threshold=2.0,
+    )
+
+    assert result is not None
+    assert len(result.image_points) == 4
+    assert len(result.object_points) == 4
+    assert len(result.scoring_points) == 4
+    assert result.corner_inlier_count == 4
+
+
+def test_temporal_corner_pnp_uses_previous_projection_before_full_search(monkeypatch):
+    camera_matrix = piece_seg_script.default_camera_matrix((640, 480), focal_scale=1.1)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    corner_indexes = [0, 2, 5, 7]
+    object_points = piece_seg_script.CUBE_CORNER_POINTS_MM[corner_indexes]
+    rvec = np.array([[0.25], [-0.15], [0.12]], dtype=np.float64)
+    previous_tvec = np.array([[5.0], [-3.0], [180.0]], dtype=np.float64)
+    current_tvec = np.array([[5.4], [-3.2], [180.5]], dtype=np.float64)
+    previous_projected, _ = piece_seg_script.cv2.projectPoints(
+        object_points,
+        rvec,
+        previous_tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    current_projected, _ = piece_seg_script.cv2.projectPoints(
+        object_points,
+        rvec,
+        current_tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    point_order = [2, 0, 3, 1]
+    previous_points = previous_projected.reshape(-1, 2)[point_order]
+    current_points = current_projected.reshape(-1, 2)[point_order]
+    previous_result = piece_seg_script.solve_best_corner_pnp(
+        previous_points,
+        [camera_matrix],
+        inlier_threshold=2.0,
+    )
+    assert previous_result is not None
+
+    def fail_full_search(*args, **kwargs):
+        raise AssertionError("temporal PnP should be tried before full correspondence search")
+
+    monkeypatch.setattr(piece_seg_script, "solve_best_corner_pnp", fail_full_search)
+
+    result = piece_seg_script.solve_temporal_or_best_corner_pnp(
+        current_points,
+        [camera_matrix],
+        previous_result=previous_result,
+        inlier_threshold=2.0,
+    )
+
+    assert result is not None
+    assert result.corner_inlier_count == len(current_points)
+    assert result.error < 1e-3
+
+
+def test_temporal_corner_pnp_falls_back_when_previous_projection_is_not_close(monkeypatch):
+    camera_matrix = piece_seg_script.default_camera_matrix((640, 480), focal_scale=1.1)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    corner_indexes = [0, 2, 5]
+    object_points = piece_seg_script.CUBE_CORNER_POINTS_MM[corner_indexes]
+    rvec = np.array([[0.25], [-0.15], [0.12]], dtype=np.float64)
+    tvec = np.array([[5.0], [-3.0], [180.0]], dtype=np.float64)
+    projected, _ = piece_seg_script.cv2.projectPoints(
+        object_points,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    previous_points = projected.reshape(-1, 2)
+    previous_result = piece_seg_script.solve_best_corner_pnp(previous_points, [camera_matrix])
+    assert previous_result is not None
+    current_points = previous_points + np.asarray([200.0, -120.0], dtype=np.float32)
+    fallback_result = object()
+
+    def fake_full_search(*args, **kwargs):
+        return fallback_result
+
+    monkeypatch.setattr(piece_seg_script, "solve_best_corner_pnp", fake_full_search)
+
+    result = piece_seg_script.solve_temporal_or_best_corner_pnp(
+        current_points,
+        [camera_matrix],
+        previous_result=previous_result,
+    )
+
+    assert result is fallback_result
 
 
 def test_sticker_sampling_uses_same_mask_as_rendering():
@@ -1544,7 +1081,7 @@ def test_sticker_sampling_uses_same_mask_as_rendering():
     assert not (bgr_samples == [220, 0, 0]).all(axis=1).any()
 
 
-def test_segmentation_padding_changes_displayed_and_sampled_mask_not_graph_mask():
+def test_segmentation_padding_changes_displayed_and_sampled_mask():
     frame = np.zeros((40, 40, 3), dtype=np.uint8)
     frame[:, :] = [40, 40, 40]
     frame[12:18, 12:18] = [0, 0, 220]
@@ -1593,126 +1130,15 @@ def test_sticker_color_sample_points_are_random_inside_mask():
     assert np.array_equal(ys, repeat_ys)
 
 
-def test_process_frame_can_draw_sticker_graph_overlay():
-    frame = np.zeros((40, 40, 3), dtype=np.uint8)
-    frame[:, :] = [40, 40, 40]
-    frame[10:20, 10:20] = [0, 0, 220]
-    args = default_args(draw_sticker_graph=True, graph_min_sticker_area=10_000)
-
-    output, _ = piece_seg_script.process_frame(
-        frame,
-        StubBboxDetector(),
-        StubStickerModel(),
-        args,
-    )
-
-    assert np.any(np.all(output == piece_seg_script.DEFAULT_STICKER_MASK_COLOR, axis=2))
-
-
-def test_process_frame_graph_uses_unpadded_mask_when_sampling_is_padded():
-    frame = np.zeros((40, 40, 3), dtype=np.uint8)
-    frame[:, :] = [40, 40, 40]
-    frame[12:18, 12:18] = [0, 0, 220]
-    args = default_args(
-        draw_sticker_graph=True,
-        graph_min_sticker_area=1,
-        segmentation_padding_px=-2,
-    )
-    captured = {}
-    original_draw_sticker_graph = piece_seg_script.draw_sticker_graph
-
-    def capture_graph(frame, graph, **kwargs):
-        captured["graph"] = graph
-        return frame
-
-    piece_seg_script.draw_sticker_graph = capture_graph
-    try:
-        piece_seg_script.process_frame(
-            frame,
-            StubBboxDetector(),
-            StubStickerModel(),
-            args,
-        )
-    finally:
-        piece_seg_script.draw_sticker_graph = original_draw_sticker_graph
-
-    graph = captured["graph"]
-    assert len(graph.nodes) == 1
-    assert graph.nodes[0].mask.sum() == 100 * 255
-
-
-def test_process_frame_grid_fit_uses_unpadded_segmentation_mask():
-    frame = np.zeros((40, 40, 3), dtype=np.uint8)
-    frame[:, :] = [40, 40, 40]
-    args = default_args(
-        draw_cube_grid_fit=True,
-        segmentation_padding_px=-2,
-    )
-    captured = {}
-    original_low_intersection_sticker_lines = piece_seg_script.low_intersection_sticker_lines
-    original_draw_low_intersection_lines = piece_seg_script.draw_low_intersection_lines
-
-    def capture_low_intersection_lines(sticker_masks, **kwargs):
-        captured["mask_sum"] = int(sticker_masks[0].sum())
-        return piece_seg_script.EmptySpaceLineOverlay(
-            lines=[],
-            sampled_points_xy=np.empty((0, 2), dtype=np.float32),
-        )
-
-    piece_seg_script.low_intersection_sticker_lines = capture_low_intersection_lines
-    piece_seg_script.draw_low_intersection_lines = lambda *args, **kwargs: None
-    try:
-        piece_seg_script.process_frame(
-            frame,
-            StubBboxDetector(),
-            StubStickerModel(),
-            args,
-        )
-    finally:
-        piece_seg_script.low_intersection_sticker_lines = original_low_intersection_sticker_lines
-        piece_seg_script.draw_low_intersection_lines = original_draw_low_intersection_lines
-
-    assert captured["mask_sum"] == 100
-
-
-def test_process_frame_does_not_accumulate_cube_net_without_classifier():
-    frame = np.zeros((40, 40, 3), dtype=np.uint8)
-    frame[:, :] = [40, 40, 40]
-    frame[10:20, 10:20] = [0, 0, 220]
-    args = default_args(graph_min_sticker_area=1)
-    net_state = piece_seg_script.CubeNetState()
-
-    piece_seg_script.process_frame(
-        frame,
-        StubBboxDetector(),
-        StubStickerModel(),
-        args,
-        cube_net_state=net_state,
-    )
-
-    assert net_state.cells == {}
-
-
-def test_parser_exposes_sticker_graph_options():
-    args = piece_seg_script.build_parser().parse_args(
-        [
-            "--draw-sticker-graph",
-            "--adjacency-radius",
-            "9",
-            "--graph-min-sticker-area",
-            "5",
-        ]
-    )
-
-    assert args.draw_sticker_graph is True
-    assert args.graph_adjacency_radius == 9
-    assert args.graph_min_sticker_area == 5
-
-
 def test_parser_exposes_original_underlay_option():
     args = piece_seg_script.build_parser().parse_args(["--show-original-underlay"])
 
     assert args.show_original_underlay is True
+
+
+def test_parser_shows_original_underlay_by_default_and_can_hide_it():
+    assert piece_seg_script.build_parser().parse_args([]).show_original_underlay is True
+    assert piece_seg_script.build_parser().parse_args(["--hide-original-underlay"]).show_original_underlay is False
 
 
 def test_parser_exposes_roi_tracking_gain_option():
@@ -1727,10 +1153,9 @@ def test_parser_exposes_roi_tracking_padding_option():
     assert args.roi_tracking_padding == 0.25
 
 
-def test_parser_exposes_cube_net_output_option():
-    args = piece_seg_script.build_parser().parse_args(["--save-net", "runs/net.png"])
-
-    assert str(args.save_net) == "runs/net.png"
+def test_parser_displays_by_default_and_can_disable_display():
+    assert piece_seg_script.build_parser().parse_args([]).display is True
+    assert piece_seg_script.build_parser().parse_args(["--no-display"]).display is False
 
 
 def test_parser_exposes_density_color_classifier_options():
