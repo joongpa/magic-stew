@@ -702,7 +702,7 @@ def test_pose_pnp_options_are_named_constants_not_parser_arguments():
 
     assert piece_seg_script.POSE_IMAGE_SIZE == 256
     assert piece_seg_script.POSE_OBJECT_CONFIDENCE == 0.5
-    assert piece_seg_script.POSE_KEYPOINT_CONFIDENCE == 0.1
+    assert piece_seg_script.POSE_KEYPOINT_CONFIDENCE == 0.2
     assert piece_seg_script.PNP_BOOTSTRAP_FRAME_COUNT == 12
     assert piece_seg_script.PNP_FOCAL_SCALE_STEPS == 5
     assert piece_seg_script.PNP_HYPOTHESIS_POINT_COUNT == 3
@@ -712,10 +712,13 @@ def test_pose_pnp_options_are_named_constants_not_parser_arguments():
     assert piece_seg_script.PNP_INLIER_THRESHOLD_PX == 10.0
     assert piece_seg_script.PNP_TEMPORAL_TRACKING_ENABLED is True
     assert piece_seg_script.PNP_TEMPORAL_MAX_CORNER_SHIFT_PX == 18.0
+    assert piece_seg_script.MID_TURN_POSE_ESTIMATION_ENABLED is True
+    assert piece_seg_script.MID_TURN_ANGLE_DEGREES == tuple(range(5, 50, 5))
 
 
 def test_cube_corner_geometry_uses_55mm_cube_size():
     assert piece_seg_script.CUBE_SIZE_MM == 55.0
+    assert piece_seg_script.CUBE_LAYER_SIZE_MM == 55.0 / 3.0
     np.testing.assert_allclose(
         piece_seg_script.CUBE_CORNER_POINTS_MM.max(axis=0),
         np.array([27.5, 27.5, 27.5]),
@@ -730,6 +733,87 @@ def test_cube_correspondence_triples_are_filtered_by_orientation_symmetry():
     assert len(piece_seg_script.CUBE_ORIENTATION_CORNER_PERMUTATIONS) == 24
     assert len(piece_seg_script.CUBE_CORNER_CORRESPONDENCE_TRIPLES) == 14
     assert all(len(set(triple)) == 3 for triple in piece_seg_script.CUBE_CORNER_CORRESPONDENCE_TRIPLES)
+
+
+def test_mid_turn_model_candidates_cover_six_faces_and_nine_angles():
+    candidates = piece_seg_script.mid_turn_corner_model_candidates()
+
+    assert len(candidates) == 54
+    assert {
+        face_name
+        for face_name, _angle, _corners, _edge_points, _edges, _mask, _display_points, _display_edges in candidates
+    } == {"B", "F", "U", "D", "R", "L"}
+    assert {
+        angle
+        for _face_name, angle, _corners, _edge_points, _edges, _mask, _display_points, _display_edges in candidates
+    } == set(range(5, 50, 5))
+
+
+def test_mid_turn_scoring_model_uses_drawn_edges_instead_of_direct_layer_connections():
+    corner_points, edge_points, edge_indexes, allowed_corner_mask = piece_seg_script.mid_turn_scoring_model("U", 25.0)
+
+    assert len(corner_points) == 8
+    assert len(edge_points) == 12
+    assert len(allowed_corner_mask) == 20
+    assert allowed_corner_mask[:8].all()
+    assert not allowed_corner_mask[8:].any()
+    assert len(edge_indexes) == 16
+    assert not any(
+        start < 8
+        and end < 8
+        and np.sign(piece_seg_script.CUBE_CORNER_POINTS_MM[start, 1])
+        != np.sign(piece_seg_script.CUBE_CORNER_POINTS_MM[end, 1])
+        for start, end in edge_indexes
+    )
+    assert all(start >= 8 or end >= 8 for start, end in edge_indexes)
+
+
+def test_mid_turn_display_model_draws_two_exact_cuboids():
+    display_points, display_edges = piece_seg_script.mid_turn_display_model("U", 25.0)
+
+    assert len(display_points) == 16
+    assert len(display_edges) == len(piece_seg_script.CUBE_CORNER_EDGES) * 2
+    np.testing.assert_allclose(
+        display_points[:8, 1].max(),
+        piece_seg_script.CUBE_HALF_SIZE_MM - piece_seg_script.CUBE_LAYER_SIZE_MM,
+    )
+    assert all(
+        (start < 8 and end < 8) or (start >= 8 and end >= 8)
+        for start, end in display_edges
+    )
+
+
+def test_mid_turn_solver_recovers_pose_when_rigid_solver_rejects_deformed_corners():
+    camera_matrix = piece_seg_script.default_camera_matrix((640, 480), focal_scale=1.1)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    rvec = np.array([[0.25], [-0.15], [0.12]], dtype=np.float64)
+    tvec = np.array([[5.0], [-3.0], [180.0]], dtype=np.float64)
+    model_corner_points = piece_seg_script.mid_turn_corner_points("U", 25.0)
+    projected, _ = piece_seg_script.cv2.projectPoints(
+        model_corner_points,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    image_points = projected.reshape(-1, 2)[[2, 0, 3, 1, 6, 4, 7, 5]]
+
+    rigid_result = piece_seg_script.solve_best_corner_pnp(
+        image_points,
+        [camera_matrix],
+        inlier_threshold=2.0,
+    )
+    mid_turn_result = piece_seg_script.solve_best_mid_turn_corner_pnp(
+        image_points,
+        [camera_matrix],
+        inlier_threshold=2.0,
+    )
+
+    assert rigid_result is None
+    assert mid_turn_result is not None
+    assert mid_turn_result.corner_inlier_count == 8
+    assert mid_turn_result.error < 1e-3
+    assert mid_turn_result.pose_label.endswith("+25")
 
 
 def test_visible_cube_masks_allow_only_camera_facing_surface_at_identity_pose():
@@ -849,7 +933,7 @@ def test_solve_best_corner_pnp_recovers_low_error_from_three_unlabeled_corners()
     assert len(set(result.corner_names)) == 3
 
 
-def test_solve_best_corner_pnp_scores_edge_keypoints_without_fitting_to_them():
+def test_solve_best_corner_pnp_scores_and_refines_with_edge_midpoints():
     camera_matrix = piece_seg_script.default_camera_matrix((640, 480), focal_scale=1.1)
     dist_coeffs = np.zeros((4, 1), dtype=np.float64)
     rvec = np.array([[0.25], [-0.15], [0.12]], dtype=np.float64)
@@ -866,14 +950,9 @@ def test_solve_best_corner_pnp_scores_edge_keypoints_without_fitting_to_them():
 
     corner_only_result = piece_seg_script.solve_best_corner_pnp(image_points, [camera_matrix])
     assert corner_only_result is not None
-    edge_start, edge_end = piece_seg_script.CUBE_CORNER_EDGES[0]
     edge_points = np.asarray(
         [
-            (
-                corner_only_result.projected_corners[edge_start]
-                + corner_only_result.projected_corners[edge_end]
-            )
-            * 0.5
+            corner_only_result.projected_edge_points[0]
         ],
         dtype=np.float32,
     )
@@ -886,7 +965,8 @@ def test_solve_best_corner_pnp_scores_edge_keypoints_without_fitting_to_them():
     )
 
     assert result is not None
-    assert len(result.image_points) == 3
+    assert len(result.image_points) == 4
+    assert len(result.object_points) == 4
     assert result.corner_inlier_count == 3
     assert result.edge_inlier_count == 1
     assert result.inlier_count == 4

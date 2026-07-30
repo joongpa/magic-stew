@@ -50,7 +50,7 @@ DISPLAY_PREVIEW_BY_DEFAULT = True
 SHOW_ORIGINAL_UNDERLAY_BY_DEFAULT = True
 POSE_IMAGE_SIZE = 256
 POSE_OBJECT_CONFIDENCE = 0.5
-POSE_KEYPOINT_CONFIDENCE = 0.1
+POSE_KEYPOINT_CONFIDENCE = 0.2
 PNP_BOOTSTRAP_FRAME_COUNT = 12
 PNP_FOCAL_SCALE_MIN = 0.7
 PNP_FOCAL_SCALE_MAX = 1.8
@@ -64,6 +64,8 @@ PNP_CORNER_DETECTION_LIMIT = 8
 PNP_EDGE_DETECTION_LIMIT = 12
 PNP_TEMPORAL_TRACKING_ENABLED = True
 PNP_TEMPORAL_MAX_CORNER_SHIFT_PX = 18.0
+MID_TURN_POSE_ESTIMATION_ENABLED = True
+MID_TURN_ANGLE_DEGREES = tuple(range(5, 50, 5))
 DEFAULT_STICKER_MASK_COLOR = (150, 150, 150)
 FACE_INSTANCE_MASK_COLORS = (
     (255, 80, 80),
@@ -79,6 +81,7 @@ DENSITY_CLUSTER_EPS_RADIANS = 0.08
 DENSITY_CLUSTER_MIN_POINTS = 4
 CUBE_SIZE_MM = 55.0
 CUBE_HALF_SIZE_MM = CUBE_SIZE_MM / 2.0
+CUBE_LAYER_SIZE_MM = CUBE_SIZE_MM / 3.0
 CUBE_CORNER_NAMES = ("UBL", "UBR", "UFR", "UFL", "DBL", "DBR", "DFR", "DFL")
 CUBE_CORNER_POINTS_MM = np.array(
     [
@@ -98,6 +101,22 @@ CUBE_CORNER_EDGES = (
     (4, 5), (5, 6), (6, 7), (7, 4),
     (0, 4), (1, 5), (2, 6), (3, 7),
 )
+CUBE_EDGE_MIDPOINT_POINTS_MM = np.asarray(
+    [
+        (CUBE_CORNER_POINTS_MM[start] + CUBE_CORNER_POINTS_MM[end]) * 0.5
+        for start, end in CUBE_CORNER_EDGES
+    ],
+    dtype=np.float32,
+)
+CUBE_EDGE_KEYPOINT_OFFSET = len(CUBE_CORNER_POINTS_MM)
+CUBE_KEYPOINT_EDGE_SEGMENTS = tuple(
+    segment
+    for edge_index, (start, end) in enumerate(CUBE_CORNER_EDGES)
+    for segment in (
+        (start, CUBE_EDGE_KEYPOINT_OFFSET + edge_index),
+        (CUBE_EDGE_KEYPOINT_OFFSET + edge_index, end),
+    )
+)
 CUBE_FACES = (
     ((0, 1, 2, 3), (0.0, 0.0, 1.0)),
     ((4, 7, 6, 5), (0.0, 0.0, -1.0)),
@@ -105,6 +124,14 @@ CUBE_FACES = (
     ((3, 2, 6, 7), (0.0, -1.0, 0.0)),
     ((1, 5, 6, 2), (1.0, 0.0, 0.0)),
     ((0, 3, 7, 4), (-1.0, 0.0, 0.0)),
+)
+MID_TURN_FACE_SPECS = (
+    ("B", 2, 1.0),
+    ("F", 2, -1.0),
+    ("U", 1, 1.0),
+    ("D", 1, -1.0),
+    ("R", 0, 1.0),
+    ("L", 0, -1.0),
 )
 
 
@@ -153,6 +180,8 @@ POSE_KEYPOINT_COLORS = {
 }
 PNP_CUBE_LINE_COLOR = (255, 80, 30)
 PNP_CUBE_POINT_COLOR = (30, 180, 255)
+PNP_CUBE_STATIC_LINE_COLOR = (100, 100, 100)
+PNP_CUBE_SEAM_LINE_COLOR = (255, 220, 80)
 
 
 def register_training_checkpoint_classes() -> None:
@@ -262,11 +291,22 @@ class CornerPnPResult:
     scoring_points: np.ndarray
     scoring_edge_points: np.ndarray
     object_points: np.ndarray
+    model_corner_points: np.ndarray
+    model_edge_points: np.ndarray
+    display_points: np.ndarray
     projected_corners: np.ndarray
+    projected_edge_points: np.ndarray
+    projected_display_points: np.ndarray
     corner_inlier_count: int
     edge_inlier_count: int
     corner_names: tuple[str, ...]
     scoring_corner_indexes: tuple[int, ...]
+    scoring_edge_indexes: tuple[int, ...]
+    edge_indexes: tuple[tuple[int, int], ...] = CUBE_CORNER_EDGES
+    allowed_corner_mask: np.ndarray | None = None
+    allowed_edge_mask: np.ndarray | None = None
+    display_edge_indexes: tuple[tuple[int, int], ...] | None = None
+    pose_label: str = ""
 
 
 @dataclass
@@ -933,6 +973,162 @@ def camera_matrix_candidates(
     ]
 
 
+def rotation_matrix_about_axis(axis: np.ndarray, angle_degrees: float) -> np.ndarray:
+    axis = np.asarray(axis, dtype=np.float64).reshape(3)
+    norm = float(np.linalg.norm(axis))
+    if norm <= 1e-9:
+        return np.eye(3, dtype=np.float64)
+    axis = axis / norm
+    angle_radians = np.deg2rad(float(angle_degrees))
+    cross = np.array(
+        [
+            [0.0, -axis[2], axis[1]],
+            [axis[2], 0.0, -axis[0]],
+            [-axis[1], axis[0], 0.0],
+        ],
+        dtype=np.float64,
+    )
+    return (
+        np.eye(3, dtype=np.float64)
+        + (np.sin(angle_radians) * cross)
+        + ((1.0 - np.cos(angle_radians)) * (cross @ cross))
+    )
+
+
+def mid_turn_corner_points(face_name: str, angle_degrees: float) -> np.ndarray:
+    matching_specs = [spec for spec in MID_TURN_FACE_SPECS if spec[0] == face_name]
+    if not matching_specs:
+        raise ValueError(f"Unknown mid-turn face {face_name!r}")
+
+    _name, axis_index, side = matching_specs[0]
+    points = CUBE_CORNER_POINTS_MM.astype(np.float64).copy()
+    layer_mask = np.isclose(points[:, axis_index], side * CUBE_HALF_SIZE_MM)
+    axis = np.zeros(3, dtype=np.float64)
+    axis[axis_index] = side
+    rotation = rotation_matrix_about_axis(axis, angle_degrees)
+    points[layer_mask] = points[layer_mask] @ rotation.T
+    return points.astype(np.float32)
+
+
+def cuboid_points_from_axis_bounds(
+    axis_bounds: tuple[tuple[float, float], tuple[float, float], tuple[float, float]],
+) -> np.ndarray:
+    x_bounds, y_bounds, z_bounds = axis_bounds
+    return np.asarray(
+        [
+            [x_bounds[0], y_bounds[1], z_bounds[1]],
+            [x_bounds[1], y_bounds[1], z_bounds[1]],
+            [x_bounds[1], y_bounds[0], z_bounds[1]],
+            [x_bounds[0], y_bounds[0], z_bounds[1]],
+            [x_bounds[0], y_bounds[1], z_bounds[0]],
+            [x_bounds[1], y_bounds[1], z_bounds[0]],
+            [x_bounds[1], y_bounds[0], z_bounds[0]],
+            [x_bounds[0], y_bounds[0], z_bounds[0]],
+        ],
+        dtype=np.float32,
+    )
+
+
+def cuboid_axis_bounds_for_layer(axis_index: int, side: float) -> tuple[
+    tuple[tuple[float, float], tuple[float, float], tuple[float, float]],
+    tuple[tuple[float, float], tuple[float, float], tuple[float, float]],
+]:
+    full_bounds = [(-CUBE_HALF_SIZE_MM, CUBE_HALF_SIZE_MM) for _axis in range(3)]
+    inner_cut = (side * CUBE_HALF_SIZE_MM) - (side * CUBE_LAYER_SIZE_MM)
+    static_bounds = list(full_bounds)
+    turned_bounds = list(full_bounds)
+    if side > 0:
+        static_bounds[axis_index] = (-CUBE_HALF_SIZE_MM, inner_cut)
+        turned_bounds[axis_index] = (inner_cut, CUBE_HALF_SIZE_MM)
+    else:
+        static_bounds[axis_index] = (inner_cut, CUBE_HALF_SIZE_MM)
+        turned_bounds[axis_index] = (-CUBE_HALF_SIZE_MM, inner_cut)
+    return tuple(static_bounds), tuple(turned_bounds)
+
+
+def mid_turn_scoring_model(
+    face_name: str,
+    angle_degrees: float,
+) -> tuple[np.ndarray, np.ndarray, tuple[tuple[int, int], ...], np.ndarray]:
+    matching_specs = [spec for spec in MID_TURN_FACE_SPECS if spec[0] == face_name]
+    if not matching_specs:
+        raise ValueError(f"Unknown mid-turn face {face_name!r}")
+
+    _name, axis_index, side = matching_specs[0]
+    axis = np.zeros(3, dtype=np.float64)
+    axis[axis_index] = side
+    rotation = rotation_matrix_about_axis(axis, angle_degrees)
+
+    layer_mask = np.isclose(CUBE_CORNER_POINTS_MM[:, axis_index], side * CUBE_HALF_SIZE_MM)
+    outer_corner_indexes = tuple(int(index) for index in np.flatnonzero(layer_mask))
+    deformed_outer_points = CUBE_CORNER_POINTS_MM.astype(np.float32).copy()
+    deformed_outer_points[list(outer_corner_indexes)] = (
+        CUBE_CORNER_POINTS_MM[list(outer_corner_indexes)].astype(np.float64) @ rotation.T
+    ).astype(np.float32)
+
+    edge_midpoints = CUBE_EDGE_MIDPOINT_POINTS_MM.astype(np.float32).copy()
+    for edge_index, (start, end) in enumerate(CUBE_CORNER_EDGES):
+        if start in outer_corner_indexes and end in outer_corner_indexes:
+            edge_midpoints[edge_index] = (
+                CUBE_EDGE_MIDPOINT_POINTS_MM[edge_index].astype(np.float64) @ rotation.T
+            ).astype(np.float32)
+
+    edge_indexes: list[tuple[int, int]] = []
+    edge_point_offset = len(CUBE_CORNER_POINTS_MM)
+    for edge_index, (start, end) in enumerate(CUBE_CORNER_EDGES):
+        start_is_turned = start in outer_corner_indexes
+        end_is_turned = end in outer_corner_indexes
+        if start_is_turned != end_is_turned:
+            continue
+
+        edge_point_index = edge_point_offset + edge_index
+        edge_indexes.append((start, edge_point_index))
+        edge_indexes.append((edge_point_index, end))
+
+    allowed_corner_mask = np.zeros(len(deformed_outer_points) + len(edge_midpoints), dtype=bool)
+    allowed_corner_mask[: len(CUBE_CORNER_POINTS_MM)] = True
+    return deformed_outer_points, edge_midpoints, tuple(edge_indexes), allowed_corner_mask
+
+
+def mid_turn_display_model(
+    face_name: str,
+    angle_degrees: float,
+) -> tuple[np.ndarray, tuple[tuple[int, int], ...]]:
+    matching_specs = [spec for spec in MID_TURN_FACE_SPECS if spec[0] == face_name]
+    if not matching_specs:
+        raise ValueError(f"Unknown mid-turn face {face_name!r}")
+
+    _name, axis_index, side = matching_specs[0]
+    static_bounds, turned_bounds = cuboid_axis_bounds_for_layer(axis_index, side)
+    static_points = cuboid_points_from_axis_bounds(static_bounds)
+    turned_points = cuboid_points_from_axis_bounds(turned_bounds)
+    axis = np.zeros(3, dtype=np.float64)
+    axis[axis_index] = side
+    rotation = rotation_matrix_about_axis(axis, angle_degrees)
+    rotated_turned_points = (turned_points.astype(np.float64) @ rotation.T).astype(np.float32)
+
+    turned_offset = len(static_points)
+    display_points = np.vstack([static_points, rotated_turned_points]).astype(np.float32)
+    display_edges = tuple(CUBE_CORNER_EDGES) + tuple(
+        (turned_offset + start, turned_offset + end)
+        for start, end in CUBE_CORNER_EDGES
+    )
+    return display_points, display_edges
+
+
+def mid_turn_corner_model_candidates() -> list[tuple[str, float, np.ndarray, np.ndarray, tuple[tuple[int, int], ...], np.ndarray, np.ndarray, tuple[tuple[int, int], ...]]]:
+    return [
+        (
+            face_name,
+            float(angle_degrees),
+            *mid_turn_scoring_model(face_name, float(angle_degrees)),
+            *mid_turn_display_model(face_name, float(angle_degrees)),
+        )
+        for face_name, _axis_index, _side in MID_TURN_FACE_SPECS
+        for angle_degrees in MID_TURN_ANGLE_DEGREES
+    ]
+
+
 def visible_cube_corner_and_edge_masks(
     rvec: np.ndarray,
     tvec: np.ndarray,
@@ -967,8 +1163,34 @@ def solve_corner_pnp(
     *,
     scoring_points: np.ndarray | None = None,
     scoring_edge_points: np.ndarray | None = None,
+    model_corner_points: np.ndarray | None = None,
+    model_edge_points: np.ndarray | None = None,
+    display_points: np.ndarray | None = None,
+    edge_indexes: tuple[tuple[int, int], ...] | None = None,
+    allowed_corner_mask: np.ndarray | None = None,
+    allowed_edge_mask: np.ndarray | None = None,
+    display_edge_indexes: tuple[tuple[int, int], ...] | None = None,
     inlier_threshold: float,
 ) -> CornerPnPResult | None:
+    use_static_cube_visibility = model_corner_points is None and model_edge_points is None and edge_indexes is None
+    model_corner_points = (
+        CUBE_CORNER_POINTS_MM
+        if model_corner_points is None
+        else np.asarray(model_corner_points, dtype=np.float32).reshape(-1, 3)
+    )
+    model_edge_points = (
+        CUBE_EDGE_MIDPOINT_POINTS_MM
+        if model_edge_points is None
+        else np.asarray(model_edge_points, dtype=np.float32).reshape(-1, 3)
+    )
+    model_keypoint_points = np.vstack([model_corner_points, model_edge_points]).astype(np.float32)
+    display_points = (
+        model_keypoint_points
+        if display_points is None
+        else np.asarray(display_points, dtype=np.float32).reshape(-1, 3)
+    )
+    edge_indexes = CUBE_KEYPOINT_EDGE_SEGMENTS if edge_indexes is None else tuple(edge_indexes)
+    display_edge_indexes = edge_indexes if display_edge_indexes is None else tuple(display_edge_indexes)
     image_points = np.asarray(image_points, dtype=np.float32)
     object_points = np.asarray(object_points, dtype=np.float32)
     if len(image_points) != len(object_points) or len(image_points) < 3:
@@ -992,19 +1214,45 @@ def solve_corner_pnp(
     projected = projected.reshape(-1, 2)
     matched_error = float(np.mean(np.linalg.norm(projected - image_points, axis=1)))
     projected_corners, _ = cv2.projectPoints(
-        CUBE_CORNER_POINTS_MM,
+        model_keypoint_points,
         rvec,
         tvec,
         camera_matrix,
         dist_coeffs,
     )
     projected_corners = projected_corners.reshape(-1, 2)
-    visible_corner_mask, visible_edge_mask = visible_cube_corner_and_edge_masks(rvec, tvec)
+    projected_edge_points = projected_corners[
+        len(model_corner_points): len(model_corner_points) + len(model_edge_points)
+    ]
+    projected_display_points, _ = cv2.projectPoints(
+        display_points,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    projected_display_points = projected_display_points.reshape(-1, 2)
+    if allowed_corner_mask is None or allowed_edge_mask is None:
+        if use_static_cube_visibility:
+            visible_corner_mask, _visible_edge_mask = visible_cube_corner_and_edge_masks(rvec, tvec)
+            default_corner_mask = np.zeros(len(model_keypoint_points), dtype=bool)
+            default_corner_mask[: len(visible_corner_mask)] = visible_corner_mask
+            default_edge_mask = np.ones(len(edge_indexes), dtype=bool)
+        else:
+            default_corner_mask = np.zeros(len(model_keypoint_points), dtype=bool)
+            default_corner_mask[: len(model_corner_points)] = True
+            default_edge_mask = np.ones(len(edge_indexes), dtype=bool)
+        if allowed_corner_mask is None:
+            allowed_corner_mask = default_corner_mask
+        if allowed_edge_mask is None:
+            allowed_edge_mask = default_edge_mask
+    allowed_corner_mask = np.asarray(allowed_corner_mask, dtype=bool).reshape(-1)
+    allowed_edge_mask = np.asarray(allowed_edge_mask, dtype=bool).reshape(-1)
     scoring_points = image_points if scoring_points is None else np.asarray(scoring_points, dtype=np.float32)
     corner_error, corner_inlier_count, scoring_corner_indexes = robust_projected_corner_assignment(
         scoring_points,
         projected_corners,
-        allowed_corner_mask=visible_corner_mask,
+        allowed_corner_mask=allowed_corner_mask,
         inlier_threshold=inlier_threshold,
     )
     scoring_edge_points = (
@@ -1012,10 +1260,9 @@ def solve_corner_pnp(
         if scoring_edge_points is None
         else np.asarray(scoring_edge_points, dtype=np.float32).reshape(-1, 2)
     )
-    edge_error, edge_inlier_count = robust_projected_edge_score(
+    edge_error, edge_inlier_count, scoring_edge_indexes = robust_projected_corner_assignment(
         scoring_edge_points,
-        projected_corners,
-        allowed_edge_mask=visible_edge_mask,
+        projected_edge_points,
         inlier_threshold=inlier_threshold,
     )
     inlier_count = corner_inlier_count + edge_inlier_count
@@ -1037,11 +1284,21 @@ def solve_corner_pnp(
         scoring_points=scoring_points,
         scoring_edge_points=scoring_edge_points,
         object_points=object_points,
+        model_corner_points=model_corner_points,
+        model_edge_points=model_edge_points,
+        display_points=display_points,
         projected_corners=projected_corners,
+        projected_edge_points=projected_edge_points,
+        projected_display_points=projected_display_points,
         corner_inlier_count=corner_inlier_count,
         edge_inlier_count=edge_inlier_count,
         corner_names=(),
         scoring_corner_indexes=scoring_corner_indexes,
+        scoring_edge_indexes=scoring_edge_indexes,
+        edge_indexes=edge_indexes,
+        allowed_corner_mask=allowed_corner_mask,
+        allowed_edge_mask=allowed_edge_mask,
+        display_edge_indexes=display_edge_indexes,
     )
 
 
@@ -1134,6 +1391,7 @@ def robust_projected_edge_score(
     image_points: np.ndarray,
     projected_corners: np.ndarray,
     *,
+    edge_indexes: tuple[tuple[int, int], ...] = CUBE_CORNER_EDGES,
     allowed_edge_mask: np.ndarray | None = None,
     inlier_threshold: float,
 ) -> tuple[float, int]:
@@ -1143,7 +1401,7 @@ def robust_projected_edge_score(
         return float("inf"), 0
 
     edge_segments = np.asarray(
-        [(projected[start], projected[end]) for start, end in CUBE_CORNER_EDGES],
+        [(projected[start], projected[end]) for start, end in edge_indexes],
         dtype=np.float32,
     )
     if allowed_edge_mask is not None:
@@ -1181,21 +1439,39 @@ def refine_pnp_with_scored_corner_correspondences(
     if len(scoring_points) == 0 or len(corner_indexes) != len(scoring_points):
         return result
 
-    inlier_mask = corner_indexes >= 0
-    if int(inlier_mask.sum()) < 3:
+    corner_inlier_mask = corner_indexes >= 0
+    refine_image_points = [scoring_points[corner_inlier_mask]]
+    refine_object_points = [result.model_corner_points[corner_indexes[corner_inlier_mask]]]
+
+    scoring_edge_points = np.asarray(result.scoring_edge_points, dtype=np.float32).reshape(-1, 2)
+    edge_indexes = np.asarray(result.scoring_edge_indexes, dtype=np.int32)
+    edge_inlier_mask = edge_indexes >= 0 if len(edge_indexes) == len(scoring_edge_points) else np.zeros(0, dtype=bool)
+    if len(scoring_edge_points) and len(edge_indexes) == len(scoring_edge_points):
+        refine_image_points.append(scoring_edge_points[edge_inlier_mask])
+        refine_object_points.append(result.model_edge_points[edge_indexes[edge_inlier_mask]])
+
+    if sum(len(points) for points in refine_image_points) < 3:
         return result
 
     refined = solve_corner_pnp(
-        scoring_points[inlier_mask],
-        CUBE_CORNER_POINTS_MM[corner_indexes[inlier_mask]],
+        np.concatenate(refine_image_points, axis=0),
+        np.concatenate(refine_object_points, axis=0),
         result.camera_matrix,
         scoring_points=scoring_points,
         scoring_edge_points=result.scoring_edge_points,
+        model_corner_points=result.model_corner_points,
+        model_edge_points=result.model_edge_points,
+        display_points=result.display_points,
+        edge_indexes=result.edge_indexes,
+        allowed_corner_mask=result.allowed_corner_mask,
+        allowed_edge_mask=result.allowed_edge_mask,
+        display_edge_indexes=result.display_edge_indexes,
         inlier_threshold=inlier_threshold,
     )
     if refined is None:
         return result
-    refined.corner_names = tuple(CUBE_CORNER_NAMES[index] for index in corner_indexes[inlier_mask])
+    refined.corner_names = tuple(CUBE_CORNER_NAMES[index] for index in corner_indexes[corner_inlier_mask])
+    refined.pose_label = result.pose_label
     return refined
 
 
@@ -1209,10 +1485,16 @@ def temporal_corner_assignment_from_previous_projection(
     if previous_result is None or len(points) < 3:
         return tuple()
 
-    visible_corner_mask, _visible_edge_mask = visible_cube_corner_and_edge_masks(
-        previous_result.rvec,
-        previous_result.tvec,
-    )
+    if (
+        previous_result.allowed_corner_mask is not None
+        and len(previous_result.allowed_corner_mask) == len(previous_result.projected_corners)
+    ):
+        visible_corner_mask = previous_result.allowed_corner_mask
+    else:
+        visible_corner_mask, _visible_edge_mask = visible_cube_corner_and_edge_masks(
+            previous_result.rvec,
+            previous_result.tvec,
+        )
     _error, inlier_count, assignment = robust_projected_corner_assignment(
         points,
         previous_result.projected_corners,
@@ -1257,15 +1539,23 @@ def solve_temporal_corner_pnp(
 
     result = solve_corner_pnp(
         scoring_points[inlier_mask],
-        CUBE_CORNER_POINTS_MM[corner_indexes[inlier_mask]],
+        previous_result.model_corner_points[corner_indexes[inlier_mask]],
         previous_result.camera_matrix,
         scoring_points=scoring_points,
         scoring_edge_points=scoring_edge_points,
+        model_corner_points=previous_result.model_corner_points,
+        model_edge_points=previous_result.model_edge_points,
+        display_points=previous_result.display_points,
+        edge_indexes=previous_result.edge_indexes,
+        allowed_corner_mask=previous_result.allowed_corner_mask,
+        allowed_edge_mask=previous_result.allowed_edge_mask,
+        display_edge_indexes=previous_result.display_edge_indexes,
         inlier_threshold=inlier_threshold,
     )
     if result is None:
         return None
     result.corner_names = tuple(CUBE_CORNER_NAMES[index] for index in corner_indexes[inlier_mask])
+    result.pose_label = previous_result.pose_label
     result = refine_pnp_with_scored_corner_correspondences(
         result,
         inlier_threshold=inlier_threshold,
@@ -1299,12 +1589,25 @@ def solve_best_corner_pnp(
     camera_matrices: list[np.ndarray],
     *,
     scoring_edge_points: np.ndarray | None = None,
+    model_corner_points: np.ndarray | None = None,
+    model_edge_points: np.ndarray | None = None,
+    display_points: np.ndarray | None = None,
+    edge_indexes: tuple[tuple[int, int], ...] = CUBE_KEYPOINT_EDGE_SEGMENTS,
+    allowed_corner_mask: np.ndarray | None = None,
+    allowed_edge_mask: np.ndarray | None = None,
+    display_edge_indexes: tuple[tuple[int, int], ...] | None = None,
+    pose_label: str = "",
     hypothesis_point_count: int = PNP_HYPOTHESIS_POINT_COUNT,
     inlier_threshold: float = 10.0,
 ) -> CornerPnPResult | None:
     scoring_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
     if len(scoring_points) < hypothesis_point_count:
         return None
+    model_corner_points = (
+        CUBE_CORNER_POINTS_MM
+        if model_corner_points is None
+        else np.asarray(model_corner_points, dtype=np.float32).reshape(-1, 3)
+    )
     hypothesis_point_sets = pnp_hypothesis_point_sets(
         scoring_points,
         hypothesis_point_count=hypothesis_point_count,
@@ -1315,18 +1618,26 @@ def solve_best_corner_pnp(
     for camera_matrix in camera_matrices:
         for hypothesis_points in hypothesis_point_sets:
             for corner_indexes in CUBE_CORNER_CORRESPONDENCE_TRIPLES:
-                object_points = CUBE_CORNER_POINTS_MM[list(corner_indexes)]
+                object_points = model_corner_points[list(corner_indexes)]
                 result = solve_corner_pnp(
                     hypothesis_points,
                     object_points,
                     camera_matrix,
                     scoring_points=scoring_points,
                     scoring_edge_points=scoring_edge_points,
+                    model_corner_points=model_corner_points,
+                    model_edge_points=model_edge_points,
+                    display_points=display_points,
+                    edge_indexes=edge_indexes,
+                    allowed_corner_mask=allowed_corner_mask,
+                    allowed_edge_mask=allowed_edge_mask,
+                    display_edge_indexes=display_edge_indexes,
                     inlier_threshold=inlier_threshold,
                 )
                 if result is None:
                     continue
                 result.corner_names = tuple(CUBE_CORNER_NAMES[index] for index in corner_indexes)
+                result.pose_label = pose_label
                 result = refine_pnp_with_scored_corner_correspondences(
                     result,
                     inlier_threshold=inlier_threshold,
@@ -1335,6 +1646,44 @@ def solve_best_corner_pnp(
                     best = result
     if best is None or best.corner_inlier_count < len(scoring_points):
         return None
+    return best
+
+
+def solve_best_mid_turn_corner_pnp(
+    image_points: np.ndarray,
+    camera_matrices: list[np.ndarray],
+    *,
+    scoring_edge_points: np.ndarray | None = None,
+    hypothesis_point_count: int = PNP_HYPOTHESIS_POINT_COUNT,
+    inlier_threshold: float = 10.0,
+) -> CornerPnPResult | None:
+    best: CornerPnPResult | None = None
+    for (
+        face_name,
+        angle_degrees,
+        model_corner_points,
+        model_edge_points,
+        edge_indexes,
+        allowed_corner_mask,
+        display_points,
+        display_edge_indexes,
+    ) in mid_turn_corner_model_candidates():
+        result = solve_best_corner_pnp(
+            image_points,
+            camera_matrices,
+            scoring_edge_points=scoring_edge_points,
+            model_corner_points=model_corner_points,
+            model_edge_points=model_edge_points,
+            display_points=display_points,
+            edge_indexes=edge_indexes,
+            allowed_corner_mask=allowed_corner_mask,
+            display_edge_indexes=display_edge_indexes,
+            pose_label=f"{face_name}+{angle_degrees:.0f}",
+            hypothesis_point_count=hypothesis_point_count,
+            inlier_threshold=inlier_threshold,
+        )
+        if result is not None and pnp_result_is_better(result, best):
+            best = result
     return best
 
 
@@ -1357,7 +1706,17 @@ def solve_temporal_or_best_corner_pnp(
         if temporal_result is not None:
             return temporal_result
 
-    return solve_best_corner_pnp(
+    result = solve_best_corner_pnp(
+        image_points,
+        camera_matrices,
+        scoring_edge_points=scoring_edge_points,
+        hypothesis_point_count=hypothesis_point_count,
+        inlier_threshold=inlier_threshold,
+    )
+    if result is not None or not MID_TURN_POSE_ESTIMATION_ENABLED:
+        return result
+
+    return solve_best_mid_turn_corner_pnp(
         image_points,
         camera_matrices,
         scoring_edge_points=scoring_edge_points,
@@ -1382,9 +1741,10 @@ def best_camera_matrix_for_observations(
         errors = []
         inliers = 0
         for observation in observations:
-            result = solve_best_corner_pnp(
+            result = solve_temporal_or_best_corner_pnp(
                 observation.points,
                 [camera_matrix],
+                previous_result=None,
                 scoring_edge_points=observation.edge_points,
                 inlier_threshold=inlier_threshold,
             )
@@ -1467,13 +1827,15 @@ def draw_pnp_cube(frame: np.ndarray, result: CornerPnPResult | None) -> None:
     if result is None:
         return
 
-    projected = np.asarray(result.projected_corners, dtype=np.float32)
-    for start, end in CUBE_CORNER_EDGES:
+    projected = np.asarray(result.projected_display_points, dtype=np.float32)
+    edge_indexes = result.display_edge_indexes or result.edge_indexes
+    for start, end in edge_indexes:
         start_point = tuple(np.round(projected[start]).astype(int))
         end_point = tuple(np.round(projected[end]).astype(int))
+        color = PNP_CUBE_LINE_COLOR
         cv2.line(frame, start_point, end_point, (0, 0, 0), 4, lineType=cv2.LINE_AA)
-        cv2.line(frame, start_point, end_point, PNP_CUBE_LINE_COLOR, 2, lineType=cv2.LINE_AA)
-    for point in projected:
+        cv2.line(frame, start_point, end_point, color, 2, lineType=cv2.LINE_AA)
+    for point in result.projected_corners:
         cv2.circle(frame, tuple(np.round(point).astype(int)), 4, PNP_CUBE_POINT_COLOR, -1, lineType=cv2.LINE_AA)
     for point in result.image_points:
         cv2.circle(frame, tuple(np.round(point).astype(int)), 6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
