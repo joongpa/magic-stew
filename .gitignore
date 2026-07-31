@@ -17,3 +17,8 @@ checkpoints/
 runs/
 __pycache__/
 .matplotlib-cache/
+
+# Local MCP setup
+blender_mcp_addon.py
+.mcp/
+mcp/

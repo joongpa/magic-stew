@@ -13,7 +13,7 @@ import argparse
 import importlib.util
 import sys
 from dataclasses import dataclass
-from itertools import permutations
+from itertools import combinations, permutations
 from pathlib import Path
 from time import perf_counter
 
@@ -42,9 +42,10 @@ DEFAULT_POSE_MODEL = (
     / "runs/pose/runs/cube_piece_pose_local/runs/cube_corner_edge_yolo11n_pose/weights/best.pt"
 )
 ENABLE_STICKER_SEGMENTATION = False
-ENABLE_POSE_ESTIMATION = True
+ENABLE_POSE_ESTIMATION = False
 DRAW_POSE_KEYPOINTS = True
 DRAW_PNP_CUBE = True
+DRAW_CORNER_ADJACENCY = True
 DISPLAY_WINDOW_NAME = "cube sticker segmentations"
 DISPLAY_PREVIEW_BY_DEFAULT = True
 SHOW_ORIGINAL_UNDERLAY_BY_DEFAULT = True
@@ -62,6 +63,17 @@ PNP_HYPOTHESIS_POINT_COUNT = 3
 PNP_HYPOTHESIS_ATTEMPT_LIMIT = 3
 PNP_CORNER_DETECTION_LIMIT = 8
 PNP_EDGE_DETECTION_LIMIT = 12
+ADJACENCY_CANNY_BLUR_KERNEL = 5
+ADJACENCY_CANNY_LOW = 60
+ADJACENCY_CANNY_HIGH = 160
+ADJACENCY_HOUGH_THRESHOLD = 28
+ADJACENCY_HOUGH_MIN_LINE_LENGTH = 24
+ADJACENCY_HOUGH_MAX_LINE_GAP = 10
+ADJACENCY_MAX_ANGLE_DEGREES = 10.0
+ADJACENCY_MAX_LINE_DISTANCE_PX = 9.0
+ADJACENCY_MIN_COVERAGE = 0.68
+ADJACENCY_MAX_UNCOVERED_GAP_RATIO = 0.24
+ADJACENCY_INTERVAL_PADDING_PX = 5.0
 PNP_TEMPORAL_TRACKING_ENABLED = True
 PNP_TEMPORAL_MAX_CORNER_SHIFT_PX = 18.0
 MID_TURN_POSE_ESTIMATION_ENABLED = True
@@ -307,6 +319,15 @@ class CornerPnPResult:
     allowed_edge_mask: np.ndarray | None = None
     display_edge_indexes: tuple[tuple[int, int], ...] | None = None
     pose_label: str = ""
+
+
+@dataclass(frozen=True)
+class CornerAdjacency:
+    start_index: int
+    end_index: int
+    coverage: float
+    max_uncovered_gap: float
+    accepted: bool
 
 
 @dataclass
@@ -1841,6 +1862,209 @@ def draw_pnp_cube(frame: np.ndarray, result: CornerPnPResult | None) -> None:
         cv2.circle(frame, tuple(np.round(point).astype(int)), 6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
 
 
+def odd_kernel(value: int) -> int:
+    value = max(1, int(value))
+    return value if value % 2 == 1 else value + 1
+
+
+def build_adjacency_edge_map(roi: np.ndarray, args) -> np.ndarray:
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur_kernel = odd_kernel(getattr(args, "adjacency_canny_blur", ADJACENCY_CANNY_BLUR_KERNEL))
+    if blur_kernel > 1:
+        gray = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+    canny_low = max(0, int(getattr(args, "adjacency_canny_low", ADJACENCY_CANNY_LOW)))
+    canny_high = max(1, int(getattr(args, "adjacency_canny_high", ADJACENCY_CANNY_HIGH)))
+    if canny_low > canny_high:
+        canny_low, canny_high = canny_high, canny_low
+    return cv2.Canny(gray, canny_low, canny_high)
+
+
+def merged_interval_coverage(
+    intervals: list[tuple[float, float]],
+    segment_length: float,
+) -> tuple[float, float]:
+    if segment_length <= 0.0 or not intervals:
+        return 0.0, segment_length
+
+    clipped = [
+        (max(0.0, start), min(segment_length, end))
+        for start, end in intervals
+        if end >= 0.0 and start <= segment_length
+    ]
+    clipped = [(start, end) for start, end in clipped if end > start]
+    if not clipped:
+        return 0.0, segment_length
+
+    clipped.sort()
+    merged: list[tuple[float, float]] = []
+    for start, end in clipped:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+
+    covered = sum(end - start for start, end in merged)
+    max_gap = merged[0][0]
+    for previous, current in zip(merged, merged[1:]):
+        max_gap = max(max_gap, current[0] - previous[1])
+    max_gap = max(max_gap, segment_length - merged[-1][1])
+    return covered / segment_length, max_gap
+
+
+def distance_to_line(point: np.ndarray, line_start: np.ndarray, line_unit: np.ndarray) -> float:
+    delta = point - line_start
+    projection = float(np.dot(delta, line_unit))
+    closest = line_start + (line_unit * projection)
+    return float(np.linalg.norm(point - closest))
+
+
+def corner_adjacency_evidence(
+    corner_points: np.ndarray,
+    roi_xyxy: tuple[int, int, int, int],
+    hough_lines: np.ndarray | None,
+    args,
+) -> list[CornerAdjacency]:
+    points = np.asarray(corner_points, dtype=np.float32).reshape(-1, 2)
+    if len(points) < 2 or hough_lines is None:
+        return []
+
+    roi_offset = np.asarray(roi_xyxy[:2], dtype=np.float32)
+    roi_points = points - roi_offset
+    raw_lines = np.asarray(hough_lines, dtype=np.float32).reshape(-1, 4)
+    max_angle_degrees = float(
+        getattr(args, "adjacency_max_angle_degrees", ADJACENCY_MAX_ANGLE_DEGREES)
+    )
+    min_alignment = float(np.cos(np.deg2rad(max(0.0, min(89.0, max_angle_degrees)))))
+    max_line_distance = max(
+        0.0,
+        float(getattr(args, "adjacency_max_line_distance", ADJACENCY_MAX_LINE_DISTANCE_PX)),
+    )
+    min_coverage = max(
+        0.0,
+        min(1.0, float(getattr(args, "adjacency_min_coverage", ADJACENCY_MIN_COVERAGE))),
+    )
+    max_gap_ratio = max(
+        0.0,
+        float(
+            getattr(
+                args,
+                "adjacency_max_uncovered_gap_ratio",
+                ADJACENCY_MAX_UNCOVERED_GAP_RATIO,
+            )
+        ),
+    )
+    interval_padding = max(
+        0.0,
+        float(getattr(args, "adjacency_interval_padding", ADJACENCY_INTERVAL_PADDING_PX)),
+    )
+
+    adjacencies: list[CornerAdjacency] = []
+    for start_index, end_index in combinations(range(len(roi_points)), 2):
+        start = roi_points[start_index]
+        end = roi_points[end_index]
+        delta = end - start
+        length = float(np.linalg.norm(delta))
+        if length <= 1.0:
+            continue
+        unit = delta / length
+        intervals: list[tuple[float, float]] = []
+
+        for x1, y1, x2, y2 in raw_lines:
+            line_start = np.asarray((x1, y1), dtype=np.float32)
+            line_end = np.asarray((x2, y2), dtype=np.float32)
+            line_delta = line_end - line_start
+            line_length = float(np.linalg.norm(line_delta))
+            if line_length <= 1.0:
+                continue
+
+            line_unit = line_delta / line_length
+            if abs(float(np.dot(unit, line_unit))) < min_alignment:
+                continue
+            if (
+                distance_to_line(line_start, start, unit) > max_line_distance
+                or distance_to_line(line_end, start, unit) > max_line_distance
+            ):
+                continue
+
+            projected_start = float(np.dot(line_start - start, unit))
+            projected_end = float(np.dot(line_end - start, unit))
+            interval_start = min(projected_start, projected_end) - interval_padding
+            interval_end = max(projected_start, projected_end) + interval_padding
+            intervals.append((interval_start, interval_end))
+
+        coverage, max_gap = merged_interval_coverage(intervals, length)
+        accepted = coverage >= min_coverage and max_gap <= (max_gap_ratio * length)
+        adjacencies.append(
+            CornerAdjacency(
+                start_index=start_index,
+                end_index=end_index,
+                coverage=coverage,
+                max_uncovered_gap=max_gap,
+                accepted=accepted,
+            )
+        )
+
+    return adjacencies
+
+
+def draw_corner_adjacencies(
+    frame: np.ndarray,
+    corner_points: np.ndarray,
+    roi: np.ndarray,
+    roi_xyxy: tuple[int, int, int, int],
+    args,
+) -> int:
+    points = np.asarray(corner_points, dtype=np.float32).reshape(-1, 2)
+    if len(points) < 2:
+        return 0
+
+    edges = build_adjacency_edge_map(roi, args)
+    hough_lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180.0,
+        threshold=max(
+            1,
+            int(getattr(args, "adjacency_hough_threshold", ADJACENCY_HOUGH_THRESHOLD)),
+        ),
+        minLineLength=max(
+            1,
+            int(getattr(args, "adjacency_hough_min_line_length", ADJACENCY_HOUGH_MIN_LINE_LENGTH)),
+        ),
+        maxLineGap=max(
+            0,
+            int(getattr(args, "adjacency_hough_max_line_gap", ADJACENCY_HOUGH_MAX_LINE_GAP)),
+        ),
+    )
+    adjacencies = corner_adjacency_evidence(points, roi_xyxy, hough_lines, args)
+    accepted_count = 0
+    for adjacency in adjacencies:
+        if not adjacency.accepted:
+            continue
+        start = tuple(np.round(points[adjacency.start_index]).astype(int))
+        end = tuple(np.round(points[adjacency.end_index]).astype(int))
+        cv2.line(frame, start, end, (0, 0, 0), 5, lineType=cv2.LINE_AA)
+        cv2.line(frame, start, end, (60, 255, 120), 2, lineType=cv2.LINE_AA)
+        if getattr(args, "debug_overlay", False):
+            midpoint = tuple(
+                np.round(
+                    (points[adjacency.start_index] + points[adjacency.end_index]) * 0.5
+                ).astype(int)
+            )
+            cv2.putText(
+                frame,
+                f"{adjacency.coverage:.0%}",
+                midpoint,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        accepted_count += 1
+    return accepted_count
+
+
 def draw_pose_estimate(
     frame: np.ndarray,
     roi: np.ndarray,
@@ -1867,6 +2091,19 @@ def draw_pose_estimate(
     xy, conf = result_keypoints(result, POSE_IMAGE_SIZE)
     scale_x = (x2 - x1) / float(model_roi.shape[1])
     scale_y = (y2 - y1) / float(model_roi.shape[0])
+    corner_points = collect_corner_image_points(
+        result,
+        pose_model,
+        xy,
+        conf,
+        confidence_threshold=POSE_KEYPOINT_CONFIDENCE,
+        offset_xy=(x1, y1),
+        scale_xy=(scale_x, scale_y),
+        point_limit=PNP_CORNER_DETECTION_LIMIT,
+    )
+    if getattr(args, "show_corner_adjacency", DRAW_CORNER_ADJACENCY):
+        draw_corner_adjacencies(frame, corner_points, roi, roi_xyxy, args)
+
     point_count = 0
     if DRAW_POSE_KEYPOINTS:
         point_count = draw_pose_keypoints(
@@ -1880,16 +2117,6 @@ def draw_pose_estimate(
             scale_xy=(scale_x, scale_y),
         )
 
-    corner_points = collect_corner_image_points(
-        result,
-        pose_model,
-        xy,
-        conf,
-        confidence_threshold=POSE_KEYPOINT_CONFIDENCE,
-        offset_xy=(x1, y1),
-        scale_xy=(scale_x, scale_y),
-        point_limit=PNP_CORNER_DETECTION_LIMIT,
-    )
     edge_points = collect_pose_image_points(
         result,
         pose_model,
@@ -2587,12 +2814,85 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Draw only the sticker overlay on a black background",
     )
+    parser.add_argument(
+        "--hide-corner-adjacency",
+        dest="show_corner_adjacency",
+        action="store_false",
+        help="Do not draw Canny/Hough-derived adjacency lines between detected corner keypoints",
+    )
+    parser.add_argument(
+        "--adjacency-canny-blur",
+        type=int,
+        default=ADJACENCY_CANNY_BLUR_KERNEL,
+        help="Gaussian blur kernel before Canny for corner adjacency evidence",
+    )
+    parser.add_argument(
+        "--adjacency-canny-low",
+        type=int,
+        default=ADJACENCY_CANNY_LOW,
+        help="Lower Canny threshold for corner adjacency evidence",
+    )
+    parser.add_argument(
+        "--adjacency-canny-high",
+        type=int,
+        default=ADJACENCY_CANNY_HIGH,
+        help="Upper Canny threshold for corner adjacency evidence",
+    )
+    parser.add_argument(
+        "--adjacency-hough-threshold",
+        type=int,
+        default=ADJACENCY_HOUGH_THRESHOLD,
+        help="Minimum Hough votes for line evidence used in corner adjacency",
+    )
+    parser.add_argument(
+        "--adjacency-hough-min-line-length",
+        type=int,
+        default=ADJACENCY_HOUGH_MIN_LINE_LENGTH,
+        help="Minimum Hough line length in pixels for corner adjacency evidence",
+    )
+    parser.add_argument(
+        "--adjacency-hough-max-line-gap",
+        type=int,
+        default=ADJACENCY_HOUGH_MAX_LINE_GAP,
+        help="Maximum Hough line gap in pixels for corner adjacency evidence",
+    )
+    parser.add_argument(
+        "--adjacency-max-angle-degrees",
+        type=float,
+        default=ADJACENCY_MAX_ANGLE_DEGREES,
+        help="Maximum angle difference between a Hough line and a corner-pair segment",
+    )
+    parser.add_argument(
+        "--adjacency-max-line-distance",
+        type=float,
+        default=ADJACENCY_MAX_LINE_DISTANCE_PX,
+        help="Maximum perpendicular distance from Hough line endpoints to the corner-pair segment",
+    )
+    parser.add_argument(
+        "--adjacency-min-coverage",
+        type=float,
+        default=ADJACENCY_MIN_COVERAGE,
+        help="Minimum covered fraction of the corner-pair distance required for adjacency",
+    )
+    parser.add_argument(
+        "--adjacency-max-uncovered-gap-ratio",
+        type=float,
+        default=ADJACENCY_MAX_UNCOVERED_GAP_RATIO,
+        help="Maximum uncovered gap as a fraction of the corner-pair distance",
+    )
+    parser.add_argument(
+        "--adjacency-interval-padding",
+        type=float,
+        default=ADJACENCY_INTERVAL_PADDING_PX,
+        help="Pixels added to each projected Hough interval before measuring coverage",
+    )
     parser.set_defaults(
         show_bbox=True,
         show_confidence=True,
         show_sticker_color_classification=True,
         display=DISPLAY_PREVIEW_BY_DEFAULT,
         show_original_underlay=SHOW_ORIGINAL_UNDERLAY_BY_DEFAULT,
+        show_corner_adjacency=DRAW_CORNER_ADJACENCY,
     )
     return parser
 
