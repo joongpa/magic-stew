@@ -12,8 +12,9 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import sys
+from collections import deque
 from dataclasses import dataclass
-from itertools import permutations
+from itertools import permutations, product
 from pathlib import Path
 from time import perf_counter
 
@@ -42,27 +43,25 @@ DEFAULT_POSE_MODEL = (
     / "runs/pose/runs/cube_independent_keypoints/runs/cube_independent_keypoints_yolo11n_pose/weights/best.pt"
 )
 ENABLE_STICKER_SEGMENTATION = False
-ENABLE_POSE_ESTIMATION = False
+ENABLE_POSE_ESTIMATION = True
 DRAW_POSE_KEYPOINTS = True
 DRAW_PNP_CUBE = True
-DRAW_CORNER_ADJACENCY = True
+DRAW_CORNER_ADJACENCY = False
+DRAW_POSE_GRAPH_COORDS = False
 DISPLAY_WINDOW_NAME = "cube sticker segmentations"
 DISPLAY_PREVIEW_BY_DEFAULT = True
 SHOW_ORIGINAL_UNDERLAY_BY_DEFAULT = True
 POSE_IMAGE_SIZE = 256
 POSE_OBJECT_CONFIDENCE = 0.5
-POSE_KEYPOINT_CONFIDENCE = 0.5
-PNP_BOOTSTRAP_FRAME_COUNT = 12
+POSE_KEYPOINT_CONFIDENCE = 0.8
 PNP_FOCAL_SCALE_MIN = 0.7
 PNP_FOCAL_SCALE_MAX = 1.8
 PNP_FOCAL_SCALE_STEPS = 5
-PNP_PRINCIPAL_POINT_OFFSET_RATIO = 0.0
+PNP_CAMERA_BOOTSTRAP_FRAME_COUNT = 12
 PNP_MAX_REPROJECTION_ERROR_PX = 12.0
 PNP_INLIER_THRESHOLD_PX = 10.0
-PNP_HYPOTHESIS_POINT_COUNT = 3
-PNP_HYPOTHESIS_ATTEMPT_LIMIT = 3
-PNP_CORNER_DETECTION_LIMIT = 8
-PNP_EDGE_DETECTION_LIMIT = 12
+PNP_PRUNE_REPROJECTION_ERROR_PX = 18.0
+PNP_MAX_FRAME_TRANSLATION_MM = 50.0
 ADJACENCY_CANNY_BLUR_KERNEL = 5
 ADJACENCY_CANNY_LOW = 60
 ADJACENCY_CANNY_HIGH = 160
@@ -71,15 +70,13 @@ ADJACENCY_HOUGH_MIN_LINE_LENGTH = 24
 ADJACENCY_HOUGH_MAX_LINE_GAP = 10
 ADJACENCY_MAX_ANGLE_DEGREES = 10.0
 ADJACENCY_MAX_LINE_DISTANCE_PX = 9.0
-ADJACENCY_MIN_COVERAGE = 0.82
-ADJACENCY_MAX_UNCOVERED_GAP_RATIO = 0.18
+ADJACENCY_MIN_EDGE_LENGTH_PX = 32.0
+ADJACENCY_MIN_COVERAGE = 0.95
+ADJACENCY_MAX_UNCOVERED_GAP_RATIO = 0.05
+ADJACENCY_MAX_AVERAGE_LENGTH_RATIO = 1.8
 ADJACENCY_INTERVAL_PADDING_PX = 5.0
 ADJACENCY_EDGE_DILATION_PX = 8
 ADJACENCY_KEYPOINT_INTERSECTION_DISTANCE_PX = 7.0
-PNP_TEMPORAL_TRACKING_ENABLED = True
-PNP_TEMPORAL_MAX_CORNER_SHIFT_PX = 18.0
-MID_TURN_POSE_ESTIMATION_ENABLED = True
-MID_TURN_ANGLE_DEGREES = tuple(range(5, 50, 5))
 DEFAULT_STICKER_MASK_COLOR = (150, 150, 150)
 FACE_INSTANCE_MASK_COLORS = (
     (255, 80, 80),
@@ -122,6 +119,33 @@ CUBE_EDGE_MIDPOINT_POINTS_MM = np.asarray(
     ],
     dtype=np.float32,
 )
+CUBE_GRID_MAX_INDEX = 3
+CUBE_LATTICE_COORDS = tuple(
+    (x, y, z)
+    for x in range(CUBE_GRID_MAX_INDEX + 1)
+    for y in range(CUBE_GRID_MAX_INDEX + 1)
+    for z in range(CUBE_GRID_MAX_INDEX + 1)
+    if x in (0, CUBE_GRID_MAX_INDEX)
+    or y in (0, CUBE_GRID_MAX_INDEX)
+    or z in (0, CUBE_GRID_MAX_INDEX)
+)
+CUBE_LATTICE_POINTS_MM = np.asarray(
+    [
+        (
+            (coord[0] - (CUBE_GRID_MAX_INDEX * 0.5)) * CUBE_LAYER_SIZE_MM,
+            (coord[1] - (CUBE_GRID_MAX_INDEX * 0.5)) * CUBE_LAYER_SIZE_MM,
+            (coord[2] - (CUBE_GRID_MAX_INDEX * 0.5)) * CUBE_LAYER_SIZE_MM,
+        )
+        for coord in CUBE_LATTICE_COORDS
+    ],
+    dtype=np.float32,
+)
+CUBE_LATTICE_IDENTITY_TRANSFORM = ((0, 1, 2), (1, 1, 1))
+CUBE_LATTICE_AXIS_TRANSFORMS = tuple(
+    (axis_order, signs)
+    for axis_order in permutations(range(3))
+    for signs in product((-1, 1), repeat=3)
+)
 CUBE_EDGE_KEYPOINT_OFFSET = len(CUBE_CORNER_POINTS_MM)
 CUBE_KEYPOINT_EDGE_SEGMENTS = tuple(
     segment
@@ -131,61 +155,6 @@ CUBE_KEYPOINT_EDGE_SEGMENTS = tuple(
         (CUBE_EDGE_KEYPOINT_OFFSET + edge_index, end),
     )
 )
-CUBE_FACES = (
-    ((0, 1, 2, 3), (0.0, 0.0, 1.0)),
-    ((4, 7, 6, 5), (0.0, 0.0, -1.0)),
-    ((0, 4, 5, 1), (0.0, 1.0, 0.0)),
-    ((3, 2, 6, 7), (0.0, -1.0, 0.0)),
-    ((1, 5, 6, 2), (1.0, 0.0, 0.0)),
-    ((0, 3, 7, 4), (-1.0, 0.0, 0.0)),
-)
-MID_TURN_FACE_SPECS = (
-    ("B", 2, 1.0),
-    ("F", 2, -1.0),
-    ("U", 1, 1.0),
-    ("D", 1, -1.0),
-    ("R", 0, 1.0),
-    ("L", 0, -1.0),
-)
-
-
-def cube_orientation_corner_permutations() -> tuple[tuple[int, ...], ...]:
-    corner_lookup = {
-        tuple(np.sign(point).astype(np.int8)): index
-        for index, point in enumerate(CUBE_CORNER_POINTS_MM)
-    }
-    rotations = []
-    for axis_order in permutations(range(3)):
-        permutation_matrix = np.zeros((3, 3), dtype=np.int8)
-        for output_axis, input_axis in enumerate(axis_order):
-            permutation_matrix[output_axis, input_axis] = 1
-        for signs in ((sx, sy, sz) for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)):
-            rotation = permutation_matrix * np.asarray(signs, dtype=np.int8)[:, None]
-            if round(float(np.linalg.det(rotation))) != 1:
-                continue
-            rotations.append(
-                tuple(
-                    corner_lookup[tuple(rotation @ np.sign(point).astype(np.int8))]
-                    for point in CUBE_CORNER_POINTS_MM
-                )
-            )
-    return tuple(sorted(set(rotations)))
-
-
-def cube_corner_correspondence_triples() -> tuple[tuple[int, int, int], ...]:
-    orientations = cube_orientation_corner_permutations()
-    representatives = set()
-    for corner_triple in permutations(range(len(CUBE_CORNER_POINTS_MM)), PNP_HYPOTHESIS_POINT_COUNT):
-        orbit = [
-            tuple(orientation[index] for index in corner_triple)
-            for orientation in orientations
-        ]
-        representatives.add(min(orbit))
-    return tuple(sorted(representatives))
-
-
-CUBE_ORIENTATION_CORNER_PERMUTATIONS = cube_orientation_corner_permutations()
-CUBE_CORNER_CORRESPONDENCE_TRIPLES = cube_corner_correspondence_triples()
 POSE_CLASS_NAMES = {"corner", "corner-edge", "corner-edge-center", "center"}
 POSE_KEYPOINT_COLORS = {
     "corner": (255, 255, 255),
@@ -197,6 +166,9 @@ PNP_CUBE_LINE_COLOR = (255, 80, 30)
 PNP_CUBE_POINT_COLOR = (30, 180, 255)
 PNP_CUBE_STATIC_LINE_COLOR = (100, 100, 100)
 PNP_CUBE_SEAM_LINE_COLOR = (255, 220, 80)
+POSE_GRAPH_CORRESPONDENCE_LINE_COLOR = (255, 80, 255)
+POSE_GRAPH_CORRESPONDENCE_TEXT_COLOR = (255, 255, 255)
+PNP_REPROJECTION_RESIDUAL_COLOR = (0, 255, 255)
 
 
 def register_training_checkpoint_classes() -> None:
@@ -255,11 +227,13 @@ class RoiTracker:
         frame_height: int,
         tracking_gain: float = 1.0,
         tracking_padding: float = 0.0,
+        reset_on_missing: bool = True,
     ) -> None:
         if self.roi_xyxy is None:
             return
         if tracking_bounds_xyxy is None:
-            self.reset()
+            if reset_on_missing:
+                self.reset()
             return
 
         x1, y1, x2, y2 = self.roi_xyxy
@@ -289,13 +263,7 @@ class RoiTracker:
 
 
 @dataclass
-class CornerObservation:
-    points: np.ndarray
-    edge_points: np.ndarray
-
-
-@dataclass
-class CornerPnPResult:
+class PosePnPResult:
     error: float
     inlier_count: int
     matched_error: float
@@ -304,25 +272,17 @@ class CornerPnPResult:
     rvec: np.ndarray
     tvec: np.ndarray
     image_points: np.ndarray
-    scoring_points: np.ndarray
-    scoring_edge_points: np.ndarray
     object_points: np.ndarray
-    model_corner_points: np.ndarray
-    model_edge_points: np.ndarray
     display_points: np.ndarray
-    projected_corners: np.ndarray
-    projected_edge_points: np.ndarray
+    projected_object_points: np.ndarray
     projected_display_points: np.ndarray
-    corner_inlier_count: int
-    edge_inlier_count: int
-    corner_names: tuple[str, ...]
-    scoring_corner_indexes: tuple[int, ...]
-    scoring_edge_indexes: tuple[int, ...]
-    edge_indexes: tuple[tuple[int, int], ...] = CUBE_CORNER_EDGES
-    allowed_corner_mask: np.ndarray | None = None
-    allowed_edge_mask: np.ndarray | None = None
+    point_names: tuple[str, ...]
+    edge_indexes: tuple[tuple[int, int], ...] = tuple()
     display_edge_indexes: tuple[tuple[int, int], ...] | None = None
     pose_label: str = ""
+    lattice_transform: tuple[tuple[int, int, int], tuple[int, int, int]] = CUBE_LATTICE_IDENTITY_TRANSFORM
+    invisible_point_count: int = 0
+    observed_reprojection_error: float | None = None
 
 
 @dataclass(frozen=True)
@@ -351,95 +311,253 @@ class PoseGraphEdge:
     accepted: bool
 
 
+@dataclass(frozen=True)
+class PoseGraph:
+    points: tuple[PoseGraphPoint, ...]
+    edges: tuple[PoseGraphEdge, ...]
+
+
+@dataclass(frozen=True)
+class PoseGraphCorrespondence:
+    image_points: np.ndarray
+    object_points: np.ndarray
+    graph_indexes: tuple[int, ...]
+    lattice_coords: tuple[tuple[int, int, int], ...]
+
+
+@dataclass(frozen=True)
+class PoseGraphNodeAssignment:
+    coord: tuple[int, int, int]
+    parent_index: int | None
+    local_to_global: dict[str, tuple[int, int, int]] | None
+    local_to_global_frames: tuple[dict[str, tuple[int, int, int]], ...]
+    path_faces: frozenset[tuple[int, int]]
+    depth: int
+
+
 @dataclass
-class CameraBootstrapPnP:
-    bootstrap_frames: int = 12
+class PoseGraphPnPSolver:
     focal_min: float = 0.7
     focal_max: float = 1.8
-    focal_steps: int = 7
-    principal_offset: float = 0.08
-    reprojection_error: float = 12.0
-    inlier_threshold: float = 10.0
+    focal_steps: int = 5
+    camera_bootstrap_frames: int = PNP_CAMERA_BOOTSTRAP_FRAME_COUNT
+    max_reprojection_error_px: float = PNP_MAX_REPROJECTION_ERROR_PX
+    inlier_threshold_px: float = PNP_INLIER_THRESHOLD_PX
+    prune_reprojection_error_px: float = PNP_PRUNE_REPROJECTION_ERROR_PX
+    max_frame_translation_mm: float = PNP_MAX_FRAME_TRANSLATION_MM
     camera_matrix: np.ndarray | None = None
-    observations: list[CornerObservation] | None = None
-    last_result: CornerPnPResult | None = None
+    accepted_pose_count: int = 0
+    last_tvec: np.ndarray | None = None
 
-    def __post_init__(self) -> None:
-        if self.observations is None:
-            self.observations = []
-
-    def solve(
+    def solve_correspondences(
         self,
-        image_points: np.ndarray,
+        correspondence: PoseGraphCorrespondence | None,
         image_size: tuple[int, int],
-        *,
-        edge_points: np.ndarray | None = None,
-    ) -> CornerPnPResult | None:
-        if len(image_points) < 3:
-            self.last_result = None
+        observed_graph: PoseGraph | None = None,
+        profile: dict[str, float | int] | None = None,
+    ) -> PosePnPResult | None:
+        if correspondence is None:
+            self.reset_temporal_tracking()
             return None
 
-        observations = self.observations if self.observations is not None else []
-        if self.camera_matrix is not None and len(observations) >= self.bootstrap_frames:
-            result = solve_temporal_or_best_corner_pnp(
-                image_points,
-                [self.camera_matrix],
-                previous_result=self.last_result,
-                scoring_edge_points=edge_points,
-                inlier_threshold=self.inlier_threshold,
-            )
-            self.last_result = result
-            return result
-
-        candidates = camera_matrix_candidates(
+        original_correspondence = correspondence
+        camera_matrix = (
+            self.camera_matrix
+            if self.camera_matrix is not None
+            and self.accepted_pose_count >= max(0, int(self.camera_bootstrap_frames))
+            else None
+        )
+        result = solve_best_lattice_graph_pnp_current(
+            np.asarray(correspondence.image_points, dtype=np.float32).reshape(-1, 2),
+            tuple(correspondence.lattice_coords),
             image_size,
             focal_min=self.focal_min,
             focal_max=self.focal_max,
             focal_steps=self.focal_steps,
-            principal_offset=self.principal_offset,
+            camera_matrix=camera_matrix,
+            profile=profile,
         )
-        result = solve_temporal_or_best_corner_pnp(
-            image_points,
-            candidates,
-            previous_result=self.last_result,
-            scoring_edge_points=edge_points,
-            inlier_threshold=self.inlier_threshold,
+        if result is None:
+            return None
+        pruned_correspondence = prune_high_error_pose_graph_correspondence(
+            correspondence,
+            result,
+            max_error_px=self.prune_reprojection_error_px,
         )
-        if result is None or result.inlier_count < 3 or result.error > self.reprojection_error:
-            self.last_result = None
-            return result
-
-        observations.append(
-            CornerObservation(
-                points=np.asarray(image_points, dtype=np.float32),
-                edge_points=(
-                    np.empty((0, 2), dtype=np.float32)
-                    if edge_points is None
-                    else np.asarray(edge_points, dtype=np.float32).reshape(-1, 2)
-                ),
+        if pruned_correspondence is not None:
+            pruned_result = solve_best_lattice_graph_pnp_current(
+                np.asarray(pruned_correspondence.image_points, dtype=np.float32).reshape(-1, 2),
+                tuple(pruned_correspondence.lattice_coords),
+                image_size,
+                focal_min=self.focal_min,
+                focal_max=self.focal_max,
+                focal_steps=self.focal_steps,
+                camera_matrix=camera_matrix,
+                profile=profile,
             )
+            if pruned_result is not None:
+                correspondence = pruned_correspondence
+                result = pruned_result
+        observed_error, observed_inlier_count, observed_point_count = observed_pose_graph_reprojection_score(
+            correspondence,
+            result,
+            observed_graph,
+            all_correspondence=original_correspondence,
+            inlier_threshold_px=self.inlier_threshold_px,
         )
-        del observations[: max(0, len(observations) - self.bootstrap_frames)]
-
-        best_matrix = best_camera_matrix_for_observations(
-            observations,
-            candidates,
-            inlier_threshold=self.inlier_threshold,
-        )
-        if best_matrix is not None:
-            self.camera_matrix = best_matrix
-            result = (
-                solve_temporal_or_best_corner_pnp(
-                    image_points,
-                    [best_matrix],
-                    previous_result=result,
-                    scoring_edge_points=edge_points,
-                    inlier_threshold=self.inlier_threshold,
-                )
-                or result
-            )
-        self.last_result = result
+        if (
+            observed_point_count < 3
+            or observed_inlier_count < observed_point_count
+            or observed_error > self.max_reprojection_error_px
+        ):
+            return None
+        if not pose_translation_motion_is_valid(
+            self.last_tvec,
+            getattr(result, "tvec", None),
+            max_translation_mm=self.max_frame_translation_mm,
+        ):
+            return None
+        result.observed_reprojection_error = observed_error
+        result.point_names = tuple(str(coord) for coord in correspondence.lattice_coords)
+        result.pose_label = "graph"
+        if getattr(result, "tvec", None) is not None:
+            self.last_tvec = np.asarray(result.tvec, dtype=np.float64).reshape(3, 1).copy()
+        if getattr(result, "camera_matrix", None) is not None:
+            self.camera_matrix = np.asarray(result.camera_matrix, dtype=np.float64).reshape(3, 3).copy()
+        self.accepted_pose_count += 1
         return result
+
+    def reset_temporal_tracking(self) -> None:
+        self.last_tvec = None
+
+
+def pose_translation_motion_is_valid(
+    previous_tvec: np.ndarray | None,
+    current_tvec: np.ndarray | None,
+    *,
+    max_translation_mm: float,
+) -> bool:
+    if previous_tvec is None or current_tvec is None:
+        return True
+    previous = np.asarray(previous_tvec, dtype=np.float64).reshape(3)
+    current = np.asarray(current_tvec, dtype=np.float64).reshape(3)
+    return float(np.linalg.norm(current - previous)) <= float(max_translation_mm)
+
+
+def prune_high_error_pose_graph_correspondence(
+    correspondence: PoseGraphCorrespondence,
+    result: PosePnPResult,
+    *,
+    max_error_px: float,
+) -> PoseGraphCorrespondence | None:
+    image_points = np.asarray(correspondence.image_points, dtype=np.float32).reshape(-1, 2)
+    projected_object_points = getattr(result, "projected_object_points", None)
+    if projected_object_points is None:
+        return None
+    projected_points = np.asarray(projected_object_points, dtype=np.float32).reshape(-1, 2)
+    if len(image_points) != len(projected_points) or len(image_points) <= 3:
+        return None
+
+    reprojection_errors = np.linalg.norm(projected_points - image_points, axis=1)
+    keep_mask = reprojection_errors <= float(max_error_px)
+    if bool(np.all(keep_mask)):
+        return None
+    if int(np.count_nonzero(keep_mask)) < 3:
+        return None
+
+    return PoseGraphCorrespondence(
+        image_points=image_points[keep_mask],
+        object_points=np.asarray(correspondence.object_points, dtype=np.float32).reshape(-1, 3)[keep_mask],
+        graph_indexes=tuple(
+            graph_index
+            for graph_index, keep in zip(correspondence.graph_indexes, keep_mask)
+            if bool(keep)
+        ),
+        lattice_coords=tuple(
+            coord
+            for coord, keep in zip(correspondence.lattice_coords, keep_mask)
+            if bool(keep)
+        ),
+    )
+
+
+def observed_pose_graph_reprojection_error(
+    correspondence: PoseGraphCorrespondence,
+    result: PosePnPResult,
+    observed_graph: PoseGraph | None,
+    all_correspondence: PoseGraphCorrespondence | None = None,
+) -> float:
+    return observed_pose_graph_reprojection_score(
+        correspondence,
+        result,
+        observed_graph,
+        all_correspondence=all_correspondence,
+        inlier_threshold_px=PNP_INLIER_THRESHOLD_PX,
+    )[0]
+
+
+def observed_pose_graph_reprojection_score(
+    correspondence: PoseGraphCorrespondence,
+    result: PosePnPResult,
+    observed_graph: PoseGraph | None,
+    *,
+    all_correspondence: PoseGraphCorrespondence | None = None,
+    inlier_threshold_px: float,
+) -> tuple[float, int, int]:
+    fallback_error = float(getattr(result, "matched_error", float("inf")))
+    if observed_graph is None:
+        fallback_inlier_count = int(fallback_error <= float(inlier_threshold_px)) * len(
+            correspondence.image_points
+        )
+        return fallback_error, fallback_inlier_count, len(correspondence.image_points)
+    if any(
+        getattr(result, attribute, None) is None
+        for attribute in ("rvec", "tvec", "camera_matrix", "dist_coeffs")
+    ):
+        return float("inf"), 0, len(correspondence.image_points)
+
+    retained_indexes = set(correspondence.graph_indexes)
+    source_correspondence = all_correspondence or correspondence
+    graph_indexes = []
+    object_points = []
+    transformed_object_points = cube_lattice_points_for_coords(
+        tuple(source_correspondence.lattice_coords),
+        lattice_transform=getattr(result, "lattice_transform", CUBE_LATTICE_IDENTITY_TRANSFORM),
+    )
+    for graph_index, object_point in zip(
+        source_correspondence.graph_indexes,
+        transformed_object_points,
+    ):
+        if graph_index not in retained_indexes:
+            continue
+        graph_indexes.append(graph_index)
+        object_points.append(object_point)
+    if not object_points:
+        return float("inf"), 0, 0
+
+    try:
+        projected_points, _ = cv2.projectPoints(
+            np.asarray(object_points, dtype=np.float32).reshape(-1, 3),
+            result.rvec,
+            result.tvec,
+            result.camera_matrix,
+            result.dist_coeffs,
+        )
+    except cv2.error:
+        return float("inf"), 0, len(object_points)
+    projected_points = projected_points.reshape(-1, 2)
+
+    observed_errors = []
+    for graph_index, projected_point in zip(graph_indexes, projected_points):
+        if graph_index < 0 or graph_index >= len(observed_graph.points):
+            continue
+        observed_point = np.asarray(observed_graph.points[graph_index].xy, dtype=np.float32)
+        observed_errors.append(float(np.linalg.norm(projected_point - observed_point)))
+    if not observed_errors:
+        return float("inf"), 0, len(object_points)
+    inlier_count = sum(error <= float(inlier_threshold_px) for error in observed_errors)
+    return float(np.mean(observed_errors)), int(inlier_count), len(observed_errors)
+
 
 class ColorDensityClassifier:
     def __init__(
@@ -837,132 +955,6 @@ def result_box_classes(result) -> np.ndarray | None:
     return np.asarray(classes, dtype=np.int32).reshape(-1)
 
 
-def collect_corner_image_points(
-    result,
-    pose_model,
-    xy: np.ndarray | None,
-    keypoint_conf: np.ndarray | None,
-    *,
-    confidence_threshold: float,
-    offset_xy: tuple[int, int],
-    scale_xy: tuple[float, float],
-    point_limit: int,
-) -> np.ndarray:
-    if xy is None or len(xy) == 0:
-        return np.empty((0, 2), dtype=np.float32)
-
-    classes = result_box_classes(result)
-    points_by_detection = np.asarray(xy, dtype=np.float32)
-    scores_by_detection = (
-        None
-        if keypoint_conf is None or len(keypoint_conf) == 0
-        else np.asarray(keypoint_conf, dtype=np.float32)
-    )
-    offset_x, offset_y = offset_xy
-    scale_x, scale_y = scale_xy
-    candidates: list[tuple[float, float, float]] = []
-    for detection_index, points in enumerate(points_by_detection):
-        class_id = (
-            int(classes[detection_index])
-            if classes is not None and detection_index < len(classes)
-            else -1
-        )
-        class_name = class_name_for_id(result, pose_model, class_id).removesuffix("_sticker")
-        if class_name != "corner" or len(points) == 0:
-            continue
-
-        detection_scores = (
-            None
-            if scores_by_detection is None
-            or detection_index >= len(scores_by_detection)
-            else np.asarray(scores_by_detection[detection_index], dtype=np.float32).reshape(-1)
-        )
-        keypoint_score = (
-            1.0
-            if detection_scores is None or len(detection_scores) == 0
-            else float(detection_scores[0])
-        )
-        if keypoint_score < confidence_threshold:
-            continue
-
-        point = points[0]
-        candidates.append(
-            (
-                offset_x + (float(point[0]) * scale_x),
-                offset_y + (float(point[1]) * scale_y),
-                keypoint_score,
-            )
-        )
-
-    candidates.sort(key=lambda item: item[2], reverse=True)
-    return np.asarray([(x, y) for x, y, _score in candidates[:point_limit]], dtype=np.float32)
-
-
-def collect_pose_image_points(
-    result,
-    pose_model,
-    xy: np.ndarray | None,
-    keypoint_conf: np.ndarray | None,
-    *,
-    accepted_kinds: set[str],
-    confidence_threshold: float,
-    offset_xy: tuple[int, int],
-    scale_xy: tuple[float, float],
-    point_limit: int | None = None,
-) -> np.ndarray:
-    if xy is None or len(xy) == 0:
-        return np.empty((0, 2), dtype=np.float32)
-
-    classes = result_box_classes(result)
-    points_by_detection = np.asarray(xy, dtype=np.float32)
-    scores_by_detection = (
-        None
-        if keypoint_conf is None or len(keypoint_conf) == 0
-        else np.asarray(keypoint_conf, dtype=np.float32)
-    )
-    offset_x, offset_y = offset_xy
-    scale_x, scale_y = scale_xy
-    candidates: list[tuple[float, float, float]] = []
-    for detection_index, points in enumerate(points_by_detection):
-        class_id = (
-            int(classes[detection_index])
-            if classes is not None and detection_index < len(classes)
-            else -1
-        )
-        class_name = class_name_for_id(result, pose_model, class_id).removesuffix("_sticker")
-        if class_name not in POSE_CLASS_NAMES:
-            continue
-
-        detection_scores = (
-            None
-            if scores_by_detection is None
-            or detection_index >= len(scores_by_detection)
-            else np.asarray(scores_by_detection[detection_index], dtype=np.float32).reshape(-1)
-        )
-        for keypoint_index, point in enumerate(points):
-            keypoint_score = (
-                1.0
-                if detection_scores is None or keypoint_index >= len(detection_scores)
-                else float(detection_scores[keypoint_index])
-            )
-            if keypoint_score < confidence_threshold:
-                continue
-            if pose_keypoint_kind(class_name, keypoint_index) not in accepted_kinds:
-                continue
-            candidates.append(
-                (
-                    offset_x + (float(point[0]) * scale_x),
-                    offset_y + (float(point[1]) * scale_y),
-                    keypoint_score,
-                )
-            )
-
-    candidates.sort(key=lambda item: item[2], reverse=True)
-    if point_limit is not None:
-        candidates = candidates[:point_limit]
-    return np.asarray([(x, y) for x, y, _score in candidates], dtype=np.float32)
-
-
 def collect_pose_graph_points(
     result,
     pose_model,
@@ -1053,255 +1045,157 @@ def default_camera_matrix(
     return np.array([[focal, 0.0, cx], [0.0, focal, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
 
 
-def camera_matrix_candidates(
-    image_size: tuple[int, int],
-    *,
-    focal_min: float,
-    focal_max: float,
-    focal_steps: int,
-    principal_offset: float,
-) -> list[np.ndarray]:
-    focal_steps = max(1, int(focal_steps))
-    focal_scales = np.linspace(float(focal_min), float(focal_max), focal_steps)
-    offsets = (-principal_offset, 0.0, principal_offset) if principal_offset > 0.0 else (0.0,)
-    return [
-        default_camera_matrix(
-            image_size,
-            focal_scale=float(focal_scale),
-            principal_offset_xy=(float(offset_x), float(offset_y)),
-        )
-        for focal_scale in focal_scales
-        for offset_x in offsets
-        for offset_y in offsets
-    ]
-
-
-def rotation_matrix_about_axis(axis: np.ndarray, angle_degrees: float) -> np.ndarray:
-    axis = np.asarray(axis, dtype=np.float64).reshape(3)
-    norm = float(np.linalg.norm(axis))
-    if norm <= 1e-9:
-        return np.eye(3, dtype=np.float64)
-    axis = axis / norm
-    angle_radians = np.deg2rad(float(angle_degrees))
-    cross = np.array(
-        [
-            [0.0, -axis[2], axis[1]],
-            [axis[2], 0.0, -axis[0]],
-            [-axis[1], axis[0], 0.0],
-        ],
-        dtype=np.float64,
+def transform_lattice_coord(
+    coord: tuple[int, int, int],
+    lattice_transform: tuple[tuple[int, int, int], tuple[int, int, int]],
+) -> tuple[int, int, int]:
+    axis_order, signs = lattice_transform
+    return tuple(
+        coord[axis] if sign > 0 else CUBE_GRID_MAX_INDEX - coord[axis]
+        for axis, sign in zip(axis_order, signs)
     )
+
+
+def cube_lattice_point_mm(coord: tuple[int, int, int]) -> tuple[float, float, float]:
     return (
-        np.eye(3, dtype=np.float64)
-        + (np.sin(angle_radians) * cross)
-        + ((1.0 - np.cos(angle_radians)) * (cross @ cross))
+        (coord[0] - (CUBE_GRID_MAX_INDEX * 0.5)) * CUBE_LAYER_SIZE_MM,
+        (coord[1] - (CUBE_GRID_MAX_INDEX * 0.5)) * CUBE_LAYER_SIZE_MM,
+        (coord[2] - (CUBE_GRID_MAX_INDEX * 0.5)) * CUBE_LAYER_SIZE_MM,
     )
 
 
-def mid_turn_corner_points(face_name: str, angle_degrees: float) -> np.ndarray:
-    matching_specs = [spec for spec in MID_TURN_FACE_SPECS if spec[0] == face_name]
-    if not matching_specs:
-        raise ValueError(f"Unknown mid-turn face {face_name!r}")
-
-    _name, axis_index, side = matching_specs[0]
-    points = CUBE_CORNER_POINTS_MM.astype(np.float64).copy()
-    layer_mask = np.isclose(points[:, axis_index], side * CUBE_HALF_SIZE_MM)
-    axis = np.zeros(3, dtype=np.float64)
-    axis[axis_index] = side
-    rotation = rotation_matrix_about_axis(axis, angle_degrees)
-    points[layer_mask] = points[layer_mask] @ rotation.T
-    return points.astype(np.float32)
-
-
-def cuboid_points_from_axis_bounds(
-    axis_bounds: tuple[tuple[float, float], tuple[float, float], tuple[float, float]],
+def cube_lattice_points_for_coords(
+    coords: tuple[tuple[int, int, int], ...],
+    *,
+    lattice_transform: tuple[tuple[int, int, int], tuple[int, int, int]] = CUBE_LATTICE_IDENTITY_TRANSFORM,
 ) -> np.ndarray:
-    x_bounds, y_bounds, z_bounds = axis_bounds
     return np.asarray(
         [
-            [x_bounds[0], y_bounds[1], z_bounds[1]],
-            [x_bounds[1], y_bounds[1], z_bounds[1]],
-            [x_bounds[1], y_bounds[0], z_bounds[1]],
-            [x_bounds[0], y_bounds[0], z_bounds[1]],
-            [x_bounds[0], y_bounds[1], z_bounds[0]],
-            [x_bounds[1], y_bounds[1], z_bounds[0]],
-            [x_bounds[1], y_bounds[0], z_bounds[0]],
-            [x_bounds[0], y_bounds[0], z_bounds[0]],
+            cube_lattice_point_mm(transform_lattice_coord(coord, lattice_transform))
+            for coord in coords
         ],
         dtype=np.float32,
     )
 
 
-def cuboid_axis_bounds_for_layer(axis_index: int, side: float) -> tuple[
-    tuple[tuple[float, float], tuple[float, float], tuple[float, float]],
-    tuple[tuple[float, float], tuple[float, float], tuple[float, float]],
-]:
-    full_bounds = [(-CUBE_HALF_SIZE_MM, CUBE_HALF_SIZE_MM) for _axis in range(3)]
-    inner_cut = (side * CUBE_HALF_SIZE_MM) - (side * CUBE_LAYER_SIZE_MM)
-    static_bounds = list(full_bounds)
-    turned_bounds = list(full_bounds)
-    if side > 0:
-        static_bounds[axis_index] = (-CUBE_HALF_SIZE_MM, inner_cut)
-        turned_bounds[axis_index] = (inner_cut, CUBE_HALF_SIZE_MM)
-    else:
-        static_bounds[axis_index] = (inner_cut, CUBE_HALF_SIZE_MM)
-        turned_bounds[axis_index] = (-CUBE_HALF_SIZE_MM, inner_cut)
-    return tuple(static_bounds), tuple(turned_bounds)
-
-
-def mid_turn_scoring_model(
-    face_name: str,
-    angle_degrees: float,
-) -> tuple[np.ndarray, np.ndarray, tuple[tuple[int, int], ...], np.ndarray]:
-    matching_specs = [spec for spec in MID_TURN_FACE_SPECS if spec[0] == face_name]
-    if not matching_specs:
-        raise ValueError(f"Unknown mid-turn face {face_name!r}")
-
-    _name, axis_index, side = matching_specs[0]
-    axis = np.zeros(3, dtype=np.float64)
-    axis[axis_index] = side
-    rotation = rotation_matrix_about_axis(axis, angle_degrees)
-
-    layer_mask = np.isclose(CUBE_CORNER_POINTS_MM[:, axis_index], side * CUBE_HALF_SIZE_MM)
-    outer_corner_indexes = tuple(int(index) for index in np.flatnonzero(layer_mask))
-    deformed_outer_points = CUBE_CORNER_POINTS_MM.astype(np.float32).copy()
-    deformed_outer_points[list(outer_corner_indexes)] = (
-        CUBE_CORNER_POINTS_MM[list(outer_corner_indexes)].astype(np.float64) @ rotation.T
-    ).astype(np.float32)
-
-    edge_midpoints = CUBE_EDGE_MIDPOINT_POINTS_MM.astype(np.float32).copy()
-    for edge_index, (start, end) in enumerate(CUBE_CORNER_EDGES):
-        if start in outer_corner_indexes and end in outer_corner_indexes:
-            edge_midpoints[edge_index] = (
-                CUBE_EDGE_MIDPOINT_POINTS_MM[edge_index].astype(np.float64) @ rotation.T
-            ).astype(np.float32)
-
-    edge_indexes: list[tuple[int, int]] = []
-    edge_point_offset = len(CUBE_CORNER_POINTS_MM)
-    for edge_index, (start, end) in enumerate(CUBE_CORNER_EDGES):
-        start_is_turned = start in outer_corner_indexes
-        end_is_turned = end in outer_corner_indexes
-        if start_is_turned != end_is_turned:
-            continue
-
-        edge_point_index = edge_point_offset + edge_index
-        edge_indexes.append((start, edge_point_index))
-        edge_indexes.append((edge_point_index, end))
-
-    allowed_corner_mask = np.zeros(len(deformed_outer_points) + len(edge_midpoints), dtype=bool)
-    allowed_corner_mask[: len(CUBE_CORNER_POINTS_MM)] = True
-    return deformed_outer_points, edge_midpoints, tuple(edge_indexes), allowed_corner_mask
-
-
-def mid_turn_display_model(
-    face_name: str,
-    angle_degrees: float,
-) -> tuple[np.ndarray, tuple[tuple[int, int], ...]]:
-    matching_specs = [spec for spec in MID_TURN_FACE_SPECS if spec[0] == face_name]
-    if not matching_specs:
-        raise ValueError(f"Unknown mid-turn face {face_name!r}")
-
-    _name, axis_index, side = matching_specs[0]
-    static_bounds, turned_bounds = cuboid_axis_bounds_for_layer(axis_index, side)
-    static_points = cuboid_points_from_axis_bounds(static_bounds)
-    turned_points = cuboid_points_from_axis_bounds(turned_bounds)
-    axis = np.zeros(3, dtype=np.float64)
-    axis[axis_index] = side
-    rotation = rotation_matrix_about_axis(axis, angle_degrees)
-    rotated_turned_points = (turned_points.astype(np.float64) @ rotation.T).astype(np.float32)
-
-    turned_offset = len(static_points)
-    display_points = np.vstack([static_points, rotated_turned_points]).astype(np.float32)
-    display_edges = tuple(CUBE_CORNER_EDGES) + tuple(
-        (turned_offset + start, turned_offset + end)
-        for start, end in CUBE_CORNER_EDGES
+def cube_lattice_display_points_for_transform(
+    lattice_transform: tuple[tuple[int, int, int], tuple[int, int, int]] = CUBE_LATTICE_IDENTITY_TRANSFORM,
+) -> np.ndarray:
+    return cube_lattice_points_for_coords(
+        CUBE_LATTICE_DISPLAY_CORNER_COORDS,
+        lattice_transform=lattice_transform,
     )
-    return display_points, display_edges
 
 
-def mid_turn_corner_model_candidates() -> list[tuple[str, float, np.ndarray, np.ndarray, tuple[tuple[int, int], ...], np.ndarray, np.ndarray, tuple[tuple[int, int], ...]]]:
+def invisible_surface_point_count(object_points: np.ndarray, rvec: np.ndarray) -> int:
+    object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
+    rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    invisible_count = 0
+    for point in object_points:
+        visible = False
+        for axis in range(3):
+            if abs(float(point[axis]) + CUBE_HALF_SIZE_MM) <= 1e-3:
+                normal = np.zeros(3, dtype=np.float64)
+                normal[axis] = -1.0
+            elif abs(float(point[axis]) - CUBE_HALF_SIZE_MM) <= 1e-3:
+                normal = np.zeros(3, dtype=np.float64)
+                normal[axis] = 1.0
+            else:
+                continue
+            camera_normal = rotation @ normal
+            if float(camera_normal[2]) < 0.0:
+                visible = True
+                break
+        if not visible:
+            invisible_count += 1
+    return invisible_count
+
+
+def graph_camera_matrix_candidates(
+    image_size: tuple[int, int],
+    *,
+    focal_min: float,
+    focal_max: float,
+    focal_steps: int,
+) -> list[np.ndarray]:
+    focal_steps = max(1, int(focal_steps))
     return [
-        (
-            face_name,
-            float(angle_degrees),
-            *mid_turn_scoring_model(face_name, float(angle_degrees)),
-            *mid_turn_display_model(face_name, float(angle_degrees)),
-        )
-        for face_name, _axis_index, _side in MID_TURN_FACE_SPECS
-        for angle_degrees in MID_TURN_ANGLE_DEGREES
+        default_camera_matrix(image_size, focal_scale=float(focal_scale))
+        for focal_scale in np.linspace(float(focal_min), float(focal_max), focal_steps)
     ]
 
 
-def visible_cube_corner_and_edge_masks(
-    rvec: np.ndarray,
-    tvec: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
-    tvec = np.asarray(tvec, dtype=np.float64).reshape(3)
-    visible_corners = np.zeros(len(CUBE_CORNER_POINTS_MM), dtype=bool)
-    visible_edges = np.zeros(len(CUBE_CORNER_EDGES), dtype=bool)
-    edge_lookup = {tuple(sorted(edge)): index for index, edge in enumerate(CUBE_CORNER_EDGES)}
+def solve_best_lattice_graph_pnp_current(
+    image_points: np.ndarray,
+    lattice_coords: tuple[tuple[int, int, int], ...],
+    image_size: tuple[int, int],
+    *,
+    focal_min: float,
+    focal_max: float,
+    focal_steps: int,
+    camera_matrix: np.ndarray | None = None,
+    profile: dict[str, float | int] | None = None,
+) -> PosePnPResult | None:
+    image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
+    if len(image_points) != len(lattice_coords):
+        return None
 
-    for face_corners, face_normal in CUBE_FACES:
-        face_points = CUBE_CORNER_POINTS_MM[list(face_corners)].astype(np.float64)
-        face_center_camera = rotation @ face_points.mean(axis=0) + tvec
-        normal_camera = rotation @ np.asarray(face_normal, dtype=np.float64)
-        if float(np.dot(normal_camera, -face_center_camera)) <= 0.0:
-            continue
+    best_result: PosePnPResult | None = None
+    best_score: tuple[int, float] | None = None
+    camera_matrices = (
+        [np.asarray(camera_matrix, dtype=np.float64).reshape(3, 3)]
+        if camera_matrix is not None
+        else graph_camera_matrix_candidates(
+            image_size,
+            focal_min=focal_min,
+            focal_max=focal_max,
+            focal_steps=focal_steps,
+        )
+    )
+    if profile is not None:
+        profile["pnp_camera_candidates"] = len(camera_matrices)
+        profile["pnp_axis_transforms"] = len(CUBE_LATTICE_AXIS_TRANSFORMS)
+    for camera_matrix in camera_matrices:
+        for lattice_transform in CUBE_LATTICE_AXIS_TRANSFORMS:
+            if profile is not None:
+                profile["pnp_solve_calls"] = int(profile.get("pnp_solve_calls", 0)) + 1
+            result = solve_lattice_graph_pnp(
+                image_points,
+                cube_lattice_points_for_coords(
+                    lattice_coords,
+                    lattice_transform=lattice_transform,
+                ),
+                camera_matrix,
+                display_points=cube_lattice_display_points_for_transform(lattice_transform),
+                display_edge_indexes=CUBE_LATTICE_DISPLAY_EDGE_INDEXES,
+            )
+            if result is None:
+                continue
+            result.lattice_transform = lattice_transform
+            score = (int(getattr(result, "invisible_point_count", 0)), float(result.matched_error))
+            if best_score is None or score < best_score:
+                best_score = score
+                best_result = result
+    return best_result
 
-        visible_corners[list(face_corners)] = True
-        face_cycle = list(face_corners)
-        for start, end in zip(face_cycle, face_cycle[1:] + face_cycle[:1]):
-            edge_index = edge_lookup.get(tuple(sorted((start, end))))
-            if edge_index is not None:
-                visible_edges[edge_index] = True
 
-    return visible_corners, visible_edges
-
-
-def solve_corner_pnp(
+def solve_lattice_graph_pnp(
     image_points: np.ndarray,
     object_points: np.ndarray,
     camera_matrix: np.ndarray,
     *,
-    scoring_points: np.ndarray | None = None,
-    scoring_edge_points: np.ndarray | None = None,
-    model_corner_points: np.ndarray | None = None,
-    model_edge_points: np.ndarray | None = None,
-    display_points: np.ndarray | None = None,
-    edge_indexes: tuple[tuple[int, int], ...] | None = None,
-    allowed_corner_mask: np.ndarray | None = None,
-    allowed_edge_mask: np.ndarray | None = None,
-    display_edge_indexes: tuple[tuple[int, int], ...] | None = None,
-    inlier_threshold: float,
-) -> CornerPnPResult | None:
-    use_static_cube_visibility = model_corner_points is None and model_edge_points is None and edge_indexes is None
-    model_corner_points = (
-        CUBE_CORNER_POINTS_MM
-        if model_corner_points is None
-        else np.asarray(model_corner_points, dtype=np.float32).reshape(-1, 3)
-    )
-    model_edge_points = (
-        CUBE_EDGE_MIDPOINT_POINTS_MM
-        if model_edge_points is None
-        else np.asarray(model_edge_points, dtype=np.float32).reshape(-1, 3)
-    )
-    model_keypoint_points = np.vstack([model_corner_points, model_edge_points]).astype(np.float32)
-    display_points = (
-        model_keypoint_points
-        if display_points is None
-        else np.asarray(display_points, dtype=np.float32).reshape(-1, 3)
-    )
-    edge_indexes = CUBE_KEYPOINT_EDGE_SEGMENTS if edge_indexes is None else tuple(edge_indexes)
-    display_edge_indexes = edge_indexes if display_edge_indexes is None else tuple(display_edge_indexes)
-    image_points = np.asarray(image_points, dtype=np.float32)
-    object_points = np.asarray(object_points, dtype=np.float32)
+    display_points: np.ndarray,
+    display_edge_indexes: tuple[tuple[int, int], ...],
+) -> PosePnPResult | None:
+    image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
+    object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
+    display_points = np.asarray(display_points, dtype=np.float32).reshape(-1, 3)
     if len(image_points) != len(object_points) or len(image_points) < 3:
         return None
 
     dist_coeffs = np.zeros((4, 1), dtype=np.float64)
     try:
-        ok, rvec, tvec = cv2.solvePnP(
+        ok, rvecs, tvecs, _reprojection_errors = cv2.solvePnPGeneric(
             object_points,
             image_points,
             camera_matrix,
@@ -1310,23 +1204,54 @@ def solve_corner_pnp(
         )
     except cv2.error:
         return None
-    if not ok:
+    if not ok or not rvecs or not tvecs:
         return None
 
-    projected, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs)
-    projected = projected.reshape(-1, 2)
-    matched_error = float(np.mean(np.linalg.norm(projected - image_points, axis=1)))
-    projected_corners, _ = cv2.projectPoints(
-        model_keypoint_points,
+    best_result = None
+    for rvec, tvec in zip(rvecs, tvecs):
+        try:
+            rvec, tvec = cv2.solvePnPRefineLM(
+                object_points,
+                image_points,
+                camera_matrix,
+                dist_coeffs,
+                np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+                np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+            )
+        except cv2.error:
+            pass
+        projected_graph_points, _ = cv2.projectPoints(
+            object_points,
+            rvec,
+            tvec,
+            camera_matrix,
+            dist_coeffs,
+        )
+        projected_graph_points = projected_graph_points.reshape(-1, 2)
+        reprojection_distances = np.linalg.norm(projected_graph_points - image_points, axis=1)
+        matched_error = float(np.mean(reprojection_distances))
+        invisible_count = invisible_surface_point_count(object_points, rvec)
+        candidate = (invisible_count, matched_error, rvec, tvec, projected_graph_points)
+        if best_result is None or candidate[0] < best_result[0]:
+            best_result = candidate
+        elif best_result is not None and candidate[0] == best_result[0] and candidate[1] < best_result[1]:
+            best_result = candidate
+    if best_result is None:
+        return None
+
+    invisible_count, matched_error, rvec, tvec, projected_graph_points = best_result
+    inlier_count = int(len(image_points))
+    error = matched_error
+
+    projected_graph_points, _ = cv2.projectPoints(
+        object_points,
         rvec,
         tvec,
         camera_matrix,
         dist_coeffs,
     )
-    projected_corners = projected_corners.reshape(-1, 2)
-    projected_edge_points = projected_corners[
-        len(model_corner_points): len(model_corner_points) + len(model_edge_points)
-    ]
+    projected_graph_points = projected_graph_points.reshape(-1, 2)
+
     projected_display_points, _ = cv2.projectPoints(
         display_points,
         rvec,
@@ -1335,47 +1260,7 @@ def solve_corner_pnp(
         dist_coeffs,
     )
     projected_display_points = projected_display_points.reshape(-1, 2)
-    if allowed_corner_mask is None or allowed_edge_mask is None:
-        if use_static_cube_visibility:
-            visible_corner_mask, _visible_edge_mask = visible_cube_corner_and_edge_masks(rvec, tvec)
-            default_corner_mask = np.zeros(len(model_keypoint_points), dtype=bool)
-            default_corner_mask[: len(visible_corner_mask)] = visible_corner_mask
-            default_edge_mask = np.ones(len(edge_indexes), dtype=bool)
-        else:
-            default_corner_mask = np.zeros(len(model_keypoint_points), dtype=bool)
-            default_corner_mask[: len(model_corner_points)] = True
-            default_edge_mask = np.ones(len(edge_indexes), dtype=bool)
-        if allowed_corner_mask is None:
-            allowed_corner_mask = default_corner_mask
-        if allowed_edge_mask is None:
-            allowed_edge_mask = default_edge_mask
-    allowed_corner_mask = np.asarray(allowed_corner_mask, dtype=bool).reshape(-1)
-    allowed_edge_mask = np.asarray(allowed_edge_mask, dtype=bool).reshape(-1)
-    scoring_points = image_points if scoring_points is None else np.asarray(scoring_points, dtype=np.float32)
-    corner_error, corner_inlier_count, scoring_corner_indexes = robust_projected_corner_assignment(
-        scoring_points,
-        projected_corners,
-        allowed_corner_mask=allowed_corner_mask,
-        inlier_threshold=inlier_threshold,
-    )
-    scoring_edge_points = (
-        np.empty((0, 2), dtype=np.float32)
-        if scoring_edge_points is None
-        else np.asarray(scoring_edge_points, dtype=np.float32).reshape(-1, 2)
-    )
-    edge_error, edge_inlier_count, scoring_edge_indexes = robust_projected_corner_assignment(
-        scoring_edge_points,
-        projected_edge_points,
-        inlier_threshold=inlier_threshold,
-    )
-    inlier_count = corner_inlier_count + edge_inlier_count
-    inlier_errors = []
-    if corner_inlier_count > 0:
-        inlier_errors.append(corner_error)
-    if edge_inlier_count > 0:
-        inlier_errors.append(edge_error)
-    error = float(np.mean(inlier_errors)) if inlier_errors else float("inf")
-    return CornerPnPResult(
+    return PosePnPResult(
         error=error,
         inlier_count=inlier_count,
         matched_error=matched_error,
@@ -1384,484 +1269,15 @@ def solve_corner_pnp(
         rvec=rvec,
         tvec=tvec,
         image_points=image_points,
-        scoring_points=scoring_points,
-        scoring_edge_points=scoring_edge_points,
         object_points=object_points,
-        model_corner_points=model_corner_points,
-        model_edge_points=model_edge_points,
         display_points=display_points,
-        projected_corners=projected_corners,
-        projected_edge_points=projected_edge_points,
+        projected_object_points=projected_graph_points,
         projected_display_points=projected_display_points,
-        corner_inlier_count=corner_inlier_count,
-        edge_inlier_count=edge_inlier_count,
-        corner_names=(),
-        scoring_corner_indexes=scoring_corner_indexes,
-        scoring_edge_indexes=scoring_edge_indexes,
-        edge_indexes=edge_indexes,
-        allowed_corner_mask=allowed_corner_mask,
-        allowed_edge_mask=allowed_edge_mask,
+        point_names=tuple(),
+        edge_indexes=tuple(),
         display_edge_indexes=display_edge_indexes,
+        invisible_point_count=int(invisible_count),
     )
-
-
-def robust_projected_corner_assignment(
-    image_points: np.ndarray,
-    projected_corners: np.ndarray,
-    *,
-    allowed_corner_mask: np.ndarray | None = None,
-    inlier_threshold: float,
-) -> tuple[float, int, tuple[int, ...]]:
-    points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
-    projected = np.asarray(projected_corners, dtype=np.float32).reshape(-1, 2)
-    if len(points) == 0 or len(projected) == 0 or len(points) > len(projected):
-        return float("inf"), 0, tuple()
-    if allowed_corner_mask is None:
-        allowed_corner_mask = np.ones(len(projected), dtype=bool)
-    allowed_corner_mask = np.asarray(allowed_corner_mask, dtype=bool).reshape(-1)
-    if len(allowed_corner_mask) != len(projected):
-        raise ValueError("allowed_corner_mask must match projected corner count")
-
-    distances = np.linalg.norm(points[:, None, :] - projected[None, :, :], axis=2)
-    inlier_threshold = float(inlier_threshold)
-    best_by_mask: dict[int, tuple[int, float, tuple[int, ...]]] = {0: (0, 0.0, tuple())}
-    for point_index in range(len(points)):
-        next_by_mask = {
-            mask: (count, total_error, assignment + (-1,))
-            for mask, (count, total_error, assignment) in best_by_mask.items()
-        }
-        for mask, (count, total_error, assignment) in best_by_mask.items():
-            for corner_index in range(len(projected)):
-                if not bool(allowed_corner_mask[corner_index]):
-                    continue
-                if mask & (1 << corner_index):
-                    continue
-                distance = float(distances[point_index, corner_index])
-                if distance > inlier_threshold:
-                    continue
-                next_mask = mask | (1 << corner_index)
-                candidate = (count + 1, total_error + distance, assignment + (corner_index,))
-                existing = next_by_mask.get(next_mask)
-                if existing is None or candidate[0] > existing[0] or (
-                    candidate[0] == existing[0] and candidate[1] < existing[1]
-                ):
-                    next_by_mask[next_mask] = candidate
-        best_by_mask = next_by_mask
-
-    best_inlier_count, best_total_error, best_assignment = max(
-        best_by_mask.values(),
-        key=lambda item: (item[0], -item[1]),
-    )
-    if best_inlier_count == 0:
-        return float("inf"), 0, best_assignment
-    return best_total_error / best_inlier_count, best_inlier_count, best_assignment
-
-
-def robust_projected_corner_score(
-    image_points: np.ndarray,
-    projected_corners: np.ndarray,
-    *,
-    allowed_corner_mask: np.ndarray | None = None,
-    inlier_threshold: float,
-) -> tuple[float, int]:
-    error, inlier_count, _assignment = robust_projected_corner_assignment(
-        image_points,
-        projected_corners,
-        allowed_corner_mask=allowed_corner_mask,
-        inlier_threshold=inlier_threshold,
-    )
-    return error, inlier_count
-
-
-def point_to_segments_distances(points: np.ndarray, segments: np.ndarray) -> np.ndarray:
-    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
-    segments = np.asarray(segments, dtype=np.float32).reshape(-1, 2, 2)
-    if len(points) == 0 or len(segments) == 0:
-        return np.empty((len(points), len(segments)), dtype=np.float32)
-
-    starts = segments[:, 0, :]
-    ends = segments[:, 1, :]
-    vectors = ends - starts
-    lengths_sq = np.maximum(np.sum(vectors * vectors, axis=1), 1e-6)
-    point_vectors = points[:, None, :] - starts[None, :, :]
-    t = np.sum(point_vectors * vectors[None, :, :], axis=2) / lengths_sq[None, :]
-    t = np.clip(t, 0.0, 1.0)
-    closest = starts[None, :, :] + t[:, :, None] * vectors[None, :, :]
-    return np.linalg.norm(points[:, None, :] - closest, axis=2)
-
-
-def robust_projected_edge_score(
-    image_points: np.ndarray,
-    projected_corners: np.ndarray,
-    *,
-    edge_indexes: tuple[tuple[int, int], ...] = CUBE_CORNER_EDGES,
-    allowed_edge_mask: np.ndarray | None = None,
-    inlier_threshold: float,
-) -> tuple[float, int]:
-    points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
-    projected = np.asarray(projected_corners, dtype=np.float32).reshape(-1, 2)
-    if len(points) == 0 or len(projected) == 0:
-        return float("inf"), 0
-
-    edge_segments = np.asarray(
-        [(projected[start], projected[end]) for start, end in edge_indexes],
-        dtype=np.float32,
-    )
-    if allowed_edge_mask is not None:
-        allowed_edge_mask = np.asarray(allowed_edge_mask, dtype=bool).reshape(-1)
-        if len(allowed_edge_mask) != len(edge_segments):
-            raise ValueError("allowed_edge_mask must match cube edge count")
-        edge_segments = edge_segments[allowed_edge_mask]
-        if len(edge_segments) == 0:
-            return float("inf"), 0
-    distances = point_to_segments_distances(points, edge_segments)
-    nearest_distances = distances.min(axis=1)
-    inlier_distances = nearest_distances[nearest_distances <= float(inlier_threshold)]
-    if len(inlier_distances) == 0:
-        return float("inf"), 0
-    return float(np.mean(inlier_distances)), int(len(inlier_distances))
-
-
-def pnp_result_is_better(candidate: CornerPnPResult, best: CornerPnPResult | None) -> bool:
-    if best is None:
-        return True
-    if candidate.inlier_count != best.inlier_count:
-        return candidate.inlier_count > best.inlier_count
-    if not np.isclose(candidate.error, best.error):
-        return candidate.error < best.error
-    return candidate.matched_error < best.matched_error
-
-
-def refine_pnp_with_scored_corner_correspondences(
-    result: CornerPnPResult,
-    *,
-    inlier_threshold: float,
-) -> CornerPnPResult:
-    scoring_points = np.asarray(result.scoring_points, dtype=np.float32).reshape(-1, 2)
-    corner_indexes = np.asarray(result.scoring_corner_indexes, dtype=np.int32)
-    if len(scoring_points) == 0 or len(corner_indexes) != len(scoring_points):
-        return result
-
-    corner_inlier_mask = corner_indexes >= 0
-    refine_image_points = [scoring_points[corner_inlier_mask]]
-    refine_object_points = [result.model_corner_points[corner_indexes[corner_inlier_mask]]]
-
-    scoring_edge_points = np.asarray(result.scoring_edge_points, dtype=np.float32).reshape(-1, 2)
-    edge_indexes = np.asarray(result.scoring_edge_indexes, dtype=np.int32)
-    edge_inlier_mask = edge_indexes >= 0 if len(edge_indexes) == len(scoring_edge_points) else np.zeros(0, dtype=bool)
-    if len(scoring_edge_points) and len(edge_indexes) == len(scoring_edge_points):
-        refine_image_points.append(scoring_edge_points[edge_inlier_mask])
-        refine_object_points.append(result.model_edge_points[edge_indexes[edge_inlier_mask]])
-
-    if sum(len(points) for points in refine_image_points) < 3:
-        return result
-
-    refined = solve_corner_pnp(
-        np.concatenate(refine_image_points, axis=0),
-        np.concatenate(refine_object_points, axis=0),
-        result.camera_matrix,
-        scoring_points=scoring_points,
-        scoring_edge_points=result.scoring_edge_points,
-        model_corner_points=result.model_corner_points,
-        model_edge_points=result.model_edge_points,
-        display_points=result.display_points,
-        edge_indexes=result.edge_indexes,
-        allowed_corner_mask=result.allowed_corner_mask,
-        allowed_edge_mask=result.allowed_edge_mask,
-        display_edge_indexes=result.display_edge_indexes,
-        inlier_threshold=inlier_threshold,
-    )
-    if refined is None:
-        return result
-    refined.corner_names = tuple(CUBE_CORNER_NAMES[index] for index in corner_indexes[corner_inlier_mask])
-    refined.pose_label = result.pose_label
-    return refined
-
-
-def temporal_corner_assignment_from_previous_projection(
-    image_points: np.ndarray,
-    previous_result: CornerPnPResult | None,
-    *,
-    inlier_threshold: float,
-) -> tuple[int, ...]:
-    points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
-    if previous_result is None or len(points) < 3:
-        return tuple()
-
-    if (
-        previous_result.allowed_corner_mask is not None
-        and len(previous_result.allowed_corner_mask) == len(previous_result.projected_corners)
-    ):
-        visible_corner_mask = previous_result.allowed_corner_mask
-    else:
-        visible_corner_mask, _visible_edge_mask = visible_cube_corner_and_edge_masks(
-            previous_result.rvec,
-            previous_result.tvec,
-        )
-    _error, inlier_count, assignment = robust_projected_corner_assignment(
-        points,
-        previous_result.projected_corners,
-        allowed_corner_mask=visible_corner_mask,
-        inlier_threshold=inlier_threshold,
-    )
-    required_inliers = min(
-        len(points),
-        max(3, int(previous_result.corner_inlier_count)),
-    )
-    if inlier_count < required_inliers:
-        return tuple()
-    return assignment
-
-
-def solve_temporal_corner_pnp(
-    image_points: np.ndarray,
-    previous_result: CornerPnPResult | None,
-    *,
-    scoring_edge_points: np.ndarray | None = None,
-    inlier_threshold: float,
-    max_corner_shift_px: float = PNP_TEMPORAL_MAX_CORNER_SHIFT_PX,
-) -> CornerPnPResult | None:
-    scoring_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
-    if previous_result is None or previous_result.camera_matrix is None:
-        return None
-
-    corner_indexes = np.asarray(
-        temporal_corner_assignment_from_previous_projection(
-            scoring_points,
-            previous_result,
-            inlier_threshold=max_corner_shift_px,
-        ),
-        dtype=np.int32,
-    )
-    if len(corner_indexes) != len(scoring_points):
-        return None
-
-    inlier_mask = corner_indexes >= 0
-    if int(inlier_mask.sum()) < 3:
-        return None
-
-    result = solve_corner_pnp(
-        scoring_points[inlier_mask],
-        previous_result.model_corner_points[corner_indexes[inlier_mask]],
-        previous_result.camera_matrix,
-        scoring_points=scoring_points,
-        scoring_edge_points=scoring_edge_points,
-        model_corner_points=previous_result.model_corner_points,
-        model_edge_points=previous_result.model_edge_points,
-        display_points=previous_result.display_points,
-        edge_indexes=previous_result.edge_indexes,
-        allowed_corner_mask=previous_result.allowed_corner_mask,
-        allowed_edge_mask=previous_result.allowed_edge_mask,
-        display_edge_indexes=previous_result.display_edge_indexes,
-        inlier_threshold=inlier_threshold,
-    )
-    if result is None:
-        return None
-    result.corner_names = tuple(CUBE_CORNER_NAMES[index] for index in corner_indexes[inlier_mask])
-    result.pose_label = previous_result.pose_label
-    result = refine_pnp_with_scored_corner_correspondences(
-        result,
-        inlier_threshold=inlier_threshold,
-    )
-    if result.corner_inlier_count < len(scoring_points):
-        return None
-    return result
-
-
-def pnp_hypothesis_point_sets(
-    points: np.ndarray,
-    *,
-    hypothesis_point_count: int = PNP_HYPOTHESIS_POINT_COUNT,
-    attempt_limit: int = PNP_HYPOTHESIS_ATTEMPT_LIMIT,
-) -> list[np.ndarray]:
-    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
-    if len(points) < hypothesis_point_count or attempt_limit <= 0:
-        return []
-
-    base_indexes = tuple(range(hypothesis_point_count))
-    index_sets = [base_indexes]
-    replacement_index = hypothesis_point_count
-    while len(index_sets) < attempt_limit and replacement_index < len(points):
-        index_sets.append(tuple(range(hypothesis_point_count - 1)) + (replacement_index,))
-        replacement_index += 1
-    return [points[list(indexes)] for indexes in index_sets]
-
-
-def solve_best_corner_pnp(
-    image_points: np.ndarray,
-    camera_matrices: list[np.ndarray],
-    *,
-    scoring_edge_points: np.ndarray | None = None,
-    model_corner_points: np.ndarray | None = None,
-    model_edge_points: np.ndarray | None = None,
-    display_points: np.ndarray | None = None,
-    edge_indexes: tuple[tuple[int, int], ...] = CUBE_KEYPOINT_EDGE_SEGMENTS,
-    allowed_corner_mask: np.ndarray | None = None,
-    allowed_edge_mask: np.ndarray | None = None,
-    display_edge_indexes: tuple[tuple[int, int], ...] | None = None,
-    pose_label: str = "",
-    hypothesis_point_count: int = PNP_HYPOTHESIS_POINT_COUNT,
-    inlier_threshold: float = 10.0,
-) -> CornerPnPResult | None:
-    scoring_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
-    if len(scoring_points) < hypothesis_point_count:
-        return None
-    model_corner_points = (
-        CUBE_CORNER_POINTS_MM
-        if model_corner_points is None
-        else np.asarray(model_corner_points, dtype=np.float32).reshape(-1, 3)
-    )
-    hypothesis_point_sets = pnp_hypothesis_point_sets(
-        scoring_points,
-        hypothesis_point_count=hypothesis_point_count,
-        attempt_limit=PNP_HYPOTHESIS_ATTEMPT_LIMIT,
-    )
-
-    best: CornerPnPResult | None = None
-    for camera_matrix in camera_matrices:
-        for hypothesis_points in hypothesis_point_sets:
-            for corner_indexes in CUBE_CORNER_CORRESPONDENCE_TRIPLES:
-                object_points = model_corner_points[list(corner_indexes)]
-                result = solve_corner_pnp(
-                    hypothesis_points,
-                    object_points,
-                    camera_matrix,
-                    scoring_points=scoring_points,
-                    scoring_edge_points=scoring_edge_points,
-                    model_corner_points=model_corner_points,
-                    model_edge_points=model_edge_points,
-                    display_points=display_points,
-                    edge_indexes=edge_indexes,
-                    allowed_corner_mask=allowed_corner_mask,
-                    allowed_edge_mask=allowed_edge_mask,
-                    display_edge_indexes=display_edge_indexes,
-                    inlier_threshold=inlier_threshold,
-                )
-                if result is None:
-                    continue
-                result.corner_names = tuple(CUBE_CORNER_NAMES[index] for index in corner_indexes)
-                result.pose_label = pose_label
-                result = refine_pnp_with_scored_corner_correspondences(
-                    result,
-                    inlier_threshold=inlier_threshold,
-                )
-                if pnp_result_is_better(result, best):
-                    best = result
-    if best is None or best.corner_inlier_count < len(scoring_points):
-        return None
-    return best
-
-
-def solve_best_mid_turn_corner_pnp(
-    image_points: np.ndarray,
-    camera_matrices: list[np.ndarray],
-    *,
-    scoring_edge_points: np.ndarray | None = None,
-    hypothesis_point_count: int = PNP_HYPOTHESIS_POINT_COUNT,
-    inlier_threshold: float = 10.0,
-) -> CornerPnPResult | None:
-    best: CornerPnPResult | None = None
-    for (
-        face_name,
-        angle_degrees,
-        model_corner_points,
-        model_edge_points,
-        edge_indexes,
-        allowed_corner_mask,
-        display_points,
-        display_edge_indexes,
-    ) in mid_turn_corner_model_candidates():
-        result = solve_best_corner_pnp(
-            image_points,
-            camera_matrices,
-            scoring_edge_points=scoring_edge_points,
-            model_corner_points=model_corner_points,
-            model_edge_points=model_edge_points,
-            display_points=display_points,
-            edge_indexes=edge_indexes,
-            allowed_corner_mask=allowed_corner_mask,
-            display_edge_indexes=display_edge_indexes,
-            pose_label=f"{face_name}+{angle_degrees:.0f}",
-            hypothesis_point_count=hypothesis_point_count,
-            inlier_threshold=inlier_threshold,
-        )
-        if result is not None and pnp_result_is_better(result, best):
-            best = result
-    return best
-
-
-def solve_temporal_or_best_corner_pnp(
-    image_points: np.ndarray,
-    camera_matrices: list[np.ndarray],
-    *,
-    previous_result: CornerPnPResult | None,
-    scoring_edge_points: np.ndarray | None = None,
-    hypothesis_point_count: int = PNP_HYPOTHESIS_POINT_COUNT,
-    inlier_threshold: float = 10.0,
-) -> CornerPnPResult | None:
-    if PNP_TEMPORAL_TRACKING_ENABLED and previous_result is not None:
-        temporal_result = solve_temporal_corner_pnp(
-            image_points,
-            previous_result,
-            scoring_edge_points=scoring_edge_points,
-            inlier_threshold=inlier_threshold,
-        )
-        if temporal_result is not None:
-            return temporal_result
-
-    result = solve_best_corner_pnp(
-        image_points,
-        camera_matrices,
-        scoring_edge_points=scoring_edge_points,
-        hypothesis_point_count=hypothesis_point_count,
-        inlier_threshold=inlier_threshold,
-    )
-    if result is not None or not MID_TURN_POSE_ESTIMATION_ENABLED:
-        return result
-
-    return solve_best_mid_turn_corner_pnp(
-        image_points,
-        camera_matrices,
-        scoring_edge_points=scoring_edge_points,
-        hypothesis_point_count=hypothesis_point_count,
-        inlier_threshold=inlier_threshold,
-    )
-
-
-def best_camera_matrix_for_observations(
-    observations: list[CornerObservation],
-    camera_matrices: list[np.ndarray],
-    *,
-    inlier_threshold: float,
-) -> np.ndarray | None:
-    if not observations:
-        return None
-
-    best_matrix: np.ndarray | None = None
-    best_inliers = -1
-    best_error = float("inf")
-    for camera_matrix in camera_matrices:
-        errors = []
-        inliers = 0
-        for observation in observations:
-            result = solve_temporal_or_best_corner_pnp(
-                observation.points,
-                [camera_matrix],
-                previous_result=None,
-                scoring_edge_points=observation.edge_points,
-                inlier_threshold=inlier_threshold,
-            )
-            if result is not None:
-                errors.append(result.error)
-                inliers += result.inlier_count
-        if not errors:
-            continue
-        mean_error = float(np.mean(errors))
-        if inliers > best_inliers or (inliers == best_inliers and mean_error < best_error):
-            best_inliers = inliers
-            best_error = mean_error
-            best_matrix = camera_matrix
-    return best_matrix
 
 
 def draw_pose_keypoints(
@@ -1925,9 +1341,22 @@ def draw_pose_keypoints(
     return drawn
 
 
-def draw_pnp_cube(frame: np.ndarray, result: CornerPnPResult | None) -> None:
+def draw_pnp_cube(frame: np.ndarray, result: PosePnPResult | None) -> None:
     if result is None:
         return
+
+    image_points = np.asarray(result.image_points, dtype=np.float32).reshape(-1, 2)
+    projected_object_points = np.asarray(result.projected_object_points, dtype=np.float32).reshape(-1, 2)
+    residuals = (
+        np.linalg.norm(projected_object_points - image_points, axis=1)
+        if len(image_points) == len(projected_object_points)
+        else np.empty((0,), dtype=np.float32)
+    )
+    for observed_point, projected_point in zip(image_points, projected_object_points):
+        observed = tuple(np.round(observed_point).astype(int))
+        projected_match = tuple(np.round(projected_point).astype(int))
+        cv2.line(frame, observed, projected_match, (0, 0, 0), 4, lineType=cv2.LINE_AA)
+        cv2.line(frame, observed, projected_match, PNP_REPROJECTION_RESIDUAL_COLOR, 2, lineType=cv2.LINE_AA)
 
     projected = np.asarray(result.projected_display_points, dtype=np.float32)
     edge_indexes = result.display_edge_indexes or result.edge_indexes
@@ -1937,10 +1366,39 @@ def draw_pnp_cube(frame: np.ndarray, result: CornerPnPResult | None) -> None:
         color = PNP_CUBE_LINE_COLOR
         cv2.line(frame, start_point, end_point, (0, 0, 0), 4, lineType=cv2.LINE_AA)
         cv2.line(frame, start_point, end_point, color, 2, lineType=cv2.LINE_AA)
-    for point in result.projected_corners:
-        cv2.circle(frame, tuple(np.round(point).astype(int)), 4, PNP_CUBE_POINT_COLOR, -1, lineType=cv2.LINE_AA)
-    for point in result.image_points:
-        cv2.circle(frame, tuple(np.round(point).astype(int)), 6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+    for point in projected_object_points:
+        center = tuple(np.round(point).astype(int))
+        cv2.circle(frame, center, 5, (0, 0, 0), -1, lineType=cv2.LINE_AA)
+        cv2.circle(frame, center, 3, PNP_CUBE_POINT_COLOR, -1, lineType=cv2.LINE_AA)
+    if len(residuals):
+        focal = float(result.camera_matrix[0, 0])
+        axis_order, signs = result.lattice_transform
+        observed_error = getattr(result, "observed_reprojection_error", None)
+        observed_label = "" if observed_error is None else f" obs {observed_error:.1f}"
+        label = (
+            f"pnp err mean {float(np.mean(residuals)):.1f} max {float(np.max(residuals)):.1f}{observed_label} "
+            f"f {focal:.0f} axes {axis_order} signs {signs}"
+        )
+        cv2.putText(
+            frame,
+            label,
+            (12, max(24, frame.shape[0] - 16)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 0),
+            4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            label,
+            (12, max(24, frame.shape[0] - 16)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            PNP_REPROJECTION_RESIDUAL_COLOR,
+            2,
+            cv2.LINE_AA,
+        )
 
 
 def odd_kernel(value: int) -> int:
@@ -2139,6 +1597,10 @@ def pose_graph_edge_evidence(
             )
         ),
     )
+    min_edge_length = max(
+        0.0,
+        float(getattr(args, "adjacency_min_edge_length", ADJACENCY_MIN_EDGE_LENGTH_PX)),
+    )
 
     graph_edges: list[PoseGraphEdge] = []
     for start_index, end_index in pose_graph_candidate_edges(points):
@@ -2147,6 +1609,8 @@ def pose_graph_edge_evidence(
         length = float(
             np.linalg.norm(np.asarray(end, dtype=np.float32) - np.asarray(start, dtype=np.float32))
         )
+        if length < min_edge_length:
+            continue
         skips_keypoint = segment_skips_observed_keypoint(points, start_index, end_index, args)
         if skips_keypoint:
             coverage, max_gap = 0.0, length
@@ -2169,32 +1633,764 @@ def pose_graph_edge_evidence(
     return graph_edges
 
 
-def draw_pose_graph_adjacencies(
-    frame: np.ndarray,
-    pose_points: list[PoseGraphPoint],
+def pose_graph_edge_length(
+    points: tuple[PoseGraphPoint, ...] | list[PoseGraphPoint],
+    edge: PoseGraphEdge,
+) -> float:
+    start = np.asarray(points[edge.start_index].xy, dtype=np.float32)
+    end = np.asarray(points[edge.end_index].xy, dtype=np.float32)
+    return float(np.linalg.norm(end - start))
+
+
+def prune_long_pose_graph_edges(graph: PoseGraph, args) -> PoseGraph:
+    accepted_lengths = [
+        pose_graph_edge_length(graph.points, edge)
+        for edge in graph.edges
+        if edge.accepted
+    ]
+    if not accepted_lengths:
+        return graph
+
+    max_length_ratio = max(
+        0.0,
+        float(
+            getattr(
+                args,
+                "adjacency_max_average_length_ratio",
+                ADJACENCY_MAX_AVERAGE_LENGTH_RATIO,
+            )
+        ),
+    )
+    if max_length_ratio <= 0.0:
+        return graph
+
+    max_length = float(np.mean(accepted_lengths)) * max_length_ratio
+    pruned_edges = tuple(
+        (
+            PoseGraphEdge(
+                start_index=edge.start_index,
+                end_index=edge.end_index,
+                coverage=edge.coverage,
+                max_uncovered_gap=edge.max_uncovered_gap,
+                accepted=False,
+            )
+            if edge.accepted and pose_graph_edge_length(graph.points, edge) > max_length
+            else edge
+        )
+        for edge in graph.edges
+    )
+    return PoseGraph(points=graph.points, edges=pruned_edges)
+
+
+def build_pose_graph(
+    points: list[PoseGraphPoint],
     roi: np.ndarray,
     roi_xyxy: tuple[int, int, int, int],
     args,
+) -> PoseGraph:
+    if len(points) < 2:
+        return PoseGraph(points=tuple(points), edges=tuple())
+    profile = getattr(args, "_pose_profile", None)
+    started = perf_counter()
+    edges = build_adjacency_edge_map(roi, args)
+    if profile is not None:
+        profile["edge_map_ms"] = (perf_counter() - started) * 1000.0
+        started = perf_counter()
+    graph = PoseGraph(
+        points=tuple(points),
+        edges=tuple(pose_graph_edge_evidence(points, roi_xyxy, edges, args)),
+    )
+    if profile is not None:
+        profile["edge_evidence_ms"] = (perf_counter() - started) * 1000.0
+        profile["candidate_edges"] = len(graph.edges)
+        profile["accepted_edges_before_prune"] = sum(edge.accepted for edge in graph.edges)
+        started = perf_counter()
+    graph = prune_long_pose_graph_edges(graph, args)
+    if profile is not None:
+        profile["edge_prune_ms"] = (perf_counter() - started) * 1000.0
+        profile["accepted_edges"] = sum(edge.accepted for edge in graph.edges)
+    return graph
+
+
+def pose_graph_adjacency(graph: PoseGraph) -> dict[int, list[int]]:
+    adjacency = {index: [] for index in range(len(graph.points))}
+    for edge in graph.edges:
+        if not edge.accepted:
+            continue
+        adjacency[edge.start_index].append(edge.end_index)
+        adjacency[edge.end_index].append(edge.start_index)
+    for neighbors in adjacency.values():
+        neighbors.sort(key=lambda index: (-graph.points[index].score, index))
+    return adjacency
+
+
+def pose_graph_components(
+    graph: PoseGraph,
+    adjacency: dict[int, list[int]] | None = None,
+) -> list[tuple[int, ...]]:
+    adjacency = pose_graph_adjacency(graph) if adjacency is None else adjacency
+    seen: set[int] = set()
+    components: list[tuple[int, ...]] = []
+    for start_index in range(len(graph.points)):
+        if start_index in seen:
+            continue
+        queue = deque([start_index])
+        seen.add(start_index)
+        component = []
+        while queue:
+            index = queue.popleft()
+            component.append(index)
+            for neighbor in adjacency[index]:
+                if neighbor in seen:
+                    continue
+                seen.add(neighbor)
+                queue.append(neighbor)
+        components.append(tuple(component))
+    return components
+
+
+def cube_lattice_class(coord: tuple[int, int, int]) -> str:
+    boundary_count = sum(value in (0, CUBE_GRID_MAX_INDEX) for value in coord)
+    if boundary_count == 3:
+        return "corner"
+    if boundary_count == 2:
+        return "corner-edge"
+    if boundary_count == 1:
+        return "corner-edge-center"
+    return "center"
+
+
+CUBE_LATTICE_COORDS_BY_CLASS = {
+    class_name: tuple(coord for coord in CUBE_LATTICE_COORDS if cube_lattice_class(coord) == class_name)
+    for class_name in ("corner", "corner-edge", "corner-edge-center")
+}
+CUBE_LATTICE_POINT_BY_COORD = {
+    coord: CUBE_LATTICE_POINTS_MM[index]
+    for index, coord in enumerate(CUBE_LATTICE_COORDS)
+}
+CUBE_LATTICE_DISPLAY_CORNER_COORDS = tuple(
+    coord for coord in CUBE_LATTICE_COORDS if cube_lattice_class(coord) == "corner"
+)
+CUBE_LATTICE_DISPLAY_POINTS_MM = np.asarray(
+    [CUBE_LATTICE_POINT_BY_COORD[coord] for coord in CUBE_LATTICE_DISPLAY_CORNER_COORDS],
+    dtype=np.float32,
+)
+CUBE_LATTICE_DISPLAY_EDGE_INDEXES = tuple(
+    (start_index, end_index)
+    for start_index, start_coord in enumerate(CUBE_LATTICE_DISPLAY_CORNER_COORDS)
+    for end_index, end_coord in enumerate(CUBE_LATTICE_DISPLAY_CORNER_COORDS)
+    if start_index < end_index
+    and sum(abs(start_value - end_value) for start_value, end_value in zip(start_coord, end_coord))
+    == CUBE_GRID_MAX_INDEX
+)
+CUBE_LATTICE_BOUNDARY_FACES_BY_COORD = {
+    coord: frozenset(
+        (axis, value)
+        for axis, value in enumerate(coord)
+        if value in (0, CUBE_GRID_MAX_INDEX)
+    )
+    for coord in CUBE_LATTICE_COORDS
+}
+def cube_lattice_coords_are_neighbors(
+    left: tuple[int, int, int],
+    right: tuple[int, int, int],
+) -> bool:
+    return sum(abs(left_value - right_value) for left_value, right_value in zip(left, right)) == 1
+
+
+VECTOR_GUIDED_START_COORDS = {
+    "corner": (0, 0, 0),
+    "corner-edge": (1, 0, 0),
+    "corner-edge-center": (1, 1, 0),
+}
+VECTOR_GUIDED_DIRECTION_PRIORITY = (
+    (1, 0, 0),
+    (0, 1, 0),
+    (0, 0, 1),
+    (-1, 0, 0),
+    (0, -1, 0),
+    (0, 0, -1),
+)
+VECTOR_GUIDED_DIRECTION_RANK = {
+    direction: index
+    for index, direction in enumerate(VECTOR_GUIDED_DIRECTION_PRIORITY)
+}
+VECTOR_GUIDED_LOCAL_TURN_ORDER = ("straight", "left", "right", "back")
+VECTOR_GUIDED_LOCAL_TURNS = {
+    (1, 0, 0): {
+        "straight": (1, 0, 0),
+        "left": (0, 1, 0),
+        "right": (0, 0, 1),
+        "back": (-1, 0, 0),
+    },
+    (0, 1, 0): {
+        "straight": (0, 1, 0),
+        "left": (0, 0, 1),
+        "right": (1, 0, 0),
+        "back": (0, -1, 0),
+    },
+    (0, 0, 1): {
+        "straight": (0, 0, 1),
+        "left": (1, 0, 0),
+        "right": (0, 1, 0),
+        "back": (0, 0, -1),
+    },
+    (-1, 0, 0): {
+        "straight": (-1, 0, 0),
+        "left": (0, 0, 1),
+        "right": (0, 1, 0),
+        "back": (1, 0, 0),
+    },
+    (0, -1, 0): {
+        "straight": (0, -1, 0),
+        "left": (1, 0, 0),
+        "right": (0, 0, 1),
+        "back": (0, 1, 0),
+    },
+    (0, 0, -1): {
+        "straight": (0, 0, -1),
+        "left": (0, 1, 0),
+        "right": (1, 0, 0),
+        "back": (0, 0, 1),
+    },
+}
+CUBE_LATTICE_NEIGHBOR_COORDS_BY_CLASS = {
+    (coord, class_name): tuple(
+        candidate
+        for direction in VECTOR_GUIDED_DIRECTION_PRIORITY
+        for candidate in (tuple(coord[index] + direction[index] for index in range(3)),)
+        if all(0 <= value <= CUBE_GRID_MAX_INDEX for value in candidate)
+        and candidate in CUBE_LATTICE_POINT_BY_COORD
+        and cube_lattice_class(candidate) == class_name
+    )
+    for coord in CUBE_LATTICE_COORDS
+    for class_name in ("corner", "corner-edge", "corner-edge-center")
+}
+
+
+def normalized_vector(vector: np.ndarray) -> np.ndarray | None:
+    length = float(np.linalg.norm(vector))
+    if length <= 1e-6:
+        return None
+    return (vector / length).astype(np.float32)
+
+
+def cube_lattice_neighbor_coords(
+    coord: tuple[int, int, int],
+    class_name: str,
+    *,
+    used_coords: set[tuple[int, int, int]] | None = None,
+) -> list[tuple[int, int, int]]:
+    used_coords = set() if used_coords is None else used_coords
+    return [
+        candidate
+        for candidate in CUBE_LATTICE_NEIGHBOR_COORDS_BY_CLASS.get((coord, class_name), ())
+        if candidate not in used_coords
+    ]
+
+
+def cube_lattice_boundary_faces(coord: tuple[int, int, int]) -> frozenset[tuple[int, int]]:
+    return CUBE_LATTICE_BOUNDARY_FACES_BY_COORD[coord]
+
+
+def cube_lattice_shared_boundary_faces(
+    left: tuple[int, int, int],
+    right: tuple[int, int, int],
+) -> frozenset[tuple[int, int]]:
+    return cube_lattice_boundary_faces(left) & cube_lattice_boundary_faces(right)
+
+
+def axis_delta(axis: int, sign: int) -> tuple[int, int, int]:
+    return tuple(sign if index == axis else 0 for index in range(3))
+
+
+def cross_delta(
+    left: tuple[int, int, int],
+    right: tuple[int, int, int],
+) -> tuple[int, int, int]:
+    return (
+        (left[1] * right[2]) - (left[2] * right[1]),
+        (left[2] * right[0]) - (left[0] * right[2]),
+        (left[0] * right[1]) - (left[1] * right[0]),
+    )
+
+
+def face_normal_delta(face: tuple[int, int]) -> tuple[int, int, int]:
+    axis, value = face
+    return axis_delta(axis, -1 if value == 0 else 1)
+
+
+def face_local_turn_basis(
+    previous_delta: tuple[int, int, int],
+    face: tuple[int, int],
+) -> dict[str, tuple[int, int, int]] | None:
+    normal = face_normal_delta(face)
+    if sum(abs(normal[index] * previous_delta[index]) for index in range(3)) != 0:
+        return None
+    right = cross_delta(normal, previous_delta)
+    if sum(abs(value) for value in right) != 1:
+        return None
+    return {
+        "straight": previous_delta,
+        "left": negated_delta(right),
+        "right": right,
+        "back": negated_delta(previous_delta),
+    }
+
+
+def coord_delta_axis_and_sign(
+    start: tuple[int, int, int],
+    end: tuple[int, int, int],
+) -> tuple[int, int] | None:
+    delta = tuple(end[index] - start[index] for index in range(3))
+    if sum(abs(value) for value in delta) != 1:
+        return None
+    axis = next(index for index, value in enumerate(delta) if value != 0)
+    return axis, delta[axis]
+
+
+def coord_delta(
+    start: tuple[int, int, int],
+    end: tuple[int, int, int],
+) -> tuple[int, int, int] | None:
+    delta = tuple(end[index] - start[index] for index in range(3))
+    if sum(abs(value) for value in delta) != 1:
+        return None
+    return delta
+
+
+def local_turn_scores(previous_unit: np.ndarray, next_unit: np.ndarray) -> dict[str, float]:
+    dot = float(np.dot(previous_unit, next_unit))
+    cross = float(
+        (previous_unit[0] * next_unit[1])
+        - (previous_unit[1] * next_unit[0])
+    )
+    return {
+        "straight": dot,
+        "left": -cross,
+        "right": cross,
+        "back": -dot,
+    }
+
+
+def local_turn_for_delta(
+    previous_delta: tuple[int, int, int],
+    next_delta: tuple[int, int, int],
+) -> str | None:
+    local_turns = VECTOR_GUIDED_LOCAL_TURNS.get(previous_delta, {})
+    for turn_name, turn_delta in local_turns.items():
+        if turn_delta == next_delta:
+            return turn_name
+    return None
+
+
+def local_turn_basis_for_delta(delta: tuple[int, int, int]) -> dict[str, tuple[int, int, int]] | None:
+    local_turns = VECTOR_GUIDED_LOCAL_TURNS.get(delta)
+    return None if local_turns is None else dict(local_turns)
+
+
+def local_turn_for_basis_delta(
+    basis: dict[str, tuple[int, int, int]],
+    delta: tuple[int, int, int],
+) -> str | None:
+    for turn_name, turn_delta in basis.items():
+        if turn_delta == delta:
+            return turn_name
+    return None
+
+
+def candidate_local_turn_name(
+    basis: dict[str, tuple[int, int, int]],
+    previous_delta: tuple[int, int, int],
+    next_delta: tuple[int, int, int],
+    previous_unit: np.ndarray,
+    observed_unit: np.ndarray,
+    turn_scores: dict[str, float] | None = None,
+) -> str | None:
+    turn_name = local_turn_for_basis_delta(basis, next_delta)
+    if turn_name is not None:
+        return turn_name
+    return None
+
+
+def negated_delta(delta: tuple[int, int, int]) -> tuple[int, int, int]:
+    return tuple(-value for value in delta)
+
+
+def propagated_local_to_global_frame(
+    local_to_global: dict[str, tuple[int, int, int]],
+    turn_name: str,
+) -> dict[str, tuple[int, int, int]]:
+    straight = local_to_global[turn_name]
+    if turn_name == "straight":
+        left = local_to_global["left"]
+        right = local_to_global["right"]
+    elif turn_name == "left":
+        left = local_to_global["right"]
+        right = local_to_global["straight"]
+    elif turn_name == "right":
+        left = local_to_global["straight"]
+        right = local_to_global["left"]
+    else:
+        left = local_to_global["right"]
+        right = local_to_global["left"]
+    return {
+        "straight": straight,
+        "left": left,
+        "right": right,
+        "back": negated_delta(straight),
+    }
+
+
+def unique_local_to_global_frames(
+    previous_delta: tuple[int, int, int],
+    path_faces: frozenset[tuple[int, int]],
+    fallback: dict[str, tuple[int, int, int]],
+) -> tuple[dict[str, tuple[int, int, int]], ...]:
+    frames = []
+    seen = set()
+    for face in sorted(path_faces):
+        frame = face_local_turn_basis(previous_delta, face)
+        if frame is None:
+            continue
+        key = tuple(sorted(frame.items()))
+        if key in seen:
+            continue
+        frames.append(frame)
+        seen.add(key)
+    key = tuple(sorted(fallback.items()))
+    if key not in seen:
+        frames.append(fallback)
+    return tuple(frames)
+
+
+def image_axis_preference(delta: tuple[int, int, int], observed_unit: np.ndarray) -> float:
+    axis_and_sign = coord_delta_axis_and_sign((0, 0, 0), delta)
+    if axis_and_sign is None:
+        return 0.0
+    axis, sign = axis_and_sign
+    if axis == 0:
+        return float(observed_unit[0]) * float(sign)
+    if axis == 1:
+        return -float(observed_unit[0]) * float(sign)
+    return float(observed_unit[1]) * float(sign)
+
+
+def vector_guided_pose_graph_correspondence(graph: PoseGraph) -> PoseGraphCorrespondence | None:
+    adjacency = pose_graph_adjacency(graph)
+    components = pose_graph_components(graph, adjacency)
+    components = [component for component in components if len(component) >= 2]
+    if not components:
+        return None
+
+    component = max(
+        components,
+        key=lambda indexes: (len(indexes), max(graph.points[index].score for index in indexes)),
+    )
+    component_set = set(component)
+    start_index = max(component, key=lambda index: (graph.points[index].score, -index))
+    start = graph.points[start_index]
+    start_coord = VECTOR_GUIDED_START_COORDS.get(start.class_name)
+    if start_coord is None:
+        return None
+
+    assignments: dict[int, PoseGraphNodeAssignment] = {
+        start_index: PoseGraphNodeAssignment(
+            coord=start_coord,
+            parent_index=None,
+            local_to_global=None,
+            local_to_global_frames=tuple(),
+            path_faces=cube_lattice_boundary_faces(start_coord),
+            depth=0,
+        )
+    }
+    used_coords = {start_coord}
+
+    first_neighbor_options = []
+    for neighbor_index in adjacency[start_index]:
+        if neighbor_index not in component_set:
+            continue
+        neighbor = graph.points[neighbor_index]
+        observed_unit = normalized_vector(
+            np.asarray(neighbor.xy, dtype=np.float32)
+            - np.asarray(start.xy, dtype=np.float32)
+        )
+        if observed_unit is None:
+            continue
+        for neighbor_coord in cube_lattice_neighbor_coords(
+            start_coord,
+            neighbor.class_name,
+            used_coords=used_coords,
+        ):
+            delta = tuple(neighbor_coord[index] - start_coord[index] for index in range(3))
+            first_neighbor_options.append(
+                (
+                    -neighbor.score,
+                    VECTOR_GUIDED_DIRECTION_RANK.get(delta, len(VECTOR_GUIDED_DIRECTION_PRIORITY)),
+                    neighbor_index,
+                    neighbor_coord,
+                    observed_unit,
+                )
+            )
+    if not first_neighbor_options:
+        return None
+
+    _score, _rank, first_neighbor_index, first_neighbor_coord, reference_vector = min(first_neighbor_options)
+    first_delta = coord_delta(start_coord, first_neighbor_coord)
+    if first_delta is None:
+        return None
+    first_basis = local_turn_basis_for_delta(first_delta)
+    if first_basis is None:
+        return None
+    first_path_faces = assignments[start_index].path_faces & cube_lattice_boundary_faces(
+        first_neighbor_coord
+    )
+    assignments[first_neighbor_index] = PoseGraphNodeAssignment(
+        coord=first_neighbor_coord,
+        parent_index=start_index,
+        local_to_global=first_basis,
+        local_to_global_frames=unique_local_to_global_frames(
+            first_delta,
+            first_path_faces,
+            first_basis,
+        ),
+        path_faces=first_path_faces,
+        depth=1,
+    )
+    used_coords.add(first_neighbor_coord)
+
+    queue = deque([start_index, first_neighbor_index])
+    queued_indexes = {start_index, first_neighbor_index}
+
+    def enqueue_node(index: int) -> None:
+        if index in queued_indexes:
+            return
+        queue.append(index)
+        queued_indexes.add(index)
+
+    while queue:
+        current_index = queue.popleft()
+        current_assignment = assignments[current_index]
+        current_coord = current_assignment.coord
+        current_xy = np.asarray(graph.points[current_index].xy, dtype=np.float32)
+        if current_assignment.parent_index is None:
+            current_local_to_global_frames = (first_basis,)
+            previous_unit = reference_vector
+            previous_delta = first_delta
+        else:
+            current_local_to_global_frames = current_assignment.local_to_global_frames
+            if not current_local_to_global_frames:
+                continue
+            parent_coord = assignments[current_assignment.parent_index].coord
+            previous_delta = coord_delta(parent_coord, current_coord)
+            if previous_delta is None:
+                continue
+            parent_xy = np.asarray(
+                graph.points[current_assignment.parent_index].xy,
+                dtype=np.float32,
+            )
+            previous_unit = normalized_vector(current_xy - parent_xy)
+            if previous_unit is None:
+                continue
+        candidate_assignments = []
+        for neighbor_index in adjacency[current_index]:
+            if neighbor_index not in component_set:
+                continue
+            if neighbor_index == current_assignment.parent_index:
+                continue
+            if neighbor_index in assignments:
+                continue
+
+            neighbor = graph.points[neighbor_index]
+            observed_unit = normalized_vector(np.asarray(neighbor.xy, dtype=np.float32) - current_xy)
+            if observed_unit is None:
+                continue
+            turn_scores = local_turn_scores(previous_unit, observed_unit)
+            for neighbor_coord in cube_lattice_neighbor_coords(
+                current_coord,
+                neighbor.class_name,
+                used_coords=used_coords,
+            ):
+                assigned_neighbor_coords = [
+                    assignments[assigned_neighbor_index].coord
+                    for assigned_neighbor_index in adjacency[neighbor_index]
+                    if assigned_neighbor_index in assignments
+                ]
+                conflict_count = sum(
+                    not cube_lattice_coords_are_neighbors(neighbor_coord, assigned_neighbor_coord)
+                    for assigned_neighbor_coord in assigned_neighbor_coords
+                )
+                if conflict_count > 0:
+                    continue
+                next_delta = coord_delta(current_coord, neighbor_coord)
+                if next_delta is None:
+                    continue
+                turn_options = []
+                allowed_turns = ("straight", "left", "right")
+                if current_assignment.parent_index is None:
+                    allowed_turns = (*allowed_turns, "back")
+                seen_turn_options = set()
+                for current_local_to_global in current_local_to_global_frames:
+                    for turn_name in allowed_turns:
+                        if current_local_to_global.get(turn_name) != next_delta:
+                            continue
+                        next_path_faces = (
+                            current_assignment.path_faces
+                            & cube_lattice_boundary_faces(neighbor_coord)
+                        )
+                        fallback_frame = propagated_local_to_global_frame(
+                            current_local_to_global,
+                            turn_name,
+                        )
+                        next_local_to_global_frames = unique_local_to_global_frames(
+                            next_delta,
+                            next_path_faces,
+                            fallback_frame,
+                        )
+                        option_key = (
+                            turn_name,
+                            tuple(tuple(sorted(frame.items())) for frame in next_local_to_global_frames),
+                            next_path_faces,
+                        )
+                        if option_key in seen_turn_options:
+                            continue
+                        seen_turn_options.add(option_key)
+                        turn_options.append(
+                            (
+                                turn_name,
+                                next_local_to_global_frames[0],
+                                next_local_to_global_frames,
+                                next_path_faces,
+                                (3.0 if len(assigned_neighbor_coords) >= 2 else 0.0)
+                                + (1.0 if next_path_faces else 0.0),
+                            )
+                        )
+
+                if not turn_options and len(assigned_neighbor_coords) >= 2:
+                    topology_turn = max(("straight", "left", "right"), key=turn_scores.get)
+                    next_path_faces = (
+                        current_assignment.path_faces
+                        & cube_lattice_boundary_faces(neighbor_coord)
+                    )
+                    fallback_frame = (
+                        local_turn_basis_for_delta(next_delta)
+                        or propagated_local_to_global_frame(
+                            current_local_to_global_frames[0],
+                            topology_turn,
+                        )
+                    )
+                    next_local_to_global_frames = unique_local_to_global_frames(
+                        next_delta,
+                        next_path_faces,
+                        fallback_frame,
+                    )
+                    turn_options.append(
+                        (
+                            topology_turn,
+                            next_local_to_global_frames[0],
+                            next_local_to_global_frames,
+                            next_path_faces,
+                            3.0,
+                        )
+                    )
+
+                if not turn_options:
+                    continue
+                (
+                    turn_name,
+                    next_local_to_global,
+                    next_local_to_global_frames,
+                    next_path_faces,
+                    context_bonus,
+                ) = min(
+                    turn_options,
+                    key=lambda option: (
+                        -turn_scores[option[0]] - option[4],
+                        VECTOR_GUIDED_LOCAL_TURN_ORDER.index(option[0]),
+                    ),
+                )
+                score = (
+                    turn_scores[turn_name]
+                    + context_bonus
+                )
+                candidate_assignments.append(
+                    (
+                        conflict_count,
+                        -score,
+                        -neighbor.score,
+                        neighbor_index,
+                        neighbor_coord,
+                        next_local_to_global,
+                        next_local_to_global_frames,
+                        next_path_faces,
+                    )
+                )
+
+        candidate_assignments.sort()
+        for (
+            _conflict_count,
+            _direction_score,
+            _point_score,
+            neighbor_index,
+            neighbor_coord,
+            next_local_to_global,
+            next_local_to_global_frames,
+            next_path_faces,
+        ) in candidate_assignments:
+            if neighbor_index in assignments or neighbor_coord in used_coords:
+                continue
+            assignments[neighbor_index] = PoseGraphNodeAssignment(
+                coord=neighbor_coord,
+                parent_index=current_index,
+                local_to_global=next_local_to_global,
+                local_to_global_frames=next_local_to_global_frames,
+                path_faces=next_path_faces,
+                depth=current_assignment.depth + 1,
+            )
+            used_coords.add(neighbor_coord)
+            enqueue_node(neighbor_index)
+
+    if len(assignments) < 3:
+        return None
+
+    graph_indexes = tuple(
+        sorted(
+            assignments,
+            key=lambda index: (-graph.points[index].score, index),
+        )
+    )
+    lattice_coords = tuple(assignments[index].coord for index in graph_indexes)
+    image_points = np.asarray([graph.points[index].xy for index in graph_indexes], dtype=np.float32)
+    return PoseGraphCorrespondence(
+        image_points=image_points,
+        object_points=cube_lattice_points_for_coords(lattice_coords),
+        graph_indexes=graph_indexes,
+        lattice_coords=lattice_coords,
+    )
+
+
+def draw_pose_graph_adjacencies(
+    frame: np.ndarray,
+    graph: PoseGraph,
+    args,
 ) -> int:
-    if len(pose_points) < 2:
+    if len(graph.points) < 2:
         return 0
 
-    edges = build_adjacency_edge_map(roi, args)
-    adjacencies = pose_graph_edge_evidence(pose_points, roi_xyxy, edges, args)
     accepted_count = 0
-    for adjacency in adjacencies:
+    for adjacency in graph.edges:
         if not adjacency.accepted:
             continue
-        start = tuple(np.round(pose_points[adjacency.start_index].xy).astype(int))
-        end = tuple(np.round(pose_points[adjacency.end_index].xy).astype(int))
+        start = tuple(np.round(graph.points[adjacency.start_index].xy).astype(int))
+        end = tuple(np.round(graph.points[adjacency.end_index].xy).astype(int))
         cv2.line(frame, start, end, (0, 0, 0), 5, lineType=cv2.LINE_AA)
         cv2.line(frame, start, end, (60, 255, 120), 2, lineType=cv2.LINE_AA)
         if getattr(args, "debug_overlay", False):
             midpoint = tuple(
                 np.round(
                     (
-                        np.asarray(pose_points[adjacency.start_index].xy, dtype=np.float32)
-                        + np.asarray(pose_points[adjacency.end_index].xy, dtype=np.float32)
+                        np.asarray(graph.points[adjacency.start_index].xy, dtype=np.float32)
+                        + np.asarray(graph.points[adjacency.end_index].xy, dtype=np.float32)
                     )
                     * 0.5
                 ).astype(int)
@@ -2213,33 +2409,84 @@ def draw_pose_graph_adjacencies(
     return accepted_count
 
 
+def draw_pose_graph_correspondence(
+    frame: np.ndarray,
+    graph: PoseGraph,
+    correspondence: PoseGraphCorrespondence | None,
+) -> None:
+    if correspondence is None:
+        return
+
+    used_indexes = set(correspondence.graph_indexes)
+    for edge in graph.edges:
+        if not edge.accepted:
+            continue
+        if edge.start_index not in used_indexes or edge.end_index not in used_indexes:
+            continue
+        start = tuple(np.round(graph.points[edge.start_index].xy).astype(int))
+        end = tuple(np.round(graph.points[edge.end_index].xy).astype(int))
+        cv2.line(frame, start, end, (0, 0, 0), 7, lineType=cv2.LINE_AA)
+        cv2.line(frame, start, end, POSE_GRAPH_CORRESPONDENCE_LINE_COLOR, 3, lineType=cv2.LINE_AA)
+
+    for graph_index, lattice_coord in zip(correspondence.graph_indexes, correspondence.lattice_coords):
+        point = np.asarray(graph.points[graph_index].xy, dtype=np.float32)
+        label_at = tuple(np.round(point + np.asarray((8.0, -8.0), dtype=np.float32)).astype(int))
+        label = f"{lattice_coord}"
+        cv2.putText(
+            frame,
+            label,
+            label_at,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (0, 0, 0),
+            5,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            label,
+            label_at,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            POSE_GRAPH_CORRESPONDENCE_TEXT_COLOR,
+            2,
+            cv2.LINE_AA,
+        )
+
+
 def draw_pose_estimate(
     frame: np.ndarray,
     roi: np.ndarray,
     roi_xyxy: tuple[int, int, int, int],
     pose_model,
-    pose_solver: CameraBootstrapPnP | None,
+    pose_solver: PoseGraphPnPSolver | None,
     args,
-) -> tuple[int, CornerPnPResult | None, tuple[int, int, int, int] | None]:
+) -> tuple[int, PosePnPResult | None, tuple[int, int, int, int] | None]:
     if pose_model is None:
         return 0, None, None
 
+    profile = getattr(args, "_pose_profile", None)
     x1, y1, x2, y2 = roi_xyxy
     model_roi = resize_to_square_size(roi, POSE_IMAGE_SIZE)
+    started = perf_counter()
     results = pose_model.predict(
         source=model_roi,
         conf=POSE_OBJECT_CONFIDENCE,
         imgsz=POSE_IMAGE_SIZE,
         verbose=False,
     )
+    if profile is not None:
+        profile["pose_model_ms"] = (perf_counter() - started) * 1000.0
     if not results:
+        reset_pose_solver_temporal_tracking(pose_solver)
         return 0, None, None
 
+    started = perf_counter()
     result = results[0]
     xy, conf = result_keypoints(result, POSE_IMAGE_SIZE)
     scale_x = (x2 - x1) / float(model_roi.shape[1])
     scale_y = (y2 - y1) / float(model_roi.shape[0])
-    corner_points = collect_corner_image_points(
+    pose_points = collect_pose_graph_points(
         result,
         pose_model,
         xy,
@@ -2247,21 +2494,30 @@ def draw_pose_estimate(
         confidence_threshold=POSE_KEYPOINT_CONFIDENCE,
         offset_xy=(x1, y1),
         scale_xy=(scale_x, scale_y),
-        point_limit=PNP_CORNER_DETECTION_LIMIT,
     )
+    if profile is not None:
+        profile["collect_points_ms"] = (perf_counter() - started) * 1000.0
+        profile["pose_points"] = len(pose_points)
+    should_build_pose_graph = (
+        getattr(args, "show_corner_adjacency", DRAW_CORNER_ADJACENCY)
+        or ENABLE_POSE_ESTIMATION
+    )
+    started = perf_counter()
+    pose_graph = (
+        build_pose_graph(pose_points, roi, roi_xyxy, args)
+        if should_build_pose_graph
+        else PoseGraph(points=tuple(pose_points), edges=tuple())
+    )
+    if profile is not None:
+        profile["graph_total_ms"] = (perf_counter() - started) * 1000.0
+    started = perf_counter()
     if getattr(args, "show_corner_adjacency", DRAW_CORNER_ADJACENCY):
-        pose_points = collect_pose_graph_points(
-            result,
-            pose_model,
-            xy,
-            conf,
-            confidence_threshold=POSE_KEYPOINT_CONFIDENCE,
-            offset_xy=(x1, y1),
-            scale_xy=(scale_x, scale_y),
-        )
-        draw_pose_graph_adjacencies(frame, pose_points, roi, roi_xyxy, args)
+        draw_pose_graph_adjacencies(frame, pose_graph, args)
+    if profile is not None:
+        profile["draw_adjacency_ms"] = (perf_counter() - started) * 1000.0
 
     point_count = 0
+    started = perf_counter()
     if DRAW_POSE_KEYPOINTS:
         point_count = draw_pose_keypoints(
             frame,
@@ -2273,34 +2529,51 @@ def draw_pose_estimate(
             offset_xy=(x1, y1),
             scale_xy=(scale_x, scale_y),
         )
+    if profile is not None:
+        profile["draw_keypoints_ms"] = (perf_counter() - started) * 1000.0
 
-    edge_points = collect_pose_image_points(
-        result,
-        pose_model,
-        xy,
-        conf,
-        accepted_kinds={"edge"},
-        confidence_threshold=POSE_KEYPOINT_CONFIDENCE,
-        offset_xy=(x1, y1),
-        scale_xy=(scale_x, scale_y),
-        point_limit=PNP_EDGE_DETECTION_LIMIT,
-    )
-    visible_points = (
-        np.concatenate([corner_points, edge_points], axis=0)
-        if len(corner_points) and len(edge_points)
-        else corner_points if len(corner_points) else edge_points
-    )
-    pose_tracking_bounds_xyxy = point_bounds_xyxy(visible_points, roi_xyxy)
+    graph_image_points = np.asarray([point.xy for point in pose_graph.points], dtype=np.float32)
+    pose_tracking_bounds_xyxy = point_bounds_xyxy(graph_image_points, roi_xyxy)
     pnp_result = None
     if ENABLE_POSE_ESTIMATION and pose_solver is not None:
-        pnp_result = pose_solver.solve(
-            corner_points,
-            (frame.shape[1], frame.shape[0]),
-            edge_points=edge_points,
-        )
+        started = perf_counter()
+        correspondence = vector_guided_pose_graph_correspondence(pose_graph)
+        if profile is not None:
+            profile["correspondence_ms"] = (perf_counter() - started) * 1000.0
+            profile["correspondence_points"] = (
+                0 if correspondence is None else len(correspondence.graph_indexes)
+            )
+        started = perf_counter()
+        if profile is None:
+            pnp_result = pose_solver.solve_correspondences(
+                correspondence,
+                (frame.shape[1], frame.shape[0]),
+                observed_graph=pose_graph,
+            )
+        else:
+            pnp_result = pose_solver.solve_correspondences(
+                correspondence,
+                (frame.shape[1], frame.shape[0]),
+                observed_graph=pose_graph,
+                profile=profile,
+            )
+        if profile is not None:
+            profile["pnp_ms"] = (perf_counter() - started) * 1000.0
+            profile["pnp_points"] = 0 if pnp_result is None else len(pnp_result.object_points)
+        started = perf_counter()
+        if DRAW_POSE_GRAPH_COORDS:
+            draw_pose_graph_correspondence(frame, pose_graph, correspondence)
         if DRAW_PNP_CUBE:
             draw_pnp_cube(frame, pnp_result)
+        if profile is not None:
+            profile["draw_pose_ms"] = (perf_counter() - started) * 1000.0
     return point_count, pnp_result, pose_tracking_bounds_xyxy
+
+
+def reset_pose_solver_temporal_tracking(pose_solver: PoseGraphPnPSolver | None) -> None:
+    reset = getattr(pose_solver, "reset_temporal_tracking", None)
+    if callable(reset):
+        reset()
 
 
 def mask_color_for_segment(class_name: str, segment_index: int) -> tuple[int, int, int]:
@@ -2725,6 +2998,23 @@ def draw_sticker_color_numbers(
         )
 
 
+def pose_profile_summary(profile: dict[str, float | int]) -> str:
+    timing_parts = [
+        f"model {float(profile.get('pose_model_ms', 0.0)):.1f}",
+        f"graph {float(profile.get('graph_total_ms', 0.0)):.1f}",
+        f"walk {float(profile.get('correspondence_ms', 0.0)):.1f}",
+        f"pnp {float(profile.get('pnp_ms', 0.0)):.1f}",
+        f"draw {float(profile.get('draw_pose_ms', 0.0)):.1f}",
+    ]
+    count_parts = [
+        f"pts {int(profile.get('pose_points', 0))}",
+        f"corr {int(profile.get('correspondence_points', 0))}",
+        f"edges {int(profile.get('accepted_edges', 0))}/{int(profile.get('candidate_edges', 0))}",
+        f"pnp_calls {int(profile.get('pnp_solve_calls', 0))}",
+    ]
+    return "pose ms " + " ".join(timing_parts) + " | " + " ".join(count_parts)
+
+
 def process_frame(
     frame: np.ndarray,
     bbox_detector,
@@ -2733,7 +3023,7 @@ def process_frame(
     color_classifier: ColorDensityClassifier | None = None,
     roi_tracker: RoiTracker | None = None,
     pose_model=None,
-    pose_solver: CameraBootstrapPnP | None = None,
+    pose_solver: PoseGraphPnPSolver | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     output = frame.copy()
     roi_xyxy, candidate, roi_source = roi_for_frame(frame, bbox_detector, args, roi_tracker)
@@ -2756,16 +3046,14 @@ def process_frame(
         )
     pose_keypoint_count = 0
     pnp_result = None
+    pose_profile = {} if getattr(args, "profile_pose", False) else None
+    setattr(args, "_pose_profile", pose_profile)
     if pose_model is not None:
         if ENABLE_POSE_ESTIMATION and pose_solver is None:
-            pose_solver = CameraBootstrapPnP(
-                bootstrap_frames=PNP_BOOTSTRAP_FRAME_COUNT,
+            pose_solver = PoseGraphPnPSolver(
                 focal_min=PNP_FOCAL_SCALE_MIN,
                 focal_max=PNP_FOCAL_SCALE_MAX,
                 focal_steps=PNP_FOCAL_SCALE_STEPS,
-                principal_offset=PNP_PRINCIPAL_POINT_OFFSET_RATIO,
-                reprojection_error=PNP_MAX_REPROJECTION_ERROR_PX,
-                inlier_threshold=PNP_INLIER_THRESHOLD_PX,
             )
         pose_keypoint_count, pnp_result, pose_tracking_bounds_xyxy = draw_pose_estimate(
             output,
@@ -2794,7 +3082,11 @@ def process_frame(
         roi_color = (0, 0, 255) if roi_source == "detector" else (40, 220, 40)
         cv2.rectangle(output, (x1, y1), (x2, y2), roi_color, 2)
     if args.debug_overlay:
-        pnp_label = "" if pnp_result is None else f" pnp {pnp_result.error:.1f}px"
+        pnp_label = (
+            ""
+            if pnp_result is None
+            else f" pnp {len(pnp_result.object_points)}pts {pnp_result.error:.1f}px"
+        )
         debug_label = (
             f"cube {candidate.confidence:.2f} stickers {segment_count} keypoints {pose_keypoint_count}{pnp_label}"
             if candidate is not None
@@ -2810,6 +3102,29 @@ def process_frame(
             2,
             cv2.LINE_AA,
         )
+        if pose_profile is not None:
+            cv2.putText(
+                output,
+                pose_profile_summary(pose_profile),
+                (12, 56),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 0),
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                output,
+                pose_profile_summary(pose_profile),
+                (12, 56),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+    if pose_profile is not None:
+        print(pose_profile_summary(pose_profile), flush=True)
     return output, bgr_samples
 
 
@@ -2960,6 +3275,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Draw ROI box, polygon outlines, labels, and FPS",
     )
     parser.add_argument(
+        "--profile-pose",
+        action="store_true",
+        help="Print per-frame pose timing buckets for model, graph, correspondence, PnP, and drawing.",
+    )
+    parser.add_argument(
         "--show-original-underlay",
         dest="show_original_underlay",
         action="store_true",
@@ -3024,6 +3344,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=ADJACENCY_MAX_LINE_DISTANCE_PX,
         help="Maximum perpendicular distance from Hough line endpoints to the corner-pair segment",
+    )
+    parser.add_argument(
+        "--adjacency-min-edge-length",
+        type=float,
+        default=ADJACENCY_MIN_EDGE_LENGTH_PX,
+        help="Ignore candidate pose graph connections shorter than this many pixels",
     )
     parser.add_argument(
         "--adjacency-min-coverage",
@@ -3099,14 +3425,10 @@ def main() -> int:
     color_plot_detected_frames = 0
     roi_tracker = RoiTracker()
     pose_solver = (
-        CameraBootstrapPnP(
-            bootstrap_frames=PNP_BOOTSTRAP_FRAME_COUNT,
+        PoseGraphPnPSolver(
             focal_min=PNP_FOCAL_SCALE_MIN,
             focal_max=PNP_FOCAL_SCALE_MAX,
             focal_steps=PNP_FOCAL_SCALE_STEPS,
-            principal_offset=PNP_PRINCIPAL_POINT_OFFSET_RATIO,
-            reprojection_error=PNP_MAX_REPROJECTION_ERROR_PX,
-            inlier_threshold=PNP_INLIER_THRESHOLD_PX,
         )
         if ENABLE_POSE_ESTIMATION
         else None
