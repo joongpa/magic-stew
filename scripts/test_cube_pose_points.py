@@ -28,7 +28,7 @@ DEFAULT_CUBE_POSE_MODEL = (
 )
 DEFAULT_VIEW_SIZE = 256
 POSE_OBJECT_CONFIDENCE = 0.001
-POSE_CLASS_NAMES = {"corner", "edge"}
+POSE_CLASS_NAMES = {"corner", "corner-edge", "corner-edge-center", "center"}
 KEYPOINT_COLORS = {
     "corner": (255, 255, 255),
     "edge": (0, 255, 255),
@@ -53,7 +53,8 @@ def register_training_checkpoint_classes() -> None:
         "CubeSymmetricPoseModel",
         "CubeSymmetricPoseTrainer",
     ):
-        setattr(__main__, name, getattr(training, name))
+        if hasattr(training, name):
+            setattr(__main__, name, getattr(training, name))
 
 
 @dataclass
@@ -193,11 +194,9 @@ def class_name_for_id(result, model, class_id: int) -> str:
 
 
 def keypoint_kind(class_name: str, index: int) -> str:
-    if class_name == "corner" and index == 0:
+    if class_name == "corner":
         return "corner"
-    if class_name == "edge" and index < 2:
-        return "edge"
-    if class_name == "corner" and index < 4:
+    if class_name == "corner-edge":
         return "edge"
     return "center"
 
@@ -264,10 +263,6 @@ def piece_detection_indexes(
 
 
 def piece_line_indexes(class_name: str) -> tuple[tuple[int, int], ...]:
-    if class_name == "corner":
-        return ((0, 1), (0, 2), (0, 3))
-    if class_name == "edge":
-        return ((0, 1),)
     return ()
 
 

@@ -129,6 +129,8 @@ HAND_X_OFFSET_RANGE = (-0.2, 0.2)
 HAND_Z_OFFSET_RANGE = (-1.0, 1.0)
 HAND_X_ROTATION_DEGREES = (-90.0, 0.0, 90.0)
 HAND_SKIN_MATERIAL_NAME = "SyntheticHandSkinMaterial"
+DEFAULT_MIN_VISIBLE_KEYPOINTS_WITH_HANDS = 8
+DEFAULT_MAX_HAND_PLACEMENT_ATTEMPTS = 12
 HAND_SKIN_TONE_RANGES = (
     ((0.96, 0.76, 0.62), (1.00, 0.86, 0.74)),
     ((0.84, 0.58, 0.42), (0.96, 0.72, 0.55)),
@@ -142,9 +144,11 @@ SOLVED_LOCATION_PROP = "synthetic_solved_location"
 SOLVED_ROTATION_PROP = "synthetic_solved_rotation"
 DEFAULT_OUTPUT_DIR = "data/synthetic_cube_dataset"
 DEFAULT_IMAGE_SIZE = 512
-CLASS_NAMES = ["corner", "edge"]
+CLASS_NAMES = ["corner", "corner-edge", "corner-edge-center", "center"]
 CORNER_CLASS_ID = 0
-EDGE_CLASS_ID = 1
+CORNER_EDGE_CLASS_ID = 1
+CORNER_EDGE_CENTER_CLASS_ID = 2
+CENTER_CLASS_ID = 3
 CUBE_KEYPOINT_NAMES = (
     "UBL", "UBR", "UFR", "UFL",
     "DBL", "DBR", "DFR", "DFL",
@@ -162,12 +166,13 @@ CUBE_KEYPOINT_NAMES = (
     "dBr", "dfR", "dFl", "dbL",
 )
 KEYPOINT_COUNT = len(CUBE_KEYPOINT_NAMES)
-POSE_KEYPOINT_COUNT = 7
+POSE_KEYPOINT_COUNT = 1
 KEYPOINT_BBOX_RADIUS_RATIO = 0.018
 MIN_KEYPOINT_BBOX_RADIUS_PX = 4
 POINT_VISIBILITY_UNLABELED = 0
 POINT_VISIBILITY_LABELED_OCCLUDED = 1
 POINT_VISIBILITY_VISIBLE = 2
+FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES = 10.0
 
 
 def parse_axis(axis_name: str) -> Vector:
@@ -1182,11 +1187,12 @@ def randomize_hands(
     objects: dict[str, bpy.types.Object],
     states: dict[str, dict[str, object]],
     cube_pose: dict[str, object] | None = None,
+    forced_visibility: str | None = None,
 ) -> dict[str, object] | None:
     if not objects:
         return None
 
-    visibility = random.choices(
+    visibility = forced_visibility or random.choices(
         [mode for mode, _weight in HAND_VISIBILITY_WEIGHTS],
         weights=[weight for _mode, weight in HAND_VISIBILITY_WEIGHTS],
         k=1,
@@ -1595,6 +1601,128 @@ def cube_pose_keypoint_specs() -> list[dict[str, object]]:
     return [cube_keypoint_spec(name) for name in CUBE_KEYPOINT_NAMES]
 
 
+def corner_cubie_objects() -> list[bpy.types.Object]:
+    corners = []
+    for obj in cube_objects():
+        solved_location = Vector(obj.get(SOLVED_LOCATION_PROP, obj.location))
+        if all(abs(round(solved_location[axis_index])) == 1 for axis_index in range(3)):
+            corners.append(obj)
+    return sorted(corners, key=lambda obj: obj.name)
+
+
+def center_cubie_objects() -> list[bpy.types.Object]:
+    centers = []
+    for obj in cube_objects():
+        solved_location = Vector(obj.get(SOLVED_LOCATION_PROP, obj.location))
+        outer_axis_count = sum(
+            1
+            for axis_index in range(3)
+            if abs(round(solved_location[axis_index])) == 1
+        )
+        if outer_axis_count == 1:
+            centers.append(obj)
+    return sorted(centers, key=lambda obj: obj.name)
+
+
+def corner_point_class_id(relative_one_count: int) -> int:
+    if relative_one_count == 3:
+        return CORNER_CLASS_ID
+    if relative_one_count == 2:
+        return CORNER_EDGE_CLASS_ID
+    if relative_one_count == 1:
+        return CORNER_EDGE_CENTER_CLASS_ID
+    raise ValueError(f"Unsupported keypoint relative-one count: {relative_one_count}")
+
+
+def corner_relative_keypoint_specs() -> list[dict[str, object]]:
+    specs = []
+    corners = corner_cubie_objects()
+    cube_center = cubie_world_center(cube_objects())
+    for obj in corners:
+        inner_offset = min(
+            (
+                Vector((x, y, z))
+                for x in (-0.5, 0.5)
+                for y in (-0.5, 0.5)
+                for z in (-0.5, 0.5)
+            ),
+            key=lambda offset: (obj.matrix_world @ offset - cube_center).length,
+        )
+        for relative_one_axes in (
+            (0, 1, 2),
+            (0, 1),
+            (0, 2),
+            (1, 2),
+            (0,),
+            (1,),
+            (2,),
+        ):
+            relative_one_axis_set = set(relative_one_axes)
+            local_offset = Vector(
+                tuple(
+                    -inner_offset[axis_index]
+                    if axis_index in relative_one_axis_set
+                    else inner_offset[axis_index]
+                    for axis_index in range(3)
+                )
+            )
+            point = obj.matrix_world @ local_offset
+            normals = [
+                (obj.matrix_world.to_3x3() @ axis_vector(axis_index, -inner_offset[axis_index] * 2.0)).normalized()
+                for axis_index in relative_one_axes
+            ]
+            class_id = corner_point_class_id(len(relative_one_axes))
+            specs.append({
+                "name": f"{obj.name}:{CLASS_NAMES[class_id]}:{''.join(str(axis) for axis in relative_one_axes)}",
+                "class_id": class_id,
+                "class": CLASS_NAMES[class_id],
+                "source_object": obj.name,
+                "source_piece_type": "corner",
+                "relative_point": [
+                    1 if axis_index in relative_one_axis_set else 0
+                    for axis_index in range(3)
+                ],
+                "point": point,
+                "normals": normals,
+            })
+    return specs
+
+
+def center_keypoint_specs() -> list[dict[str, object]]:
+    specs = []
+    cube_center = cubie_world_center(cube_objects())
+    for obj in center_cubie_objects():
+        best_axis_index = 0
+        best_sign = 1.0
+        best_distance = -1.0
+        for axis_index in range(3):
+            for sign in (-1.0, 1.0):
+                local_offset = axis_vector(axis_index, sign * 0.5)
+                distance = (obj.matrix_world @ local_offset - cube_center).length
+                if distance > best_distance:
+                    best_axis_index = axis_index
+                    best_sign = sign
+                    best_distance = distance
+        local_offset = axis_vector(best_axis_index, best_sign * 0.5)
+        point = obj.matrix_world @ local_offset
+        normal = (obj.matrix_world.to_3x3() @ axis_vector(best_axis_index, best_sign)).normalized()
+        specs.append({
+            "name": f"{obj.name}:{CLASS_NAMES[CENTER_CLASS_ID]}",
+            "class_id": CENTER_CLASS_ID,
+            "class": CLASS_NAMES[CENTER_CLASS_ID],
+            "source_object": obj.name,
+            "source_piece_type": "center",
+            "relative_point": "center",
+            "point": point,
+            "normals": [normal],
+        })
+    return specs
+
+
+def cube_keypoint_specs_from_corners_and_centers() -> list[dict[str, object]]:
+    return [*corner_relative_keypoint_specs(), *center_keypoint_specs()]
+
+
 def lowercase_letter(letter: str) -> str:
     return letter.lower()
 
@@ -1675,7 +1803,11 @@ def edge_piece_name_specs() -> list[dict[str, object]]:
 
 def point_faces_camera(point: Vector, normals: list[Vector], camera_location: Vector) -> bool:
     toward_camera = camera_location - point
-    return any(normal.dot(toward_camera) > 0.0 for normal in normals)
+    if toward_camera.length <= 1e-6:
+        return False
+    min_dot = math.sin(math.radians(FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES))
+    view_direction = toward_camera.normalized()
+    return any(normal.normalized().dot(view_direction) >= min_dot for normal in normals)
 
 
 def ray_to_point(camera: bpy.types.Object, point: Vector) -> tuple[Vector, Vector, float]:
@@ -1685,28 +1817,38 @@ def ray_to_point(camera: bpy.types.Object, point: Vector) -> tuple[Vector, Vecto
     return origin, offset.normalized(), distance
 
 
-def hand_occludes_point(
+def object_occluding_point(
     point: Vector,
-    hand_names: set[str],
     depsgraph: bpy.types.Depsgraph,
+    ignored_object_names: set[str] | None = None,
     distance_tolerance: float = 0.02,
-) -> bool:
-    if not hand_names:
-        return False
+) -> str | None:
+    ignored_object_names = ignored_object_names or set()
     scene = bpy.context.scene
     camera = get_camera()
     origin, direction, point_distance = ray_to_point(camera, point)
-    hit, location, _normal, _polygon_index, hit_object, _matrix = scene.ray_cast(
-        depsgraph,
-        origin,
-        direction,
-        distance=point_distance + distance_tolerance,
-    )
-    if not hit or hit_object is None:
-        return False
-    if hit_object.name not in hand_names:
-        return False
-    return (location - origin).length < point_distance - distance_tolerance
+    traveled = 0.0
+    epsilon = 0.001
+    while traveled < point_distance - distance_tolerance:
+        hit, location, _normal, _polygon_index, hit_object, _matrix = scene.ray_cast(
+            depsgraph,
+            origin,
+            direction,
+            distance=(point_distance - traveled) + distance_tolerance,
+        )
+        if not hit or hit_object is None:
+            return None
+
+        hit_distance = (location - origin).length
+        traveled += hit_distance
+        if traveled >= point_distance - distance_tolerance:
+            return None
+        if hit_object.name not in ignored_object_names:
+            return str(hit_object.name)
+
+        origin = location + (direction * epsilon)
+        traveled += epsilon
+    return None
 
 
 def yolo_pose_line(
@@ -1942,7 +2084,8 @@ def render_pose_keypoints(path: Path | None) -> tuple[list[str], list[dict[str, 
     bpy.context.view_layer.update()
     projected_by_name: dict[str, tuple[float, float, int]] = {}
     metadata_by_name: dict[str, dict[str, object]] = {}
-    for index, spec in enumerate(cube_pose_keypoint_specs()):
+    keypoint_specs = cube_keypoint_specs_from_corners_and_centers()
+    for index, spec in enumerate(keypoint_specs):
         point = spec["point"]
         if not isinstance(point, Vector):
             continue
@@ -1950,6 +2093,7 @@ def render_pose_keypoints(path: Path | None) -> tuple[list[str], list[dict[str, 
         normals = spec["normals"]
         projected = project_world_point(point, camera, scene)
         hand_occluded = False
+        occluded_by = None
         if projected is None:
             x, y = 0.0, 0.0
             visibility = POINT_VISIBILITY_UNLABELED
@@ -1958,80 +2102,35 @@ def render_pose_keypoints(path: Path | None) -> tuple[list[str], list[dict[str, 
             visibility = POINT_VISIBILITY_UNLABELED
         else:
             x, y = projected
-            hand_occluded = hand_occludes_point(point, visible_hand_names, depsgraph)
-            visibility = POINT_VISIBILITY_LABELED_OCCLUDED if hand_occluded else POINT_VISIBILITY_VISIBLE
+            source_object = str(spec.get("source_object", ""))
+            ignored_object_names = {source_object} if source_object else set()
+            occluded_by = object_occluding_point(point, depsgraph, ignored_object_names)
+            hand_occluded = occluded_by in visible_hand_names
+            visibility = POINT_VISIBILITY_LABELED_OCCLUDED if occluded_by is not None else POINT_VISIBILITY_VISIBLE
 
         projected_by_name[name] = (x, y, visibility)
         metadata_by_name[name] = {
             "index": index,
             "name": name,
+            "class": spec.get("class"),
+            "class_id": spec.get("class_id"),
+            "source_object": spec.get("source_object"),
+            "source_piece_type": spec.get("source_piece_type"),
+            "relative_point": spec.get("relative_point"),
             "world_point": [point.x, point.y, point.z],
             "pixel_point": [x, y],
             "normalized_point": list(normalize_point(x, y, width, height)),
             "visibility": visibility,
             "hand_occluded": hand_occluded,
+            "occluded_by": occluded_by,
         }
 
-    for piece_index, corner_name in enumerate([name for name in CUBE_KEYPOINT_NAMES if name.isupper()], start=1):
-        main_name = canonical_cube_keypoint_name(corner_name)
-        main_keypoint = projected_piece_keypoint(main_name, projected_by_name)
-        ordered_faces = [
-            face
-            for face, _point in clockwise_keypoints(
-                main_keypoint,
-                [
-                    (
-                        face,
-                        projected_piece_keypoint(
-                            corner_keypoint_name_for_faces(corner_name, {face}),
-                            projected_by_name,
-                        ),
-                    )
-                    for face in corner_name
-                ],
-            )
-        ]
-        ordered_faces = rotate_sequence_to_start(ordered_faces, corner_name[0])
-        ordered_edge_facing = [
-            corner_keypoint_name_for_faces(corner_name, {ordered_faces[index - 1], face})
-            for index, face in enumerate(ordered_faces)
-        ]
-        ordered_center_facing = [
-            corner_keypoint_name_for_faces(corner_name, {face})
-            for face in ordered_faces
-        ]
+    for point_index, spec in enumerate(keypoint_specs, start=1):
+        name = str(spec["name"])
         line, pose_object = pose_object_from_keypoints(
-            class_id=CORNER_CLASS_ID,
-            name=f"corner_{piece_index}",
-            keypoint_names=[main_name, *ordered_edge_facing, *ordered_center_facing],
-            projected_by_name=projected_by_name,
-            metadata_by_name=metadata_by_name,
-            width=width,
-            height=height,
-        )
-        if line is not None and pose_object is not None:
-            lines.append(line)
-            pose_objects.append(pose_object)
-
-    for piece_index, edge_spec in enumerate(edge_piece_name_specs(), start=1):
-        edge_line_with_source_indexes = sorted(
-            [
-                (source_index, str(name), projected_piece_keypoint(str(name), projected_by_name))
-                for source_index, name in enumerate(edge_spec["edge_line"])
-            ],
-            key=lambda item: left_to_right_key(item[2]),
-        )
-        edge_line_names = [name for _source_index, name, _point in edge_line_with_source_indexes]
-        edge_line_source_indexes = [source_index for source_index, _name, _point in edge_line_with_source_indexes]
-        center_side_names = [
-            str(center_side[source_index])
-            for center_side in edge_spec["center_sides"]
-            for source_index in edge_line_source_indexes
-        ]
-        line, pose_object = pose_object_from_keypoints(
-            class_id=EDGE_CLASS_ID,
-            name=f"edge_{piece_index}",
-            keypoint_names=[*edge_line_names, *center_side_names],
+            class_id=int(spec["class_id"]),
+            name=f"{spec['class']}_{point_index}",
+            keypoint_names=[name],
             projected_by_name=projected_by_name,
             metadata_by_name=metadata_by_name,
             width=width,
@@ -2046,11 +2145,50 @@ def render_pose_keypoints(path: Path | None) -> tuple[list[str], list[dict[str, 
 
     return lines, pose_objects, {
         "keypoint_shape": [POSE_KEYPOINT_COUNT, 3],
-        "source_keypoints": KEYPOINT_COUNT,
+        "source_keypoints": len(keypoint_specs),
         "visible_hands": sorted(visible_hand_names),
-        "candidates": len(CUBE_KEYPOINT_NAMES),
-        "piece_candidates": 20,
+        "candidates": len(keypoint_specs),
+        "piece_candidates": len(corner_cubie_objects()) + len(center_cubie_objects()),
     }
+
+
+def pose_visibility_summary(pose_objects: list[dict[str, object]]) -> dict[str, int]:
+    summary = {
+        "unlabeled": 0,
+        "occluded": 0,
+        "visible": 0,
+        "total": 0,
+    }
+    for pose_object in pose_objects:
+        for keypoint in pose_object.get("keypoints", []):
+            visibility = int(keypoint.get("visibility", POINT_VISIBILITY_UNLABELED))
+            summary["total"] += 1
+            if visibility == POINT_VISIBILITY_VISIBLE:
+                summary["visible"] += 1
+            elif visibility == POINT_VISIBILITY_LABELED_OCCLUDED:
+                summary["occluded"] += 1
+            else:
+                summary["unlabeled"] += 1
+    return summary
+
+
+def hand_pose_is_acceptable(
+    hand_randomization: dict[str, object] | None,
+    pose_objects: list[dict[str, object]],
+    min_visible_keypoints: int,
+) -> tuple[bool, dict[str, int]]:
+    summary = pose_visibility_summary(pose_objects)
+    if hand_randomization is None:
+        return True, summary
+    hand_objects_metadata = hand_randomization.get("objects", {})
+    visible_hand_count = sum(
+        1
+        for metadata in hand_objects_metadata.values()
+        if isinstance(metadata, dict) and bool(metadata.get("visible"))
+    )
+    if visible_hand_count == 0:
+        return True, summary
+    return summary["visible"] >= max(0, min_visible_keypoints), summary
 
 
 def write_pose_keypoint_mask(
@@ -2071,11 +2209,15 @@ def write_pose_keypoint_mask(
     output = np.zeros((height, width, 3), dtype=np.uint8)
     fill_colors = {
         CORNER_CLASS_ID: (90, 90, 90),
-        EDGE_CLASS_ID: (0, 95, 95),
+        CORNER_EDGE_CLASS_ID: (0, 95, 95),
+        CORNER_EDGE_CENTER_CLASS_ID: (95, 0, 95),
+        CENTER_CLASS_ID: (95, 95, 0),
     }
     point_colors = {
         CORNER_CLASS_ID: (255, 255, 255),
-        EDGE_CLASS_ID: (0, 255, 255),
+        CORNER_EDGE_CLASS_ID: (0, 255, 255),
+        CORNER_EDGE_CENTER_CLASS_ID: (255, 120, 255),
+        CENTER_CLASS_ID: (255, 255, 0),
     }
     for pose_object in pose_objects:
         class_id = int(pose_object["class_id"])
@@ -2097,10 +2239,6 @@ def write_pose_keypoint_mask(
             cv2.line(output, start, end, fill_color, thickness=9, lineType=cv2.LINE_AA)
             cv2.line(output, start, end, outline_color, thickness=2, lineType=cv2.LINE_AA)
 
-        label_anchor = None
-        if labeled_points:
-            label_anchor = np.asarray(labeled_points, dtype=np.float32).mean(axis=0)
-
         for keypoint in pose_object["keypoints"]:
             visibility = int(keypoint["visibility"])
             if visibility == POINT_VISIBILITY_UNLABELED:
@@ -2112,31 +2250,6 @@ def write_pose_keypoint_mask(
             center = (round(float(x)), round(float(y)))
             cv2.circle(output, center, 5, draw_color, thickness=-1, lineType=cv2.LINE_AA)
             cv2.circle(output, center, 7, (0, 0, 0), thickness=1, lineType=cv2.LINE_AA)
-            label = str(keypoint.get("label", int(keypoint["index"]) + 1))
-            text_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            label_point = np.asarray([float(x), float(y)], dtype=np.float32)
-            if label_anchor is not None:
-                label_point = (label_point * 0.65) + (label_anchor * 0.35)
-            text_x = int(round(float(label_point[0]) - text_size[0] / 2))
-            text_y = int(round(float(label_point[1]) + text_size[1] / 2))
-            pad = 2
-            cv2.rectangle(
-                output,
-                (text_x - pad, text_y - text_size[1] - pad),
-                (text_x + text_size[0] + pad, text_y + baseline + pad),
-                (0, 0, 0),
-                thickness=-1,
-            )
-            cv2.putText(
-                output,
-                label,
-                (text_x, text_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                draw_color,
-                1,
-                cv2.LINE_AA,
-            )
 
     cv2.imwrite(str(path), output)
 
@@ -2160,6 +2273,8 @@ def generate_dataset(
     cube_rotational_blur_samples: int,
     degrade_probability: float,
     render_masks: bool,
+    min_visible_keypoints_with_hands: int,
+    max_hand_placement_attempts: int,
 ) -> None:
     images_dir = output_dir / "images"
     masks_dir = output_dir / "masks" if render_masks else None
@@ -2202,7 +2317,47 @@ def generate_dataset(
 
         hands = hand_objects()
         hand_states = hand_object_states(hands)
-        hand_randomization = randomize_hands(hands, hand_states, cube_pose)
+        hand_attempts = []
+        hand_randomization = None
+        preflight_pose_objects = []
+        preflight_pose_geometry = {}
+        accepted_hand_pose = False
+        attempts = max(1, int(max_hand_placement_attempts))
+        for attempt_index in range(1, attempts + 1):
+            hand_randomization = randomize_hands(hands, hand_states, cube_pose)
+            _preflight_lines, preflight_pose_objects, preflight_pose_geometry = render_pose_keypoints(None)
+            acceptable, visibility_summary = hand_pose_is_acceptable(
+                hand_randomization,
+                preflight_pose_objects,
+                min_visible_keypoints=min_visible_keypoints_with_hands,
+            )
+            hand_attempts.append({
+                "attempt": attempt_index,
+                "accepted": acceptable,
+                "visibility": visibility_summary,
+                "hands": hand_randomization,
+            })
+            if acceptable:
+                accepted_hand_pose = True
+                break
+            restore_hand_objects(hands, hand_states)
+
+        if not accepted_hand_pose:
+            hand_randomization = randomize_hands(hands, hand_states, cube_pose, forced_visibility="none")
+            _preflight_lines, preflight_pose_objects, preflight_pose_geometry = render_pose_keypoints(None)
+            _acceptable, visibility_summary = hand_pose_is_acceptable(
+                hand_randomization,
+                preflight_pose_objects,
+                min_visible_keypoints=min_visible_keypoints_with_hands,
+            )
+            hand_attempts.append({
+                "attempt": attempts + 1,
+                "accepted": True,
+                "fallback": "hide_hands",
+                "visibility": visibility_summary,
+                "hands": hand_randomization,
+            })
+
         try:
             rotational_blur = render_cube_rotational_blur_png(
                 image_path,
@@ -2217,6 +2372,8 @@ def generate_dataset(
             )
             yolo_lines, pose_objects, pose_geometry = render_pose_keypoints(mask_path)
             write_yolo_pose(label_path, yolo_lines)
+            pose_geometry["preflight_visibility"] = pose_visibility_summary(preflight_pose_objects)
+            pose_geometry["hand_attempts"] = len(hand_attempts)
         finally:
             restore_hand_objects(hands, hand_states)
 
@@ -2236,6 +2393,7 @@ def generate_dataset(
             "cube_rotational_blur": rotational_blur,
             "camera_degradation": camera_degradation,
             "hands": hand_randomization,
+            "hand_attempts": hand_attempts,
             "pose_geometry": pose_geometry,
             "keypoints": pose_objects,
             "objects": len(yolo_lines),
@@ -2328,6 +2486,21 @@ def cli_args() -> argparse.Namespace:
         action="store_true",
         help="Skip writing visualization masks; segmentation labels are still written.",
     )
+    parser.add_argument(
+        "--min-visible-keypoints-with-hands",
+        type=int,
+        default=DEFAULT_MIN_VISIBLE_KEYPOINTS_WITH_HANDS,
+        help=(
+            "Minimum visible keypoint objects required when hands are visible. "
+            "Hand poses below this threshold are retried."
+        ),
+    )
+    parser.add_argument(
+        "--max-hand-placement-attempts",
+        type=int,
+        default=DEFAULT_MAX_HAND_PLACEMENT_ATTEMPTS,
+        help="Maximum hand randomization attempts before falling back to a no-hand frame.",
+    )
 
     argv = sys.argv
     if "--" not in argv:
@@ -2355,6 +2528,8 @@ def main() -> None:
         cube_rotational_blur_samples=args.cube_rotational_blur_samples,
         degrade_probability=args.degrade_probability,
         render_masks=not args.no_masks,
+        min_visible_keypoints_with_hands=args.min_visible_keypoints_with_hands,
+        max_hand_placement_attempts=args.max_hand_placement_attempts,
     )
 
 

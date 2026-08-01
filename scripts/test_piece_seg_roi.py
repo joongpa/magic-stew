@@ -3,8 +3,8 @@
 Pipeline:
 1. Detect the whole cube with the existing bbox detector.
 2. Crop a padded square ROI around that bbox.
-3. Run the independent corner/edge pose model on the ROI.
-4. Draw predicted pose keypoints and the fitted 55mm cube.
+3. Run the independent one-point pose model on the ROI.
+4. Draw predicted keypoints color-coded by class and the fitted 55mm cube.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import argparse
 import importlib.util
 import sys
 from dataclasses import dataclass
-from itertools import combinations, permutations
+from itertools import permutations
 from pathlib import Path
 from time import perf_counter
 
@@ -39,7 +39,7 @@ DEFAULT_STICKER_MODEL = (
 )
 DEFAULT_POSE_MODEL = (
     ROOT
-    / "runs/pose/runs/cube_piece_pose_local/runs/cube_corner_edge_yolo11n_pose/weights/best.pt"
+    / "runs/pose/runs/cube_independent_keypoints/runs/cube_independent_keypoints_yolo11n_pose/weights/best.pt"
 )
 ENABLE_STICKER_SEGMENTATION = False
 ENABLE_POSE_ESTIMATION = False
@@ -51,7 +51,7 @@ DISPLAY_PREVIEW_BY_DEFAULT = True
 SHOW_ORIGINAL_UNDERLAY_BY_DEFAULT = True
 POSE_IMAGE_SIZE = 256
 POSE_OBJECT_CONFIDENCE = 0.5
-POSE_KEYPOINT_CONFIDENCE = 0.2
+POSE_KEYPOINT_CONFIDENCE = 0.5
 PNP_BOOTSTRAP_FRAME_COUNT = 12
 PNP_FOCAL_SCALE_MIN = 0.7
 PNP_FOCAL_SCALE_MAX = 1.8
@@ -71,9 +71,11 @@ ADJACENCY_HOUGH_MIN_LINE_LENGTH = 24
 ADJACENCY_HOUGH_MAX_LINE_GAP = 10
 ADJACENCY_MAX_ANGLE_DEGREES = 10.0
 ADJACENCY_MAX_LINE_DISTANCE_PX = 9.0
-ADJACENCY_MIN_COVERAGE = 0.68
-ADJACENCY_MAX_UNCOVERED_GAP_RATIO = 0.24
+ADJACENCY_MIN_COVERAGE = 0.82
+ADJACENCY_MAX_UNCOVERED_GAP_RATIO = 0.18
 ADJACENCY_INTERVAL_PADDING_PX = 5.0
+ADJACENCY_EDGE_DILATION_PX = 8
+ADJACENCY_KEYPOINT_INTERSECTION_DISTANCE_PX = 7.0
 PNP_TEMPORAL_TRACKING_ENABLED = True
 PNP_TEMPORAL_MAX_CORNER_SHIFT_PX = 18.0
 MID_TURN_POSE_ESTIMATION_ENABLED = True
@@ -184,11 +186,12 @@ def cube_corner_correspondence_triples() -> tuple[tuple[int, int, int], ...]:
 
 CUBE_ORIENTATION_CORNER_PERMUTATIONS = cube_orientation_corner_permutations()
 CUBE_CORNER_CORRESPONDENCE_TRIPLES = cube_corner_correspondence_triples()
-POSE_CLASS_NAMES = {"corner", "edge"}
+POSE_CLASS_NAMES = {"corner", "corner-edge", "corner-edge-center", "center"}
 POSE_KEYPOINT_COLORS = {
     "corner": (255, 255, 255),
-    "edge": (0, 255, 255),
-    "center": (255, 120, 255),
+    "corner-edge": (0, 255, 255),
+    "corner-edge-center": (255, 120, 255),
+    "center": (255, 255, 0),
 }
 PNP_CUBE_LINE_COLOR = (255, 80, 30)
 PNP_CUBE_POINT_COLOR = (30, 180, 255)
@@ -212,7 +215,8 @@ def register_training_checkpoint_classes() -> None:
         "CubeSymmetricPoseModel",
         "CubeSymmetricPoseTrainer",
     ):
-        setattr(__main__, name, getattr(training, name))
+        if hasattr(training, name):
+            setattr(__main__, name, getattr(training, name))
 
 
 @dataclass
@@ -323,6 +327,23 @@ class CornerPnPResult:
 
 @dataclass(frozen=True)
 class CornerAdjacency:
+    start_index: int
+    end_index: int
+    coverage: float
+    max_uncovered_gap: float
+    accepted: bool
+
+
+@dataclass(frozen=True)
+class PoseGraphPoint:
+    point_index: int
+    class_name: str
+    xy: tuple[float, float]
+    score: float
+
+
+@dataclass(frozen=True)
+class PoseGraphEdge:
     start_index: int
     end_index: int
     coverage: float
@@ -769,12 +790,12 @@ def class_name_for_id(result, sticker_model, class_id: int) -> str:
 
 
 def pose_keypoint_kind(class_name: str, index: int) -> str:
-    if class_name == "corner" and index == 0:
+    if class_name == "corner":
         return "corner"
-    if class_name == "edge" and index < 2:
+    if class_name == "corner-edge":
         return "edge"
-    if class_name == "corner" and index < 4:
-        return "edge"
+    if class_name == "corner-edge-center":
+        return "edge-center"
     return "center"
 
 
@@ -940,6 +961,67 @@ def collect_pose_image_points(
     if point_limit is not None:
         candidates = candidates[:point_limit]
     return np.asarray([(x, y) for x, y, _score in candidates], dtype=np.float32)
+
+
+def collect_pose_graph_points(
+    result,
+    pose_model,
+    xy: np.ndarray | None,
+    keypoint_conf: np.ndarray | None,
+    *,
+    confidence_threshold: float,
+    offset_xy: tuple[int, int],
+    scale_xy: tuple[float, float],
+) -> list[PoseGraphPoint]:
+    if xy is None or len(xy) == 0:
+        return []
+
+    classes = result_box_classes(result)
+    points_by_detection = np.asarray(xy, dtype=np.float32)
+    scores_by_detection = (
+        None
+        if keypoint_conf is None or len(keypoint_conf) == 0
+        else np.asarray(keypoint_conf, dtype=np.float32)
+    )
+    offset_x, offset_y = offset_xy
+    scale_x, scale_y = scale_xy
+    observed: list[PoseGraphPoint] = []
+    for detection_index, points in enumerate(points_by_detection):
+        class_id = (
+            int(classes[detection_index])
+            if classes is not None and detection_index < len(classes)
+            else -1
+        )
+        class_name = class_name_for_id(result, pose_model, class_id).removesuffix("_sticker")
+        if class_name not in {"corner", "corner-edge", "corner-edge-center"}:
+            continue
+
+        detection_scores = (
+            None
+            if scores_by_detection is None
+            or detection_index >= len(scores_by_detection)
+            else np.asarray(scores_by_detection[detection_index], dtype=np.float32).reshape(-1)
+        )
+        for keypoint_index, point in enumerate(points):
+            keypoint_score = (
+                1.0
+                if detection_scores is None or keypoint_index >= len(detection_scores)
+                else float(detection_scores[keypoint_index])
+            )
+            if keypoint_score < confidence_threshold:
+                continue
+            observed.append(
+                PoseGraphPoint(
+                    point_index=len(observed),
+                    class_name=class_name,
+                    xy=(
+                        offset_x + (float(point[0]) * scale_x),
+                        offset_y + (float(point[1]) * scale_y),
+                    ),
+                    score=keypoint_score,
+                )
+            )
+    return observed
 
 
 def point_bounds_xyxy(points: np.ndarray, roi_xyxy: tuple[int, int, int, int]) -> tuple[int, int, int, int] | None:
@@ -1836,8 +1918,7 @@ def draw_pose_keypoints(
             if not (0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]):
                 continue
 
-            kind = pose_keypoint_kind(class_name, keypoint_index)
-            color = POSE_KEYPOINT_COLORS.get(kind, (255, 255, 255))
+            color = POSE_KEYPOINT_COLORS.get(class_name, (255, 255, 255))
             cv2.circle(frame, (x, y), 4, color, -1, lineType=cv2.LINE_AA)
             cv2.circle(frame, (x, y), 5, (0, 0, 0), 1, lineType=cv2.LINE_AA)
             drawn += 1
@@ -1911,34 +1992,139 @@ def merged_interval_coverage(
     return covered / segment_length, max_gap
 
 
-def distance_to_line(point: np.ndarray, line_start: np.ndarray, line_unit: np.ndarray) -> float:
-    delta = point - line_start
-    projection = float(np.dot(delta, line_unit))
-    closest = line_start + (line_unit * projection)
-    return float(np.linalg.norm(point - closest))
+POSE_GRAPH_NEIGHBOR_LIMITS = {
+    "corner": {"corner-edge": 3},
+    "corner-edge": {"corner": 1, "corner-edge": 1, "corner-edge-center": 2},
+    "corner-edge-center": {"corner-edge-center": 2, "corner-edge": 2},
+}
 
 
-def corner_adjacency_evidence(
-    corner_points: np.ndarray,
-    roi_xyxy: tuple[int, int, int, int],
-    hough_lines: np.ndarray | None,
+def pose_graph_candidate_edges(points: list[PoseGraphPoint]) -> list[tuple[int, int]]:
+    candidate_edges: set[tuple[int, int]] = set()
+    for source_index, source in enumerate(points):
+        neighbor_limits = POSE_GRAPH_NEIGHBOR_LIMITS.get(source.class_name, {})
+        source_xy = np.asarray(source.xy, dtype=np.float32)
+        for neighbor_class, limit in neighbor_limits.items():
+            neighbors = [
+                (
+                    float(np.linalg.norm(np.asarray(target.xy, dtype=np.float32) - source_xy)),
+                    target_index,
+                )
+                for target_index, target in enumerate(points)
+                if target_index != source_index and target.class_name == neighbor_class
+            ]
+            neighbors.sort(key=lambda item: item[0])
+            for _distance, target_index in neighbors[: max(0, limit)]:
+                candidate_edges.add(tuple(sorted((source_index, target_index))))
+    return sorted(candidate_edges)
+
+
+def edge_support_along_segment(
+    edge_map: np.ndarray,
+    start_xy: tuple[float, float],
+    end_xy: tuple[float, float],
+) -> tuple[float, float]:
+    start = np.asarray(start_xy, dtype=np.float32)
+    end = np.asarray(end_xy, dtype=np.float32)
+    delta = end - start
+    length = float(np.linalg.norm(delta))
+    if length <= 1.0:
+        return 0.0, length
+
+    sample_count = max(2, int(np.ceil(length)) + 1)
+    t = np.linspace(0.0, 1.0, sample_count, dtype=np.float32)
+    samples = start[None, :] + ((end - start)[None, :] * t[:, None])
+    xs = np.round(samples[:, 0]).astype(np.int32)
+    ys = np.round(samples[:, 1]).astype(np.int32)
+    inside = (
+        (xs >= 0)
+        & (xs < edge_map.shape[1])
+        & (ys >= 0)
+        & (ys < edge_map.shape[0])
+    )
+    support = np.zeros(sample_count, dtype=bool)
+    support[inside] = edge_map[ys[inside], xs[inside]] > 0
+
+    if not bool(support.any()):
+        return 0.0, length
+
+    sample_step = length / max(1, sample_count - 1)
+    intervals: list[tuple[float, float]] = []
+    run_start: int | None = None
+    for sample_index, has_edge in enumerate(support):
+        if has_edge and run_start is None:
+            run_start = sample_index
+        if (not has_edge or sample_index == len(support) - 1) and run_start is not None:
+            run_end = sample_index if has_edge else sample_index - 1
+            intervals.append(
+                (
+                    (run_start * sample_step) - sample_step,
+                    (run_end * sample_step) + sample_step,
+                )
+            )
+            run_start = None
+
+    return merged_interval_coverage(intervals, length)
+
+
+def dilated_adjacency_edge_map(edge_map: np.ndarray, args) -> np.ndarray:
+    dilation_px = max(0, int(getattr(args, "adjacency_edge_dilation", ADJACENCY_EDGE_DILATION_PX)))
+    if dilation_px <= 0:
+        return edge_map
+    kernel_size = (dilation_px * 2) + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.dilate(edge_map, kernel)
+
+
+def segment_skips_observed_keypoint(
+    points: list[PoseGraphPoint],
+    start_index: int,
+    end_index: int,
     args,
-) -> list[CornerAdjacency]:
-    points = np.asarray(corner_points, dtype=np.float32).reshape(-1, 2)
-    if len(points) < 2 or hough_lines is None:
+) -> bool:
+    start = np.asarray(points[start_index].xy, dtype=np.float32)
+    end = np.asarray(points[end_index].xy, dtype=np.float32)
+    delta = end - start
+    length = float(np.linalg.norm(delta))
+    if length <= 1.0:
+        return False
+
+    unit = delta / length
+    intersection_distance = max(
+        0.0,
+        float(
+            getattr(
+                args,
+                "adjacency_keypoint_intersection_distance",
+                ADJACENCY_KEYPOINT_INTERSECTION_DISTANCE_PX,
+            )
+        ),
+    )
+    endpoint_margin = min(intersection_distance, length * 0.25)
+    for point_index, point in enumerate(points):
+        if point_index in (start_index, end_index):
+            continue
+        point_xy = np.asarray(point.xy, dtype=np.float32)
+        projection = float(np.dot(point_xy - start, unit))
+        if projection <= endpoint_margin or projection >= length - endpoint_margin:
+            continue
+        closest = start + (unit * projection)
+        if float(np.linalg.norm(point_xy - closest)) <= intersection_distance:
+            return True
+    return False
+
+
+def pose_graph_edge_evidence(
+    points: list[PoseGraphPoint],
+    roi_xyxy: tuple[int, int, int, int],
+    edge_map: np.ndarray,
+    args,
+) -> list[PoseGraphEdge]:
+    if len(points) < 2:
         return []
 
     roi_offset = np.asarray(roi_xyxy[:2], dtype=np.float32)
-    roi_points = points - roi_offset
-    raw_lines = np.asarray(hough_lines, dtype=np.float32).reshape(-1, 4)
-    max_angle_degrees = float(
-        getattr(args, "adjacency_max_angle_degrees", ADJACENCY_MAX_ANGLE_DEGREES)
-    )
-    min_alignment = float(np.cos(np.deg2rad(max(0.0, min(89.0, max_angle_degrees)))))
-    max_line_distance = max(
-        0.0,
-        float(getattr(args, "adjacency_max_line_distance", ADJACENCY_MAX_LINE_DISTANCE_PX)),
-    )
+    sampled_edges = dilated_adjacency_edge_map(edge_map, args)
     min_coverage = max(
         0.0,
         min(1.0, float(getattr(args, "adjacency_min_coverage", ADJACENCY_MIN_COVERAGE))),
@@ -1953,49 +2139,26 @@ def corner_adjacency_evidence(
             )
         ),
     )
-    interval_padding = max(
-        0.0,
-        float(getattr(args, "adjacency_interval_padding", ADJACENCY_INTERVAL_PADDING_PX)),
-    )
 
-    adjacencies: list[CornerAdjacency] = []
-    for start_index, end_index in combinations(range(len(roi_points)), 2):
-        start = roi_points[start_index]
-        end = roi_points[end_index]
-        delta = end - start
-        length = float(np.linalg.norm(delta))
-        if length <= 1.0:
-            continue
-        unit = delta / length
-        intervals: list[tuple[float, float]] = []
-
-        for x1, y1, x2, y2 in raw_lines:
-            line_start = np.asarray((x1, y1), dtype=np.float32)
-            line_end = np.asarray((x2, y2), dtype=np.float32)
-            line_delta = line_end - line_start
-            line_length = float(np.linalg.norm(line_delta))
-            if line_length <= 1.0:
-                continue
-
-            line_unit = line_delta / line_length
-            if abs(float(np.dot(unit, line_unit))) < min_alignment:
-                continue
-            if (
-                distance_to_line(line_start, start, unit) > max_line_distance
-                or distance_to_line(line_end, start, unit) > max_line_distance
-            ):
-                continue
-
-            projected_start = float(np.dot(line_start - start, unit))
-            projected_end = float(np.dot(line_end - start, unit))
-            interval_start = min(projected_start, projected_end) - interval_padding
-            interval_end = max(projected_start, projected_end) + interval_padding
-            intervals.append((interval_start, interval_end))
-
-        coverage, max_gap = merged_interval_coverage(intervals, length)
-        accepted = coverage >= min_coverage and max_gap <= (max_gap_ratio * length)
-        adjacencies.append(
-            CornerAdjacency(
+    graph_edges: list[PoseGraphEdge] = []
+    for start_index, end_index in pose_graph_candidate_edges(points):
+        start = tuple(np.asarray(points[start_index].xy, dtype=np.float32) - roi_offset)
+        end = tuple(np.asarray(points[end_index].xy, dtype=np.float32) - roi_offset)
+        length = float(
+            np.linalg.norm(np.asarray(end, dtype=np.float32) - np.asarray(start, dtype=np.float32))
+        )
+        skips_keypoint = segment_skips_observed_keypoint(points, start_index, end_index, args)
+        if skips_keypoint:
+            coverage, max_gap = 0.0, length
+        else:
+            coverage, max_gap = edge_support_along_segment(sampled_edges, start, end)
+        accepted = (
+            not skips_keypoint
+            and coverage >= min_coverage
+            and max_gap <= (max_gap_ratio * length)
+        )
+        graph_edges.append(
+            PoseGraphEdge(
                 start_index=start_index,
                 end_index=end_index,
                 coverage=coverage,
@@ -2003,52 +2166,37 @@ def corner_adjacency_evidence(
                 accepted=accepted,
             )
         )
+    return graph_edges
 
-    return adjacencies
 
-
-def draw_corner_adjacencies(
+def draw_pose_graph_adjacencies(
     frame: np.ndarray,
-    corner_points: np.ndarray,
+    pose_points: list[PoseGraphPoint],
     roi: np.ndarray,
     roi_xyxy: tuple[int, int, int, int],
     args,
 ) -> int:
-    points = np.asarray(corner_points, dtype=np.float32).reshape(-1, 2)
-    if len(points) < 2:
+    if len(pose_points) < 2:
         return 0
 
     edges = build_adjacency_edge_map(roi, args)
-    hough_lines = cv2.HoughLinesP(
-        edges,
-        rho=1,
-        theta=np.pi / 180.0,
-        threshold=max(
-            1,
-            int(getattr(args, "adjacency_hough_threshold", ADJACENCY_HOUGH_THRESHOLD)),
-        ),
-        minLineLength=max(
-            1,
-            int(getattr(args, "adjacency_hough_min_line_length", ADJACENCY_HOUGH_MIN_LINE_LENGTH)),
-        ),
-        maxLineGap=max(
-            0,
-            int(getattr(args, "adjacency_hough_max_line_gap", ADJACENCY_HOUGH_MAX_LINE_GAP)),
-        ),
-    )
-    adjacencies = corner_adjacency_evidence(points, roi_xyxy, hough_lines, args)
+    adjacencies = pose_graph_edge_evidence(pose_points, roi_xyxy, edges, args)
     accepted_count = 0
     for adjacency in adjacencies:
         if not adjacency.accepted:
             continue
-        start = tuple(np.round(points[adjacency.start_index]).astype(int))
-        end = tuple(np.round(points[adjacency.end_index]).astype(int))
+        start = tuple(np.round(pose_points[adjacency.start_index].xy).astype(int))
+        end = tuple(np.round(pose_points[adjacency.end_index].xy).astype(int))
         cv2.line(frame, start, end, (0, 0, 0), 5, lineType=cv2.LINE_AA)
         cv2.line(frame, start, end, (60, 255, 120), 2, lineType=cv2.LINE_AA)
         if getattr(args, "debug_overlay", False):
             midpoint = tuple(
                 np.round(
-                    (points[adjacency.start_index] + points[adjacency.end_index]) * 0.5
+                    (
+                        np.asarray(pose_points[adjacency.start_index].xy, dtype=np.float32)
+                        + np.asarray(pose_points[adjacency.end_index].xy, dtype=np.float32)
+                    )
+                    * 0.5
                 ).astype(int)
             )
             cv2.putText(
@@ -2102,7 +2250,16 @@ def draw_pose_estimate(
         point_limit=PNP_CORNER_DETECTION_LIMIT,
     )
     if getattr(args, "show_corner_adjacency", DRAW_CORNER_ADJACENCY):
-        draw_corner_adjacencies(frame, corner_points, roi, roi_xyxy, args)
+        pose_points = collect_pose_graph_points(
+            result,
+            pose_model,
+            xy,
+            conf,
+            confidence_threshold=POSE_KEYPOINT_CONFIDENCE,
+            offset_xy=(x1, y1),
+            scale_xy=(scale_x, scale_y),
+        )
+        draw_pose_graph_adjacencies(frame, pose_points, roi, roi_xyxy, args)
 
     point_count = 0
     if DRAW_POSE_KEYPOINTS:
@@ -2885,6 +3042,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=ADJACENCY_INTERVAL_PADDING_PX,
         help="Pixels added to each projected Hough interval before measuring coverage",
+    )
+    parser.add_argument(
+        "--adjacency-edge-dilation",
+        type=int,
+        default=ADJACENCY_EDGE_DILATION_PX,
+        help="Half-width in pixels around candidate pose graph connections checked for Canny edge support",
+    )
+    parser.add_argument(
+        "--adjacency-keypoint-intersection-distance",
+        type=float,
+        default=ADJACENCY_KEYPOINT_INTERSECTION_DISTANCE_PX,
+        help="Reject candidate pose graph connections that pass within this many pixels of another keypoint",
     )
     parser.set_defaults(
         show_bbox=True,

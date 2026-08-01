@@ -716,6 +716,76 @@ def test_pose_pnp_options_are_named_constants_not_parser_arguments():
     assert piece_seg_script.MID_TURN_ANGLE_DEGREES == tuple(range(5, 50, 5))
 
 
+def test_pose_graph_candidate_edges_follow_class_neighbor_limits():
+    points = [
+        piece_seg_script.PoseGraphPoint(0, "corner", (0.0, 0.0), 0.9),
+        piece_seg_script.PoseGraphPoint(1, "corner", (1.0, 1.0), 0.9),
+        piece_seg_script.PoseGraphPoint(2, "corner-edge", (3.0, 0.0), 0.9),
+        piece_seg_script.PoseGraphPoint(3, "corner-edge", (6.0, 0.0), 0.9),
+        piece_seg_script.PoseGraphPoint(4, "corner-edge", (9.0, 0.0), 0.9),
+        piece_seg_script.PoseGraphPoint(5, "corner-edge", (30.0, 0.0), 0.9),
+        piece_seg_script.PoseGraphPoint(6, "corner-edge-center", (4.0, 2.0), 0.9),
+        piece_seg_script.PoseGraphPoint(7, "corner-edge-center", (5.0, 2.0), 0.9),
+        piece_seg_script.PoseGraphPoint(8, "corner-edge-center", (40.0, 2.0), 0.9),
+    ]
+
+    edges = set(piece_seg_script.pose_graph_candidate_edges(points))
+
+    assert (0, 1) not in edges
+    assert {(0, 2), (0, 3), (0, 4)} <= edges
+    assert (0, 5) not in edges
+    assert (2, 3) in edges
+    assert {(2, 6), (2, 7)} <= edges
+    assert (2, 8) not in edges
+
+
+def test_edge_evidence_requires_mostly_full_blurry_candidate_segment():
+    edge_map = np.zeros((24, 100), dtype=np.uint8)
+    piece_seg_script.cv2.line(edge_map, (4, 11), (84, 11), 255, 1)
+    points = [
+        piece_seg_script.PoseGraphPoint(0, "corner", (0.0, 12.0), 0.9),
+        piece_seg_script.PoseGraphPoint(1, "corner-edge", (90.0, 12.0), 0.9),
+    ]
+
+    evidence = piece_seg_script.pose_graph_edge_evidence(
+        points,
+        (0, 0, 100, 24),
+        edge_map,
+        SimpleNamespace(adjacency_edge_dilation=3),
+    )
+
+    assert evidence[0].accepted
+    assert evidence[0].coverage > piece_seg_script.ADJACENCY_MIN_COVERAGE
+    assert evidence[0].max_uncovered_gap < (
+        piece_seg_script.ADJACENCY_MAX_UNCOVERED_GAP_RATIO * 90.0
+    )
+
+
+def test_edge_evidence_rejects_candidate_that_skips_observed_keypoint():
+    edge_map = np.zeros((24, 120), dtype=np.uint8)
+    piece_seg_script.cv2.line(edge_map, (0, 12), (100, 12), 255, 1)
+    points = [
+        piece_seg_script.PoseGraphPoint(0, "corner", (0.0, 12.0), 0.9),
+        piece_seg_script.PoseGraphPoint(1, "corner-edge", (50.0, 13.0), 0.9),
+        piece_seg_script.PoseGraphPoint(2, "corner-edge", (100.0, 12.0), 0.9),
+    ]
+
+    evidence = piece_seg_script.pose_graph_edge_evidence(
+        points,
+        (0, 0, 120, 24),
+        edge_map,
+        SimpleNamespace(
+            adjacency_edge_dilation=1,
+            adjacency_keypoint_intersection_distance=4.0,
+        ),
+    )
+
+    skipped_edge = next(edge for edge in evidence if edge.start_index == 0 and edge.end_index == 2)
+
+    assert skipped_edge.coverage == 0.0
+    assert not skipped_edge.accepted
+
+
 def test_cube_corner_geometry_uses_55mm_cube_size():
     assert piece_seg_script.CUBE_SIZE_MM == 55.0
     assert piece_seg_script.CUBE_LAYER_SIZE_MM == 55.0 / 3.0
