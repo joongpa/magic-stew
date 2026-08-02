@@ -21,10 +21,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import site
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import bpy
@@ -68,28 +70,53 @@ BACKGROUND_SIZE = 12.0
 BACKGROUND_SCENE_COLLECTION_NAME = "SyntheticBackgroundScene"
 BACKGROUND_SCENE_PREFIX = "SyntheticBackgroundObject"
 BACKGROUND_SCENE_MATERIAL_PREFIX = "SyntheticBackgroundMaterial"
+BACKGROUND_ASSET_COLLECTION_PREFIX = "SyntheticBackgroundAsset"
+BACKGROUND_ASSET_ROOT_SUFFIX = "_ROOT"
+BACKGROUND_ASSET_BLEND_CANDIDATES = (
+    PROJECT / "syntheticAssets" / "BackgroundAssets.blend",
+    PROJECT / "config" / "synthetic_assets" / "BackgroundAssets.blend",
+)
 BACKGROUND_TABLE_Z = -1.5
 BACKGROUND_TABLE_SIZE_RANGE = (18.0, 26.0)
 BACKGROUND_WALL_DISTANCE_RANGE = (5.5, 8.5)
 BACKGROUND_WALL_SIZE_RANGE = (18.0, 28.0)
-BACKGROUND_OBJECT_DEPTH_RANGE = (2.2, 7.5)
-BACKGROUND_OBJECT_RIGHT_RANGE = (-6.5, 6.5)
-BACKGROUND_OBJECT_SCALE_RANGE = (0.08, 0.75)
-BACKGROUND_KEEP_OUT_RIGHT = 2.2
-BACKGROUND_KEEP_OUT_DEPTH = 2.4
-DEFAULT_BACKGROUND_OBJECT_COUNT = 32
-BACKGROUND_CUBIE_COLLECTION_NAME = "SyntheticBackgroundCubies"
-BACKGROUND_CUBIE_PREFIX = "SyntheticBackgroundCubie"
-BACKGROUND_CUBIE_DISTANCE_RANGE = (3.0, 3.8)
-BACKGROUND_CUBIE_RIGHT_RANGE = (-8, 8)
-BACKGROUND_CUBIE_UP_RANGE = (-6, 6)
-BACKGROUND_CUBIE_SCALE_RANGE = (0.65, 1.05)
-DEFAULT_BACKGROUND_CUBIE_PROBABILITY = 0.0
-DEFAULT_MAX_BACKGROUND_CUBIES = 3
-FALSE_CUBIE_COLLECTION_NAME = "SyntheticFalseCubies"
-FALSE_CUBIE_PREFIX = "SyntheticFalseCubie"
-FALSE_CUBIE_COLOR_MATERIAL_NAMES = ("White", "Yellow", "Red", "Orange", "Blue", "Green")
-DEFAULT_FALSE_CUBIE_PROBABILITY = 1.0
+BACKGROUND_OBJECT_DEPTH_RANGE = (1.35, 5.5)
+BACKGROUND_OBJECT_RIGHT_RANGE = (-4.8, 4.8)
+BACKGROUND_OBJECT_SCALE_RANGE = (0.24, 1.35)
+BACKGROUND_KEEP_OUT_RIGHT = 1.35
+BACKGROUND_KEEP_OUT_DEPTH = 1.2
+DEFAULT_BACKGROUND_OBJECT_COUNT = 5
+BACKGROUND_OBJECT_COUNT_JITTER = (0.45, 1.15)
+BACKGROUND_REALISTIC_PROP_PROBABILITY = 1.0
+BACKGROUND_BLEND_ASSET_PROBABILITY = 1.0
+BACKGROUND_BLEND_ASSET_SCALE_RANGE = (1.25, 2.25)
+BACKGROUND_BLEND_ASSET_VISIBLE_DEPTH_RANGE = (1.45, 3.4)
+BACKGROUND_BLEND_ASSET_VISIBLE_RIGHT_RANGE = (-3.1, 3.1)
+BACKGROUND_BLEND_ASSET_VISIBLE_KEEP_OUT_RIGHT = 1.15
+BACKGROUND_BLEND_ASSET_COLLECTION_PREFIXES = (
+    "Asset_",
+)
+BACKGROUND_BLEND_ASSET_EXCLUDED_PREFIXES = (
+    "Asset_PrimitiveClutter",
+)
+BACKGROUND_BLEND_ASSET_FAMILY_WEIGHTS = {
+    "Asset_Laptop": 1.0,
+    "Asset_BookStack": 1.0,
+    "Asset_CardboardBox": 1.0,
+    "Asset_FabricPanel": 1.0,
+    "Asset_WallScreen": 1.0,
+    "Asset_Poster": 1.0,
+    "Asset_RubiksCube": 1.0,
+    "Asset_Mug": 1.4,
+    "Asset_DeskLamp": 1.2,
+    "Asset_Pens": 1.1,
+    "Asset_NotebookPhone": 1.0,
+}
+STICKER_COLOR_MATERIAL_NAMES = ("White", "Yellow", "Red", "Orange", "Blue", "Green")
+STICKER_ROUGHNESS_RANGE = (0.18, 0.38)
+STICKER_SPECULAR_RANGE = (0.45, 0.75)
+STICKER_COAT_WEIGHT_RANGE = (0.08, 0.24)
+STICKER_COAT_ROUGHNESS_RANGE = (0.12, 0.32)
 CORE_FILL_OBJECT_NAMES = ("StickerlessBlackCoreFill", "StickerlessBlackCoreSphereFill")
 LAYER_RENDER_STATE_WEIGHTS = (
     ("none", 0.40),
@@ -116,14 +143,14 @@ DEGRADE_COMPRESSION_PROBABILITY = 0.8
 DEGRADE_RESCALE_PROBABILITY = 0.35
 HAND_NAMES = ("left-hand", "right-hand")
 HAND_VISIBILITY_WEIGHTS = (
-    ("none", 0.3),
-    ("left", 0.1),
-    ("right", 0.1),
-    ("both", 0.5),
-    # ("none", 1),
-    # ("left", 0),
-    # ("right", 0),
-    # ("both", 0),
+    # ("none", 0.3),
+    # ("left", 0.1),
+    # ("right", 0.1),
+    # ("both", 0.5),
+    ("none", 1),
+    ("left", 0),
+    ("right", 0),
+    ("both", 0),
 )
 HAND_X_OFFSET_RANGE = (-0.2, 0.2)
 HAND_Z_OFFSET_RANGE = (-1.0, 1.0)
@@ -139,6 +166,7 @@ HAND_SKIN_TONE_RANGES = (
     ((0.26, 0.14, 0.09), (0.44, 0.26, 0.17)),
     ((0.12, 0.07, 0.045), (0.28, 0.16, 0.10)),
 )
+ACTIVE_RANDOM_SEED: int | None = None
 
 SOLVED_LOCATION_PROP = "synthetic_solved_location"
 SOLVED_ROTATION_PROP = "synthetic_solved_rotation"
@@ -566,6 +594,45 @@ def set_principled_input(material: bpy.types.Material, input_name: str, value: o
         bsdf.inputs[input_name].default_value = value
 
 
+def randomize_sticker_material_gloss() -> dict[str, dict[str, float]]:
+    """Give Rubik's cube stickers mild glossy highlights while preserving labels."""
+    material_settings = {}
+    for name in STICKER_COLOR_MATERIAL_NAMES:
+        material = bpy.data.materials.get(name)
+        if material is None:
+            continue
+
+        material.use_nodes = True
+        roughness = random.uniform(*STICKER_ROUGHNESS_RANGE)
+        specular = random.uniform(*STICKER_SPECULAR_RANGE)
+        coat_weight = random.uniform(*STICKER_COAT_WEIGHT_RANGE)
+        coat_roughness = random.uniform(*STICKER_COAT_ROUGHNESS_RANGE)
+
+        set_principled_input(material, "Roughness", roughness)
+        set_principled_input(material, "Specular IOR Level", specular)
+        set_principled_input(material, "Specular", specular)
+        set_principled_input(material, "Coat Weight", coat_weight)
+        set_principled_input(material, "Clearcoat", coat_weight)
+        set_principled_input(material, "Coat Roughness", coat_roughness)
+        set_principled_input(material, "Clearcoat Roughness", coat_roughness)
+
+        material_settings[name] = {
+            "roughness": roughness,
+            "specular": specular,
+            "coat_weight": coat_weight,
+            "coat_roughness": coat_roughness,
+        }
+    return material_settings
+
+
+def runtime_random_seed() -> int:
+    try:
+        entropy = int.from_bytes(os.urandom(8), "big")
+    except OSError:
+        entropy = 0
+    return entropy ^ time.time_ns() ^ os.getpid() ^ id(object())
+
+
 def random_color_from_ranges(
     ranges: tuple[tuple[tuple[float, float, float], tuple[float, float, float]], ...],
 ) -> tuple[float, float, float, float]:
@@ -690,6 +757,40 @@ def noisy_material(
     return material
 
 
+def glossy_material(
+    name: str,
+    base_color: tuple[float, float, float, float],
+    *,
+    roughness: float,
+    specular: float,
+    metallic: float = 0.0,
+) -> bpy.types.Material:
+    material = noisy_material(name, base_color, textured=False)
+    set_principled_input(material, "Roughness", roughness)
+    set_principled_input(material, "Specular IOR Level", specular)
+    set_principled_input(material, "Specular", specular)
+    set_principled_input(material, "Metallic", metallic)
+    return material
+
+
+def emissive_material(
+    name: str,
+    base_color: tuple[float, float, float, float],
+    *,
+    strength: float,
+) -> bpy.types.Material:
+    material = glossy_material(
+        name,
+        base_color,
+        roughness=random.uniform(0.12, 0.32),
+        specular=random.uniform(0.35, 0.75),
+    )
+    set_principled_input(material, "Emission Color", base_color)
+    set_principled_input(material, "Emission", base_color)
+    set_principled_input(material, "Emission Strength", strength)
+    return material
+
+
 def background_object_material(name: str) -> bpy.types.Material:
     if random.random() < 0.72:
         return noisy_material(
@@ -702,8 +803,11 @@ def background_object_material(name: str) -> bpy.types.Material:
 
 def clear_background_scene() -> None:
     for obj in list(bpy.data.objects):
-        if obj.name.startswith(BACKGROUND_SCENE_PREFIX):
+        if obj.name.startswith(BACKGROUND_SCENE_PREFIX) or obj.name.startswith(BACKGROUND_ASSET_COLLECTION_PREFIX):
             bpy.data.objects.remove(obj, do_unlink=True)
+    for collection in list(bpy.data.collections):
+        if collection.name.startswith(BACKGROUND_ASSET_COLLECTION_PREFIX):
+            bpy.data.collections.remove(collection)
     for material in list(bpy.data.materials):
         if material.name.startswith(BACKGROUND_SCENE_MATERIAL_PREFIX):
             bpy.data.materials.remove(material, do_unlink=True)
@@ -723,6 +827,13 @@ def link_to_collection(obj: bpy.types.Object, collection: bpy.types.Collection) 
     for existing_collection in list(obj.users_collection):
         if existing_collection != collection:
             existing_collection.objects.unlink(obj)
+
+
+def active_created_object() -> bpy.types.Object:
+    obj = getattr(bpy.context, "object", None) or bpy.context.view_layer.objects.active
+    if obj is None:
+        raise RuntimeError("Blender did not expose the object created by the previous operator.")
+    return obj
 
 
 def camera_basis() -> tuple[Vector, Vector, Vector]:
@@ -779,7 +890,7 @@ def add_background_plane(
         bpy.ops.mesh.primitive_plane_add(size=size, location=location)
     else:
         bpy.ops.mesh.primitive_plane_add(size=size, location=location, rotation=rotation.to_euler())
-    plane = bpy.context.object
+    plane = active_created_object()
     plane.name = name
     plane.data.materials.append(material)
     link_to_collection(plane, collection)
@@ -805,6 +916,564 @@ def background_object_offsets(clearance: float) -> tuple[float, float]:
         right = random.uniform(*BACKGROUND_OBJECT_RIGHT_RANGE)
         depth = random.uniform(min_depth, max(min_depth, BACKGROUND_OBJECT_DEPTH_RANGE[1]))
     return right, depth
+
+
+def add_background_box(
+    collection: bpy.types.Collection,
+    name: str,
+    location: Vector,
+    scale: tuple[float, float, float],
+    material: bpy.types.Material,
+    rotation: Quaternion | None = None,
+) -> bpy.types.Object:
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=location)
+    obj = active_created_object()
+    obj.name = name
+    obj.rotation_mode = "QUATERNION"
+    obj.rotation_quaternion = rotation or Quaternion((1.0, 0.0, 0.0, 0.0))
+    obj.scale = scale
+    obj.data.materials.append(material)
+    link_to_collection(obj, collection)
+    return obj
+
+
+def prop_location(table_forward: Vector, table_right: Vector, right: float, depth: float, height: float) -> Vector:
+    return (table_forward * depth) + (table_right * right) + Vector((0.0, 0.0, BACKGROUND_TABLE_Z + height * 0.5))
+
+
+def random_table_yaw() -> Quaternion:
+    return Quaternion(Vector((0.0, 0.0, 1.0)), random.uniform(0.0, math.tau))
+
+
+def background_asset_blend_path() -> Path | None:
+    return next((path for path in BACKGROUND_ASSET_BLEND_CANDIDATES if path.exists()), None)
+
+
+def background_asset_collection_names(path: Path) -> list[str]:
+    with bpy.data.libraries.load(str(path), link=False) as (data_from, _data_to):
+        return [
+            name
+            for name in data_from.collections
+            if any(
+                name.startswith(prefix)
+                for prefix in BACKGROUND_BLEND_ASSET_COLLECTION_PREFIXES
+            )
+            and not any(
+                name.startswith(prefix)
+                for prefix in BACKGROUND_BLEND_ASSET_EXCLUDED_PREFIXES
+            )
+        ]
+
+
+def append_background_asset_collection(path: Path, source_name: str, instance_name: str) -> bpy.types.Collection | None:
+    with bpy.data.libraries.load(str(path), link=False) as (data_from, data_to):
+        if source_name not in data_from.collections:
+            return None
+        data_to.collections = [source_name]
+
+    imported = data_to.collections[0] if data_to.collections else None
+    if imported is None:
+        return None
+    imported.name = instance_name
+    return imported
+
+
+def background_asset_collection_weight(name: str) -> float:
+    return next(
+        (
+            weight
+            for prefix, weight in BACKGROUND_BLEND_ASSET_FAMILY_WEIGHTS.items()
+            if name.startswith(prefix)
+        ),
+        0.7,
+    )
+
+
+def collection_asset_objects(collection: bpy.types.Collection) -> list[bpy.types.Object]:
+    objects = getattr(collection, "all_objects", collection.objects)
+    return [obj for obj in objects if obj.type in {"MESH", "LIGHT"}]
+
+
+def collection_asset_root(collection: bpy.types.Collection) -> bpy.types.Object | None:
+    direct_objects = list(collection.objects)
+    root_name = f"{collection.name}{BACKGROUND_ASSET_ROOT_SUFFIX}"
+    for obj in direct_objects:
+        if obj.type == "EMPTY" and obj.name == root_name:
+            return obj
+    for obj in direct_objects:
+        if obj.type == "EMPTY" and obj.name.endswith(BACKGROUND_ASSET_ROOT_SUFFIX):
+            return obj
+    return None
+
+
+def linked_object_bounds(objects: list[bpy.types.Object]) -> tuple[Vector, Vector] | None:
+    points = []
+    for obj in objects:
+        if obj.type != "MESH":
+            continue
+        points.extend(obj.matrix_world @ Vector(corner) for corner in obj.bound_box)
+    if not points:
+        return None
+    min_point = Vector((min(point.x for point in points), min(point.y for point in points), min(point.z for point in points)))
+    max_point = Vector((max(point.x for point in points), max(point.y for point in points), max(point.z for point in points)))
+    return min_point, max_point
+
+
+def link_collection_to_collection(
+    child: bpy.types.Collection,
+    parent: bpy.types.Collection,
+) -> None:
+    if child.name not in parent.children.keys():
+        parent.children.link(child)
+    for scene_child in list(bpy.context.scene.collection.children):
+        if scene_child == child and scene_child != parent:
+            bpy.context.scene.collection.children.unlink(child)
+
+
+def place_background_asset_collection(
+    asset_collection: bpy.types.Collection,
+    parent_collection: bpy.types.Collection,
+    name_prefix: str,
+    location: Vector,
+    rotation: Quaternion,
+    scale: float,
+) -> dict[str, object] | None:
+    asset_objects = collection_asset_objects(asset_collection)
+    mesh_objects = [obj for obj in asset_objects if obj.type == "MESH"]
+    if not mesh_objects:
+        return None
+
+    link_collection_to_collection(asset_collection, parent_collection)
+    root = collection_asset_root(asset_collection)
+    for obj in asset_objects:
+        obj.name = f"{name_prefix}.{obj.name}"
+    if root is not None:
+        root.name = f"{name_prefix}.{root.name}"
+
+    bounds = linked_object_bounds(mesh_objects)
+    if bounds is None:
+        return None
+    min_point, max_point = bounds
+    center = (min_point + max_point) * 0.5
+    min_z = min_point.z
+    transform = (
+        Matrix.Translation(location)
+        @ rotation.to_matrix().to_4x4()
+        @ Matrix.Diagonal((scale, scale, scale, 1.0))
+        @ Matrix.Translation(Vector((-center.x, -center.y, -min_z)))
+    )
+    if root is not None:
+        root.matrix_world = transform @ root.matrix_world
+    else:
+        for obj in asset_objects:
+            obj.matrix_world = transform @ obj.matrix_world
+            if hasattr(obj, "rotation_mode"):
+                obj.rotation_mode = "QUATERNION"
+
+    bpy.context.view_layer.update()
+    bounds_after = linked_object_bounds(mesh_objects)
+    if bounds_after is None:
+        dimensions = [0.0, 0.0, 0.0]
+    else:
+        placed_min, placed_max = bounds_after
+        dimensions = [
+            placed_max.x - placed_min.x,
+            placed_max.y - placed_min.y,
+            placed_max.z - placed_min.z,
+        ]
+    return {
+        "family": "blend_asset",
+        "collection": asset_collection.name,
+        "root": root.name if root is not None else None,
+        "names": [obj.name for obj in asset_objects],
+        "mesh_count": len(mesh_objects),
+        "light_count": len([obj for obj in asset_objects if obj.type == "LIGHT"]),
+        "scale": scale,
+        "dimensions": dimensions,
+    }
+
+
+def add_blend_asset_prop(
+    collection: bpy.types.Collection,
+    index: int,
+    table_forward: Vector,
+    table_right: Vector,
+    used_asset_sources: set[str] | None = None,
+) -> dict[str, object] | None:
+    path = background_asset_blend_path()
+    if path is None:
+        return None
+
+    asset_names = background_asset_collection_names(path)
+    if not asset_names:
+        return None
+
+    available_collections = [
+        name
+        for name in asset_names
+        if used_asset_sources is None or name not in used_asset_sources
+    ]
+    if not available_collections:
+        available_collections = asset_names
+
+    source_name = random.choices(
+        available_collections,
+        weights=[background_asset_collection_weight(name) for name in available_collections],
+        k=1,
+    )[0]
+    instance_name = f"{BACKGROUND_ASSET_COLLECTION_PREFIX}.{index:03d}.{source_name}"
+    asset_collection = append_background_asset_collection(path, source_name, instance_name)
+    if asset_collection is None:
+        return None
+
+    camera_direction, camera_right, _camera_up = camera_basis()
+    right = random.uniform(*BACKGROUND_BLEND_ASSET_VISIBLE_RIGHT_RANGE)
+    if abs(right) < BACKGROUND_BLEND_ASSET_VISIBLE_KEEP_OUT_RIGHT:
+        right = random.choice((-1.0, 1.0)) * random.uniform(
+            BACKGROUND_BLEND_ASSET_VISIBLE_KEEP_OUT_RIGHT,
+            max(BACKGROUND_BLEND_ASSET_VISIBLE_KEEP_OUT_RIGHT, BACKGROUND_BLEND_ASSET_VISIBLE_RIGHT_RANGE[1]),
+        )
+    depth = random.uniform(*BACKGROUND_BLEND_ASSET_VISIBLE_DEPTH_RANGE)
+    location = (camera_direction * depth) + (camera_right * right) + Vector((0.0, 0.0, BACKGROUND_TABLE_Z))
+    rotation = random_table_yaw()
+    scale = random.uniform(*BACKGROUND_BLEND_ASSET_SCALE_RANGE)
+    placed = place_background_asset_collection(
+        asset_collection,
+        collection,
+        f"{BACKGROUND_SCENE_PREFIX}.blend_asset.{index:03d}",
+        location,
+        rotation,
+        scale,
+    )
+    if placed is None:
+        bpy.data.collections.remove(asset_collection)
+        return None
+
+    return {
+        **placed,
+        "source_file": str(path),
+        "source_name": source_name,
+        "camera_offsets": {"right": right, "depth": depth},
+    }
+
+
+def add_laptop_prop(
+    collection: bpy.types.Collection,
+    index: int,
+    table_forward: Vector,
+    table_right: Vector,
+) -> dict[str, object]:
+    right, depth = background_object_offsets(0.45)
+    yaw = random_table_yaw()
+    local_right = yaw @ Vector((1.0, 0.0, 0.0))
+    local_forward = yaw @ Vector((0.0, 1.0, 0.0))
+    width = random.uniform(1.45, 2.55)
+    base_depth = random.uniform(1.0, 1.75)
+    base_height = random.uniform(0.05, 0.11)
+    screen_height = random.uniform(0.8, 1.55)
+    base_location = prop_location(table_forward, table_right, right, depth, base_height)
+
+    body_mat = glossy_material(
+        f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.laptop_body.{index:03d}",
+        random.choice(((0.02, 0.022, 0.026, 1.0), (0.45, 0.46, 0.47, 1.0), (0.08, 0.08, 0.09, 1.0))),
+        roughness=random.uniform(0.22, 0.52),
+        specular=random.uniform(0.28, 0.62),
+        metallic=random.choice((0.0, 0.0, random.uniform(0.15, 0.45))),
+    )
+    screen_mat = emissive_material(
+        f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.laptop_screen.{index:03d}",
+        random.choice(((0.75, 0.9, 1.0, 1.0), (0.95, 0.96, 1.0, 1.0), (0.25, 0.52, 1.0, 1.0))),
+        strength=random.uniform(0.25, 1.6),
+    )
+    key_mat = glossy_material(
+        f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.laptop_keys.{index:03d}",
+        random.choice(((0.015, 0.015, 0.016, 1.0), (0.82, 0.82, 0.78, 1.0))),
+        roughness=random.uniform(0.34, 0.72),
+        specular=random.uniform(0.12, 0.38),
+    )
+
+    base = add_background_box(
+        collection,
+        f"{BACKGROUND_SCENE_PREFIX}.laptop_base.{index:03d}",
+        base_location,
+        (width, base_depth, base_height),
+        body_mat,
+        yaw,
+    )
+    screen_location = base_location + (local_forward * (base_depth * 0.48)) + Vector((0.0, 0.0, screen_height * 0.52))
+    screen = add_background_box(
+        collection,
+        f"{BACKGROUND_SCENE_PREFIX}.laptop_screen.{index:03d}",
+        screen_location,
+        (width * 0.94, 0.035, screen_height),
+        screen_mat,
+        yaw,
+    )
+
+    key_count = 0
+    rows = random.randint(3, 5)
+    cols = random.randint(7, 11)
+    key_w = width * 0.72 / cols
+    key_d = base_depth * 0.42 / rows
+    start_right = -width * 0.36 + key_w * 0.5
+    start_forward = -base_depth * 0.28 + key_d * 0.5
+    for row in range(rows):
+        for col in range(cols):
+            if random.random() < 0.08:
+                continue
+            key_location = (
+                base_location
+                + (local_right * (start_right + col * key_w))
+                + (local_forward * (start_forward + row * key_d))
+                + Vector((0.0, 0.0, base_height * 0.62))
+            )
+            add_background_box(
+                collection,
+                f"{BACKGROUND_SCENE_PREFIX}.laptop_key.{index:03d}.{row:02d}.{col:02d}",
+                key_location,
+                (key_w * 0.72, key_d * 0.68, 0.012),
+                key_mat,
+                yaw,
+            )
+            key_count += 1
+
+    return {
+        "family": "laptop",
+        "name": base.name,
+        "screen": screen.name,
+        "key_count": key_count,
+        "table_offsets": {"right": right, "depth": depth},
+        "size": {"width": width, "depth": base_depth, "screen_height": screen_height},
+    }
+
+
+def add_book_or_box_prop(
+    collection: bpy.types.Collection,
+    index: int,
+    table_forward: Vector,
+    table_right: Vector,
+) -> dict[str, object]:
+    right, depth = background_object_offsets(0.4)
+    yaw = random_table_yaw()
+    count = random.randint(1, 4)
+    placed = []
+    z_cursor = 0.0
+    width = random.uniform(0.9, 1.9)
+    depth_size = random.uniform(0.7, 1.55)
+    for layer in range(count):
+        height = random.uniform(0.12, 0.45)
+        color = random.choice((random_bright_object_color(), random_background_color(), random_table_color()))
+        material = noisy_material(f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.book_box.{index:03d}.{layer:02d}", color, textured=True)
+        location = prop_location(table_forward, table_right, right, depth, height) + Vector((0.0, 0.0, z_cursor))
+        obj = add_background_box(
+            collection,
+            f"{BACKGROUND_SCENE_PREFIX}.book_box.{index:03d}.{layer:02d}",
+            location,
+            (width * random.uniform(0.85, 1.08), depth_size * random.uniform(0.78, 1.1), height),
+            material,
+            yaw @ Quaternion(Vector((0.0, 0.0, 1.0)), random.uniform(-0.15, 0.15)),
+        )
+        placed.append(obj.name)
+        z_cursor += height
+
+    return {
+        "family": "books_boxes",
+        "names": placed,
+        "table_offsets": {"right": right, "depth": depth},
+        "layers": count,
+    }
+
+
+def add_fabric_panel_prop(
+    collection: bpy.types.Collection,
+    index: int,
+    table_forward: Vector,
+    table_right: Vector,
+) -> dict[str, object]:
+    right, depth = background_object_offsets(0.45)
+    yaw = random_table_yaw()
+    width = random.uniform(0.8, 1.9)
+    height = random.uniform(1.35, 3.2)
+    thickness = random.uniform(0.035, 0.11)
+    base_color = random.choice((random_bright_object_color(), random_background_color()))
+    material = noisy_material(f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.fabric.{index:03d}", base_color, textured=True)
+    location = prop_location(table_forward, table_right, right, depth, height)
+    panel = add_background_box(collection, f"{BACKGROUND_SCENE_PREFIX}.fabric.{index:03d}", location, (width, thickness, height), material, yaw)
+
+    stripe_count = random.randint(2, 6)
+    stripe_mat = noisy_material(f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.fabric_stripe.{index:03d}", random_bright_object_color(), textured=False)
+    local_right = yaw @ Vector((1.0, 0.0, 0.0))
+    local_forward = yaw @ Vector((0.0, -1.0, 0.0))
+    for stripe in range(stripe_count):
+        stripe_x = random.uniform(-width * 0.42, width * 0.42)
+        stripe_location = location + (local_right * stripe_x) + (local_forward * (thickness * 0.65))
+        add_background_box(
+            collection,
+            f"{BACKGROUND_SCENE_PREFIX}.fabric_stripe.{index:03d}.{stripe:02d}",
+            stripe_location,
+            (random.uniform(0.025, 0.09), 0.012, height * random.uniform(0.82, 1.0)),
+            stripe_mat,
+            yaw,
+        )
+
+    return {
+        "family": "fabric_panel",
+        "name": panel.name,
+        "stripe_count": stripe_count,
+        "table_offsets": {"right": right, "depth": depth},
+        "size": {"width": width, "height": height},
+    }
+
+
+def add_screen_or_poster_prop(
+    collection: bpy.types.Collection,
+    index: int,
+    table_forward: Vector,
+    table_right: Vector,
+    wall_distance: float,
+) -> dict[str, object]:
+    right = random.uniform(*BACKGROUND_OBJECT_RIGHT_RANGE)
+    width = random.uniform(1.2, 3.3)
+    height = random.uniform(0.8, 2.25)
+    z = BACKGROUND_TABLE_Z + random.uniform(0.9, 3.0)
+    location = (table_forward * (wall_distance - 0.035)) + (table_right * right) + Vector((0.0, 0.0, z))
+    wall_normal = -table_forward
+    rotation = wall_normal.to_track_quat("Y", "Z")
+    is_screen = random.random() < 0.55
+    material = (
+        emissive_material(
+            f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.wall_screen.{index:03d}",
+            random_bright_object_color(),
+            strength=random.uniform(0.2, 1.4),
+        )
+        if is_screen
+        else noisy_material(f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.poster.{index:03d}", random_bright_object_color(), textured=True)
+    )
+    panel = add_background_box(
+        collection,
+        f"{BACKGROUND_SCENE_PREFIX}.{'wall_screen' if is_screen else 'poster'}.{index:03d}",
+        location,
+        (width, 0.018, height),
+        material,
+        rotation,
+    )
+
+    block_count = random.randint(2, 7)
+    for block in range(block_count):
+        block_mat = glossy_material(
+            f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.poster_block.{index:03d}.{block:02d}",
+            random.choice((random_bright_object_color(), (0.04, 0.04, 0.045, 1.0), (0.96, 0.96, 0.92, 1.0))),
+            roughness=random.uniform(0.18, 0.62),
+            specular=random.uniform(0.12, 0.55),
+        )
+        local_right = rotation @ Vector((1.0, 0.0, 0.0))
+        local_up = rotation @ Vector((0.0, 0.0, 1.0))
+        local_forward = rotation @ Vector((0.0, -1.0, 0.0))
+        block_location = (
+            location
+            + local_right * random.uniform(-width * 0.38, width * 0.38)
+            + local_up * random.uniform(-height * 0.32, height * 0.32)
+            + local_forward * 0.016
+        )
+        add_background_box(
+            collection,
+            f"{BACKGROUND_SCENE_PREFIX}.poster_block.{index:03d}.{block:02d}",
+            block_location,
+            (random.uniform(width * 0.08, width * 0.32), 0.012, random.uniform(height * 0.04, height * 0.18)),
+            block_mat,
+            rotation,
+        )
+
+    return {
+        "family": "wall_screen" if is_screen else "poster",
+        "name": panel.name,
+        "block_count": block_count,
+        "wall_offset": {"right": right, "distance": wall_distance},
+        "size": {"width": width, "height": height},
+    }
+
+
+def add_primitive_clutter_prop(
+    collection: bpy.types.Collection,
+    index: int,
+    table_forward: Vector,
+    table_right: Vector,
+) -> dict[str, object]:
+    scale = random.uniform(*BACKGROUND_OBJECT_SCALE_RANGE)
+    right, depth = background_object_offsets(scale * 1.2)
+    z_scale = scale * random.uniform(0.35, 1.8)
+    location = prop_location(table_forward, table_right, right, depth, z_scale)
+    shape = random.choice(("cube", "cylinder", "uv_sphere"))
+    if shape == "cube":
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=location)
+    elif shape == "cylinder":
+        bpy.ops.mesh.primitive_cylinder_add(vertices=random.choice((12, 16, 24)), radius=0.5, depth=1.0, location=location)
+    else:
+        bpy.ops.mesh.primitive_uv_sphere_add(segments=16, ring_count=8, radius=0.5, location=location)
+
+    obj = active_created_object()
+    obj.name = f"{BACKGROUND_SCENE_PREFIX}.primitive.{index:03d}"
+    obj.rotation_mode = "QUATERNION"
+    obj.rotation_quaternion = random_table_yaw()
+    obj.scale = (
+        scale * random.uniform(0.45, 2.4),
+        scale * random.uniform(0.45, 2.4),
+        z_scale,
+    )
+    obj.data.materials.append(background_object_material(f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.primitive.{index:03d}"))
+    link_to_collection(obj, collection)
+    return {
+        "family": "primitive",
+        "name": obj.name,
+        "shape": shape,
+        "location": [obj.location.x, obj.location.y, obj.location.z],
+        "table_offsets": {"right": right, "depth": depth},
+        "scale": [obj.scale.x, obj.scale.y, obj.scale.z],
+    }
+
+
+def add_realistic_background_prop(
+    collection: bpy.types.Collection,
+    index: int,
+    table_forward: Vector,
+    table_right: Vector,
+    wall_distance: float,
+    used_asset_sources: set[str] | None = None,
+) -> dict[str, object]:
+    if random.random() < BACKGROUND_BLEND_ASSET_PROBABILITY:
+        blend_asset = add_blend_asset_prop(
+            collection,
+            index,
+            table_forward,
+            table_right,
+            used_asset_sources,
+        )
+        if blend_asset is not None:
+            source_name = blend_asset.get("source_name")
+            if used_asset_sources is not None and isinstance(source_name, str):
+                used_asset_sources.add(source_name)
+            return blend_asset
+        if background_asset_blend_path() is not None:
+            return {
+                "family": "blend_asset_failed",
+                "source_file": str(background_asset_blend_path()),
+                "reason": "append_failed",
+            }
+
+    family = random.choices(
+        ("laptop", "books_boxes", "fabric_panel", "screen_poster", "primitive"),
+        weights=(0.22, 0.26, 0.18, 0.18, 0.16),
+        k=1,
+    )[0]
+    if family == "laptop":
+        return add_laptop_prop(collection, index, table_forward, table_right)
+    if family == "books_boxes":
+        return add_book_or_box_prop(collection, index, table_forward, table_right)
+    if family == "fabric_panel":
+        return add_fabric_panel_prop(collection, index, table_forward, table_right)
+    if family == "screen_poster":
+        return add_screen_or_poster_prop(collection, index, table_forward, table_right, wall_distance)
+    return add_primitive_clutter_prop(collection, index, table_forward, table_right)
 
 
 def randomize_3d_background(object_count: int) -> dict[str, object]:
@@ -842,43 +1511,23 @@ def randomize_3d_background(object_count: int) -> dict[str, object]:
         wall_material,
     )
 
-    shapes = ("cube", "cylinder", "uv_sphere")
     placed = []
-    for index in range(max(0, object_count)):
-        scale = random.uniform(*BACKGROUND_OBJECT_SCALE_RANGE)
-        right, depth = background_object_offsets(scale * 2.4)
-        z_scale = scale * random.uniform(0.35, 1.8)
-        location = (
-            (table_forward * depth)
-            + (table_right * right)
-            + Vector((0.0, 0.0, BACKGROUND_TABLE_Z + z_scale * 0.5))
-        )
-        shape = random.choice(shapes)
-        if shape == "cube":
-            bpy.ops.mesh.primitive_cube_add(size=1.0, location=location)
-        elif shape == "cylinder":
-            bpy.ops.mesh.primitive_cylinder_add(vertices=random.choice((12, 16, 24)), radius=0.5, depth=1.0, location=location)
+    used_asset_sources: set[str] = set()
+    scene_object_count = round(max(0, object_count) * random.uniform(*BACKGROUND_OBJECT_COUNT_JITTER))
+    for index in range(scene_object_count):
+        if random.random() < BACKGROUND_REALISTIC_PROP_PROBABILITY:
+            placed.append(
+                add_realistic_background_prop(
+                    collection,
+                    index,
+                    table_forward,
+                    table_right,
+                    wall_distance,
+                    used_asset_sources,
+                )
+            )
         else:
-            bpy.ops.mesh.primitive_uv_sphere_add(segments=16, ring_count=8, radius=0.5, location=location)
-
-        obj = bpy.context.object
-        obj.name = f"{BACKGROUND_SCENE_PREFIX}.{index:03d}"
-        obj.rotation_mode = "QUATERNION"
-        obj.rotation_quaternion = Quaternion(Vector((0.0, 0.0, 1.0)), random.uniform(0.0, math.tau))
-        obj.scale = (
-            scale * random.uniform(0.45, 2.4),
-            scale * random.uniform(0.45, 2.4),
-            z_scale,
-        )
-        obj.data.materials.append(background_object_material(f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.{index:03d}"))
-        link_to_collection(obj, collection)
-        placed.append({
-            "name": obj.name,
-            "shape": shape,
-            "location": [obj.location.x, obj.location.y, obj.location.z],
-            "table_offsets": {"right": right, "depth": depth},
-            "scale": [obj.scale.x, obj.scale.y, obj.scale.z],
-        })
+            placed.append(add_primitive_clutter_prop(collection, index, table_forward, table_right))
 
     bpy.context.view_layer.update()
     return {
@@ -886,7 +1535,15 @@ def randomize_3d_background(object_count: int) -> dict[str, object]:
         "world_color": list(world_color),
         "table": {"name": table.name, "z": BACKGROUND_TABLE_Z, "size": table_size, "color": list(table_color)},
         "wall": {"name": wall.name, "distance": wall_distance, "size": wall_size},
+        "requested_object_count": object_count,
         "object_count": len(placed),
+        "blend_asset_count": sum(1 for obj in placed if obj.get("family") == "blend_asset"),
+        "blend_asset_sources": [
+            obj.get("source_name")
+            for obj in placed
+            if obj.get("family") == "blend_asset"
+        ],
+        "families": [obj.get("family") for obj in placed],
         "objects": placed,
     }
 
@@ -897,89 +1554,6 @@ def randomize_background(object_count: int) -> dict[str, object]:
     return randomize_3d_background(object_count)
 
 
-def clear_background_cubies() -> None:
-    for obj in list(bpy.data.objects):
-        if obj.name.startswith(BACKGROUND_CUBIE_PREFIX):
-            bpy.data.objects.remove(obj, do_unlink=True)
-
-
-def clear_false_cubies() -> None:
-    for obj in list(bpy.data.objects):
-        if obj.name.startswith(FALSE_CUBIE_PREFIX):
-            bpy.data.objects.remove(obj, do_unlink=True)
-
-
-def background_cubie_collection() -> bpy.types.Collection:
-    collection = bpy.data.collections.get(BACKGROUND_CUBIE_COLLECTION_NAME)
-    if collection is None:
-        collection = bpy.data.collections.new(BACKGROUND_CUBIE_COLLECTION_NAME)
-        bpy.context.scene.collection.children.link(collection)
-    return collection
-
-
-def false_cubie_collection() -> bpy.types.Collection:
-    collection = bpy.data.collections.get(FALSE_CUBIE_COLLECTION_NAME)
-    if collection is None:
-        collection = bpy.data.collections.new(FALSE_CUBIE_COLLECTION_NAME)
-        bpy.context.scene.collection.children.link(collection)
-    return collection
-
-
-def randomize_background_cubies(
-    source_objects: list[bpy.types.Object],
-    probability: float,
-    max_count: int,
-) -> int:
-    clear_background_cubies()
-    if probability <= 0.0 or max_count <= 0 or random.random() >= probability:
-        return 0
-
-    camera = get_camera()
-    camera_rotation = camera.rotation_quaternion
-    camera_direction = camera_rotation @ Vector((0.0, 0.0, -1.0))
-    camera_right = camera_rotation @ Vector((1.0, 0.0, 0.0))
-    camera_up = camera_rotation @ Vector((0.0, 1.0, 0.0))
-    collection = background_cubie_collection()
-
-    count = random.randint(1, max_count)
-    for index in range(count):
-        source = random.choice(source_objects)
-        cubie = source.copy()
-        cubie.data = source.data
-        cubie.animation_data_clear()
-        cubie.name = f"{BACKGROUND_CUBIE_PREFIX}.{index:03d}"
-
-        depth = random.uniform(*BACKGROUND_CUBIE_DISTANCE_RANGE)
-        right = random.uniform(*BACKGROUND_CUBIE_RIGHT_RANGE)
-        up = random.uniform(*BACKGROUND_CUBIE_UP_RANGE)
-        cubie.location = (camera_direction * depth) + (camera_right * right) + (camera_up * up)
-        cubie.rotation_mode = "QUATERNION"
-        cubie.rotation_quaternion = Quaternion(
-            (
-                random.uniform(-1.0, 1.0),
-                random.uniform(-1.0, 1.0),
-                random.uniform(-1.0, 1.0),
-                random.uniform(-1.0, 1.0),
-            )
-        ).normalized()
-        cubie.scale = (1.0, 1.0, 1.0)
-        cubie.scale *= random.uniform(*BACKGROUND_CUBIE_SCALE_RANGE)
-
-        collection.objects.link(cubie)
-
-    bpy.context.view_layer.update()
-    return count
-
-
-def camera_visible_face_labels(axes: dict[str, Vector], visible_normals: list[Vector]) -> set[str]:
-    visible_keys = {axis_key(normal) for normal in visible_normals}
-    return {
-        face
-        for face, axis in axes.items()
-        if axis_key(axis) in visible_keys
-    }
-
-
 def cubie_world_center(objects: list[bpy.types.Object]) -> Vector:
     if not objects:
         return Vector((0.0, 0.0, 0.0))
@@ -987,133 +1561,6 @@ def cubie_world_center(objects: list[bpy.types.Object]) -> Vector:
     for obj in objects:
         center += obj.location
     return center / len(objects)
-
-
-def cubie_world_face_axes(obj: bpy.types.Object) -> dict[str, Vector]:
-    rotation = obj.rotation_quaternion
-    return {
-        "X+": rotation @ Vector((1.0, 0.0, 0.0)),
-        "X-": rotation @ Vector((-1.0, 0.0, 0.0)),
-        "Y+": rotation @ Vector((0.0, 1.0, 0.0)),
-        "Y-": rotation @ Vector((0.0, -1.0, 0.0)),
-        "Z+": rotation @ Vector((0.0, 0.0, 1.0)),
-        "Z-": rotation @ Vector((0.0, 0.0, -1.0)),
-    }
-
-
-def cubie_outer_faces(obj: bpy.types.Object, center: Vector) -> dict[str, Vector]:
-    offset = obj.location - center
-    return {
-        face: axis.normalized()
-        for face, axis in cubie_world_face_axes(obj).items()
-        if offset.dot(axis) > 0.45
-    }
-
-
-def false_cubie_candidates(
-    objects: list[bpy.types.Object],
-) -> tuple[list[dict[str, object]], dict[str, object]]:
-    camera = get_camera()
-    center = cubie_world_center(objects)
-    candidates = []
-    visible_face_count = 0
-
-    for obj in objects:
-        outer_faces = cubie_outer_faces(obj, center)
-        visible_faces = {
-            face
-            for face, axis in outer_faces.items()
-            if axis.dot(camera.location - obj.location) > 0.0
-        }
-        hidden_faces = set(outer_faces) - visible_faces
-        visible_face_count += len(visible_faces)
-        if not visible_faces or not hidden_faces:
-            continue
-        for face in sorted(hidden_faces):
-            candidates.append({
-                "target": obj,
-                "face": face,
-                "axis": outer_faces[face],
-                "target_faces": sorted(outer_faces),
-                "target_visible_faces": sorted(visible_faces),
-            })
-
-    return candidates, {
-        "cube_center": [center.x, center.y, center.z],
-        "visible_face_count": visible_face_count,
-        "candidate_count": len(candidates),
-    }
-
-
-def random_false_cubie_material() -> bpy.types.Material:
-    missing = [
-        name
-        for name in FALSE_CUBIE_COLOR_MATERIAL_NAMES
-        if bpy.data.materials.get(name) is None
-    ]
-    if missing:
-        raise ValueError(
-            "Missing false cubie color materials in Blender file: "
-            + ", ".join(missing)
-        )
-    return bpy.data.materials[random.choice(FALSE_CUBIE_COLOR_MATERIAL_NAMES)]
-
-
-def set_cubie_solid_material(obj: bpy.types.Object, material: bpy.types.Material) -> None:
-    obj.data.materials.clear()
-    obj.data.materials.append(material)
-    for polygon in obj.data.polygons:
-        polygon.material_index = 0
-
-
-def randomize_false_cubie(
-    source_objects: list[bpy.types.Object],
-    probability: float,
-) -> dict[str, object] | None:
-    clear_false_cubies()
-    if probability <= 0.0 or random.random() >= probability:
-        return None
-
-    candidates, geometry = false_cubie_candidates(source_objects)
-    if not candidates:
-        return {
-            **geometry,
-            "placed": False,
-            "reason": "no_candidate_faces",
-        }
-
-    source = random.choice(source_objects)
-    candidate = random.choice(candidates)
-    target = candidate["target"]
-    face = str(candidate["face"])
-    axis = candidate["axis"]
-    material = random_false_cubie_material()
-
-    cubie = source.copy()
-    cubie.data = source.data.copy()
-    cubie.animation_data_clear()
-    cubie.name = f"{FALSE_CUBIE_PREFIX}.000"
-    cubie.location = target.location + axis
-    cubie.rotation_mode = "QUATERNION"
-    cubie.rotation_quaternion = target.rotation_quaternion.copy()
-    cubie.scale = (1.0, 1.0, 1.0)
-    set_cubie_solid_material(cubie, material)
-
-    false_cubie_collection().objects.link(cubie)
-    bpy.context.view_layer.update()
-
-    return {
-        **geometry,
-        "placed": True,
-        "name": cubie.name,
-        "source": source.name,
-        "target": target.name,
-        "color": material.name,
-        "face": face,
-        "target_faces": candidate["target_faces"],
-        "target_visible_faces": candidate["target_visible_faces"],
-        "location": [cubie.location.x, cubie.location.y, cubie.location.z],
-    }
 
 
 def hand_objects() -> dict[str, bpy.types.Object]:
@@ -1252,21 +1699,16 @@ def randomize_hands(
 def randomize_scene(
     scramble_length: int = DEFAULT_SCRAMBLE_LENGTH,
     background_object_count: int = DEFAULT_BACKGROUND_OBJECT_COUNT,
-    background_cubie_probability: float = DEFAULT_BACKGROUND_CUBIE_PROBABILITY,
-    max_background_cubies: int = DEFAULT_MAX_BACKGROUND_CUBIES,
-    false_cubie_probability: float = DEFAULT_FALSE_CUBIE_PROBABILITY,
 ) -> tuple[
     list[str],
     dict[str, object],
     dict[str, object],
-    int,
     dict[str, object],
     dict[str, object],
-    dict[str, object] | None,
     dict[str, object],
+    dict[str, dict[str, float]],
 ]:
-    clear_background_cubies()
-    clear_false_cubies()
+    sticker_materials = randomize_sticker_material_gloss()
     objects = cube_objects()
     core_objects = core_fill_objects()
     reset_cube(objects)
@@ -1287,26 +1729,16 @@ def randomize_scene(
 
     layer_state = randomize_layer_render_state(objects)
 
-    background_cubies = randomize_background_cubies(
-        objects,
-        probability=background_cubie_probability,
-        max_count=max_background_cubies,
-    )
     pose_objects = list(objects) + core_objects
     cube_pose = randomize_cube_global_pose(pose_objects)
-    false_cubie = randomize_false_cubie(
-        objects,
-        probability=false_cubie_probability,
-    )
     return (
         moves,
         layer_state,
         background_randomization,
-        background_cubies,
         camera_randomization,
         light_randomization,
-        false_cubie,
         cube_pose,
+        sticker_materials,
     )
 
 
@@ -2265,9 +2697,6 @@ def generate_dataset(
     width: int,
     height: int,
     background_object_count: int,
-    background_cubie_probability: float,
-    max_background_cubies: int,
-    false_cubie_probability: float,
     cube_rotational_blur_probability: float,
     max_cube_rotational_blur_degrees: float,
     cube_rotational_blur_samples: int,
@@ -2292,23 +2721,16 @@ def generate_dataset(
             moves,
             layer_state,
             background_randomization,
-            background_cubies,
             camera_randomization,
             light_randomization,
-            false_cubie,
             cube_pose,
+            sticker_materials,
         ) = randomize_scene(
             scramble_length,
             background_object_count=background_object_count,
-            background_cubie_probability=background_cubie_probability,
-            max_background_cubies=max_background_cubies,
-            false_cubie_probability=false_cubie_probability,
         )
         objects = cube_objects()
         render_objects = list(objects)
-        if false_cubie is not None and false_cubie.get("placed"):
-            if false_cubie_object := bpy.data.objects.get(str(false_cubie["name"])):
-                render_objects.append(false_cubie_object)
 
         stem = f"{(index):06d}"
         image_path = images_dir / f"{stem}.png"
@@ -2378,6 +2800,7 @@ def generate_dataset(
             restore_hand_objects(hands, hand_states)
 
         metadata.append({
+            "active_random_seed": ACTIVE_RANDOM_SEED,
             "image": str(image_path),
             "mask": str(mask_path) if mask_path is not None else None,
             "label": str(label_path),
@@ -2387,9 +2810,8 @@ def generate_dataset(
             "camera": camera_randomization,
             "light": light_randomization,
             "background": background_randomization,
-            "background_cubies": background_cubies,
-            "false_cubie": false_cubie,
             "cube_pose": cube_pose,
+            "sticker_materials": sticker_materials,
             "cube_rotational_blur": rotational_blur,
             "camera_degradation": camera_degradation,
             "hands": hand_randomization,
@@ -2399,11 +2821,12 @@ def generate_dataset(
             "objects": len(yolo_lines),
         })
         mask_message = f", {mask_path}" if mask_path is not None else ""
+        blend_asset_count = background_randomization.get("blend_asset_count", 0)
+        blend_asset_sources = background_randomization.get("blend_asset_sources", [])
         print(
             f"Wrote {image_path}{mask_message}, and {label_path} "
             f"with {len(yolo_lines)} pose keypoint objects, "
-            f"{background_cubies} background cubies "
-            f"{'with' if false_cubie and false_cubie.get('placed') else 'without'} false cubie "
+            f"{blend_asset_count} blend background assets {blend_asset_sources}, "
             f"{'with' if rotational_blur else 'without'} rotational blur "
             f"and {'with' if camera_degradation else 'without'} camera degradation"
         )
@@ -2434,28 +2857,7 @@ def cli_args() -> argparse.Namespace:
         "--background-object-count",
         type=int,
         default=DEFAULT_BACKGROUND_OBJECT_COUNT,
-        help="Number of random 3D clutter objects to place behind and around the cube.",
-    )
-    parser.add_argument(
-        "--background-cubie-probability",
-        type=float,
-        default=DEFAULT_BACKGROUND_CUBIE_PROBABILITY,
-        help="Probability of adding unlabeled individual cubie distractors behind the cube.",
-    )
-    parser.add_argument(
-        "--max-background-cubies",
-        type=int,
-        default=DEFAULT_MAX_BACKGROUND_CUBIES,
-        help="Maximum number of unlabeled background cubie distractors when enabled.",
-    )
-    parser.add_argument(
-        "--false-cubie-probability",
-        type=float,
-        default=DEFAULT_FALSE_CUBIE_PROBABILITY,
-        help=(
-            "Probability of adding one unlabeled cubie attached to a hidden exterior "
-            "face of a partially visible cubie."
-        ),
+        help="Nominal number of sparse background props to place behind and around the cube.",
     )
     parser.add_argument(
         "--cube-rotational-blur-probability",
@@ -2509,9 +2911,14 @@ def cli_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global ACTIVE_RANDOM_SEED
     args = cli_args()
     if args.seed is not None:
-        random.seed(args.seed)
+        ACTIVE_RANDOM_SEED = args.seed
+    else:
+        ACTIVE_RANDOM_SEED = runtime_random_seed()
+    random.seed(ACTIVE_RANDOM_SEED)
+    print(f"Using random seed {ACTIVE_RANDOM_SEED}")
 
     generate_dataset(
         output_dir=args.output_dir,
@@ -2520,9 +2927,6 @@ def main() -> None:
         width=args.width,
         height=args.height,
         background_object_count=args.background_object_count,
-        background_cubie_probability=args.background_cubie_probability,
-        max_background_cubies=args.max_background_cubies,
-        false_cubie_probability=args.false_cubie_probability,
         cube_rotational_blur_probability=args.cube_rotational_blur_probability,
         max_cube_rotational_blur_degrees=args.max_cube_rotational_blur_degrees,
         cube_rotational_blur_samples=args.cube_rotational_blur_samples,
