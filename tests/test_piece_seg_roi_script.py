@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "test_piece_seg_roi.py"
@@ -764,6 +765,8 @@ def test_pose_pnp_options_are_named_constants_not_parser_arguments():
     assert piece_seg_script.POSE_IMAGE_SIZE == 256
     assert piece_seg_script.POSE_OBJECT_CONFIDENCE == 0.5
     assert piece_seg_script.POSE_KEYPOINT_CONFIDENCE == 0.8
+    assert piece_seg_script.ENABLE_POSE_ESTIMATION is True
+    assert piece_seg_script.ENABLE_POSE_GRAPH_CORRESPONDENCE is True
     assert piece_seg_script.DRAW_PNP_CUBE is True
     assert piece_seg_script.DRAW_POSE_GRAPH_COORDS is False
     assert piece_seg_script.PNP_FOCAL_SCALE_MIN == 0.7
@@ -772,7 +775,8 @@ def test_pose_pnp_options_are_named_constants_not_parser_arguments():
     assert piece_seg_script.PNP_MAX_REPROJECTION_ERROR_PX == 12.0
     assert piece_seg_script.PNP_INLIER_THRESHOLD_PX == 10.0
     assert piece_seg_script.PNP_PRUNE_REPROJECTION_ERROR_PX == 18.0
-    assert piece_seg_script.PNP_MAX_FRAME_TRANSLATION_MM == 50.0
+    assert not hasattr(piece_seg_script, "PNP_MAX_FRAME_TRANSLATION_MM")
+    assert piece_seg_script.ADJACENCY_REFERENCE_ROI_SIZE_PX == 600.0
     assert piece_seg_script.ADJACENCY_MIN_EDGE_LENGTH_PX == 32.0
     assert piece_seg_script.ADJACENCY_MAX_AVERAGE_LENGTH_RATIO == 1.8
     assert not hasattr(piece_seg_script, "PNP_GRAPH_CORRESPONDENCE_POINT_COUNT")
@@ -801,6 +805,235 @@ def test_pose_graph_candidate_edges_follow_class_neighbor_limits():
     assert (2, 8) not in edges
 
 
+def test_shared_lattice_boundary_faces_finds_the_square_face():
+    assert piece_seg_script.shared_lattice_boundary_faces(
+        ((0, 0, 0), (3, 0, 0), (3, 3, 0))
+    ) == frozenset({(2, 0)})
+
+
+def fake_pose_pnp_result(
+    *,
+    image_points=None,
+    object_points=None,
+    camera_matrix=None,
+    display_points=None,
+    display_edge_indexes=tuple(),
+    matched_error=0.0,
+):
+    image_points = (
+        np.zeros((3, 2), dtype=np.float32)
+        if image_points is None
+        else np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
+    )
+    object_points = (
+        np.zeros((len(image_points), 3), dtype=np.float32)
+        if object_points is None
+        else np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
+    )
+    display_points = (
+        np.zeros((8, 3), dtype=np.float32)
+        if display_points is None
+        else np.asarray(display_points, dtype=np.float32).reshape(-1, 3)
+    )
+    camera_matrix = (
+        piece_seg_script.default_camera_matrix((100, 100))
+        if camera_matrix is None
+        else np.asarray(camera_matrix, dtype=np.float64)
+    )
+    return piece_seg_script.PosePnPResult(
+        error=matched_error,
+        inlier_count=len(image_points),
+        matched_error=matched_error,
+        camera_matrix=camera_matrix,
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+        rvec=np.zeros((3, 1), dtype=np.float64),
+        tvec=np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64),
+        image_points=image_points,
+        object_points=object_points,
+        display_points=display_points,
+        projected_object_points=image_points.copy(),
+        projected_display_points=np.zeros((len(display_points), 2), dtype=np.float32),
+        point_names=tuple(),
+        display_edge_indexes=display_edge_indexes,
+        invisible_point_count=0,
+    )
+
+
+def test_observed_pose_score_uses_nearest_projected_same_class_point_only(monkeypatch):
+    result = SimpleNamespace(rvec=np.zeros((3, 1), dtype=np.float64))
+    graph = piece_seg_script.PoseGraph(
+        points=(
+            piece_seg_script.PoseGraphPoint(0, "corner", (10.0, 10.0), 0.9),
+            piece_seg_script.PoseGraphPoint(1, "corner-edge", (50.0, 10.0), 0.9),
+            piece_seg_script.PoseGraphPoint(2, "corner-edge-center", (50.0, 50.0), 0.9),
+            piece_seg_script.PoseGraphPoint(3, "center", (200.0, 200.0), 0.9),
+        ),
+        edges=tuple(),
+    )
+
+    def fake_projected_lattice_points_by_class(_result):
+        return {
+            "corner": (
+                np.asarray([[10.0, 10.0], [500.0, 500.0]], dtype=np.float32),
+                np.zeros((2, 3), dtype=np.float32),
+            ),
+            "corner-edge": (
+                np.asarray([[500.0, 10.0], [51.0, 10.0]], dtype=np.float32),
+                np.zeros((2, 3), dtype=np.float32),
+            ),
+            "corner-edge-center": (
+                np.asarray([[50.0, 52.0], [700.0, 700.0]], dtype=np.float32),
+                np.zeros((2, 3), dtype=np.float32),
+            ),
+        }
+
+    monkeypatch.setattr(
+        piece_seg_script,
+        "projected_lattice_points_by_class",
+        fake_projected_lattice_points_by_class,
+    )
+    monkeypatch.setattr(piece_seg_script, "object_point_has_visible_surface", lambda *_args: True)
+
+    error, inlier_count, point_count, invisible_count = (
+        piece_seg_script.observed_pose_model_nearest_same_class_score(
+            result,
+            graph,
+            inlier_threshold_px=3.0,
+        )
+    )
+
+    assert point_count == 3
+    assert inlier_count == 3
+    assert invisible_count == 0
+    assert error == 1.0
+
+
+def test_projected_lattice_points_by_class_applies_result_lattice_transform(monkeypatch):
+    transform = ((2, 1, 0), (-1, 1, 1))
+    result = fake_pose_pnp_result()
+    result.lattice_transform = transform
+    projected_object_points = []
+
+    def fake_project_points(object_points, *_args, **_kwargs):
+        object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
+        projected_object_points.append(object_points.copy())
+        return object_points[:, :2].reshape(-1, 1, 2), None
+
+    monkeypatch.setattr(piece_seg_script.cv2, "projectPoints", fake_project_points)
+
+    projected_by_class = piece_seg_script.projected_lattice_points_by_class(result)
+
+    assert set(projected_by_class) == {"corner", "corner-edge", "corner-edge-center"}
+    expected_corner_points = piece_seg_script.cube_lattice_points_for_coords(
+        piece_seg_script.CUBE_LATTICE_COORDS_BY_CLASS["corner"],
+        lattice_transform=transform,
+    )
+    np.testing.assert_allclose(projected_by_class["corner"][1], expected_corner_points)
+    np.testing.assert_allclose(projected_object_points[0], expected_corner_points)
+
+
+def test_observed_pose_score_prefers_visible_same_class_match_over_backside_match(monkeypatch):
+    result = SimpleNamespace(rvec=np.zeros((3, 1), dtype=np.float64))
+    graph = piece_seg_script.PoseGraph(
+        points=(
+            piece_seg_script.PoseGraphPoint(0, "corner", (10.0, 10.0), 0.9),
+            piece_seg_script.PoseGraphPoint(1, "corner", (20.0, 10.0), 0.9),
+            piece_seg_script.PoseGraphPoint(2, "corner", (20.0, 20.0), 0.9),
+        ),
+        edges=tuple(),
+    )
+
+    monkeypatch.setattr(
+        piece_seg_script,
+        "projected_lattice_points_by_class",
+        lambda _result: {
+            "corner": (
+                np.asarray([[10.0, 10.0], [20.0, 10.0], [20.0, 20.0]], dtype=np.float32),
+                np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float32),
+            )
+        },
+    )
+    def fake_visible(object_point, _rvec):
+        point = np.asarray(object_point, dtype=np.float32).reshape(3)
+        return not np.isclose(float(point[0]), 1.0)
+
+    monkeypatch.setattr(piece_seg_script, "object_point_has_visible_surface", fake_visible)
+
+    error, inlier_count, point_count, invisible_count = (
+        piece_seg_script.observed_pose_model_nearest_same_class_score(
+            result,
+            graph,
+            inlier_threshold_px=3.0,
+        )
+    )
+
+    assert error == pytest.approx(10.0 / 3.0)
+    assert inlier_count == 2
+    assert point_count == 3
+    assert invisible_count == 0
+
+
+def test_observed_pose_score_matches_same_class_model_points_once(monkeypatch):
+    result = SimpleNamespace(rvec=np.zeros((3, 1), dtype=np.float64))
+    graph = piece_seg_script.PoseGraph(
+        points=(
+            piece_seg_script.PoseGraphPoint(0, "corner", (10.0, 10.0), 0.9),
+            piece_seg_script.PoseGraphPoint(1, "corner", (10.2, 10.0), 0.9),
+            piece_seg_script.PoseGraphPoint(2, "corner", (100.0, 100.0), 0.9),
+        ),
+        edges=tuple(),
+    )
+
+    monkeypatch.setattr(
+        piece_seg_script,
+        "projected_lattice_points_by_class",
+        lambda _result: {
+            "corner": (
+                np.asarray([[10.0, 10.0], [100.0, 100.0], [101.0, 100.0]], dtype=np.float32),
+                np.zeros((3, 3), dtype=np.float32),
+            )
+        },
+    )
+    monkeypatch.setattr(piece_seg_script, "object_point_has_visible_surface", lambda *_args: True)
+
+    error, inlier_count, point_count, invisible_count = (
+        piece_seg_script.observed_pose_model_nearest_same_class_score(
+            result,
+            graph,
+            inlier_threshold_px=3.0,
+        )
+    )
+
+    assert error == pytest.approx(np.linalg.norm(np.asarray([90.8, 90.0])) / 3.0)
+    assert inlier_count == 2
+    assert point_count == 3
+    assert invisible_count == 0
+
+
+def test_pose_graph_correspondence_flow_is_disabled_when_flag_is_off(monkeypatch):
+    def fail_correspondence(_graph):
+        raise AssertionError("pose graph traversal should stay disabled")
+
+    monkeypatch.setattr(piece_seg_script, "ENABLE_POSE_ESTIMATION", True)
+    monkeypatch.setattr(piece_seg_script, "ENABLE_POSE_GRAPH_CORRESPONDENCE", False)
+    monkeypatch.setattr(piece_seg_script, "vector_guided_pose_graph_correspondence", fail_correspondence)
+    frame = np.zeros((24, 24, 3), dtype=np.uint8)
+    roi = frame[2:22, 2:22]
+
+    point_count, pnp_result, tracking_bounds = piece_seg_script.draw_pose_estimate(
+        frame,
+        roi,
+        (2, 2, 22, 22),
+        StubCornerPoseModel(point_xy=(128.0, 128.0)),
+        RaisingPoseSolver(),
+        default_args(enable_sticker_segmentation=False),
+    )
+
+    assert point_count == 1
+    assert pnp_result is None
+    assert tracking_bounds is not None
+
+
 def test_edge_evidence_requires_mostly_full_blurry_candidate_segment():
     edge_map = np.zeros((24, 100), dtype=np.uint8)
     piece_seg_script.cv2.line(edge_map, (4, 11), (84, 11), 255, 1)
@@ -813,11 +1046,15 @@ def test_edge_evidence_requires_mostly_full_blurry_candidate_segment():
         points,
         (0, 0, 100, 24),
         edge_map,
-        SimpleNamespace(adjacency_edge_dilation=3),
+        SimpleNamespace(
+            adjacency_edge_dilation=3,
+            adjacency_reference_roi_size=100.0,
+            adjacency_min_coverage=0.95,
+        ),
     )
 
     assert evidence[0].accepted
-    assert evidence[0].coverage > piece_seg_script.ADJACENCY_MIN_COVERAGE
+    assert evidence[0].coverage > 0.95
     assert evidence[0].max_uncovered_gap < (
         piece_seg_script.ADJACENCY_MAX_UNCOVERED_GAP_RATIO * 90.0
     )
@@ -835,7 +1072,7 @@ def test_edge_evidence_ignores_candidate_edges_shorter_than_min_length():
         points,
         (0, 0, 64, 24),
         edge_map,
-        SimpleNamespace(adjacency_edge_dilation=0),
+        SimpleNamespace(adjacency_edge_dilation=0, adjacency_reference_roi_size=64.0),
     )
 
     assert {(edge.start_index, edge.end_index) for edge in evidence} == {(0, 2)}
@@ -858,6 +1095,7 @@ def test_edge_evidence_rejects_candidate_that_skips_observed_keypoint():
         SimpleNamespace(
             adjacency_edge_dilation=1,
             adjacency_keypoint_intersection_distance=4.0,
+            adjacency_reference_roi_size=120.0,
         ),
     )
 
@@ -865,6 +1103,57 @@ def test_edge_evidence_rejects_candidate_that_skips_observed_keypoint():
 
     assert skipped_edge.coverage == 0.0
     assert not skipped_edge.accepted
+
+
+def test_draw_pose_graph_adjacencies_highlights_all_candidate_edge_strip_width(monkeypatch):
+    line_calls = []
+    graph = piece_seg_script.PoseGraph(
+        points=(
+            piece_seg_script.PoseGraphPoint(0, "corner", (10.0, 12.0), 0.9),
+            piece_seg_script.PoseGraphPoint(1, "corner-edge", (60.0, 12.0), 0.9),
+            piece_seg_script.PoseGraphPoint(2, "corner-edge", (60.0, 32.0), 0.9),
+        ),
+        edges=(
+            piece_seg_script.PoseGraphEdge(0, 1, 1.0, 0.0, True),
+            piece_seg_script.PoseGraphEdge(0, 2, 0.0, 20.0, False),
+        ),
+    )
+
+    monkeypatch.setattr(
+        piece_seg_script.cv2,
+        "line",
+        lambda *args, **kwargs: line_calls.append((args, kwargs)),
+    )
+
+    accepted_count = piece_seg_script.draw_pose_graph_adjacencies(
+        np.zeros((48, 80, 3), dtype=np.uint8),
+        graph,
+        SimpleNamespace(adjacency_edge_dilation=10, debug_overlay=False),
+    )
+
+    assert accepted_count == 1
+    assert line_calls[0][0][3] == piece_seg_script.POSE_GRAPH_EDGE_STRIP_COLOR
+    assert line_calls[0][0][4] == 21
+    assert line_calls[1][0][3] == piece_seg_script.POSE_GRAPH_EDGE_STRIP_COLOR
+    assert line_calls[1][0][4] == 21
+    assert line_calls[2][0][4] == 5
+    assert line_calls[3][0][4] == 2
+
+
+def test_adjacency_pixel_parameters_scale_from_reference_roi_size():
+    args = SimpleNamespace(adjacency_edge_dilation=10)
+
+    assert piece_seg_script.adjacency_edge_strip_width_px(args, roi_side=180.0) == 7
+    assert piece_seg_script.adjacency_edge_strip_width_px(args, roi_side=600.0) == 21
+    assert piece_seg_script.adjacency_edge_strip_width_px(args, roi_side=1200.0) == 41
+    assert (
+        piece_seg_script.scaled_adjacency_px(
+            piece_seg_script.ADJACENCY_MIN_EDGE_LENGTH_PX,
+            300.0,
+            SimpleNamespace(),
+        )
+        == 16.0
+    )
 
 
 def test_pose_graph_prunes_edges_noticeably_longer_than_average():
@@ -1277,7 +1566,7 @@ def test_graph_pnp_solver_rejects_observed_point_outside_inlier_threshold(monkey
     assert result is None
 
 
-def test_graph_pnp_solver_rejects_single_frame_translation_jump(monkeypatch):
+def test_graph_pnp_solver_allows_single_frame_translation_jump(monkeypatch):
     correspondence = piece_seg_script.PoseGraphCorrespondence(
         image_points=np.asarray([[20.0, 20.0], [40.0, 20.0], [20.0, 40.0]], dtype=np.float32),
         object_points=piece_seg_script.cube_lattice_points_for_coords(
@@ -1322,11 +1611,11 @@ def test_graph_pnp_solver_rejects_single_frame_translation_jump(monkeypatch):
 
     assert first_result is not None
     assert second_result is not None
-    assert third_result is None
-    np.testing.assert_allclose(solver.last_tvec, np.asarray([[0.0], [0.0], [149.0]]))
+    assert third_result is not None
+    assert not hasattr(solver, "last_tvec")
 
 
-def test_graph_pnp_solver_resets_temporal_filter_after_missing_correspondence(monkeypatch):
+def test_graph_pnp_solver_missing_correspondence_does_not_affect_next_pose(monkeypatch):
     correspondence = piece_seg_script.PoseGraphCorrespondence(
         image_points=np.asarray([[20.0, 20.0], [40.0, 20.0], [20.0, 40.0]], dtype=np.float32),
         object_points=piece_seg_script.cube_lattice_points_for_coords(
@@ -1367,7 +1656,7 @@ def test_graph_pnp_solver_resets_temporal_filter_after_missing_correspondence(mo
     assert first_result is not None
     assert missed_result is None
     assert second_result is not None
-    np.testing.assert_allclose(solver.last_tvec, np.asarray([[0.0], [0.0], [201.0]]))
+    assert not hasattr(solver, "last_tvec")
 
 
 def test_graph_pnp_solver_prunes_high_error_points_once(monkeypatch):
@@ -1787,9 +2076,10 @@ def test_solve_lattice_graph_pnp_prefers_visible_surface_candidate(monkeypatch):
     np.testing.assert_allclose(result.rvec, visible_rvec)
 
 
-def test_draw_pnp_cube_draws_only_correspondence_point_markers(monkeypatch):
+def test_draw_pnp_cube_draws_only_projected_object_point_markers(monkeypatch):
     line_calls = []
     circle_calls = []
+    text_calls = []
     result = SimpleNamespace(
         projected_display_points=np.asarray(
             [[10.0, 10.0], [20.0, 10.0], [20.0, 20.0]],
@@ -1801,7 +2091,10 @@ def test_draw_pnp_cube_draws_only_correspondence_point_markers(monkeypatch):
         ),
         display_edge_indexes=((0, 1), (1, 2)),
         edge_indexes=tuple(),
-        image_points=np.asarray([[20.0, 20.0]], dtype=np.float32),
+        image_points=np.asarray(
+            [[20.0, 20.0], [24.0, 20.0], [24.0, 24.0]],
+            dtype=np.float32,
+        ),
         camera_matrix=piece_seg_script.default_camera_matrix((32, 32)),
         lattice_transform=piece_seg_script.CUBE_LATTICE_IDENTITY_TRANSFORM,
     )
@@ -1816,6 +2109,11 @@ def test_draw_pnp_cube_draws_only_correspondence_point_markers(monkeypatch):
         "circle",
         lambda *args, **kwargs: circle_calls.append((args, kwargs)),
     )
+    monkeypatch.setattr(
+        piece_seg_script.cv2,
+        "putText",
+        lambda *args, **kwargs: text_calls.append((args, kwargs)),
+    )
 
     piece_seg_script.draw_pnp_cube(np.zeros((32, 32, 3), dtype=np.uint8), result)
 
@@ -1823,6 +2121,7 @@ def test_draw_pnp_cube_draws_only_correspondence_point_markers(monkeypatch):
     assert len(circle_calls) == 4
     centers = [call[0][1] for call in circle_calls]
     assert centers == [(12, 12), (12, 12), (18, 18), (18, 18)]
+    assert not any("1:" in call[0][1] for call in text_calls)
 
 
 def test_draw_pose_graph_correspondence_highlights_used_graph_and_labels_coords():

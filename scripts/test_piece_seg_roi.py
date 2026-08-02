@@ -44,9 +44,10 @@ DEFAULT_POSE_MODEL = (
 )
 ENABLE_STICKER_SEGMENTATION = False
 ENABLE_POSE_ESTIMATION = True
+ENABLE_POSE_GRAPH_CORRESPONDENCE = True
 DRAW_POSE_KEYPOINTS = True
 DRAW_PNP_CUBE = True
-DRAW_CORNER_ADJACENCY = False
+DRAW_CORNER_ADJACENCY = True
 DRAW_POSE_GRAPH_COORDS = False
 DISPLAY_WINDOW_NAME = "cube sticker segmentations"
 DISPLAY_PREVIEW_BY_DEFAULT = True
@@ -54,29 +55,24 @@ SHOW_ORIGINAL_UNDERLAY_BY_DEFAULT = True
 POSE_IMAGE_SIZE = 256
 POSE_OBJECT_CONFIDENCE = 0.5
 POSE_KEYPOINT_CONFIDENCE = 0.8
+ADJACENCY_REFERENCE_ROI_SIZE_PX = 600.0
 PNP_FOCAL_SCALE_MIN = 0.7
 PNP_FOCAL_SCALE_MAX = 1.8
 PNP_FOCAL_SCALE_STEPS = 5
 PNP_CAMERA_BOOTSTRAP_FRAME_COUNT = 12
 PNP_MAX_REPROJECTION_ERROR_PX = 12.0
 PNP_INLIER_THRESHOLD_PX = 10.0
+PNP_MAX_OBSERVED_OUTLIER_FRACTION = 0.10
 PNP_PRUNE_REPROJECTION_ERROR_PX = 18.0
-PNP_MAX_FRAME_TRANSLATION_MM = 50.0
-ADJACENCY_CANNY_BLUR_KERNEL = 5
-ADJACENCY_CANNY_LOW = 60
+ADJACENCY_CANNY_BLUR_KERNEL = 1
+ADJACENCY_CANNY_LOW = 30
 ADJACENCY_CANNY_HIGH = 160
-ADJACENCY_HOUGH_THRESHOLD = 28
-ADJACENCY_HOUGH_MIN_LINE_LENGTH = 24
-ADJACENCY_HOUGH_MAX_LINE_GAP = 10
-ADJACENCY_MAX_ANGLE_DEGREES = 10.0
-ADJACENCY_MAX_LINE_DISTANCE_PX = 9.0
 ADJACENCY_MIN_EDGE_LENGTH_PX = 32.0
-ADJACENCY_MIN_COVERAGE = 0.95
+ADJACENCY_MIN_COVERAGE = 1
 ADJACENCY_MAX_UNCOVERED_GAP_RATIO = 0.05
 ADJACENCY_MAX_AVERAGE_LENGTH_RATIO = 1.8
-ADJACENCY_INTERVAL_PADDING_PX = 5.0
-ADJACENCY_EDGE_DILATION_PX = 8
-ADJACENCY_KEYPOINT_INTERSECTION_DISTANCE_PX = 7.0
+ADJACENCY_EDGE_DILATION_PX = 9
+ADJACENCY_KEYPOINT_INTERSECTION_DISTANCE_PX = 5
 DEFAULT_STICKER_MASK_COLOR = (150, 150, 150)
 FACE_INSTANCE_MASK_COLORS = (
     (255, 80, 80),
@@ -166,8 +162,19 @@ PNP_CUBE_LINE_COLOR = (255, 80, 30)
 PNP_CUBE_POINT_COLOR = (30, 180, 255)
 PNP_CUBE_STATIC_LINE_COLOR = (100, 100, 100)
 PNP_CUBE_SEAM_LINE_COLOR = (255, 220, 80)
+PNP_DEBUG_POSE_COLORS = (
+    (255, 80, 80),
+    (80, 220, 255),
+    (80, 255, 120),
+    (255, 120, 255),
+    (255, 220, 80),
+    (180, 120, 255),
+)
+PNP_DEBUG_POSE_ALPHA = 0.30
 POSE_GRAPH_CORRESPONDENCE_LINE_COLOR = (255, 80, 255)
 POSE_GRAPH_CORRESPONDENCE_TEXT_COLOR = (255, 255, 255)
+POSE_GRAPH_EDGE_STRIP_COLOR = (80, 220, 255)
+POSE_GRAPH_EDGE_STRIP_ALPHA = 0.22
 PNP_REPROJECTION_RESIDUAL_COLOR = (0, 255, 255)
 
 
@@ -283,6 +290,10 @@ class PosePnPResult:
     lattice_transform: tuple[tuple[int, int, int], tuple[int, int, int]] = CUBE_LATTICE_IDENTITY_TRANSFORM
     invisible_point_count: int = 0
     observed_reprojection_error: float | None = None
+    correspondence_lattice_coords: tuple[tuple[int, int, int], ...] = tuple()
+    correspondence_face: tuple[int, int] | None = None
+    correspondence_face_normal_z: float | None = None
+    debug_pose_candidates: tuple["PosePnPResult", ...] = tuple()
 
 
 @dataclass(frozen=True)
@@ -343,11 +354,10 @@ class PoseGraphPnPSolver:
     camera_bootstrap_frames: int = PNP_CAMERA_BOOTSTRAP_FRAME_COUNT
     max_reprojection_error_px: float = PNP_MAX_REPROJECTION_ERROR_PX
     inlier_threshold_px: float = PNP_INLIER_THRESHOLD_PX
+    max_observed_outlier_fraction: float = PNP_MAX_OBSERVED_OUTLIER_FRACTION
     prune_reprojection_error_px: float = PNP_PRUNE_REPROJECTION_ERROR_PX
-    max_frame_translation_mm: float = PNP_MAX_FRAME_TRANSLATION_MM
     camera_matrix: np.ndarray | None = None
     accepted_pose_count: int = 0
-    last_tvec: np.ndarray | None = None
 
     def solve_correspondences(
         self,
@@ -357,7 +367,6 @@ class PoseGraphPnPSolver:
         profile: dict[str, float | int] | None = None,
     ) -> PosePnPResult | None:
         if correspondence is None:
-            self.reset_temporal_tracking()
             return None
 
         original_correspondence = correspondence
@@ -411,37 +420,16 @@ class PoseGraphPnPSolver:
             or observed_error > self.max_reprojection_error_px
         ):
             return None
-        if not pose_translation_motion_is_valid(
-            self.last_tvec,
-            getattr(result, "tvec", None),
-            max_translation_mm=self.max_frame_translation_mm,
-        ):
-            return None
         result.observed_reprojection_error = observed_error
         result.point_names = tuple(str(coord) for coord in correspondence.lattice_coords)
         result.pose_label = "graph"
-        if getattr(result, "tvec", None) is not None:
-            self.last_tvec = np.asarray(result.tvec, dtype=np.float64).reshape(3, 1).copy()
         if getattr(result, "camera_matrix", None) is not None:
             self.camera_matrix = np.asarray(result.camera_matrix, dtype=np.float64).reshape(3, 3).copy()
         self.accepted_pose_count += 1
         return result
 
     def reset_temporal_tracking(self) -> None:
-        self.last_tvec = None
-
-
-def pose_translation_motion_is_valid(
-    previous_tvec: np.ndarray | None,
-    current_tvec: np.ndarray | None,
-    *,
-    max_translation_mm: float,
-) -> bool:
-    if previous_tvec is None or current_tvec is None:
-        return True
-    previous = np.asarray(previous_tvec, dtype=np.float64).reshape(3)
-    current = np.asarray(current_tvec, dtype=np.float64).reshape(3)
-    return float(np.linalg.norm(current - previous)) <= float(max_translation_mm)
+        pass
 
 
 def prune_high_error_pose_graph_correspondence(
@@ -861,6 +849,39 @@ def square_roi_from_center(
     return x1, y1, x1 + side_px, y1 + side_px
 
 
+def roi_side_px(roi_xyxy: tuple[int, int, int, int]) -> float:
+    x1, y1, x2, y2 = roi_xyxy
+    return float(max(1, max(x2 - x1, y2 - y1)))
+
+
+def adjacency_roi_scale(roi_side: float, args) -> float:
+    reference_side = max(
+        1.0,
+        float(getattr(args, "adjacency_reference_roi_size", ADJACENCY_REFERENCE_ROI_SIZE_PX)),
+    )
+    return max(1.0, float(roi_side)) / reference_side
+
+
+def scaled_adjacency_px(
+    value: float,
+    roi_side: float,
+    args,
+    *,
+    min_value: float = 0.0,
+) -> float:
+    return max(float(min_value), float(value) * adjacency_roi_scale(roi_side, args))
+
+
+def scaled_adjacency_int_px(
+    value: float,
+    roi_side: float,
+    args,
+    *,
+    min_value: int = 0,
+) -> int:
+    return max(int(min_value), int(round(scaled_adjacency_px(value, roi_side, args))))
+
+
 def apply_mask_padding(mask: np.ndarray, padding_px: int) -> np.ndarray:
     if padding_px == 0 or not bool(mask.any()):
         return mask
@@ -1111,6 +1132,43 @@ def invisible_surface_point_count(object_points: np.ndarray, rvec: np.ndarray) -
     return invisible_count
 
 
+def object_point_has_visible_surface(object_point: np.ndarray, rvec: np.ndarray) -> bool:
+    point = np.asarray(object_point, dtype=np.float32).reshape(3)
+    rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    for axis in range(3):
+        if abs(float(point[axis]) + CUBE_HALF_SIZE_MM) <= 1e-3:
+            normal = np.zeros(3, dtype=np.float64)
+            normal[axis] = -1.0
+        elif abs(float(point[axis]) - CUBE_HALF_SIZE_MM) <= 1e-3:
+            normal = np.zeros(3, dtype=np.float64)
+            normal[axis] = 1.0
+        else:
+            continue
+        camera_normal = rotation @ normal
+        if float(camera_normal[2]) < 0.0:
+            return True
+    return False
+
+
+def lattice_boundary_face_is_visible(
+    face: tuple[int, int],
+    rvec: np.ndarray,
+) -> bool:
+    return lattice_boundary_face_camera_normal_z(face, rvec) < 0.0
+
+
+def lattice_boundary_face_camera_normal_z(
+    face: tuple[int, int],
+    rvec: np.ndarray,
+) -> float:
+    axis, value = face
+    normal = np.zeros(3, dtype=np.float64)
+    normal[int(axis)] = -1.0 if int(value) == 0 else 1.0
+    rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    camera_normal = rotation @ normal
+    return float(camera_normal[2])
+
+
 def graph_camera_matrix_candidates(
     image_size: tuple[int, int],
     *,
@@ -1187,11 +1245,42 @@ def solve_lattice_graph_pnp(
     display_points: np.ndarray,
     display_edge_indexes: tuple[tuple[int, int], ...],
 ) -> PosePnPResult | None:
+    candidates = solve_lattice_graph_pnp_candidates(
+        image_points,
+        object_points,
+        camera_matrix,
+        display_points=display_points,
+        display_edge_indexes=display_edge_indexes,
+    )
+    if not candidates:
+        return None
+
+    best_result = None
+    for result in candidates:
+        candidate = (
+            int(getattr(result, "invisible_point_count", 0)),
+            float(result.matched_error),
+        )
+        if best_result is None:
+            best_result = (candidate, result)
+        elif candidate < best_result[0]:
+            best_result = (candidate, result)
+    return None if best_result is None else best_result[1]
+
+
+def solve_lattice_graph_pnp_candidates(
+    image_points: np.ndarray,
+    object_points: np.ndarray,
+    camera_matrix: np.ndarray,
+    *,
+    display_points: np.ndarray,
+    display_edge_indexes: tuple[tuple[int, int], ...],
+) -> list[PosePnPResult]:
     image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
     object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
     display_points = np.asarray(display_points, dtype=np.float32).reshape(-1, 3)
     if len(image_points) != len(object_points) or len(image_points) < 3:
-        return None
+        return []
 
     dist_coeffs = np.zeros((4, 1), dtype=np.float64)
     try:
@@ -1203,11 +1292,11 @@ def solve_lattice_graph_pnp(
             flags=cv2.SOLVEPNP_SQPNP,
         )
     except cv2.error:
-        return None
+        return []
     if not ok or not rvecs or not tvecs:
-        return None
+        return []
 
-    best_result = None
+    candidates: list[PosePnPResult] = []
     for rvec, tvec in zip(rvecs, tvecs):
         try:
             rvec, tvec = cv2.solvePnPRefineLM(
@@ -1231,53 +1320,36 @@ def solve_lattice_graph_pnp(
         reprojection_distances = np.linalg.norm(projected_graph_points - image_points, axis=1)
         matched_error = float(np.mean(reprojection_distances))
         invisible_count = invisible_surface_point_count(object_points, rvec)
-        candidate = (invisible_count, matched_error, rvec, tvec, projected_graph_points)
-        if best_result is None or candidate[0] < best_result[0]:
-            best_result = candidate
-        elif best_result is not None and candidate[0] == best_result[0] and candidate[1] < best_result[1]:
-            best_result = candidate
-    if best_result is None:
-        return None
 
-    invisible_count, matched_error, rvec, tvec, projected_graph_points = best_result
-    inlier_count = int(len(image_points))
-    error = matched_error
-
-    projected_graph_points, _ = cv2.projectPoints(
-        object_points,
-        rvec,
-        tvec,
-        camera_matrix,
-        dist_coeffs,
-    )
-    projected_graph_points = projected_graph_points.reshape(-1, 2)
-
-    projected_display_points, _ = cv2.projectPoints(
-        display_points,
-        rvec,
-        tvec,
-        camera_matrix,
-        dist_coeffs,
-    )
-    projected_display_points = projected_display_points.reshape(-1, 2)
-    return PosePnPResult(
-        error=error,
-        inlier_count=inlier_count,
-        matched_error=matched_error,
-        camera_matrix=np.asarray(camera_matrix, dtype=np.float64),
-        dist_coeffs=dist_coeffs,
-        rvec=rvec,
-        tvec=tvec,
-        image_points=image_points,
-        object_points=object_points,
-        display_points=display_points,
-        projected_object_points=projected_graph_points,
-        projected_display_points=projected_display_points,
-        point_names=tuple(),
-        edge_indexes=tuple(),
-        display_edge_indexes=display_edge_indexes,
-        invisible_point_count=int(invisible_count),
-    )
+        projected_display_points, _ = cv2.projectPoints(
+            display_points,
+            rvec,
+            tvec,
+            camera_matrix,
+            dist_coeffs,
+        )
+        projected_display_points = projected_display_points.reshape(-1, 2)
+        candidates.append(
+            PosePnPResult(
+                error=matched_error,
+                inlier_count=int(len(image_points)),
+                matched_error=matched_error,
+                camera_matrix=np.asarray(camera_matrix, dtype=np.float64),
+                dist_coeffs=dist_coeffs,
+                rvec=rvec,
+                tvec=tvec,
+                image_points=image_points,
+                object_points=object_points,
+                display_points=display_points,
+                projected_object_points=projected_graph_points,
+                projected_display_points=projected_display_points,
+                point_names=tuple(),
+                edge_indexes=tuple(),
+                display_edge_indexes=display_edge_indexes,
+                invisible_point_count=int(invisible_count),
+            )
+        )
+    return candidates
 
 
 def draw_pose_keypoints(
@@ -1345,6 +1417,8 @@ def draw_pnp_cube(frame: np.ndarray, result: PosePnPResult | None) -> None:
     if result is None:
         return
 
+    draw_pnp_debug_pose_candidates(frame, result)
+
     image_points = np.asarray(result.image_points, dtype=np.float32).reshape(-1, 2)
     projected_object_points = np.asarray(result.projected_object_points, dtype=np.float32).reshape(-1, 2)
     residuals = (
@@ -1374,10 +1448,14 @@ def draw_pnp_cube(frame: np.ndarray, result: PosePnPResult | None) -> None:
         focal = float(result.camera_matrix[0, 0])
         axis_order, signs = result.lattice_transform
         observed_error = getattr(result, "observed_reprojection_error", None)
-        observed_label = "" if observed_error is None else f" obs {observed_error:.1f}"
+        display_error = float(np.mean(residuals)) if observed_error is None else float(observed_error)
+        fit_label = "" if observed_error is None else f" fit {float(np.mean(residuals)):.1f}"
+        face = getattr(result, "correspondence_face", None)
+        face_normal_z = getattr(result, "correspondence_face_normal_z", None)
+        face_label = "" if face is None or face_normal_z is None else f" face {face} nz {face_normal_z:.2f}"
         label = (
-            f"pnp err mean {float(np.mean(residuals)):.1f} max {float(np.max(residuals)):.1f}{observed_label} "
-            f"f {focal:.0f} axes {axis_order} signs {signs}"
+            f"pnp err {display_error:.1f}{fit_label} max {float(np.max(residuals)):.1f} "
+            f"f {focal:.0f}{face_label} axes {axis_order} signs {signs}"
         )
         cv2.putText(
             frame,
@@ -1401,14 +1479,72 @@ def draw_pnp_cube(frame: np.ndarray, result: PosePnPResult | None) -> None:
         )
 
 
+def draw_pnp_debug_pose_candidates(frame: np.ndarray, result: PosePnPResult) -> None:
+    candidates = tuple(getattr(result, "debug_pose_candidates", tuple()))
+    if not candidates:
+        return
+
+    overlay = frame.copy()
+    for candidate_index, candidate in enumerate(candidates):
+        projected = np.asarray(candidate.projected_display_points, dtype=np.float32).reshape(-1, 2)
+        edge_indexes = candidate.display_edge_indexes or candidate.edge_indexes
+        if len(projected) == 0 or not edge_indexes:
+            continue
+        color = PNP_DEBUG_POSE_COLORS[candidate_index % len(PNP_DEBUG_POSE_COLORS)]
+        for start, end in edge_indexes:
+            start_point = tuple(np.round(projected[start]).astype(int))
+            end_point = tuple(np.round(projected[end]).astype(int))
+            cv2.line(overlay, start_point, end_point, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+            cv2.line(overlay, start_point, end_point, color, 1, lineType=cv2.LINE_AA)
+
+        label_point = tuple(np.round(projected[0]).astype(int))
+        label = f"{candidate_index + 1}:{float(getattr(candidate, 'observed_reprojection_error', 0.0)):.1f}"
+        cv2.putText(
+            overlay,
+            label,
+            (label_point[0] + 4, label_point[1] + 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            overlay,
+            label,
+            (label_point[0] + 4, label_point[1] + 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+    cv2.addWeighted(
+        overlay,
+        float(PNP_DEBUG_POSE_ALPHA),
+        frame,
+        1.0 - float(PNP_DEBUG_POSE_ALPHA),
+        0.0,
+        dst=frame,
+    )
+
+
 def odd_kernel(value: int) -> int:
     value = max(1, int(value))
     return value if value % 2 == 1 else value + 1
 
 
-def build_adjacency_edge_map(roi: np.ndarray, args) -> np.ndarray:
+def build_adjacency_edge_map(roi: np.ndarray, args, *, roi_side: float | None = None) -> np.ndarray:
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    blur_kernel = odd_kernel(getattr(args, "adjacency_canny_blur", ADJACENCY_CANNY_BLUR_KERNEL))
+    roi_side = float(max(roi.shape[:2])) if roi_side is None else float(roi_side)
+    blur_kernel = odd_kernel(
+        scaled_adjacency_int_px(
+            getattr(args, "adjacency_canny_blur", ADJACENCY_CANNY_BLUR_KERNEL),
+            roi_side,
+            args,
+            min_value=1,
+        )
+    )
     if blur_kernel > 1:
         gray = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
     canny_low = max(0, int(getattr(args, "adjacency_canny_low", ADJACENCY_CANNY_LOW)))
@@ -1525,8 +1661,18 @@ def edge_support_along_segment(
     return merged_interval_coverage(intervals, length)
 
 
-def dilated_adjacency_edge_map(edge_map: np.ndarray, args) -> np.ndarray:
-    dilation_px = max(0, int(getattr(args, "adjacency_edge_dilation", ADJACENCY_EDGE_DILATION_PX)))
+def dilated_adjacency_edge_map(
+    edge_map: np.ndarray,
+    args,
+    *,
+    roi_side: float | None = None,
+) -> np.ndarray:
+    roi_side = float(max(edge_map.shape[:2])) if roi_side is None else float(roi_side)
+    dilation_px = scaled_adjacency_int_px(
+        getattr(args, "adjacency_edge_dilation", ADJACENCY_EDGE_DILATION_PX),
+        roi_side,
+        args,
+    )
     if dilation_px <= 0:
         return edge_map
     kernel_size = (dilation_px * 2) + 1
@@ -1534,11 +1680,22 @@ def dilated_adjacency_edge_map(edge_map: np.ndarray, args) -> np.ndarray:
     return cv2.dilate(edge_map, kernel)
 
 
+def adjacency_edge_strip_width_px(args, *, roi_side: float) -> int:
+    dilation_px = scaled_adjacency_int_px(
+        getattr(args, "adjacency_edge_dilation", ADJACENCY_EDGE_DILATION_PX),
+        roi_side,
+        args,
+    )
+    return (dilation_px * 2) + 1
+
+
 def segment_skips_observed_keypoint(
     points: list[PoseGraphPoint],
     start_index: int,
     end_index: int,
     args,
+    *,
+    roi_side: float,
 ) -> bool:
     start = np.asarray(points[start_index].xy, dtype=np.float32)
     end = np.asarray(points[end_index].xy, dtype=np.float32)
@@ -1550,12 +1707,14 @@ def segment_skips_observed_keypoint(
     unit = delta / length
     intersection_distance = max(
         0.0,
-        float(
+        scaled_adjacency_px(
             getattr(
                 args,
                 "adjacency_keypoint_intersection_distance",
                 ADJACENCY_KEYPOINT_INTERSECTION_DISTANCE_PX,
-            )
+            ),
+            roi_side,
+            args,
         ),
     )
     endpoint_margin = min(intersection_distance, length * 0.25)
@@ -1582,7 +1741,8 @@ def pose_graph_edge_evidence(
         return []
 
     roi_offset = np.asarray(roi_xyxy[:2], dtype=np.float32)
-    sampled_edges = dilated_adjacency_edge_map(edge_map, args)
+    roi_side = roi_side_px(roi_xyxy)
+    sampled_edges = dilated_adjacency_edge_map(edge_map, args, roi_side=roi_side)
     min_coverage = max(
         0.0,
         min(1.0, float(getattr(args, "adjacency_min_coverage", ADJACENCY_MIN_COVERAGE))),
@@ -1599,7 +1759,11 @@ def pose_graph_edge_evidence(
     )
     min_edge_length = max(
         0.0,
-        float(getattr(args, "adjacency_min_edge_length", ADJACENCY_MIN_EDGE_LENGTH_PX)),
+        scaled_adjacency_px(
+            getattr(args, "adjacency_min_edge_length", ADJACENCY_MIN_EDGE_LENGTH_PX),
+            roi_side,
+            args,
+        ),
     )
 
     graph_edges: list[PoseGraphEdge] = []
@@ -1611,7 +1775,13 @@ def pose_graph_edge_evidence(
         )
         if length < min_edge_length:
             continue
-        skips_keypoint = segment_skips_observed_keypoint(points, start_index, end_index, args)
+        skips_keypoint = segment_skips_observed_keypoint(
+            points,
+            start_index,
+            end_index,
+            args,
+            roi_side=roi_side,
+        )
         if skips_keypoint:
             coverage, max_gap = 0.0, length
         else:
@@ -1692,7 +1862,8 @@ def build_pose_graph(
         return PoseGraph(points=tuple(points), edges=tuple())
     profile = getattr(args, "_pose_profile", None)
     started = perf_counter()
-    edges = build_adjacency_edge_map(roi, args)
+    side = roi_side_px(roi_xyxy)
+    edges = build_adjacency_edge_map(roi, args, roi_side=side)
     if profile is not None:
         profile["edge_map_ms"] = (perf_counter() - started) * 1000.0
         started = perf_counter()
@@ -1764,6 +1935,8 @@ CUBE_LATTICE_COORDS_BY_CLASS = {
     class_name: tuple(coord for coord in CUBE_LATTICE_COORDS if cube_lattice_class(coord) == class_name)
     for class_name in ("corner", "corner-edge", "corner-edge-center")
 }
+
+
 CUBE_LATTICE_POINT_BY_COORD = {
     coord: CUBE_LATTICE_POINTS_MM[index]
     for index, coord in enumerate(CUBE_LATTICE_COORDS)
@@ -1783,6 +1956,140 @@ CUBE_LATTICE_DISPLAY_EDGE_INDEXES = tuple(
     and sum(abs(start_value - end_value) for start_value, end_value in zip(start_coord, end_coord))
     == CUBE_GRID_MAX_INDEX
 )
+
+
+def shared_lattice_boundary_faces(
+    lattice_coords: tuple[tuple[int, int, int], ...],
+) -> frozenset[tuple[int, int]]:
+    if not lattice_coords:
+        return frozenset()
+    shared_faces = set(cube_lattice_boundary_faces(lattice_coords[0]))
+    for coord in lattice_coords[1:]:
+        shared_faces &= set(cube_lattice_boundary_faces(coord))
+    return frozenset(shared_faces)
+
+
+def lattice_correspondence_face_is_visible(
+    lattice_coords: tuple[tuple[int, int, int], ...],
+    rvec: np.ndarray,
+) -> bool:
+    shared_faces = shared_lattice_boundary_faces(lattice_coords)
+    if not shared_faces:
+        return False
+    return any(lattice_boundary_face_is_visible(face, rvec) for face in shared_faces)
+
+
+def projected_lattice_points_by_class(
+    result: PosePnPResult,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    projected_by_class: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if any(
+        getattr(result, attribute, None) is None
+        for attribute in ("rvec", "tvec", "camera_matrix", "dist_coeffs")
+    ):
+        return projected_by_class
+
+    for class_name in ("corner", "corner-edge", "corner-edge-center"):
+        coords = CUBE_LATTICE_COORDS_BY_CLASS[class_name]
+        object_points = cube_lattice_points_for_coords(
+            coords,
+            lattice_transform=getattr(result, "lattice_transform", CUBE_LATTICE_IDENTITY_TRANSFORM),
+        )
+        try:
+            projected_points, _ = cv2.projectPoints(
+                object_points,
+                result.rvec,
+                result.tvec,
+                result.camera_matrix,
+                result.dist_coeffs,
+            )
+        except cv2.error:
+            continue
+        projected_by_class[class_name] = (
+            projected_points.reshape(-1, 2).astype(np.float32, copy=False),
+            object_points.astype(np.float32, copy=False),
+        )
+    return projected_by_class
+
+
+def observed_pose_model_nearest_same_class_score(
+    result: PosePnPResult,
+    observed_graph: PoseGraph,
+    *,
+    inlier_threshold_px: float,
+) -> tuple[float, int, int, int]:
+    projected_by_class = projected_lattice_points_by_class(result)
+    errors = []
+    invisible_observed_count = 0
+    observed_point_count = 0
+    observed_points_by_class: dict[str, list[PoseGraphPoint]] = {
+        class_name: [
+            point
+            for point in observed_graph.points
+            if point.class_name == class_name
+        ]
+        for class_name in ("corner", "corner-edge", "corner-edge-center")
+    }
+    for class_name, observed_points in observed_points_by_class.items():
+        if not observed_points:
+            continue
+        projected_entry = projected_by_class.get(class_name)
+        if projected_entry is None:
+            continue
+        projected_points, object_points = projected_entry
+        if len(projected_points) == 0:
+            continue
+
+        visible_mask = np.asarray(
+            [
+                object_point_has_visible_surface(object_point, result.rvec)
+                for object_point in object_points
+            ],
+            dtype=bool,
+        )
+        candidate_projected_points = projected_points[visible_mask]
+        using_invisible_fallback = False
+        if len(candidate_projected_points) == 0:
+            candidate_projected_points = projected_points
+            using_invisible_fallback = True
+
+        observed_xy = np.asarray([point.xy for point in observed_points], dtype=np.float32).reshape(-1, 2)
+        distance_matrix = np.linalg.norm(
+            observed_xy[:, None, :] - candidate_projected_points[None, :, :],
+            axis=2,
+        )
+        assigned_observed: set[int] = set()
+        assigned_model: set[int] = set()
+        ranked_pairs = sorted(
+            (
+                (float(distance_matrix[observed_index, model_index]), observed_index, model_index)
+                for observed_index in range(distance_matrix.shape[0])
+                for model_index in range(distance_matrix.shape[1])
+            ),
+            key=lambda item: item[0],
+        )
+        for distance, observed_index, model_index in ranked_pairs:
+            if observed_index in assigned_observed or model_index in assigned_model:
+                continue
+            assigned_observed.add(observed_index)
+            assigned_model.add(model_index)
+            errors.append(distance)
+
+        for observed_index in range(len(observed_points)):
+            if observed_index in assigned_observed:
+                continue
+            errors.append(float(distance_matrix[observed_index].min()))
+
+        observed_point_count += len(observed_points)
+        if using_invisible_fallback:
+            invisible_observed_count += len(observed_points)
+
+    if not errors:
+        return float("inf"), 0, observed_point_count, invisible_observed_count
+    inlier_count = sum(error <= float(inlier_threshold_px) for error in errors)
+    return float(np.mean(errors)), int(inlier_count), len(errors), invisible_observed_count
+
+
 CUBE_LATTICE_BOUNDARY_FACES_BY_COORD = {
     coord: frozenset(
         (axis, value)
@@ -2373,11 +2680,41 @@ def draw_pose_graph_adjacencies(
     frame: np.ndarray,
     graph: PoseGraph,
     args,
+    *,
+    roi_side: float | None = None,
 ) -> int:
     if len(graph.points) < 2:
         return 0
 
     accepted_count = 0
+    roi_side = (
+        ADJACENCY_REFERENCE_ROI_SIZE_PX
+        if roi_side is None
+        else float(roi_side)
+    )
+    strip_width_px = adjacency_edge_strip_width_px(args, roi_side=roi_side)
+    if strip_width_px > 1:
+        strip_overlay = frame.copy()
+        for adjacency in graph.edges:
+            start = tuple(np.round(graph.points[adjacency.start_index].xy).astype(int))
+            end = tuple(np.round(graph.points[adjacency.end_index].xy).astype(int))
+            cv2.line(
+                strip_overlay,
+                start,
+                end,
+                POSE_GRAPH_EDGE_STRIP_COLOR,
+                strip_width_px,
+                lineType=cv2.LINE_AA,
+            )
+        cv2.addWeighted(
+            strip_overlay,
+            float(POSE_GRAPH_EDGE_STRIP_ALPHA),
+            frame,
+            1.0 - float(POSE_GRAPH_EDGE_STRIP_ALPHA),
+            0.0,
+            dst=frame,
+        )
+
     for adjacency in graph.edges:
         if not adjacency.accepted:
             continue
@@ -2500,7 +2837,7 @@ def draw_pose_estimate(
         profile["pose_points"] = len(pose_points)
     should_build_pose_graph = (
         getattr(args, "show_corner_adjacency", DRAW_CORNER_ADJACENCY)
-        or ENABLE_POSE_ESTIMATION
+        or ENABLE_POSE_GRAPH_CORRESPONDENCE
     )
     started = perf_counter()
     pose_graph = (
@@ -2512,7 +2849,7 @@ def draw_pose_estimate(
         profile["graph_total_ms"] = (perf_counter() - started) * 1000.0
     started = perf_counter()
     if getattr(args, "show_corner_adjacency", DRAW_CORNER_ADJACENCY):
-        draw_pose_graph_adjacencies(frame, pose_graph, args)
+        draw_pose_graph_adjacencies(frame, pose_graph, args, roi_side=roi_side_px(roi_xyxy))
     if profile is not None:
         profile["draw_adjacency_ms"] = (perf_counter() - started) * 1000.0
 
@@ -2535,7 +2872,7 @@ def draw_pose_estimate(
     graph_image_points = np.asarray([point.xy for point in pose_graph.points], dtype=np.float32)
     pose_tracking_bounds_xyxy = point_bounds_xyxy(graph_image_points, roi_xyxy)
     pnp_result = None
-    if ENABLE_POSE_ESTIMATION and pose_solver is not None:
+    if ENABLE_POSE_ESTIMATION and ENABLE_POSE_GRAPH_CORRESPONDENCE and pose_solver is not None:
         started = perf_counter()
         correspondence = vector_guided_pose_graph_correspondence(pose_graph)
         if profile is not None:
@@ -3301,7 +3638,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--adjacency-canny-blur",
         type=int,
         default=ADJACENCY_CANNY_BLUR_KERNEL,
-        help="Gaussian blur kernel before Canny for corner adjacency evidence",
+        help="Gaussian blur kernel before Canny, in pixels at the reference ROI size",
     )
     parser.add_argument(
         "--adjacency-canny-low",
@@ -3316,40 +3653,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Upper Canny threshold for corner adjacency evidence",
     )
     parser.add_argument(
-        "--adjacency-hough-threshold",
-        type=int,
-        default=ADJACENCY_HOUGH_THRESHOLD,
-        help="Minimum Hough votes for line evidence used in corner adjacency",
-    )
-    parser.add_argument(
-        "--adjacency-hough-min-line-length",
-        type=int,
-        default=ADJACENCY_HOUGH_MIN_LINE_LENGTH,
-        help="Minimum Hough line length in pixels for corner adjacency evidence",
-    )
-    parser.add_argument(
-        "--adjacency-hough-max-line-gap",
-        type=int,
-        default=ADJACENCY_HOUGH_MAX_LINE_GAP,
-        help="Maximum Hough line gap in pixels for corner adjacency evidence",
-    )
-    parser.add_argument(
-        "--adjacency-max-angle-degrees",
-        type=float,
-        default=ADJACENCY_MAX_ANGLE_DEGREES,
-        help="Maximum angle difference between a Hough line and a corner-pair segment",
-    )
-    parser.add_argument(
-        "--adjacency-max-line-distance",
-        type=float,
-        default=ADJACENCY_MAX_LINE_DISTANCE_PX,
-        help="Maximum perpendicular distance from Hough line endpoints to the corner-pair segment",
-    )
-    parser.add_argument(
         "--adjacency-min-edge-length",
         type=float,
         default=ADJACENCY_MIN_EDGE_LENGTH_PX,
-        help="Ignore candidate pose graph connections shorter than this many pixels",
+        help="Ignore candidate pose graph connections shorter than this many pixels at the reference ROI size",
     )
     parser.add_argument(
         "--adjacency-min-coverage",
@@ -3364,22 +3671,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum uncovered gap as a fraction of the corner-pair distance",
     )
     parser.add_argument(
-        "--adjacency-interval-padding",
-        type=float,
-        default=ADJACENCY_INTERVAL_PADDING_PX,
-        help="Pixels added to each projected Hough interval before measuring coverage",
-    )
-    parser.add_argument(
         "--adjacency-edge-dilation",
         type=int,
         default=ADJACENCY_EDGE_DILATION_PX,
-        help="Half-width in pixels around candidate pose graph connections checked for Canny edge support",
+        help="Half-width in pixels at the reference ROI size around candidate pose graph connections checked for Canny edge support",
     )
     parser.add_argument(
         "--adjacency-keypoint-intersection-distance",
         type=float,
         default=ADJACENCY_KEYPOINT_INTERSECTION_DISTANCE_PX,
-        help="Reject candidate pose graph connections that pass within this many pixels of another keypoint",
+        help="Reject candidate pose graph connections that pass within this many reference-ROI pixels of another keypoint",
+    )
+    parser.add_argument(
+        "--adjacency-reference-roi-size",
+        type=float,
+        default=ADJACENCY_REFERENCE_ROI_SIZE_PX,
+        help="ROI side length represented by the adjacency pixel defaults",
     )
     parser.set_defaults(
         show_bbox=True,
