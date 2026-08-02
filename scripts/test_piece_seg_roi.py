@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import random
 import sys
 from collections import deque
 from dataclasses import dataclass
@@ -47,7 +48,7 @@ ENABLE_POSE_ESTIMATION = True
 ENABLE_POSE_GRAPH_CORRESPONDENCE = True
 DRAW_POSE_KEYPOINTS = True
 DRAW_PNP_CUBE = True
-DRAW_CORNER_ADJACENCY = True
+DRAW_CORNER_ADJACENCY = False
 DRAW_POSE_GRAPH_COORDS = False
 DISPLAY_WINDOW_NAME = "cube sticker segmentations"
 DISPLAY_PREVIEW_BY_DEFAULT = True
@@ -60,18 +61,20 @@ PNP_FOCAL_SCALE_MIN = 0.7
 PNP_FOCAL_SCALE_MAX = 1.8
 PNP_FOCAL_SCALE_STEPS = 5
 PNP_CAMERA_BOOTSTRAP_FRAME_COUNT = 12
-PNP_MAX_REPROJECTION_ERROR_PX = 12.0
+PNP_MAX_REPROJECTION_ERROR_PX = 7
+PNP_REFINEMENT_REPROJECTION_ERROR_PX = 24
+PNP_MAX_REFINEMENT_ATTEMPTS = 12
 PNP_INLIER_THRESHOLD_PX = 10.0
 PNP_MAX_OBSERVED_OUTLIER_FRACTION = 0.10
 PNP_PRUNE_REPROJECTION_ERROR_PX = 18.0
 ADJACENCY_CANNY_BLUR_KERNEL = 1
 ADJACENCY_CANNY_LOW = 30
-ADJACENCY_CANNY_HIGH = 160
+ADJACENCY_CANNY_HIGH = 180
 ADJACENCY_MIN_EDGE_LENGTH_PX = 32.0
 ADJACENCY_MIN_COVERAGE = 1
-ADJACENCY_MAX_UNCOVERED_GAP_RATIO = 0.05
-ADJACENCY_MAX_AVERAGE_LENGTH_RATIO = 1.8
-ADJACENCY_EDGE_DILATION_PX = 9
+ADJACENCY_MAX_UNCOVERED_GAP_RATIO = 0.03
+ADJACENCY_MAX_AVERAGE_LENGTH_RATIO = 1.5
+ADJACENCY_EDGE_DILATION_PX = 7
 ADJACENCY_KEYPOINT_INTERSECTION_DISTANCE_PX = 5
 DEFAULT_STICKER_MASK_COLOR = (150, 150, 150)
 FACE_INSTANCE_MASK_COLORS = (
@@ -162,6 +165,9 @@ PNP_CUBE_LINE_COLOR = (255, 80, 30)
 PNP_CUBE_POINT_COLOR = (30, 180, 255)
 PNP_CUBE_STATIC_LINE_COLOR = (100, 100, 100)
 PNP_CUBE_SEAM_LINE_COLOR = (255, 220, 80)
+PNP_OBSERVED_MODEL_DISTANCE_COLOR = (0, 255, 255)
+PNP_OBSERVED_MODEL_DISTANCE_ALPHA = 0.35
+PNP_REFINEMENT_POINT_COLOR = (255, 0, 255)
 PNP_DEBUG_POSE_COLORS = (
     (255, 80, 80),
     (80, 220, 255),
@@ -293,6 +299,8 @@ class PosePnPResult:
     correspondence_lattice_coords: tuple[tuple[int, int, int], ...] = tuple()
     correspondence_face: tuple[int, int] | None = None
     correspondence_face_normal_z: float | None = None
+    refinement_graph_index: int | None = None
+    refinement_lattice_coord: tuple[int, int, int] | None = None
     debug_pose_candidates: tuple["PosePnPResult", ...] = tuple()
 
 
@@ -329,11 +337,21 @@ class PoseGraph:
 
 
 @dataclass(frozen=True)
+class FramePoseStats:
+    keypoint_count: int
+    valid_pose: bool
+
+
+@dataclass(frozen=True)
 class PoseGraphCorrespondence:
     image_points: np.ndarray
     object_points: np.ndarray
     graph_indexes: tuple[int, ...]
     lattice_coords: tuple[tuple[int, int, int], ...]
+
+    @property
+    def key(self) -> tuple[tuple[int, ...], tuple[tuple[int, int, int], ...]]:
+        return (tuple(self.graph_indexes), tuple(self.lattice_coords))
 
 
 @dataclass(frozen=True)
@@ -344,6 +362,7 @@ class PoseGraphNodeAssignment:
     local_to_global_frames: tuple[dict[str, tuple[int, int, int]], ...]
     path_faces: frozenset[tuple[int, int]]
     depth: int
+    has_turn: bool
 
 
 @dataclass
@@ -353,11 +372,42 @@ class PoseGraphPnPSolver:
     focal_steps: int = 5
     camera_bootstrap_frames: int = PNP_CAMERA_BOOTSTRAP_FRAME_COUNT
     max_reprojection_error_px: float = PNP_MAX_REPROJECTION_ERROR_PX
+    refinement_reprojection_error_px: float = PNP_REFINEMENT_REPROJECTION_ERROR_PX
+    max_refinement_attempts: int = PNP_MAX_REFINEMENT_ATTEMPTS
     inlier_threshold_px: float = PNP_INLIER_THRESHOLD_PX
     max_observed_outlier_fraction: float = PNP_MAX_OBSERVED_OUTLIER_FRACTION
     prune_reprojection_error_px: float = PNP_PRUNE_REPROJECTION_ERROR_PX
     camera_matrix: np.ndarray | None = None
+    lattice_transform: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
+    rejected_pose_result: PosePnPResult | None = None
+    last_tvec: np.ndarray | None = None
     accepted_pose_count: int = 0
+
+    def solve_correspondence_candidates(
+        self,
+        correspondences: tuple[PoseGraphCorrespondence, ...] | list[PoseGraphCorrespondence],
+        image_size: tuple[int, int],
+        observed_graph: PoseGraph | None = None,
+        profile: dict[str, float | int] | None = None,
+    ) -> PosePnPResult | None:
+        max_seed_attempts = max(0, int(self.max_refinement_attempts))
+        refinement_budget = {"remaining": max(0, int(self.max_refinement_attempts))}
+        self.rejected_pose_result = None
+        for correspondence in tuple(correspondences)[:max_seed_attempts]:
+            if profile is not None:
+                profile["seed_attempts"] = int(profile.get("seed_attempts", 0)) + 1
+            result = self.solve_correspondences(
+                correspondence,
+                image_size,
+                observed_graph=observed_graph,
+                profile=profile,
+                refinement_budget=refinement_budget,
+                clear_rejected=False,
+            )
+            if result is not None:
+                return result
+        self.clear_last_tvec()
+        return None
 
     def solve_correspondences(
         self,
@@ -365,9 +415,13 @@ class PoseGraphPnPSolver:
         image_size: tuple[int, int],
         observed_graph: PoseGraph | None = None,
         profile: dict[str, float | int] | None = None,
+        refinement_budget: dict[str, int] | None = None,
+        clear_rejected: bool = True,
     ) -> PosePnPResult | None:
+        if clear_rejected:
+            self.rejected_pose_result = None
         if correspondence is None:
-            return None
+            return self.miss_pose_result(clear_temporal=clear_rejected)
 
         original_correspondence = correspondence
         camera_matrix = (
@@ -375,6 +429,11 @@ class PoseGraphPnPSolver:
             if self.camera_matrix is not None
             and self.accepted_pose_count >= max(0, int(self.camera_bootstrap_frames))
             else None
+        )
+        lattice_transforms = (
+            (self.lattice_transform,)
+            if camera_matrix is not None and self.lattice_transform is not None
+            else CUBE_LATTICE_AXIS_TRANSFORMS
         )
         result = solve_best_lattice_graph_pnp_current(
             np.asarray(correspondence.image_points, dtype=np.float32).reshape(-1, 2),
@@ -384,52 +443,155 @@ class PoseGraphPnPSolver:
             focal_max=self.focal_max,
             focal_steps=self.focal_steps,
             camera_matrix=camera_matrix,
+            lattice_transforms=lattice_transforms,
+            previous_tvec=self.last_tvec,
             profile=profile,
         )
         if result is None:
-            return None
-        pruned_correspondence = prune_high_error_pose_graph_correspondence(
+            return self.miss_pose_result(clear_temporal=clear_rejected)
+        self.remember_rejected_pose_result(result, correspondence)
+        backface_only_count = pose_correspondence_backface_only_point_count(
             correspondence,
             result,
-            max_error_px=self.prune_reprojection_error_px,
         )
-        if pruned_correspondence is not None:
-            pruned_result = solve_best_lattice_graph_pnp_current(
-                np.asarray(pruned_correspondence.image_points, dtype=np.float32).reshape(-1, 2),
-                tuple(pruned_correspondence.lattice_coords),
+        if profile is not None:
+            profile["pnp_backface_only_correspondence_points"] = backface_only_count
+        if backface_only_count > 0:
+            return self.miss_pose_result(clear_temporal=clear_rejected)
+        if observed_graph is None:
+            observed_error, observed_inlier_count, observed_point_count = observed_pose_graph_reprojection_score(
+                correspondence,
+                result,
+                observed_graph,
+                all_correspondence=original_correspondence,
+                inlier_threshold_px=self.inlier_threshold_px,
+            )
+        else:
+            (
+                observed_error,
+                observed_inlier_count,
+                observed_point_count,
+                invisible_observed_count,
+            ) = observed_pose_model_nearest_same_class_score(
+                result,
+                observed_graph,
+                inlier_threshold_px=self.inlier_threshold_px,
+            )
+            if profile is not None:
+                profile["pnp_observed_invisible_points"] = invisible_observed_count
+            backface_fit_count, _backface_tested_count = observed_pose_model_backface_fit_count(
+                result,
+                observed_graph,
+                inlier_threshold_px=self.inlier_threshold_px,
+            )
+            if profile is not None:
+                profile["pnp_backface_fit_points"] = backface_fit_count
+            if backface_fit_count >= 3:
+                self.remember_rejected_pose_result(result, correspondence, observed_error)
+                return self.miss_pose_result(clear_temporal=clear_rejected)
+        if observed_point_count < 3:
+            return self.miss_pose_result(clear_temporal=clear_rejected)
+        self.remember_rejected_pose_result(result, correspondence, observed_error)
+        if observed_error <= self.max_reprojection_error_px:
+            refined = refine_pose_correspondence_with_visible_observed_points(
+                correspondence,
+                result,
+                observed_graph,
                 image_size,
                 focal_min=self.focal_min,
                 focal_max=self.focal_max,
                 focal_steps=self.focal_steps,
                 camera_matrix=camera_matrix,
+                lattice_transforms=lattice_transforms,
+                previous_tvec=self.last_tvec,
+                max_attempts=1,
+                refinement_budget=refinement_budget,
+                accept_error_px=self.max_reprojection_error_px,
+                inlier_threshold_px=self.inlier_threshold_px,
                 profile=profile,
+                return_first_result=True,
             )
-            if pruned_result is not None:
-                correspondence = pruned_correspondence
-                result = pruned_result
-        observed_error, observed_inlier_count, observed_point_count = observed_pose_graph_reprojection_score(
+            if refined is None:
+                return self.accept_pose_result(result, correspondence, observed_error)
+            refined_correspondence, refined_result, refined_error = refined
+            if refined_error < observed_error:
+                return self.accept_pose_result(refined_result, refined_correspondence, refined_error)
+            return self.accept_pose_result(result, correspondence, observed_error)
+        if observed_error > self.refinement_reprojection_error_px:
+            return self.miss_pose_result(clear_temporal=clear_rejected)
+
+        refined = refine_pose_correspondence_with_visible_observed_points(
             correspondence,
             result,
             observed_graph,
-            all_correspondence=original_correspondence,
+            image_size,
+            focal_min=self.focal_min,
+            focal_max=self.focal_max,
+            focal_steps=self.focal_steps,
+            camera_matrix=camera_matrix,
+            lattice_transforms=lattice_transforms,
+            previous_tvec=self.last_tvec,
+            max_attempts=self.max_refinement_attempts,
+            refinement_budget=refinement_budget,
+            accept_error_px=self.max_reprojection_error_px,
             inlier_threshold_px=self.inlier_threshold_px,
+            profile=profile,
         )
-        if (
-            observed_point_count < 3
-            or observed_inlier_count < observed_point_count
-            or observed_error > self.max_reprojection_error_px
-        ):
-            return None
+        if refined is None:
+            return self.miss_pose_result(clear_temporal=clear_rejected)
+        refined_correspondence, refined_result, refined_error = refined
+        return self.accept_pose_result(refined_result, refined_correspondence, refined_error)
+
+    def clear_last_tvec(self) -> None:
+        self.last_tvec = None
+
+    def miss_pose_result(self, *, clear_temporal: bool = True) -> None:
+        if clear_temporal:
+            self.clear_last_tvec()
+        return None
+
+    def remember_rejected_pose_result(
+        self,
+        result: PosePnPResult,
+        correspondence: PoseGraphCorrespondence,
+        observed_error: float | None = None,
+    ) -> None:
+        result.observed_reprojection_error = observed_error
+        result.point_names = tuple(str(coord) for coord in correspondence.lattice_coords)
+        result.pose_label = "graph-rejected"
+        candidate_error = float(getattr(result, "matched_error", float("inf")))
+        current_error = (
+            float("inf")
+            if self.rejected_pose_result is None
+            else float(getattr(self.rejected_pose_result, "matched_error", float("inf")))
+        )
+        if candidate_error < current_error:
+            self.rejected_pose_result = result
+
+    def accept_pose_result(
+        self,
+        result: PosePnPResult,
+        correspondence: PoseGraphCorrespondence,
+        observed_error: float,
+    ) -> PosePnPResult:
+        self.rejected_pose_result = None
         result.observed_reprojection_error = observed_error
         result.point_names = tuple(str(coord) for coord in correspondence.lattice_coords)
         result.pose_label = "graph"
         if getattr(result, "camera_matrix", None) is not None:
             self.camera_matrix = np.asarray(result.camera_matrix, dtype=np.float64).reshape(3, 3).copy()
+        if getattr(result, "tvec", None) is not None:
+            self.last_tvec = np.asarray(result.tvec, dtype=np.float64).reshape(3, 1).copy()
+        self.lattice_transform = getattr(result, "lattice_transform", CUBE_LATTICE_IDENTITY_TRANSFORM)
         self.accepted_pose_count += 1
         return result
 
     def reset_temporal_tracking(self) -> None:
-        pass
+        self.camera_matrix = None
+        self.lattice_transform = None
+        self.rejected_pose_result = None
+        self.last_tvec = None
+        self.accepted_pose_count = 0
 
 
 def prune_high_error_pose_graph_correspondence(
@@ -545,6 +707,223 @@ def observed_pose_graph_reprojection_score(
         return float("inf"), 0, len(object_points)
     inlier_count = sum(error <= float(inlier_threshold_px) for error in observed_errors)
     return float(np.mean(observed_errors)), int(inlier_count), len(observed_errors)
+
+
+def refine_pose_correspondence_with_visible_observed_points(
+    correspondence: PoseGraphCorrespondence,
+    result: PosePnPResult,
+    observed_graph: PoseGraph | None,
+    image_size: tuple[int, int],
+    *,
+    focal_min: float,
+    focal_max: float,
+    focal_steps: int,
+    camera_matrix: np.ndarray | None,
+    lattice_transforms: tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...],
+    max_attempts: int,
+    refinement_budget: dict[str, int] | None,
+    accept_error_px: float,
+    inlier_threshold_px: float,
+    previous_tvec: np.ndarray | None = None,
+    profile: dict[str, float | int] | None = None,
+    return_first_result: bool = False,
+) -> tuple[PoseGraphCorrespondence, PosePnPResult, float] | None:
+    if observed_graph is None:
+        return None
+
+    used_graph_indexes = set(correspondence.graph_indexes)
+    used_lattice_coords = set(correspondence.lattice_coords)
+    candidate_graph_indexes = [
+        index
+        for index, point in enumerate(observed_graph.points)
+        if index not in used_graph_indexes
+        and point.class_name in CUBE_LATTICE_COORDS_BY_CLASS
+    ]
+    candidate_graph_indexes.sort(
+        key=lambda index: (
+            -observed_point_distance_to_nearest_correspondence_point(
+                observed_graph.points[index],
+                correspondence,
+            ),
+            -observed_graph.points[index].score,
+            index,
+        )
+    )
+    remaining_attempts = max(0, int(max_attempts))
+    if refinement_budget is not None:
+        remaining_attempts = min(
+            remaining_attempts,
+            max(0, int(refinement_budget.get("remaining", 0))),
+        )
+    candidate_graph_indexes = candidate_graph_indexes[:remaining_attempts]
+    if profile is not None:
+        profile["refinement_candidates"] = len(candidate_graph_indexes)
+
+    for graph_index in candidate_graph_indexes:
+        if refinement_budget is not None:
+            if refinement_budget["remaining"] <= 0:
+                break
+            refinement_budget["remaining"] -= 1
+        observed_point = observed_graph.points[graph_index]
+        nearest_coord = nearest_visible_lattice_coord_for_observed_point(
+            observed_point,
+            result,
+            used_lattice_coords=used_lattice_coords,
+        )
+        if nearest_coord is None:
+            continue
+
+        augmented = append_pose_graph_correspondence(
+            correspondence,
+            graph_index,
+            observed_point.xy,
+            nearest_coord,
+        )
+        refined_result = solve_best_lattice_graph_pnp_current(
+            np.asarray(augmented.image_points, dtype=np.float32).reshape(-1, 2),
+            tuple(augmented.lattice_coords),
+            image_size,
+            focal_min=focal_min,
+            focal_max=focal_max,
+            focal_steps=focal_steps,
+            camera_matrix=camera_matrix,
+            lattice_transforms=lattice_transforms,
+            previous_tvec=previous_tvec,
+            profile=profile,
+        )
+        if refined_result is None:
+            continue
+        backface_only_count = pose_correspondence_backface_only_point_count(
+            augmented,
+            refined_result,
+        )
+        if profile is not None:
+            profile["refinement_backface_only_correspondence_points"] = backface_only_count
+        if backface_only_count > 0:
+            continue
+        refined_error, _inlier_count, refined_point_count, _invisible_count = (
+            observed_pose_model_nearest_same_class_score(
+                refined_result,
+                observed_graph,
+                inlier_threshold_px=inlier_threshold_px,
+            )
+        )
+        backface_fit_count, _backface_tested_count = observed_pose_model_backface_fit_count(
+            refined_result,
+            observed_graph,
+            inlier_threshold_px=inlier_threshold_px,
+        )
+        if profile is not None:
+            profile["refinement_attempts"] = int(profile.get("refinement_attempts", 0)) + 1
+            profile["refinement_backface_fit_points"] = backface_fit_count
+        if backface_fit_count >= 3:
+            continue
+        if refined_point_count >= 3 and (
+            refined_error <= float(accept_error_px) or bool(return_first_result)
+        ):
+            refined_result.refinement_graph_index = int(graph_index)
+            refined_result.refinement_lattice_coord = nearest_coord
+            return augmented, refined_result, refined_error
+    return None
+
+
+def observed_point_distance_to_nearest_correspondence_point(
+    point: PoseGraphPoint,
+    correspondence: PoseGraphCorrespondence,
+) -> float:
+    image_points = np.asarray(correspondence.image_points, dtype=np.float32).reshape(-1, 2)
+    if image_points.size == 0:
+        return 0.0
+    point_xy = np.asarray(point.xy, dtype=np.float32).reshape(1, 2)
+    distances = np.linalg.norm(image_points - point_xy, axis=1)
+    return float(np.min(distances))
+
+
+def append_pose_graph_correspondence(
+    correspondence: PoseGraphCorrespondence,
+    graph_index: int,
+    image_xy: tuple[float, float],
+    lattice_coord: tuple[int, int, int],
+) -> PoseGraphCorrespondence:
+    lattice_coords = (*correspondence.lattice_coords, lattice_coord)
+    image_points = np.concatenate(
+        [
+            np.asarray(correspondence.image_points, dtype=np.float32).reshape(-1, 2),
+            np.asarray(image_xy, dtype=np.float32).reshape(1, 2),
+        ],
+        axis=0,
+    )
+    return PoseGraphCorrespondence(
+        image_points=image_points,
+        object_points=cube_lattice_points_for_coords(lattice_coords),
+        graph_indexes=(*correspondence.graph_indexes, int(graph_index)),
+        lattice_coords=lattice_coords,
+    )
+
+
+def nearest_visible_lattice_coord_for_observed_point(
+    observed_point: PoseGraphPoint,
+    result: PosePnPResult,
+    *,
+    used_lattice_coords: set[tuple[int, int, int]],
+) -> tuple[int, int, int] | None:
+    entries = visible_projected_lattice_points_for_class(result, observed_point.class_name)
+    if not entries:
+        return None
+    observed_xy = np.asarray(observed_point.xy, dtype=np.float32)
+    usable_entries = [
+        (coord, projected_xy)
+        for coord, projected_xy in entries
+        if coord not in used_lattice_coords
+    ]
+    if not usable_entries:
+        return None
+    coord, _projected = min(
+        usable_entries,
+        key=lambda entry: float(np.linalg.norm(np.asarray(entry[1], dtype=np.float32) - observed_xy)),
+    )
+    return coord
+
+
+def visible_projected_lattice_points_for_class(
+    result: PosePnPResult,
+    class_name: str,
+) -> list[tuple[tuple[int, int, int], np.ndarray]]:
+    coords = CUBE_LATTICE_COORDS_BY_CLASS.get(class_name)
+    if not coords:
+        return []
+    if any(
+        getattr(result, attribute, None) is None
+        for attribute in ("rvec", "tvec", "camera_matrix", "dist_coeffs")
+    ):
+        return []
+
+    object_points = cube_lattice_points_for_coords(
+        coords,
+        lattice_transform=getattr(result, "lattice_transform", CUBE_LATTICE_IDENTITY_TRANSFORM),
+    )
+    visible = [
+        (coord, object_point)
+        for coord, object_point in zip(coords, object_points)
+        if result_object_point_has_visible_surface(object_point, result)
+    ]
+    if not visible:
+        return []
+    visible_coords, visible_object_points = zip(*visible)
+    try:
+        projected_points, _ = cv2.projectPoints(
+            np.asarray(visible_object_points, dtype=np.float32).reshape(-1, 3),
+            result.rvec,
+            result.tvec,
+            result.camera_matrix,
+            result.dist_coeffs,
+        )
+    except cv2.error:
+        return []
+    return [
+        (coord, projected_xy)
+        for coord, projected_xy in zip(visible_coords, projected_points.reshape(-1, 2))
+    ]
 
 
 class ColorDensityClassifier:
@@ -1108,31 +1487,77 @@ def cube_lattice_display_points_for_transform(
     )
 
 
-def invisible_surface_point_count(object_points: np.ndarray, rvec: np.ndarray) -> int:
+def invisible_surface_point_count(
+    object_points: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+) -> int:
     object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
+    return sum(
+        not object_point_has_visible_surface(point, rvec, tvec)
+        for point in object_points
+    )
+
+
+def object_point_has_visible_surface(
+    object_point: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray | None = None,
+) -> bool:
+    if tvec is None:
+        return object_point_has_front_facing_boundary_surface(object_point, rvec)
+    return not object_point_is_occluded_by_cube(object_point, rvec, tvec)
+
+
+def result_object_point_has_visible_surface(
+    object_point: np.ndarray,
+    result: PosePnPResult,
+) -> bool:
+    tvec = getattr(result, "tvec", None)
+    if tvec is None:
+        return object_point_has_visible_surface(object_point, result.rvec)
+    try:
+        return object_point_has_visible_surface(object_point, result.rvec, tvec)
+    except TypeError:
+        return object_point_has_visible_surface(object_point, result.rvec)
+
+
+def object_point_is_occluded_by_cube(
+    object_point: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+) -> bool:
+    point = np.asarray(object_point, dtype=np.float64).reshape(3)
     rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
-    invisible_count = 0
-    for point in object_points:
-        visible = False
-        for axis in range(3):
-            if abs(float(point[axis]) + CUBE_HALF_SIZE_MM) <= 1e-3:
-                normal = np.zeros(3, dtype=np.float64)
-                normal[axis] = -1.0
-            elif abs(float(point[axis]) - CUBE_HALF_SIZE_MM) <= 1e-3:
-                normal = np.zeros(3, dtype=np.float64)
-                normal[axis] = 1.0
-            else:
-                continue
-            camera_normal = rotation @ normal
-            if float(camera_normal[2]) < 0.0:
-                visible = True
-                break
-        if not visible:
-            invisible_count += 1
-    return invisible_count
+    camera_origin = (-rotation.T @ np.asarray(tvec, dtype=np.float64).reshape(3, 1)).reshape(3)
+    direction = point - camera_origin
+    if float(np.linalg.norm(direction)) <= 1e-9:
+        return False
+
+    bounds_min = np.full(3, -float(CUBE_HALF_SIZE_MM), dtype=np.float64)
+    bounds_max = np.full(3, float(CUBE_HALF_SIZE_MM), dtype=np.float64)
+    t_enter = 0.0
+    t_exit = 1.0
+    for axis in range(3):
+        origin_value = float(camera_origin[axis])
+        direction_value = float(direction[axis])
+        if abs(direction_value) <= 1e-12:
+            if origin_value < bounds_min[axis] or origin_value > bounds_max[axis]:
+                return False
+            continue
+        near = (bounds_min[axis] - origin_value) / direction_value
+        far = (bounds_max[axis] - origin_value) / direction_value
+        if near > far:
+            near, far = far, near
+        t_enter = max(t_enter, float(near))
+        t_exit = min(t_exit, float(far))
+        if t_enter > t_exit:
+            return False
+
+    return 1e-5 < t_enter < 1.0 - 1e-4
 
 
-def object_point_has_visible_surface(object_point: np.ndarray, rvec: np.ndarray) -> bool:
+def object_point_has_front_facing_boundary_surface(object_point: np.ndarray, rvec: np.ndarray) -> bool:
     point = np.asarray(object_point, dtype=np.float32).reshape(3)
     rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
     for axis in range(3):
@@ -1169,6 +1594,39 @@ def lattice_boundary_face_camera_normal_z(
     return float(camera_normal[2])
 
 
+def visible_lattice_boundary_faces_for_pose(
+    rvec: np.ndarray,
+) -> frozenset[tuple[int, int]]:
+    rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    visible_faces = set()
+    for axis in range(3):
+        for value, sign in ((0, -1.0), (CUBE_GRID_MAX_INDEX, 1.0)):
+            normal = np.zeros(3, dtype=np.float64)
+            normal[axis] = sign
+            camera_normal = rotation @ normal
+            if float(camera_normal[2]) < 0.0:
+                visible_faces.add((axis, value))
+    return frozenset(visible_faces)
+
+
+def pose_correspondence_backface_only_point_count(
+    correspondence: PoseGraphCorrespondence,
+    result: PosePnPResult,
+) -> int:
+    if getattr(result, "rvec", None) is None or getattr(result, "tvec", None) is None:
+        return 0
+    lattice_transform = getattr(result, "lattice_transform", CUBE_LATTICE_IDENTITY_TRANSFORM)
+    object_points = cube_lattice_points_for_coords(
+        tuple(correspondence.lattice_coords),
+        lattice_transform=lattice_transform,
+    )
+    backface_only_count = 0
+    for object_point in object_points:
+        if not object_point_has_visible_surface(object_point, result.rvec, result.tvec):
+            backface_only_count += 1
+    return backface_only_count
+
+
 def graph_camera_matrix_candidates(
     image_size: tuple[int, int],
     *,
@@ -1192,6 +1650,8 @@ def solve_best_lattice_graph_pnp_current(
     focal_max: float,
     focal_steps: int,
     camera_matrix: np.ndarray | None = None,
+    lattice_transforms: tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...] = CUBE_LATTICE_AXIS_TRANSFORMS,
+    previous_tvec: np.ndarray | None = None,
     profile: dict[str, float | int] | None = None,
 ) -> PosePnPResult | None:
     image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
@@ -1199,7 +1659,12 @@ def solve_best_lattice_graph_pnp_current(
         return None
 
     best_result: PosePnPResult | None = None
-    best_score: tuple[int, float] | None = None
+    best_score: tuple[float, ...] | None = None
+    previous_tvec_array = (
+        None
+        if previous_tvec is None
+        else np.asarray(previous_tvec, dtype=np.float64).reshape(3, 1)
+    )
     camera_matrices = (
         [np.asarray(camera_matrix, dtype=np.float64).reshape(3, 3)]
         if camera_matrix is not None
@@ -1210,11 +1675,14 @@ def solve_best_lattice_graph_pnp_current(
             focal_steps=focal_steps,
         )
     )
+    lattice_transforms = tuple(lattice_transforms)
+    if not lattice_transforms:
+        return None
     if profile is not None:
         profile["pnp_camera_candidates"] = len(camera_matrices)
-        profile["pnp_axis_transforms"] = len(CUBE_LATTICE_AXIS_TRANSFORMS)
+        profile["pnp_axis_transforms"] = len(lattice_transforms)
     for camera_matrix in camera_matrices:
-        for lattice_transform in CUBE_LATTICE_AXIS_TRANSFORMS:
+        for lattice_transform in lattice_transforms:
             if profile is not None:
                 profile["pnp_solve_calls"] = int(profile.get("pnp_solve_calls", 0)) + 1
             result = solve_lattice_graph_pnp(
@@ -1230,7 +1698,18 @@ def solve_best_lattice_graph_pnp_current(
             if result is None:
                 continue
             result.lattice_transform = lattice_transform
-            score = (int(getattr(result, "invisible_point_count", 0)), float(result.matched_error))
+            invisible_count = float(getattr(result, "invisible_point_count", 0))
+            matched_error = float(result.matched_error)
+            if previous_tvec_array is None or getattr(result, "tvec", None) is None:
+                score = (invisible_count, matched_error)
+            else:
+                translation_jump = float(
+                    np.linalg.norm(
+                        np.asarray(result.tvec, dtype=np.float64).reshape(3, 1)
+                        - previous_tvec_array
+                    )
+                )
+                score = (invisible_count, translation_jump, matched_error)
             if best_score is None or score < best_score:
                 best_score = score
                 best_result = result
@@ -1319,7 +1798,7 @@ def solve_lattice_graph_pnp_candidates(
         projected_graph_points = projected_graph_points.reshape(-1, 2)
         reprojection_distances = np.linalg.norm(projected_graph_points - image_points, axis=1)
         matched_error = float(np.mean(reprojection_distances))
-        invisible_count = invisible_surface_point_count(object_points, rvec)
+        invisible_count = invisible_surface_point_count(object_points, rvec, tvec)
 
         projected_display_points, _ = cv2.projectPoints(
             display_points,
@@ -1413,11 +1892,25 @@ def draw_pose_keypoints(
     return drawn
 
 
-def draw_pnp_cube(frame: np.ndarray, result: PosePnPResult | None) -> None:
+def draw_pnp_cube(
+    frame: np.ndarray,
+    result: PosePnPResult | None,
+    *,
+    alpha: float = 1.0,
+    observed_graph: PoseGraph | None = None,
+    profile: dict[str, float | int] | None = None,
+) -> None:
     if result is None:
         return
 
-    draw_pnp_debug_pose_candidates(frame, result)
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    target = frame if alpha >= 1.0 else frame.copy()
+
+    draw_pnp_debug_pose_candidates(target, result)
+    if observed_graph is not None:
+        draw_observed_model_distance_lines(target, result, observed_graph)
+        if DRAW_POSE_GRAPH_COORDS:
+            draw_refinement_point_marker(target, result, observed_graph)
 
     image_points = np.asarray(result.image_points, dtype=np.float32).reshape(-1, 2)
     projected_object_points = np.asarray(result.projected_object_points, dtype=np.float32).reshape(-1, 2)
@@ -1429,8 +1922,8 @@ def draw_pnp_cube(frame: np.ndarray, result: PosePnPResult | None) -> None:
     for observed_point, projected_point in zip(image_points, projected_object_points):
         observed = tuple(np.round(observed_point).astype(int))
         projected_match = tuple(np.round(projected_point).astype(int))
-        cv2.line(frame, observed, projected_match, (0, 0, 0), 4, lineType=cv2.LINE_AA)
-        cv2.line(frame, observed, projected_match, PNP_REPROJECTION_RESIDUAL_COLOR, 2, lineType=cv2.LINE_AA)
+        cv2.line(target, observed, projected_match, (0, 0, 0), 4, lineType=cv2.LINE_AA)
+        cv2.line(target, observed, projected_match, PNP_REPROJECTION_RESIDUAL_COLOR, 2, lineType=cv2.LINE_AA)
 
     projected = np.asarray(result.projected_display_points, dtype=np.float32)
     edge_indexes = result.display_edge_indexes or result.edge_indexes
@@ -1438,27 +1931,37 @@ def draw_pnp_cube(frame: np.ndarray, result: PosePnPResult | None) -> None:
         start_point = tuple(np.round(projected[start]).astype(int))
         end_point = tuple(np.round(projected[end]).astype(int))
         color = PNP_CUBE_LINE_COLOR
-        cv2.line(frame, start_point, end_point, (0, 0, 0), 4, lineType=cv2.LINE_AA)
-        cv2.line(frame, start_point, end_point, color, 2, lineType=cv2.LINE_AA)
+        cv2.line(target, start_point, end_point, (0, 0, 0), 4, lineType=cv2.LINE_AA)
+        cv2.line(target, start_point, end_point, color, 2, lineType=cv2.LINE_AA)
     for point in projected_object_points:
         center = tuple(np.round(point).astype(int))
-        cv2.circle(frame, center, 5, (0, 0, 0), -1, lineType=cv2.LINE_AA)
-        cv2.circle(frame, center, 3, PNP_CUBE_POINT_COLOR, -1, lineType=cv2.LINE_AA)
+        cv2.circle(target, center, 5, (0, 0, 0), -1, lineType=cv2.LINE_AA)
+        cv2.circle(target, center, 3, PNP_CUBE_POINT_COLOR, -1, lineType=cv2.LINE_AA)
     if len(residuals):
         focal = float(result.camera_matrix[0, 0])
         axis_order, signs = result.lattice_transform
         observed_error = getattr(result, "observed_reprojection_error", None)
+        if observed_graph is None:
+            object_error = float(getattr(result, "matched_error", float(np.mean(residuals))))
+        else:
+            object_error = observed_pose_model_nearest_same_class_score(
+                result,
+                observed_graph,
+                inlier_threshold_px=PNP_INLIER_THRESHOLD_PX,
+            )[0]
         display_error = float(np.mean(residuals)) if observed_error is None else float(observed_error)
         fit_label = "" if observed_error is None else f" fit {float(np.mean(residuals)):.1f}"
         face = getattr(result, "correspondence_face", None)
         face_normal_z = getattr(result, "correspondence_face_normal_z", None)
         face_label = "" if face is None or face_normal_z is None else f" face {face} nz {face_normal_z:.2f}"
+        rejected_label = " rejected" if getattr(result, "pose_label", "") == "graph-rejected" else ""
+        attempt_label = pose_attempt_summary(profile)
         label = (
-            f"pnp err {display_error:.1f}{fit_label} max {float(np.max(residuals)):.1f} "
+            f"pnp{rejected_label} {attempt_label} obj {object_error:.1f} err {display_error:.1f}{fit_label} max {float(np.max(residuals)):.1f} "
             f"f {focal:.0f}{face_label} axes {axis_order} signs {signs}"
         )
         cv2.putText(
-            frame,
+            target,
             label,
             (12, max(24, frame.shape[0] - 16)),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -1468,7 +1971,7 @@ def draw_pnp_cube(frame: np.ndarray, result: PosePnPResult | None) -> None:
             cv2.LINE_AA,
         )
         cv2.putText(
-            frame,
+            target,
             label,
             (12, max(24, frame.shape[0] - 16)),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -1477,6 +1980,74 @@ def draw_pnp_cube(frame: np.ndarray, result: PosePnPResult | None) -> None:
             2,
             cv2.LINE_AA,
         )
+    if alpha < 1.0:
+        cv2.addWeighted(target, alpha, frame, 1.0 - alpha, 0.0, dst=frame)
+
+
+def draw_observed_model_distance_lines(
+    frame: np.ndarray,
+    result: PosePnPResult,
+    observed_graph: PoseGraph,
+) -> None:
+    matches = observed_pose_model_nearest_same_class_matches(result, observed_graph)
+    if not matches:
+        return
+
+    overlay = frame.copy()
+    for observed_xy, projected_xy, _distance, _using_invisible_fallback in matches:
+        observed = tuple(np.round(observed_xy).astype(int))
+        projected = tuple(np.round(projected_xy).astype(int))
+        cv2.line(overlay, observed, projected, PNP_OBSERVED_MODEL_DISTANCE_COLOR, 2, lineType=cv2.LINE_AA)
+    cv2.addWeighted(
+        overlay,
+        float(PNP_OBSERVED_MODEL_DISTANCE_ALPHA),
+        frame,
+        1.0 - float(PNP_OBSERVED_MODEL_DISTANCE_ALPHA),
+        0.0,
+        dst=frame,
+    )
+
+
+def draw_refinement_point_marker(
+    frame: np.ndarray,
+    result: PosePnPResult,
+    observed_graph: PoseGraph,
+) -> None:
+    graph_index = getattr(result, "refinement_graph_index", None)
+    if graph_index is None:
+        return
+    graph_index = int(graph_index)
+    if graph_index < 0 or graph_index >= len(observed_graph.points):
+        return
+
+    point = observed_graph.points[graph_index]
+    center = tuple(np.round(np.asarray(point.xy, dtype=np.float32)).astype(int))
+    cv2.circle(frame, center, 9, (0, 0, 0), 2, lineType=cv2.LINE_AA)
+    cv2.circle(frame, center, 7, PNP_REFINEMENT_POINT_COLOR, 2, lineType=cv2.LINE_AA)
+
+    lattice_coord = getattr(result, "refinement_lattice_coord", None)
+    label = "refine" if lattice_coord is None else f"refine {lattice_coord}"
+    label_xy = (center[0] + 10, center[1] - 8)
+    cv2.putText(
+        frame,
+        label,
+        label_xy,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (0, 0, 0),
+        3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        label,
+        label_xy,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        PNP_REFINEMENT_POINT_COLOR,
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def draw_pnp_debug_pose_candidates(frame: np.ndarray, result: PosePnPResult) -> None:
@@ -2018,10 +2589,84 @@ def observed_pose_model_nearest_same_class_score(
     *,
     inlier_threshold_px: float,
 ) -> tuple[float, int, int, int]:
+    matches = observed_pose_model_nearest_same_class_matches(result, observed_graph)
+    errors = [distance for _observed_xy, _projected_xy, distance, _fallback in matches]
+    observed_point_count = sum(
+        1
+        for point in observed_graph.points
+        if point.class_name in ("corner", "corner-edge", "corner-edge-center")
+    )
+    invisible_observed_count = sum(1 for *_points, using_invisible_fallback in matches if using_invisible_fallback)
+    if not errors:
+        return float("inf"), 0, observed_point_count, invisible_observed_count
+    inlier_count = sum(error <= float(inlier_threshold_px) for error in errors)
+    return float(np.mean(errors)), int(inlier_count), len(errors), invisible_observed_count
+
+
+def observed_pose_model_backface_fit_count(
+    result: PosePnPResult,
+    observed_graph: PoseGraph,
+    *,
+    inlier_threshold_px: float,
+) -> tuple[int, int]:
     projected_by_class = projected_lattice_points_by_class(result)
-    errors = []
-    invisible_observed_count = 0
-    observed_point_count = 0
+    backface_fit_count = 0
+    tested_count = 0
+    for class_name in ("corner", "corner-edge", "corner-edge-center"):
+        observed_points = [
+            point
+            for point in observed_graph.points
+            if point.class_name == class_name
+        ]
+        if not observed_points:
+            continue
+        projected_entry = projected_by_class.get(class_name)
+        if projected_entry is None:
+            continue
+        projected_points, object_points = projected_entry
+        if len(projected_points) == 0 or len(projected_points) != len(object_points):
+            continue
+        visible_mask = np.asarray(
+            [
+                result_object_point_has_visible_surface(object_point, result)
+                for object_point in object_points
+            ],
+            dtype=bool,
+        )
+        hidden_projected_points = projected_points[~visible_mask]
+        if len(hidden_projected_points) == 0:
+            continue
+        visible_projected_points = projected_points[visible_mask]
+        observed_xy = np.asarray([point.xy for point in observed_points], dtype=np.float32).reshape(-1, 2)
+        hidden_distances = np.linalg.norm(
+            observed_xy[:, None, :] - hidden_projected_points[None, :, :],
+            axis=2,
+        )
+        nearest_hidden = np.min(hidden_distances, axis=1)
+        if len(visible_projected_points) == 0:
+            nearest_visible = np.full_like(nearest_hidden, float("inf"), dtype=np.float32)
+        else:
+            visible_distances = np.linalg.norm(
+                observed_xy[:, None, :] - visible_projected_points[None, :, :],
+                axis=2,
+            )
+            nearest_visible = np.min(visible_distances, axis=1)
+        tested_count += len(observed_xy)
+        backface_fit_count += int(
+            np.count_nonzero(
+                (nearest_hidden <= float(inlier_threshold_px))
+                & (nearest_hidden <= nearest_visible)
+            )
+        )
+    return backface_fit_count, tested_count
+
+
+def observed_pose_model_nearest_same_class_matches(
+    result: PosePnPResult,
+    observed_graph: PoseGraph,
+) -> list[tuple[np.ndarray, np.ndarray, float, bool]]:
+    projected_by_class = projected_lattice_points_by_class(result)
+    matches: list[tuple[np.ndarray, np.ndarray, float, bool]] = []
     observed_points_by_class: dict[str, list[PoseGraphPoint]] = {
         class_name: [
             point
@@ -2037,12 +2682,12 @@ def observed_pose_model_nearest_same_class_score(
         if projected_entry is None:
             continue
         projected_points, object_points = projected_entry
-        if len(projected_points) == 0:
+        if len(projected_points) == 0 or len(projected_points) != len(object_points):
             continue
 
         visible_mask = np.asarray(
             [
-                object_point_has_visible_surface(object_point, result.rvec)
+                result_object_point_has_visible_surface(object_point, result)
                 for object_point in object_points
             ],
             dtype=bool,
@@ -2058,36 +2703,13 @@ def observed_pose_model_nearest_same_class_score(
             observed_xy[:, None, :] - candidate_projected_points[None, :, :],
             axis=2,
         )
-        assigned_observed: set[int] = set()
-        assigned_model: set[int] = set()
-        ranked_pairs = sorted(
-            (
-                (float(distance_matrix[observed_index, model_index]), observed_index, model_index)
-                for observed_index in range(distance_matrix.shape[0])
-                for model_index in range(distance_matrix.shape[1])
-            ),
-            key=lambda item: item[0],
-        )
-        for distance, observed_index, model_index in ranked_pairs:
-            if observed_index in assigned_observed or model_index in assigned_model:
-                continue
-            assigned_observed.add(observed_index)
-            assigned_model.add(model_index)
-            errors.append(distance)
+        nearest_model_indexes = np.argmin(distance_matrix, axis=1)
+        for observed_xy_point, model_index in zip(observed_xy, nearest_model_indexes):
+            projected_xy = candidate_projected_points[int(model_index)]
+            distance = float(np.linalg.norm(observed_xy_point - projected_xy))
+            matches.append((observed_xy_point, projected_xy, distance, using_invisible_fallback))
 
-        for observed_index in range(len(observed_points)):
-            if observed_index in assigned_observed:
-                continue
-            errors.append(float(distance_matrix[observed_index].min()))
-
-        observed_point_count += len(observed_points)
-        if using_invisible_fallback:
-            invisible_observed_count += len(observed_points)
-
-    if not errors:
-        return float("inf"), 0, observed_point_count, invisible_observed_count
-    inlier_count = sum(error <= float(inlier_threshold_px) for error in errors)
-    return float(np.mean(errors)), int(inlier_count), len(errors), invisible_observed_count
+    return matches
 
 
 CUBE_LATTICE_BOUNDARY_FACES_BY_COORD = {
@@ -2383,281 +3005,11 @@ def image_axis_preference(delta: tuple[int, int, int], observed_unit: np.ndarray
     return float(observed_unit[1]) * float(sign)
 
 
-def vector_guided_pose_graph_correspondence(graph: PoseGraph) -> PoseGraphCorrespondence | None:
-    adjacency = pose_graph_adjacency(graph)
-    components = pose_graph_components(graph, adjacency)
-    components = [component for component in components if len(component) >= 2]
-    if not components:
-        return None
-
-    component = max(
-        components,
-        key=lambda indexes: (len(indexes), max(graph.points[index].score for index in indexes)),
-    )
-    component_set = set(component)
-    start_index = max(component, key=lambda index: (graph.points[index].score, -index))
-    start = graph.points[start_index]
-    start_coord = VECTOR_GUIDED_START_COORDS.get(start.class_name)
-    if start_coord is None:
-        return None
-
-    assignments: dict[int, PoseGraphNodeAssignment] = {
-        start_index: PoseGraphNodeAssignment(
-            coord=start_coord,
-            parent_index=None,
-            local_to_global=None,
-            local_to_global_frames=tuple(),
-            path_faces=cube_lattice_boundary_faces(start_coord),
-            depth=0,
-        )
-    }
-    used_coords = {start_coord}
-
-    first_neighbor_options = []
-    for neighbor_index in adjacency[start_index]:
-        if neighbor_index not in component_set:
-            continue
-        neighbor = graph.points[neighbor_index]
-        observed_unit = normalized_vector(
-            np.asarray(neighbor.xy, dtype=np.float32)
-            - np.asarray(start.xy, dtype=np.float32)
-        )
-        if observed_unit is None:
-            continue
-        for neighbor_coord in cube_lattice_neighbor_coords(
-            start_coord,
-            neighbor.class_name,
-            used_coords=used_coords,
-        ):
-            delta = tuple(neighbor_coord[index] - start_coord[index] for index in range(3))
-            first_neighbor_options.append(
-                (
-                    -neighbor.score,
-                    VECTOR_GUIDED_DIRECTION_RANK.get(delta, len(VECTOR_GUIDED_DIRECTION_PRIORITY)),
-                    neighbor_index,
-                    neighbor_coord,
-                    observed_unit,
-                )
-            )
-    if not first_neighbor_options:
-        return None
-
-    _score, _rank, first_neighbor_index, first_neighbor_coord, reference_vector = min(first_neighbor_options)
-    first_delta = coord_delta(start_coord, first_neighbor_coord)
-    if first_delta is None:
-        return None
-    first_basis = local_turn_basis_for_delta(first_delta)
-    if first_basis is None:
-        return None
-    first_path_faces = assignments[start_index].path_faces & cube_lattice_boundary_faces(
-        first_neighbor_coord
-    )
-    assignments[first_neighbor_index] = PoseGraphNodeAssignment(
-        coord=first_neighbor_coord,
-        parent_index=start_index,
-        local_to_global=first_basis,
-        local_to_global_frames=unique_local_to_global_frames(
-            first_delta,
-            first_path_faces,
-            first_basis,
-        ),
-        path_faces=first_path_faces,
-        depth=1,
-    )
-    used_coords.add(first_neighbor_coord)
-
-    queue = deque([start_index, first_neighbor_index])
-    queued_indexes = {start_index, first_neighbor_index}
-
-    def enqueue_node(index: int) -> None:
-        if index in queued_indexes:
-            return
-        queue.append(index)
-        queued_indexes.add(index)
-
-    while queue:
-        current_index = queue.popleft()
-        current_assignment = assignments[current_index]
-        current_coord = current_assignment.coord
-        current_xy = np.asarray(graph.points[current_index].xy, dtype=np.float32)
-        if current_assignment.parent_index is None:
-            current_local_to_global_frames = (first_basis,)
-            previous_unit = reference_vector
-            previous_delta = first_delta
-        else:
-            current_local_to_global_frames = current_assignment.local_to_global_frames
-            if not current_local_to_global_frames:
-                continue
-            parent_coord = assignments[current_assignment.parent_index].coord
-            previous_delta = coord_delta(parent_coord, current_coord)
-            if previous_delta is None:
-                continue
-            parent_xy = np.asarray(
-                graph.points[current_assignment.parent_index].xy,
-                dtype=np.float32,
-            )
-            previous_unit = normalized_vector(current_xy - parent_xy)
-            if previous_unit is None:
-                continue
-        candidate_assignments = []
-        for neighbor_index in adjacency[current_index]:
-            if neighbor_index not in component_set:
-                continue
-            if neighbor_index == current_assignment.parent_index:
-                continue
-            if neighbor_index in assignments:
-                continue
-
-            neighbor = graph.points[neighbor_index]
-            observed_unit = normalized_vector(np.asarray(neighbor.xy, dtype=np.float32) - current_xy)
-            if observed_unit is None:
-                continue
-            turn_scores = local_turn_scores(previous_unit, observed_unit)
-            for neighbor_coord in cube_lattice_neighbor_coords(
-                current_coord,
-                neighbor.class_name,
-                used_coords=used_coords,
-            ):
-                assigned_neighbor_coords = [
-                    assignments[assigned_neighbor_index].coord
-                    for assigned_neighbor_index in adjacency[neighbor_index]
-                    if assigned_neighbor_index in assignments
-                ]
-                conflict_count = sum(
-                    not cube_lattice_coords_are_neighbors(neighbor_coord, assigned_neighbor_coord)
-                    for assigned_neighbor_coord in assigned_neighbor_coords
-                )
-                if conflict_count > 0:
-                    continue
-                next_delta = coord_delta(current_coord, neighbor_coord)
-                if next_delta is None:
-                    continue
-                turn_options = []
-                allowed_turns = ("straight", "left", "right")
-                if current_assignment.parent_index is None:
-                    allowed_turns = (*allowed_turns, "back")
-                seen_turn_options = set()
-                for current_local_to_global in current_local_to_global_frames:
-                    for turn_name in allowed_turns:
-                        if current_local_to_global.get(turn_name) != next_delta:
-                            continue
-                        next_path_faces = (
-                            current_assignment.path_faces
-                            & cube_lattice_boundary_faces(neighbor_coord)
-                        )
-                        fallback_frame = propagated_local_to_global_frame(
-                            current_local_to_global,
-                            turn_name,
-                        )
-                        next_local_to_global_frames = unique_local_to_global_frames(
-                            next_delta,
-                            next_path_faces,
-                            fallback_frame,
-                        )
-                        option_key = (
-                            turn_name,
-                            tuple(tuple(sorted(frame.items())) for frame in next_local_to_global_frames),
-                            next_path_faces,
-                        )
-                        if option_key in seen_turn_options:
-                            continue
-                        seen_turn_options.add(option_key)
-                        turn_options.append(
-                            (
-                                turn_name,
-                                next_local_to_global_frames[0],
-                                next_local_to_global_frames,
-                                next_path_faces,
-                                (3.0 if len(assigned_neighbor_coords) >= 2 else 0.0)
-                                + (1.0 if next_path_faces else 0.0),
-                            )
-                        )
-
-                if not turn_options and len(assigned_neighbor_coords) >= 2:
-                    topology_turn = max(("straight", "left", "right"), key=turn_scores.get)
-                    next_path_faces = (
-                        current_assignment.path_faces
-                        & cube_lattice_boundary_faces(neighbor_coord)
-                    )
-                    fallback_frame = (
-                        local_turn_basis_for_delta(next_delta)
-                        or propagated_local_to_global_frame(
-                            current_local_to_global_frames[0],
-                            topology_turn,
-                        )
-                    )
-                    next_local_to_global_frames = unique_local_to_global_frames(
-                        next_delta,
-                        next_path_faces,
-                        fallback_frame,
-                    )
-                    turn_options.append(
-                        (
-                            topology_turn,
-                            next_local_to_global_frames[0],
-                            next_local_to_global_frames,
-                            next_path_faces,
-                            3.0,
-                        )
-                    )
-
-                if not turn_options:
-                    continue
-                (
-                    turn_name,
-                    next_local_to_global,
-                    next_local_to_global_frames,
-                    next_path_faces,
-                    context_bonus,
-                ) = min(
-                    turn_options,
-                    key=lambda option: (
-                        -turn_scores[option[0]] - option[4],
-                        VECTOR_GUIDED_LOCAL_TURN_ORDER.index(option[0]),
-                    ),
-                )
-                score = (
-                    turn_scores[turn_name]
-                    + context_bonus
-                )
-                candidate_assignments.append(
-                    (
-                        conflict_count,
-                        -score,
-                        -neighbor.score,
-                        neighbor_index,
-                        neighbor_coord,
-                        next_local_to_global,
-                        next_local_to_global_frames,
-                        next_path_faces,
-                    )
-                )
-
-        candidate_assignments.sort()
-        for (
-            _conflict_count,
-            _direction_score,
-            _point_score,
-            neighbor_index,
-            neighbor_coord,
-            next_local_to_global,
-            next_local_to_global_frames,
-            next_path_faces,
-        ) in candidate_assignments:
-            if neighbor_index in assignments or neighbor_coord in used_coords:
-                continue
-            assignments[neighbor_index] = PoseGraphNodeAssignment(
-                coord=neighbor_coord,
-                parent_index=current_index,
-                local_to_global=next_local_to_global,
-                local_to_global_frames=next_local_to_global_frames,
-                path_faces=next_path_faces,
-                depth=current_assignment.depth + 1,
-            )
-            used_coords.add(neighbor_coord)
-            enqueue_node(neighbor_index)
-
-    if len(assignments) < 3:
+def pose_graph_correspondence_from_assignments(
+    graph: PoseGraph,
+    assignments: dict[int, PoseGraphNodeAssignment],
+) -> PoseGraphCorrespondence | None:
+    if len(assignments) < 3 or not any(assignment.has_turn for assignment in assignments.values()):
         return None
 
     graph_indexes = tuple(
@@ -2674,6 +3026,483 @@ def vector_guided_pose_graph_correspondence(graph: PoseGraph) -> PoseGraphCorres
         graph_indexes=graph_indexes,
         lattice_coords=lattice_coords,
     )
+
+
+def mirrored_first_neighbor_lattice_coord(
+    start_class_name: str,
+    first_neighbor_class_name: str,
+    first_neighbor_coord: tuple[int, int, int],
+) -> tuple[int, int, int] | None:
+    mirror_pairs: tuple[
+        tuple[str, str, tuple[int, int, int], tuple[int, int, int]],
+        ...
+    ] = (
+        ("corner-edge", "corner-edge-center", (1, 1, 0), (1, 0, 1)),
+        ("corner-edge-center", "corner-edge-center", (2, 1, 0), (1, 2, 0)),
+        ("corner-edge-center", "corner-edge", (1, 0, 0), (0, 1, 0)),
+    )
+    for pair_start_class, pair_neighbor_class, first_coord, second_coord in mirror_pairs:
+        if (
+            start_class_name != pair_start_class
+            or first_neighbor_class_name != pair_neighbor_class
+        ):
+            continue
+        if first_neighbor_coord == first_coord:
+            return second_coord
+        if first_neighbor_coord == second_coord:
+            return first_coord
+    return None
+
+
+def pose_graph_component_has_observed_turn(
+    graph: PoseGraph,
+    adjacency: tuple[tuple[int, ...], ...],
+    component: tuple[int, ...],
+    *,
+    min_cross: float = 0.15,
+) -> bool:
+    component_set = set(component)
+    for current_index in component:
+        current_xy = np.asarray(graph.points[current_index].xy, dtype=np.float32)
+        neighbor_units = []
+        for neighbor_index in adjacency[current_index]:
+            if neighbor_index not in component_set:
+                continue
+            neighbor_unit = normalized_vector(
+                np.asarray(graph.points[neighbor_index].xy, dtype=np.float32) - current_xy
+            )
+            if neighbor_unit is not None:
+                neighbor_units.append(neighbor_unit)
+        for first_index, first_unit in enumerate(neighbor_units):
+            for second_unit in neighbor_units[first_index + 1:]:
+                cross = float(
+                    (first_unit[0] * second_unit[1])
+                    - (first_unit[1] * second_unit[0])
+                )
+                if abs(cross) >= float(min_cross):
+                    return True
+    return False
+
+
+def weighted_shuffle_start_options(
+    start_options: list[tuple[tuple[int, ...], int]],
+    point_weights: dict[int, float],
+) -> list[tuple[tuple[int, ...], int]]:
+    remaining = list(start_options)
+    shuffled = []
+    while remaining:
+        weights = [max(0.0, float(point_weights.get(index, 1.0))) for _component, index in remaining]
+        total = sum(weights)
+        if total <= 0.0:
+            random.shuffle(remaining)
+            shuffled.extend(remaining)
+            break
+        target = random.random() * total
+        cumulative = 0.0
+        selected_index = len(remaining) - 1
+        for option_index, weight in enumerate(weights):
+            cumulative += weight
+            if target <= cumulative:
+                selected_index = option_index
+                break
+        shuffled.append(remaining.pop(selected_index))
+    return shuffled
+
+
+def _vector_guided_pose_graph_correspondence_candidates_from_start(
+    graph: PoseGraph,
+    adjacency: tuple[tuple[int, ...], ...],
+    component: tuple[int, ...],
+    start_index: int,
+    *,
+    max_candidates: int | None = None,
+    point_weights: dict[int, float] | None = None,
+    exclude_keys: set[tuple[tuple[int, ...], tuple[tuple[int, int, int], ...]]] | None = None,
+) -> tuple[PoseGraphCorrespondence, ...]:
+    component_set = set(component)
+    start = graph.points[start_index]
+    start_coord = VECTOR_GUIDED_START_COORDS.get(start.class_name)
+    if start_coord is None:
+        return tuple()
+
+    def weighted_point_score(index: int) -> float:
+        weight = 1.0 if point_weights is None else float(point_weights.get(index, 1.0))
+        return float(graph.points[index].score) * max(0.0, weight)
+
+    start_assignment = PoseGraphNodeAssignment(
+        coord=start_coord,
+        parent_index=None,
+        local_to_global=None,
+        local_to_global_frames=tuple(),
+        path_faces=cube_lattice_boundary_faces(start_coord),
+        depth=0,
+        has_turn=False,
+    )
+    start_used_coords = {start_coord}
+
+    first_neighbor_options = []
+    for neighbor_index in adjacency[start_index]:
+        if neighbor_index not in component_set:
+            continue
+        neighbor = graph.points[neighbor_index]
+        observed_unit = normalized_vector(
+            np.asarray(neighbor.xy, dtype=np.float32)
+            - np.asarray(start.xy, dtype=np.float32)
+        )
+        if observed_unit is None:
+            continue
+        for neighbor_coord in cube_lattice_neighbor_coords(
+            start_coord,
+            neighbor.class_name,
+            used_coords=start_used_coords,
+        ):
+            delta = tuple(neighbor_coord[index] - start_coord[index] for index in range(3))
+            first_neighbor_options.append(
+                (
+                    -weighted_point_score(neighbor_index),
+                    VECTOR_GUIDED_DIRECTION_RANK.get(delta, len(VECTOR_GUIDED_DIRECTION_PRIORITY)),
+                    neighbor_index,
+                    neighbor_coord,
+                    observed_unit,
+                )
+            )
+    if not first_neighbor_options:
+        return tuple()
+
+    correspondences: list[PoseGraphCorrespondence] = []
+    correspondence_keys: set[tuple[tuple[int, ...], tuple[tuple[int, int, int], ...]]] = set()
+
+    def add_correspondence(
+        assignments: dict[int, PoseGraphNodeAssignment],
+    ) -> bool:
+        correspondence = pose_graph_correspondence_from_assignments(graph, assignments)
+        if correspondence is None:
+            return False
+        key = correspondence.key
+        if key in correspondence_keys or (exclude_keys is not None and key in exclude_keys):
+            return False
+        correspondence_keys.add(key)
+        correspondences.append(correspondence)
+        return max_candidates is not None and len(correspondences) >= max_candidates
+
+    def walk_from_first_neighbor(
+        first_neighbor_index: int,
+        first_neighbor_coord: tuple[int, int, int],
+        reference_vector: np.ndarray,
+    ) -> bool:
+        first_delta = coord_delta(start_coord, first_neighbor_coord)
+        if first_delta is None:
+            return False
+        first_basis = local_turn_basis_for_delta(first_delta)
+        if first_basis is None:
+            return False
+        assignments: dict[int, PoseGraphNodeAssignment] = {
+            start_index: start_assignment,
+        }
+        used_coords = {start_coord}
+        first_path_faces = start_assignment.path_faces & cube_lattice_boundary_faces(
+            first_neighbor_coord
+        )
+        assignments[first_neighbor_index] = PoseGraphNodeAssignment(
+            coord=first_neighbor_coord,
+            parent_index=start_index,
+            local_to_global=first_basis,
+            local_to_global_frames=unique_local_to_global_frames(
+                first_delta,
+                first_path_faces,
+                first_basis,
+            ),
+            path_faces=first_path_faces,
+            depth=1,
+            has_turn=False,
+        )
+        used_coords.add(first_neighbor_coord)
+
+        queue = deque([start_index, first_neighbor_index])
+        queued_indexes = {start_index, first_neighbor_index}
+
+        def enqueue_node(index: int) -> None:
+            if index in queued_indexes:
+                return
+            queue.append(index)
+            queued_indexes.add(index)
+
+        while queue:
+            current_index = queue.popleft()
+            current_assignment = assignments[current_index]
+            current_coord = current_assignment.coord
+            current_xy = np.asarray(graph.points[current_index].xy, dtype=np.float32)
+            if current_assignment.parent_index is None:
+                current_local_to_global_frames = (first_basis,)
+                previous_unit = reference_vector
+            else:
+                current_local_to_global_frames = current_assignment.local_to_global_frames
+                if not current_local_to_global_frames:
+                    continue
+                parent_coord = assignments[current_assignment.parent_index].coord
+                previous_delta = coord_delta(parent_coord, current_coord)
+                if previous_delta is None:
+                    continue
+                parent_xy = np.asarray(
+                    graph.points[current_assignment.parent_index].xy,
+                    dtype=np.float32,
+                )
+                previous_unit = normalized_vector(current_xy - parent_xy)
+                if previous_unit is None:
+                    continue
+            candidate_assignments = []
+            for neighbor_index in adjacency[current_index]:
+                if neighbor_index not in component_set:
+                    continue
+                if neighbor_index == current_assignment.parent_index:
+                    continue
+                if neighbor_index in assignments:
+                    continue
+
+                neighbor = graph.points[neighbor_index]
+                observed_unit = normalized_vector(np.asarray(neighbor.xy, dtype=np.float32) - current_xy)
+                if observed_unit is None:
+                    continue
+                turn_scores = local_turn_scores(previous_unit, observed_unit)
+                for neighbor_coord in cube_lattice_neighbor_coords(
+                    current_coord,
+                    neighbor.class_name,
+                    used_coords=used_coords,
+                ):
+                    assigned_neighbor_coords = [
+                        assignments[assigned_neighbor_index].coord
+                        for assigned_neighbor_index in adjacency[neighbor_index]
+                        if assigned_neighbor_index in assignments
+                    ]
+                    conflict_count = sum(
+                        not cube_lattice_coords_are_neighbors(neighbor_coord, assigned_neighbor_coord)
+                        for assigned_neighbor_coord in assigned_neighbor_coords
+                    )
+                    if conflict_count > 0:
+                        continue
+                    next_delta = coord_delta(current_coord, neighbor_coord)
+                    if next_delta is None:
+                        continue
+                    turn_options = []
+                    allowed_turns = ("straight", "left", "right")
+                    if current_assignment.parent_index is None:
+                        allowed_turns = (*allowed_turns, "back")
+                    seen_turn_options = set()
+                    for current_local_to_global in current_local_to_global_frames:
+                        for turn_name in allowed_turns:
+                            if current_local_to_global.get(turn_name) != next_delta:
+                                continue
+                            next_path_faces = (
+                                current_assignment.path_faces
+                                & cube_lattice_boundary_faces(neighbor_coord)
+                            )
+                            fallback_frame = propagated_local_to_global_frame(
+                                current_local_to_global,
+                                turn_name,
+                            )
+                            next_local_to_global_frames = unique_local_to_global_frames(
+                                next_delta,
+                                next_path_faces,
+                                fallback_frame,
+                            )
+                            option_key = (
+                                turn_name,
+                                tuple(tuple(sorted(frame.items())) for frame in next_local_to_global_frames),
+                                next_path_faces,
+                            )
+                            if option_key in seen_turn_options:
+                                continue
+                            seen_turn_options.add(option_key)
+                            turn_options.append(
+                                (
+                                    turn_name,
+                                    next_local_to_global_frames[0],
+                                    next_local_to_global_frames,
+                                    next_path_faces,
+                                    (3.0 if len(assigned_neighbor_coords) >= 2 else 0.0)
+                                    + (1.0 if next_path_faces else 0.0),
+                                )
+                            )
+
+                    if not turn_options and len(assigned_neighbor_coords) >= 2:
+                        topology_turn = max(("straight", "left", "right"), key=turn_scores.get)
+                        next_path_faces = (
+                            current_assignment.path_faces
+                            & cube_lattice_boundary_faces(neighbor_coord)
+                        )
+                        fallback_frame = (
+                            local_turn_basis_for_delta(next_delta)
+                            or propagated_local_to_global_frame(
+                                current_local_to_global_frames[0],
+                                topology_turn,
+                            )
+                        )
+                        next_local_to_global_frames = unique_local_to_global_frames(
+                            next_delta,
+                            next_path_faces,
+                            fallback_frame,
+                        )
+                        turn_options.append(
+                            (
+                                topology_turn,
+                                next_local_to_global_frames[0],
+                                next_local_to_global_frames,
+                                next_path_faces,
+                                3.0,
+                            )
+                        )
+
+                    if not turn_options:
+                        continue
+                    (
+                        turn_name,
+                        next_local_to_global,
+                        next_local_to_global_frames,
+                        next_path_faces,
+                        context_bonus,
+                    ) = min(
+                        turn_options,
+                        key=lambda option: (
+                            -turn_scores[option[0]] - option[4],
+                            VECTOR_GUIDED_LOCAL_TURN_ORDER.index(option[0]),
+                        ),
+                    )
+                    score = (
+                        turn_scores[turn_name]
+                        + context_bonus
+                    )
+                    candidate_assignments.append(
+                        (
+                            conflict_count,
+                            -score,
+                            -weighted_point_score(neighbor_index),
+                            neighbor_index,
+                            neighbor_coord,
+                            next_local_to_global,
+                            next_local_to_global_frames,
+                            next_path_faces,
+                            turn_name in ("left", "right"),
+                        )
+                    )
+
+            candidate_assignments.sort()
+            for (
+                _conflict_count,
+                _direction_score,
+                _point_score,
+                neighbor_index,
+                neighbor_coord,
+                next_local_to_global,
+                next_local_to_global_frames,
+                next_path_faces,
+                has_turn,
+            ) in candidate_assignments:
+                if neighbor_index in assignments or neighbor_coord in used_coords:
+                    continue
+                node_has_turn = current_assignment.has_turn or bool(has_turn)
+                assignments[neighbor_index] = PoseGraphNodeAssignment(
+                    coord=neighbor_coord,
+                    parent_index=current_index,
+                    local_to_global=next_local_to_global,
+                    local_to_global_frames=next_local_to_global_frames,
+                    path_faces=next_path_faces,
+                    depth=current_assignment.depth + 1,
+                    has_turn=node_has_turn,
+                )
+                used_coords.add(neighbor_coord)
+                if node_has_turn and len(assignments) >= 3:
+                    if add_correspondence(assignments):
+                        return True
+                enqueue_node(neighbor_index)
+
+        return add_correspondence(assignments)
+
+    _score, _rank, first_neighbor_index, first_neighbor_coord, reference_vector = min(first_neighbor_options)
+    first_neighbor = graph.points[first_neighbor_index]
+    first_neighbor_coord_options = [first_neighbor_coord]
+    mirrored_coord = mirrored_first_neighbor_lattice_coord(
+        start.class_name,
+        first_neighbor.class_name,
+        first_neighbor_coord,
+    )
+    if mirrored_coord is not None:
+        first_neighbor_coord_options.append(mirrored_coord)
+    for coord_option in first_neighbor_coord_options:
+        if walk_from_first_neighbor(first_neighbor_index, coord_option, reference_vector):
+            return tuple(correspondences)
+    return tuple(correspondences)
+
+
+def vector_guided_pose_graph_correspondence_candidates(
+    graph: PoseGraph,
+    *,
+    max_candidates: int | None = None,
+    point_weights: dict[int, float] | None = None,
+    exclude_keys: set[tuple[tuple[int, ...], tuple[tuple[int, int, int], ...]]] | None = None,
+) -> tuple[PoseGraphCorrespondence, ...]:
+    if max_candidates is not None:
+        max_candidates = max(0, int(max_candidates))
+        if max_candidates == 0:
+            return tuple()
+
+    adjacency = pose_graph_adjacency(graph)
+    components = pose_graph_components(graph, adjacency)
+    eligible_components = [
+        component
+        for component in components
+        if len(component) >= 3
+        and pose_graph_component_has_observed_turn(graph, adjacency, component)
+    ]
+    if not eligible_components:
+        return tuple()
+
+    start_options = [
+        (component, index)
+        for component in eligible_components
+        for index in component
+        if graph.points[index].class_name in VECTOR_GUIDED_START_COORDS
+    ]
+    if not start_options:
+        return tuple()
+    if point_weights is None:
+        random.shuffle(start_options)
+    else:
+        start_options = weighted_shuffle_start_options(start_options, point_weights)
+
+    correspondences: list[PoseGraphCorrespondence] = []
+    correspondence_keys: set[tuple[tuple[int, ...], tuple[tuple[int, int, int], ...]]] = (
+        set() if exclude_keys is None else set(exclude_keys)
+    )
+    for component, start_index in start_options:
+        remaining = (
+            None
+            if max_candidates is None
+            else max(0, max_candidates - len(correspondences))
+        )
+        if remaining == 0:
+            break
+        for correspondence in _vector_guided_pose_graph_correspondence_candidates_from_start(
+            graph,
+            adjacency,
+            component,
+            start_index,
+            max_candidates=remaining,
+            point_weights=point_weights,
+            exclude_keys=correspondence_keys,
+        ):
+            key = correspondence.key
+            if key in correspondence_keys:
+                continue
+            correspondence_keys.add(key)
+            correspondences.append(correspondence)
+            if max_candidates is not None and len(correspondences) >= max_candidates:
+                return tuple(correspondences)
+    return tuple(correspondences)
+
+
+def vector_guided_pose_graph_correspondence(graph: PoseGraph) -> PoseGraphCorrespondence | None:
+    correspondences = vector_guided_pose_graph_correspondence_candidates(graph, max_candidates=1)
+    return None if not correspondences else correspondences[0]
 
 
 def draw_pose_graph_adjacencies(
@@ -2874,26 +3703,68 @@ def draw_pose_estimate(
     pnp_result = None
     if ENABLE_POSE_ESTIMATION and ENABLE_POSE_GRAPH_CORRESPONDENCE and pose_solver is not None:
         started = perf_counter()
-        correspondence = vector_guided_pose_graph_correspondence(pose_graph)
+        max_correspondence_candidates = max(
+            0,
+            int(getattr(pose_solver, "max_refinement_attempts", PNP_MAX_REFINEMENT_ATTEMPTS)),
+        )
+        correspondences: list[PoseGraphCorrespondence] = []
+        correspondence = None
+        tried_correspondence_keys: set[tuple[tuple[int, ...], tuple[tuple[int, int, int], ...]]] = set()
+        point_weights = {index: 1.0 for index in range(len(pose_graph.points))}
+        if profile is not None:
+            profile["correspondence_generation_ms"] = 0.0
+        refinement_budget = {"remaining": max_correspondence_candidates}
+        solve_started = perf_counter()
+        for _attempt_index in range(max_correspondence_candidates):
+            generation_started = perf_counter()
+            next_correspondences = vector_guided_pose_graph_correspondence_candidates(
+                pose_graph,
+                max_candidates=1,
+                point_weights=point_weights,
+                exclude_keys=tried_correspondence_keys,
+            )
+            if profile is not None:
+                profile["correspondence_generation_ms"] = (
+                    float(profile.get("correspondence_generation_ms", 0.0))
+                    + (perf_counter() - generation_started) * 1000.0
+                )
+            if not next_correspondences:
+                break
+            correspondence = next_correspondences[0]
+            correspondences.append(correspondence)
+            tried_correspondence_keys.add(correspondence.key)
+            if profile is not None:
+                profile["seed_attempts"] = int(profile.get("seed_attempts", 0)) + 1
+            try:
+                pnp_result = pose_solver.solve_correspondences(
+                    correspondence,
+                    (frame.shape[1], frame.shape[0]),
+                    observed_graph=pose_graph,
+                    profile=profile,
+                    refinement_budget=refinement_budget,
+                    clear_rejected=False,
+                )
+            except TypeError:
+                pnp_result = pose_solver.solve_correspondences(
+                    correspondence,
+                    (frame.shape[1], frame.shape[0]),
+                    observed_graph=pose_graph,
+                )
+            if pnp_result is not None:
+                break
+            for graph_index in correspondence.graph_indexes:
+                point_weights[graph_index] = float(point_weights.get(graph_index, 1.0)) * 0.5
+        if pnp_result is None:
+            clear_last_tvec = getattr(pose_solver, "clear_last_tvec", None)
+            if callable(clear_last_tvec):
+                clear_last_tvec()
         if profile is not None:
             profile["correspondence_ms"] = (perf_counter() - started) * 1000.0
+            profile["solve_ms"] = (perf_counter() - solve_started) * 1000.0
             profile["correspondence_points"] = (
                 0 if correspondence is None else len(correspondence.graph_indexes)
             )
-        started = perf_counter()
-        if profile is None:
-            pnp_result = pose_solver.solve_correspondences(
-                correspondence,
-                (frame.shape[1], frame.shape[0]),
-                observed_graph=pose_graph,
-            )
-        else:
-            pnp_result = pose_solver.solve_correspondences(
-                correspondence,
-                (frame.shape[1], frame.shape[0]),
-                observed_graph=pose_graph,
-                profile=profile,
-            )
+            profile["correspondence_candidates"] = len(correspondences)
         if profile is not None:
             profile["pnp_ms"] = (perf_counter() - started) * 1000.0
             profile["pnp_points"] = 0 if pnp_result is None else len(pnp_result.object_points)
@@ -2901,7 +3772,18 @@ def draw_pose_estimate(
         if DRAW_POSE_GRAPH_COORDS:
             draw_pose_graph_correspondence(frame, pose_graph, correspondence)
         if DRAW_PNP_CUBE:
-            draw_pnp_cube(frame, pnp_result)
+            rejected_pnp_result = (
+                getattr(pose_solver, "rejected_pose_result", None)
+                if pnp_result is None
+                else None
+            )
+            draw_pnp_cube(
+                frame,
+                pnp_result or rejected_pnp_result,
+                alpha=0.5 if pnp_result is None else 1.0,
+                observed_graph=pose_graph,
+                profile=profile,
+            )
         if profile is not None:
             profile["draw_pose_ms"] = (perf_counter() - started) * 1000.0
     return point_count, pnp_result, pose_tracking_bounds_xyxy
@@ -3347,9 +4229,52 @@ def pose_profile_summary(profile: dict[str, float | int]) -> str:
         f"pts {int(profile.get('pose_points', 0))}",
         f"corr {int(profile.get('correspondence_points', 0))}",
         f"edges {int(profile.get('accepted_edges', 0))}/{int(profile.get('candidate_edges', 0))}",
+        f"p1 {int(profile.get('seed_attempts', 0))}",
+        f"p2 {int(profile.get('refinement_attempts', 0))}",
         f"pnp_calls {int(profile.get('pnp_solve_calls', 0))}",
     ]
     return "pose ms " + " ".join(timing_parts) + " | " + " ".join(count_parts)
+
+
+def pose_attempt_summary(profile: dict[str, float | int] | None) -> str:
+    profile = {} if profile is None else profile
+    return (
+        f"p1 {int(profile.get('seed_attempts', 0))} "
+        f"p2 {int(profile.get('refinement_attempts', 0))}"
+    )
+
+
+def print_pose_validity_summary(valid_pose_frames: int, invalid_pose_frames: int) -> None:
+    keypoint_frames = int(valid_pose_frames) + int(invalid_pose_frames)
+    print(
+        "pose summary: "
+        f"{valid_pose_frames} valid, {invalid_pose_frames} invalid "
+        f"out of {keypoint_frames} frames with keypoint detections",
+        flush=True,
+    )
+
+
+def source_fps(capture: cv2.VideoCapture, fallback: float = 30.0) -> float:
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    if not np.isfinite(fps) or fps <= 1e-3:
+        return float(fallback)
+    return fps
+
+
+def create_video_writer(path: Path, frame_shape: tuple[int, ...], fps: float) -> cv2.VideoWriter:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = frame_shape[:2]
+    suffix = path.suffix.lower()
+    fourcc_name = "mp4v" if suffix in {".mp4", ".m4v", ".mov"} else "MJPG"
+    writer = cv2.VideoWriter(
+        str(path),
+        cv2.VideoWriter_fourcc(*fourcc_name),
+        float(fps),
+        (int(width), int(height)),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open video writer for {path}")
+    return writer
 
 
 def process_frame(
@@ -3361,11 +4286,15 @@ def process_frame(
     roi_tracker: RoiTracker | None = None,
     pose_model=None,
     pose_solver: PoseGraphPnPSolver | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_pose_stats: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, FramePoseStats]:
     output = frame.copy()
     roi_xyxy, candidate, roi_source = roi_for_frame(frame, bbox_detector, args, roi_tracker)
     if roi_xyxy is None:
-        return output, np.empty((0, 3), dtype=np.uint8)
+        bgr_samples = np.empty((0, 3), dtype=np.uint8)
+        if return_pose_stats:
+            return output, bgr_samples, FramePoseStats(keypoint_count=0, valid_pose=False)
+        return output, bgr_samples
 
     x1, y1, x2, y2 = roi_xyxy
     roi = frame[y1:y2, x1:x2]
@@ -3383,7 +4312,7 @@ def process_frame(
         )
     pose_keypoint_count = 0
     pnp_result = None
-    pose_profile = {} if getattr(args, "profile_pose", False) else None
+    pose_profile = {}
     setattr(args, "_pose_profile", pose_profile)
     if pose_model is not None:
         if ENABLE_POSE_ESTIMATION and pose_solver is None:
@@ -3460,8 +4389,17 @@ def process_frame(
                 1,
                 cv2.LINE_AA,
             )
-    if pose_profile is not None:
+    if getattr(args, "profile_pose", False) and pose_profile is not None:
         print(pose_profile_summary(pose_profile), flush=True)
+    if return_pose_stats:
+        return (
+            output,
+            bgr_samples,
+            FramePoseStats(
+                keypoint_count=pose_keypoint_count,
+                valid_pose=pnp_result is not None,
+            ),
+        )
     return output, bgr_samples
 
 
@@ -3602,6 +4540,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--save", type=Path)
+    parser.add_argument(
+        "--save-video",
+        type=Path,
+        help="Output path for processed video frames.",
+    )
     parser.add_argument("--display", dest="display", action="store_true")
     parser.add_argument("--no-display", dest="display", action="store_false")
     parser.add_argument("--hide-bbox", dest="show_bbox", action="store_false")
@@ -3730,6 +4673,8 @@ def main() -> int:
     color_plot_requested = ENABLE_STICKER_SEGMENTATION and color_plot_outputs_requested(args)
     color_plot_bgr_batches = []
     color_plot_detected_frames = 0
+    valid_pose_frames = 0
+    invalid_pose_frames = 0
     roi_tracker = RoiTracker()
     pose_solver = (
         PoseGraphPnPSolver(
@@ -3750,7 +4695,7 @@ def main() -> int:
         frame = cv2.imread(source)
         if frame is None:
             raise SystemExit(f"Could not read image: {source}")
-        output, bgr_samples = process_frame(
+        output, bgr_samples, pose_stats = process_frame(
             frame,
             bbox_detector,
             sticker_model,
@@ -3759,6 +4704,7 @@ def main() -> int:
             roi_tracker,
             pose_model,
             pose_solver,
+            return_pose_stats=True,
         )
         if color_plot_requested:
             if len(bgr_samples) == 0:
@@ -3795,6 +4741,10 @@ def main() -> int:
             cv2.imshow(DISPLAY_WINDOW_NAME, output)
             cv2.waitKey(0)
             cv2.destroyAllWindows()
+        print_pose_validity_summary(
+            1 if pose_stats.keypoint_count > 0 and pose_stats.valid_pose else 0,
+            1 if pose_stats.keypoint_count > 0 and not pose_stats.valid_pose else 0,
+        )
         return 0
 
     capture = cv2.VideoCapture(source)
@@ -3804,62 +4754,82 @@ def main() -> int:
         raise SystemExit(f"Could not open source: {args.source}")
 
     previous = perf_counter()
-    while True:
-        ok, frame = capture.read()
-        if not ok:
-            break
-        output, bgr_samples = process_frame(
-            frame,
-            bbox_detector,
-            sticker_model,
-            args,
-            color_classifier,
-            roi_tracker,
-            pose_model,
-            pose_solver,
-        )
-        now = perf_counter()
-        fps = 1.0 / max(now - previous, 1e-6)
-        previous = now
-        if args.debug_overlay:
-            cv2.putText(
-                output,
-                f"FPS {fps:.1f}",
-                (12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                3,
-            )
-            cv2.putText(
-                output,
-                f"FPS {fps:.1f}",
-                (12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (20, 20, 20),
-                1,
-            )
-
-        if args.save and args.once:
-            cv2.imwrite(str(args.save), output)
-        if color_plot_requested:
-            if color_plot_detected_frames < args.color_plot_frames and len(bgr_samples) > 0:
-                color_plot_bgr_batches.append(bgr_samples)
-                color_plot_detected_frames += 1
-                if color_plot_detected_frames >= args.color_plot_frames and not args.display:
-                    break
-        if args.display:
-            cv2.imshow(DISPLAY_WINDOW_NAME, output)
-            key = cv2.waitKey(0 if args.once else 1) & 0xFF
-            if key == ord("q"):
+    video_writer = None
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
                 break
-        if args.once:
-            break
+            output, bgr_samples, pose_stats = process_frame(
+                frame,
+                bbox_detector,
+                sticker_model,
+                args,
+                color_classifier,
+                roi_tracker,
+                pose_model,
+                pose_solver,
+                return_pose_stats=True,
+            )
+            if pose_stats.keypoint_count > 0:
+                if pose_stats.valid_pose:
+                    valid_pose_frames += 1
+                else:
+                    invalid_pose_frames += 1
+            now = perf_counter()
+            fps = 1.0 / max(now - previous, 1e-6)
+            previous = now
+            if args.debug_overlay:
+                cv2.putText(
+                    output,
+                    f"FPS {fps:.1f}",
+                    (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
+                    3,
+                )
+                cv2.putText(
+                    output,
+                    f"FPS {fps:.1f}",
+                    (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (20, 20, 20),
+                    1,
+                )
+
+            if args.save_video:
+                if video_writer is None:
+                    video_writer = create_video_writer(
+                        args.save_video,
+                        output.shape,
+                        source_fps(capture),
+                    )
+                video_writer.write(output)
+            if args.save and args.once:
+                cv2.imwrite(str(args.save), output)
+            if color_plot_requested:
+                if color_plot_detected_frames < args.color_plot_frames and len(bgr_samples) > 0:
+                    color_plot_bgr_batches.append(bgr_samples)
+                    color_plot_detected_frames += 1
+                    if color_plot_detected_frames >= args.color_plot_frames and not args.display:
+                        break
+            if args.display:
+                cv2.imshow(DISPLAY_WINDOW_NAME, output)
+                key = cv2.waitKey(0 if args.once else 1) & 0xFF
+                if key == ord("q"):
+                    break
+            if args.once:
+                break
+    finally:
+        if video_writer is not None:
+            video_writer.release()
 
     if args.display:
         cv2.destroyAllWindows()
     capture.release()
+    print_pose_validity_summary(valid_pose_frames, invalid_pose_frames)
     if color_plot_requested:
         if not color_plot_bgr_batches:
             raise SystemExit("Could not collect color plot samples from any segmented frames")
