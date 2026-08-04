@@ -10,6 +10,7 @@ Pipeline:
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import combinations
@@ -19,37 +20,28 @@ from time import perf_counter
 import cv2
 import numpy as np
 
-import sys
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from live_recognition.cube_net import (  # noqa: E402
-    CubeNetState,
-    build_cube_net_from_graph,
-    draw_cube_net,
-)
+from live_recognition.cube_net import (CubeNetState,  # noqa: E402
+                                       build_cube_net_from_graph,
+                                       draw_cube_net)
 from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
-from live_recognition.piece_graph import (  # noqa: E402
-    PieceGraph,
-    StickerNode,
-    _legal_mask_adjacencies,
-    draw_piece_graph as draw_sticker_graph,
-)
-from live_recognition.visualization import (  # noqa: E402
-    _reliable_color_mask,
-    save_hsv_samples_interactive_plot,
-    save_rgb_samples_interactive_plot,
-    save_rgb_samples_plot,
-)
-
+from live_recognition.piece_graph import (PieceGraph, StickerNode,
+                                          _legal_mask_adjacencies)
+from live_recognition.piece_graph import \
+    draw_piece_graph as draw_sticker_graph  # noqa: E402
+from live_recognition.visualization import (_reliable_color_mask,  # noqa: E402
+                                            save_hsv_samples_interactive_plot,
+                                            save_rgb_samples_interactive_plot,
+                                            save_rgb_samples_plot)
 
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 DEFAULT_STICKER_MODEL = (
     ROOT
-    / "runs/segment/runs/cube_face_seg_local/runs/cube_face_sticker_yolo11n_seg/weights/best.pt"
+    / "runs/segment/runs/cube_face_sticker_seg_local/runs/cube_face_sticker_yolo11n_seg-2/weights/best.pt"
 )
 DEFAULT_STICKER_MASK_COLOR = (150, 150, 150)
 FACE_INSTANCE_MASK_COLORS = (
@@ -251,11 +243,12 @@ class ColorDensityClassifier:
         if float(np.linalg.norm(rgb)) < self.min_brightness:
             return None
 
-        distances = angular_distance_to_normalized_rgb_clusters(
+        distances = distances_to_rgb_clusters(
             rgb,
             self.cluster_samples,
         )
-        if len(distances) == 0 or float(distances.min()) > self.density_cluster_eps_radians:
+        max_distance = density_cluster_rgb_radius(self.density_cluster_eps_radians)
+        if len(distances) == 0 or float(distances.min()) > max_distance:
             return None
         return int(distances.argmin())
 
@@ -274,26 +267,23 @@ class ColorDensityClassifier:
         return int(np.bincount(np.asarray(votes, dtype=np.int32)).argmax())
 
 
-def normalized_rgb_points(rgb_samples: np.ndarray) -> np.ndarray:
-    samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
-    brightness = np.maximum(np.linalg.norm(samples, axis=1, keepdims=True), 1.0)
-    return samples / brightness
+def density_cluster_rgb_radius(eps_radians: float) -> float:
+    chord_radius = float(np.sqrt(max(0.0, 2.0 - 2.0 * np.cos(float(eps_radians)))))
+    return max(chord_radius * 255.0, 1e-6)
 
 
-def angular_distance_to_normalized_rgb_clusters(
+def distances_to_rgb_clusters(
     rgb_sample: np.ndarray,
     cluster_samples: list[np.ndarray],
 ) -> np.ndarray:
-    point = normalized_rgb_points(np.asarray(rgb_sample, dtype=np.float32).reshape(1, 3))[0]
+    point = np.asarray(rgb_sample, dtype=np.float32).reshape(1, 3)
     distances = []
     for samples in cluster_samples:
         samples = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
         if len(samples) == 0:
             distances.append(np.inf)
             continue
-        normalized_samples = normalized_rgb_points(samples)
-        max_cosine = float(np.max(np.clip(normalized_samples @ point, -1.0, 1.0)))
-        distances.append(float(np.arccos(max_cosine)))
+        distances.append(float(np.min(np.linalg.norm(samples - point, axis=1))))
     return np.asarray(distances, dtype=np.float32)
 
 
@@ -315,7 +305,7 @@ def density_rgb_clusters(
         return np.empty((0, 3), dtype=np.float32), []
 
     labels = density_bin_labels(
-        normalized_rgb_points(usable),
+        usable,
         eps_radians=eps_radians,
         min_points=min_points,
     )
@@ -362,13 +352,13 @@ def merge_smallest_clusters_to_nearest_neighbor(
 
 
 def nearest_cluster_index(clusters: list[np.ndarray], source_index: int) -> int:
-    source_centroid = normalized_rgb_points(clusters[source_index]).mean(axis=0)
+    source_centroid = np.asarray(clusters[source_index], dtype=np.float32).mean(axis=0)
     best_index = 0 if source_index != 0 else 1
     best_distance = np.inf
     for index, cluster in enumerate(clusters):
         if index == source_index:
             continue
-        centroid = normalized_rgb_points(cluster).mean(axis=0)
+        centroid = np.asarray(cluster, dtype=np.float32).mean(axis=0)
         distance = float(np.linalg.norm(source_centroid - centroid))
         if distance < best_distance:
             best_distance = distance
@@ -387,9 +377,7 @@ def density_bin_labels(
     if len(samples) == 0:
         return labels
 
-    eps = max(float(eps_radians), 1e-6)
-    chord_radius = float(np.sqrt(max(0.0, 2.0 - 2.0 * np.cos(eps))))
-    cell_size = max(chord_radius, 1e-6)
+    cell_size = density_cluster_rgb_radius(eps_radians)
     cell_keys, sample_cell_indexes, cell_counts = np.unique(
         np.floor(samples / cell_size).astype(np.int32),
         axis=0,
@@ -2937,8 +2925,7 @@ def sticker_piece_type(class_name: str) -> str:
 
 
 def mask_color_for_segment(class_name: str, segment_index: int) -> tuple[int, int, int]:
-    if class_name == "face":
-        return FACE_INSTANCE_MASK_COLORS[segment_index % len(FACE_INSTANCE_MASK_COLORS)]
+    del class_name, segment_index
     return DEFAULT_STICKER_MASK_COLOR
 
 
@@ -3207,8 +3194,6 @@ def draw_sticker_segments(
     sticker_color_numbers = []
     classifier_bgr_batches = []
     sticker_nodes = []
-    grid_fit_masks = []
-    face_hull_masks = []
     build_sticker_nodes = args.draw_sticker_graph or cube_net_state is not None
     color_samples = roi_color_samples(roi)
     tracking_min_x: int | None = None
@@ -3250,10 +3235,6 @@ def draw_sticker_segments(
             sample_mask = mask_bool
         draw_mask = sample_mask
         graph_mask = mask_bool
-        if class_name == "face":
-            face_hull_masks.append(graph_mask)
-        if getattr(args, "draw_cube_grid_fit", False):
-            grid_fit_masks.append(graph_mask)
 
         ys, xs = np.nonzero(graph_mask)
         mask_min_x = int(xs.min())
@@ -3395,31 +3376,7 @@ def draw_sticker_segments(
             frame[overlay_mask] = blended.clip(0, 255).astype(np.uint8)
     else:
         frame[:] = overlay
-    if face_hull_masks:
-        draw_face_parallelogram_hulls(
-            frame,
-            face_hull_masks,
-            roi_shape=(roi_height, roi_width),
-            offset_xy=(x1, y1),
-        )
-    projection_panel = face_projection_panel(
-        roi,
-        face_hull_masks,
-        roi_shape=(roi_height, roi_width),
-        output_height=frame.shape[0],
-    )
-    if getattr(args, "draw_cube_grid_fit", False) and grid_fit_masks:
-        line_overlay = low_intersection_sticker_lines(
-            grid_fit_masks,
-            roi_shape=(roi_height, roi_width),
-            line_width_px=getattr(args, "empty_space_line_width", EMPTY_SPACE_LINE_WIDTH_PX),
-            angle_bucket_degrees=getattr(
-                args,
-                "basis_angle_bucket_degrees",
-                BASIS_VECTOR_ANGLE_BUCKET_DEGREES,
-            ),
-        )
-        draw_low_intersection_lines(frame, line_overlay, offset_xy=(x1, y1))
+    projection_panel = None
     if (args.draw_sticker_graph or cube_net_state is not None) and sticker_nodes:
         graph = direct_sticker_graph(
             sticker_nodes,
@@ -3748,13 +3705,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="density_cluster_eps_radians",
         type=float,
         default=DENSITY_CLUSTER_EPS_RADIANS,
-        help="Angular radius for normalized RGB density clustering",
+        help="RGB distance radius for density clustering, expressed with the legacy angular scale",
     )
     parser.add_argument(
         "--density-cluster-min-neighbors",
         type=int,
         default=DENSITY_CLUSTER_MIN_POINTS,
-        help="Minimum normalized RGB points in the epsilon neighborhood for a density core point",
+        help="Minimum RGB points in the epsilon neighborhood for a density core point",
     )
     parser.add_argument(
         "--color-plot-frames",

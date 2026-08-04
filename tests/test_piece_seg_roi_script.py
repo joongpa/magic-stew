@@ -441,9 +441,9 @@ def test_process_frame_accepts_face_segmentation_class():
     )
 
     assert len(bgr_samples) > 0
-    assert output.shape[0] == frame.shape[0]
-    assert output.shape[1] > frame.shape[1]
-    assert np.any(output[:, : frame.shape[1]] != frame)
+    assert output.shape == frame.shape
+    assert np.any(output != frame)
+    assert np.any(np.all(output == piece_seg_script.DEFAULT_STICKER_MASK_COLOR, axis=2))
 
 
 def test_draw_sticker_segments_prunes_face_mostly_covered_by_larger_face():
@@ -462,11 +462,11 @@ def test_draw_sticker_segments_prunes_face_mostly_covered_by_larger_face():
     assert count == 1
     assert len(bgr_samples) > 0
     assert tracking_bounds == (40, 40, 180, 180)
-    assert projection_panel is not None
+    assert projection_panel is None
     assert np.array_equal(frame[35, 35], np.asarray([0, 0, 0], dtype=np.uint8))
     assert np.array_equal(
         frame[50, 50],
-        np.asarray(piece_seg_script.FACE_INSTANCE_MASK_COLORS[0], dtype=np.uint8),
+        np.asarray(piece_seg_script.DEFAULT_STICKER_MASK_COLOR, dtype=np.uint8),
     )
 
 
@@ -1641,28 +1641,26 @@ def test_process_frame_graph_uses_unpadded_mask_when_sampling_is_padded():
     assert graph.nodes[0].mask.sum() == 100 * 255
 
 
-def test_process_frame_grid_fit_uses_unpadded_segmentation_mask():
+def test_process_frame_grid_fit_display_is_disabled():
     frame = np.zeros((40, 40, 3), dtype=np.uint8)
     frame[:, :] = [40, 40, 40]
     args = default_args(
         draw_cube_grid_fit=True,
         segmentation_padding_px=-2,
     )
-    captured = {}
     original_low_intersection_sticker_lines = piece_seg_script.low_intersection_sticker_lines
     original_draw_low_intersection_lines = piece_seg_script.draw_low_intersection_lines
 
     def capture_low_intersection_lines(sticker_masks, **kwargs):
-        captured["mask_sum"] = int(sticker_masks[0].sum())
-        return piece_seg_script.EmptySpaceLineOverlay(
-            lines=[],
-            sampled_points_xy=np.empty((0, 2), dtype=np.float32),
-        )
+        raise AssertionError("cube grid fitting display should be disabled")
+
+    def capture_draw_low_intersection_lines(*args, **kwargs):
+        raise AssertionError("cube grid fitting display should be disabled")
 
     piece_seg_script.low_intersection_sticker_lines = capture_low_intersection_lines
-    piece_seg_script.draw_low_intersection_lines = lambda *args, **kwargs: None
+    piece_seg_script.draw_low_intersection_lines = capture_draw_low_intersection_lines
     try:
-        piece_seg_script.process_frame(
+        output, _ = piece_seg_script.process_frame(
             frame,
             StubBboxDetector(),
             StubStickerModel(),
@@ -1672,7 +1670,7 @@ def test_process_frame_grid_fit_uses_unpadded_segmentation_mask():
         piece_seg_script.low_intersection_sticker_lines = original_low_intersection_sticker_lines
         piece_seg_script.draw_low_intersection_lines = original_draw_low_intersection_lines
 
-    assert captured["mask_sum"] == 100
+    assert np.any(np.all(output == piece_seg_script.DEFAULT_STICKER_MASK_COLOR, axis=2))
 
 
 def test_process_frame_does_not_accumulate_cube_net_without_classifier():
@@ -1801,6 +1799,23 @@ def test_classifier_cluster_indexes_match_display_classifier():
     )
 
     assert indexes.tolist() == [0, 1, -1]
+
+
+def test_color_classifier_uses_raw_rgb_distance_not_brightness_normalization():
+    classifier = piece_seg_script.ColorDensityClassifier(
+        required_frames=1,
+        cluster_count=1,
+        min_brightness=1,
+        density_cluster_eps_radians=0.08,
+        density_cluster_min_neighbors=1,
+    )
+    classifier.centroids = np.array([[220.0, 0.0, 0.0]], dtype=np.float32)
+    classifier.cluster_samples = [
+        np.array([[220.0, 0.0, 0.0]], dtype=np.float32),
+    ]
+
+    assert classifier.classify_bgr(np.array([0, 0, 220], dtype=np.uint8)) == 0
+    assert classifier.classify_bgr(np.array([0, 0, 40], dtype=np.uint8)) is None
 
 
 def test_normalized_rgb_html_plot_path_uses_rgb_html_stem():
