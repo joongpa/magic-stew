@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "test_piece_seg_roi.py"
@@ -426,6 +427,26 @@ def test_process_frame_can_show_original_image_under_overlay():
         + np.asarray(piece_seg_script.DEFAULT_STICKER_MASK_COLOR, dtype=np.float32) * 0.5
     ).astype(np.uint8)
     assert np.array_equal(output[15, 15], expected_blend)
+
+
+def test_process_frame_can_show_masks_in_side_panel():
+    frame = np.zeros((40, 40, 3), dtype=np.uint8)
+    frame[:, :] = [40, 40, 40]
+    frame[10:20, 10:20] = [0, 0, 220]
+    args = default_args(show_masks_side_panel=True)
+
+    output, bgr_samples = piece_seg_script.process_frame(
+        frame,
+        StubBboxDetector(),
+        StubStickerModel(),
+        args,
+    )
+
+    assert len(bgr_samples) > 1
+    assert output.shape == (40, 80, 3)
+    assert np.array_equal(output[:, :40], frame)
+    assert np.any(output[10:20, 50:60] != 0)
+    assert np.all(output[:, 40:50] == 0)
 
 
 def test_process_frame_accepts_face_segmentation_class():
@@ -1523,6 +1544,7 @@ def test_parser_defaults_low_intersection_line_options():
 
     assert args.empty_space_line_width == 5
     assert args.basis_angle_bucket_degrees == 5.0
+    assert args.cluster_merge_ray_distance_divisor == 4.0
 
 
 def test_sticker_sampling_uses_same_mask_as_rendering():
@@ -1713,6 +1735,12 @@ def test_parser_exposes_original_underlay_option():
     assert args.show_original_underlay is True
 
 
+def test_parser_exposes_masks_side_panel_option():
+    args = piece_seg_script.build_parser().parse_args(["--show-masks-side-panel"])
+
+    assert args.show_masks_side_panel is True
+
+
 def test_parser_exposes_roi_tracking_gain_option():
     args = piece_seg_script.build_parser().parse_args(["--roi-tracking-gain", "1.8"])
 
@@ -1731,24 +1759,215 @@ def test_parser_exposes_cube_net_output_option():
     assert str(args.save_net) == "runs/net.png"
 
 
+def test_parser_exposes_video_output_option():
+    args = piece_seg_script.build_parser().parse_args(["--save-video", "runs/out.mp4"])
+
+    assert str(args.save_video) == "runs/out.mp4"
+
+
+def test_capture_fps_or_default_uses_capture_fps():
+    capture = SimpleNamespace(get=lambda prop: 24.0)
+
+    assert piece_seg_script.capture_fps_or_default(capture) == 24.0
+
+
+def test_capture_fps_or_default_falls_back_for_invalid_fps():
+    capture = SimpleNamespace(get=lambda prop: 0.0)
+
+    assert piece_seg_script.capture_fps_or_default(capture) == 30.0
+
+
 def test_parser_exposes_density_color_classifier_options():
     args = piece_seg_script.build_parser().parse_args(
         [
             "--color-classifier-mode",
             "density-cluster",
-            "--cluster-eps-radians",
-            "0.02",
+            "--cluster-eps",
+            "12",
+            "--density-cluster-eps-reference-rgb",
+            "160",
             "--density-cluster-min-neighbors",
             "70",
             "--sticker-color-min-brightness",
             "50",
+            "--sticker-color-max-brightness",
+            "240",
+            "--sticker-color-max-cluster-distance",
+            "14",
+            "--cluster-merge-ray-distance-divisor",
+            "3",
         ]
     )
 
     assert args.color_classifier_mode == "density-cluster"
-    assert args.density_cluster_eps_radians == 0.02
+    assert args.density_cluster_eps == 12
+    assert args.density_cluster_eps_reference_rgb == 160
     assert args.density_cluster_min_neighbors == 70
     assert args.sticker_color_min_brightness == 50
+    assert args.sticker_color_max_brightness == 240
+    assert args.sticker_color_max_cluster_distance == 14
+    assert args.cluster_merge_ray_distance_divisor == 3
+
+
+def test_parser_exposes_hsv_density_color_classifier_options():
+    args = piece_seg_script.build_parser().parse_args(
+        [
+            "--color-classifier-mode",
+            "hsv-density-cluster",
+            "--hsv-density-cluster-eps",
+            "18",
+            "--hsv-density-cluster-min-neighbors",
+            "5",
+        ]
+    )
+
+    assert args.color_classifier_mode == "hsv-density-cluster"
+    assert args.hsv_density_cluster_eps == 18
+    assert args.hsv_density_cluster_min_neighbors == 5
+
+
+def test_parser_exposes_balanced_gmm_color_classifier_options():
+    args = piece_seg_script.build_parser().parse_args(
+        [
+            "--color-classifier-mode",
+            "balanced-gmm",
+            "--gmm-max-mahalanobis-distance",
+            "12",
+            "--gmm-regularization",
+            "16",
+            "--gmm-ray-variance-floor",
+            "4096",
+            "--gmm-constrain-covariance-to-ray",
+            "--gmm-perpendicular-variance-floor",
+            "25",
+            "--gmm-perpendicular-variance-ceiling",
+            "49",
+            "--gmm-dense-core-k-neighbors",
+            "5",
+            "--gmm-dense-core-quantile",
+            "0.25",
+            "--gmm-color-priors",
+            "red=255,0,0;green=0,255,0;blue=0,0,255",
+            "--gmm-prior-strength",
+            "0.5",
+            "--gmm-min-assignment-confidence",
+            "0.7",
+            "--gmm-assignment-balance",
+            "0.75",
+            "--gmm-balance-iterations",
+            "12",
+            "--gmm-max-iterations",
+            "20",
+            "--gmm-tolerance",
+            "0.01",
+        ]
+    )
+
+    assert args.color_classifier_mode == "balanced-gmm"
+    assert args.gmm_max_mahalanobis_distance == 12
+    assert args.gmm_regularization == 16
+    assert args.gmm_ray_variance_floor == 4096
+    assert args.gmm_constrain_covariance_to_ray is True
+    assert args.gmm_perpendicular_variance_floor == 25
+    assert args.gmm_perpendicular_variance_ceiling == 49
+    assert args.gmm_dense_core_k_neighbors == 5
+    assert args.gmm_dense_core_quantile == 0.25
+    assert np.allclose(
+        args.gmm_color_priors,
+        np.array(
+            [
+                [255.0, 0.0, 0.0],
+                [0.0, 255.0, 0.0],
+                [0.0, 0.0, 255.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+    assert args.gmm_prior_strength == 0.5
+    assert args.gmm_min_assignment_confidence == 0.7
+    assert args.gmm_assignment_balance == 0.75
+    assert args.gmm_balance_iterations == 12
+    assert args.gmm_max_iterations == 20
+    assert args.gmm_tolerance == 0.01
+
+
+def test_parser_exposes_density_peak_color_classifier_options():
+    args = piece_seg_script.build_parser().parse_args(
+        [
+            "--color-classifier-mode",
+            "density-peak",
+            "--density-peak-k-neighbors",
+            "9",
+            "--density-peak-max-fit-samples",
+            "1200",
+            "--density-peak-min-peak-distance",
+            "22",
+        ]
+    )
+
+    assert args.color_classifier_mode == "density-peak"
+    assert args.density_peak_k_neighbors == 9
+    assert args.density_peak_max_fit_samples == 1200
+    assert args.density_peak_min_peak_distance == 22
+
+
+def test_parser_exposes_dense_ray_color_classifier_options():
+    args = piece_seg_script.build_parser().parse_args(
+        [
+            "--color-classifier-mode",
+            "dense-ray",
+            "--dense-ray-k-neighbors",
+            "7",
+            "--dense-ray-max-fit-samples",
+            "900",
+            "--dense-ray-min-anchor-distance",
+            "24",
+            "--dense-ray-max-distance",
+            "11",
+        ]
+    )
+
+    assert args.color_classifier_mode == "dense-ray"
+    assert args.dense_ray_k_neighbors == 7
+    assert args.dense_ray_max_fit_samples == 900
+    assert args.dense_ray_min_anchor_distance == 24
+    assert args.dense_ray_max_distance == 11
+
+
+def test_parser_exposes_balanced_cone_color_classifier_options():
+    args = piece_seg_script.build_parser().parse_args(
+        [
+            "--color-classifier-mode",
+            "balanced-cone",
+            "--cone-max-angle-radians",
+            "0.2",
+            "--cone-assignment-balance",
+            "0.6",
+            "--cone-assignment-sharpness",
+            "55",
+            "--cone-balance-iterations",
+            "8",
+            "--cone-max-iterations",
+            "12",
+        ]
+    )
+
+    assert args.color_classifier_mode == "balanced-cone"
+    assert args.cone_max_angle_radians == 0.2
+    assert args.cone_assignment_balance == 0.6
+    assert args.cone_assignment_sharpness == 55
+    assert args.cone_balance_iterations == 8
+    assert args.cone_max_iterations == 12
+
+
+def test_parser_rejects_removed_sticker_color_frames_option():
+    with pytest.raises(SystemExit):
+        piece_seg_script.build_parser().parse_args(["--sticker-color-frames", "12"])
+
+
+def test_parser_does_not_expose_hsv_grid_plot_mode():
+    with pytest.raises(SystemExit):
+        piece_seg_script.build_parser().parse_args(["--hsv-plot-mode", "grid"])
 
 
 def test_color_plot_frames_zero_disables_color_features():
@@ -1770,7 +1989,7 @@ def test_classifier_cluster_indexes_match_display_classifier():
         required_frames=1,
         cluster_count=2,
         min_brightness=1,
-        density_cluster_eps_radians=0.2,
+        density_cluster_eps=20,
         density_cluster_min_neighbors=2,
     )
     classifier.centroids = np.array(
@@ -1801,12 +2020,1114 @@ def test_classifier_cluster_indexes_match_display_classifier():
     assert indexes.tolist() == [0, 1, -1]
 
 
+def test_balanced_gmm_classifier_learns_long_thin_rgb_rays():
+    classifier = piece_seg_script.BalancedGMMColorClassifier(
+        required_frames=1,
+        cluster_count=3,
+        min_brightness=1,
+        max_mahalanobis_distance=16,
+        regularization=9,
+        max_iterations=40,
+    )
+    rgb_samples = []
+    for brightness in range(30, 241, 30):
+        rgb_samples.append([brightness, 4, 0])
+        rgb_samples.append([4, brightness, 0])
+        rgb_samples.append([0, 4, brightness])
+    bgr_samples = np.asarray(rgb_samples, dtype=np.uint8)[:, ::-1]
+
+    classifier.observe_frame(bgr_samples)
+
+    assert classifier.ready
+    assert len(classifier.cluster_samples) == 3
+    red_cluster = classifier.classify_bgr(np.array([0, 0, 120], dtype=np.uint8))
+    green_cluster = classifier.classify_bgr(np.array([0, 120, 0], dtype=np.uint8))
+    blue_cluster = classifier.classify_bgr(np.array([120, 0, 0], dtype=np.uint8))
+    assert red_cluster is not None
+    assert green_cluster is not None
+    assert blue_cluster is not None
+    assert len({red_cluster, green_cluster, blue_cluster}) == 3
+
+
+def test_balanced_gmm_classifier_rejects_low_confidence_assignments():
+    classifier = piece_seg_script.BalancedGMMColorClassifier(
+        required_frames=1,
+        cluster_count=2,
+        min_brightness=1,
+        max_mahalanobis_distance=10000,
+        regularization=1,
+        min_assignment_confidence=0.7,
+    )
+    classifier.centroids = np.array(
+        [
+            [100.0, 0.0, 0.0],
+            [0.0, 100.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    classifier.covariances = np.array(
+        [
+            np.eye(3, dtype=np.float32) * 1000.0,
+            np.eye(3, dtype=np.float32) * 1000.0,
+        ],
+        dtype=np.float32,
+    )
+    classifier.precisions = np.array(
+        [
+            np.linalg.inv(classifier.covariances[0]),
+            np.linalg.inv(classifier.covariances[1]),
+        ],
+        dtype=np.float32,
+    )
+    classifier.cluster_samples = [
+        np.array([[100.0, 0.0, 0.0]], dtype=np.float32),
+        np.array([[0.0, 100.0, 0.0]], dtype=np.float32),
+    ]
+
+    assert classifier.classify_bgr(np.array([0, 0, 100], dtype=np.uint8)) == 0
+    assert classifier.classify_bgr(np.array([0, 50, 50], dtype=np.uint8)) is None
+
+
+def test_balanced_gmm_classifier_rejects_samples_above_max_brightness():
+    classifier = piece_seg_script.BalancedGMMColorClassifier(
+        required_frames=1,
+        cluster_count=1,
+        min_brightness=1,
+        max_brightness=120,
+        max_mahalanobis_distance=10000,
+        regularization=1,
+        min_assignment_confidence=0.0,
+    )
+    classifier.centroids = np.array([[100.0, 0.0, 0.0]], dtype=np.float32)
+    classifier.covariances = np.array([np.eye(3, dtype=np.float32) * 1000.0], dtype=np.float32)
+    classifier.precisions = np.array([np.linalg.inv(classifier.covariances[0])], dtype=np.float32)
+    classifier.cluster_samples = [np.array([[100.0, 0.0, 0.0]], dtype=np.float32)]
+
+    assert classifier.classify_bgr(np.array([0, 0, 100], dtype=np.uint8)) == 0
+    assert classifier.classify_bgr(np.array([0, 0, 200], dtype=np.uint8)) is None
+
+
+def test_balanced_gmm_ray_variance_floor_keeps_components_long():
+    rgb_samples = []
+    for brightness in range(30, 241, 30):
+        rgb_samples.append([brightness, 3, 0])
+        rgb_samples.append([3, brightness, 0])
+        rgb_samples.append([0, 3, brightness])
+
+    _labels, centroids, _clusters, covariances, _precisions = (
+        piece_seg_script.balanced_gmm_rgb_cluster_memberships(
+            np.asarray(rgb_samples, dtype=np.uint8),
+            target_clusters=3,
+            min_brightness=1,
+            max_mahalanobis_distance=25,
+            regularization=4,
+            ray_variance_floor=4096,
+            max_iterations=30,
+        )
+    )
+
+    assert centroids.shape == (3, 3)
+    for centroid, covariance in zip(centroids, covariances):
+        ray = centroid / np.linalg.norm(centroid)
+        assert float(ray @ covariance @ ray) >= 4096 - 1e-3
+
+
+def test_balanced_gmm_memberships_mark_samples_above_max_brightness_unknown():
+    rgb_samples = np.array(
+        [
+            [40, 0, 0],
+            [80, 0, 0],
+            [160, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    labels, centroids, clusters, _covariances, _precisions = (
+        piece_seg_script.balanced_gmm_rgb_cluster_memberships(
+            rgb_samples,
+            target_clusters=1,
+            min_brightness=1,
+            max_brightness=100,
+            max_mahalanobis_distance=10000,
+            regularization=4,
+            min_assignment_confidence=0.0,
+            max_iterations=10,
+        )
+    )
+
+    assert centroids.shape == (1, 3)
+    assert len(clusters) == 1
+    assert labels.tolist() == [0, 0, -1]
+
+
+def test_balanced_gmm_can_constrain_covariance_to_origin_ray():
+    covariance = np.array(
+        [
+            [100.0, 60.0, 20.0],
+            [60.0, 80.0, 10.0],
+            [20.0, 10.0, 40.0],
+        ],
+        dtype=np.float32,
+    )
+    shaped = piece_seg_script._shape_gmm_covariance_for_ray(
+        covariance,
+        np.array([10.0, 0.0, 0.0], dtype=np.float32),
+        ray_variance_floor=400.0,
+        constrain_covariance_to_ray=True,
+        perpendicular_variance_floor=25.0,
+        perpendicular_variance_ceiling=30.0,
+    )
+
+    assert np.allclose(shaped, np.diag([400.0, 30.0, 30.0]))
+
+
+def test_balanced_gmm_memberships_use_constrained_ray_covariances():
+    rgb_samples = []
+    for brightness in range(40, 221, 45):
+        rgb_samples.append([brightness, 2, 0])
+        rgb_samples.append([2, brightness, 0])
+
+    _labels, centroids, _clusters, covariances, _precisions = (
+        piece_seg_script.balanced_gmm_rgb_cluster_memberships(
+            np.asarray(rgb_samples, dtype=np.uint8),
+            target_clusters=2,
+            min_brightness=1,
+            max_mahalanobis_distance=25,
+            regularization=4,
+            ray_variance_floor=900,
+            constrain_covariance_to_ray=True,
+            perpendicular_variance_floor=16,
+            perpendicular_variance_ceiling=25,
+            max_iterations=20,
+        )
+    )
+
+    assert centroids.shape == (2, 3)
+    for centroid, covariance in zip(centroids, covariances):
+        ray = centroid / np.linalg.norm(centroid)
+        perpendicular = np.eye(3, dtype=np.float32) - np.outer(ray, ray)
+        cross_component = perpendicular @ covariance @ ray
+        assert np.linalg.norm(cross_component) < 1e-3
+        assert float(ray @ covariance @ ray) >= 900 - 1e-3
+
+
+def test_balanced_gmm_color_priors_lock_component_rays():
+    rgb_samples = []
+    for brightness in range(40, 221, 45):
+        rgb_samples.append([brightness, 3, 0])
+        rgb_samples.append([3, brightness, 0])
+    rgb_samples.extend([[90, 75, 0], [120, 90, 0], [150, 105, 0]])
+    priors = np.array(
+        [
+            [255.0, 0.0, 0.0],
+            [0.0, 255.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    labels, centroids, _clusters, covariances, _precisions = (
+        piece_seg_script.balanced_gmm_rgb_cluster_memberships(
+            np.asarray(rgb_samples, dtype=np.uint8),
+            target_clusters=2,
+            min_brightness=1,
+            max_mahalanobis_distance=10000,
+            regularization=4,
+            ray_variance_floor=900,
+            constrain_covariance_to_ray=True,
+            perpendicular_variance_floor=16,
+            perpendicular_variance_ceiling=25,
+            prior_rgb_values=priors,
+            prior_strength=1.0,
+            max_iterations=30,
+        )
+    )
+
+    assert centroids.shape == (2, 3)
+    assert labels[0] != labels[1]
+    assert centroids[0, 0] > 0
+    assert np.allclose(centroids[0, 1:], [0.0, 0.0], atol=1e-4)
+    assert centroids[1, 1] > 0
+    assert np.allclose(centroids[1, [0, 2]], [0.0, 0.0], atol=1e-4)
+    for prior, covariance in zip(priors, covariances):
+        ray = prior / np.linalg.norm(prior)
+        perpendicular = np.eye(3, dtype=np.float32) - np.outer(ray, ray)
+        cross_component = perpendicular @ covariance @ ray
+        assert np.linalg.norm(cross_component) < 1e-3
+
+
+def test_gmm_dense_core_filter_drops_sparse_bridge_samples():
+    samples = np.array(
+        [
+            [40.0, 0.0, 0.0],
+            [42.0, 0.0, 0.0],
+            [44.0, 0.0, 0.0],
+            [120.0, 0.0, 0.0],
+            [200.0, 0.0, 0.0],
+            [202.0, 0.0, 0.0],
+            [204.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    indexes = piece_seg_script._gmm_dense_core_local_indexes(
+        samples,
+        k_neighbors=2,
+        drop_quantile=0.25,
+    )
+
+    assert 3 not in indexes.tolist()
+    assert {0, 1, 2, 4, 5}.issubset(set(indexes.tolist()))
+
+
+def test_gmm_dense_core_filter_honors_extreme_drop_quantile():
+    samples = np.stack(
+        [
+            np.array([float(index), 0.0, 0.0], dtype=np.float32)
+            for index in range(100)
+        ],
+        axis=0,
+    )
+
+    indexes = piece_seg_script._gmm_dense_core_local_indexes(
+        samples,
+        k_neighbors=3,
+        drop_quantile=0.99,
+    )
+
+    assert len(indexes) == 1
+
+
+def test_balanced_gmm_dense_core_prefilter_still_labels_all_usable_samples():
+    rgb_samples = np.array(
+        [
+            [40, 0, 0],
+            [42, 0, 0],
+            [44, 0, 0],
+            [120, 0, 0],
+            [200, 0, 0],
+            [202, 0, 0],
+            [204, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    labels, centroids, clusters, _covariances, _precisions = (
+        piece_seg_script.balanced_gmm_rgb_cluster_memberships(
+            rgb_samples,
+            target_clusters=2,
+            min_brightness=1,
+            max_mahalanobis_distance=10000,
+            regularization=4,
+            dense_core_k_neighbors=2,
+            dense_core_quantile=0.25,
+            max_iterations=20,
+        )
+    )
+
+    assert centroids.shape == (2, 3)
+    assert len(clusters) == 2
+    assert np.all(labels >= 0)
+
+
+def test_balanced_gmm_dense_core_prefilter_can_mark_eliminated_samples_unknown():
+    rgb_samples = np.array(
+        [
+            [40, 0, 0],
+            [42, 0, 0],
+            [44, 0, 0],
+            [120, 0, 0],
+            [200, 0, 0],
+            [202, 0, 0],
+            [204, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    labels, centroids, clusters, _covariances, _precisions = (
+        piece_seg_script.balanced_gmm_rgb_cluster_memberships(
+            rgb_samples,
+            target_clusters=2,
+            min_brightness=1,
+            max_mahalanobis_distance=10000,
+            regularization=4,
+            dense_core_k_neighbors=2,
+            dense_core_quantile=0.25,
+            dense_core_outliers_unknown=True,
+            max_iterations=20,
+        )
+    )
+
+    assert centroids.shape == (2, 3)
+    assert len(clusters) == 2
+    assert labels[3] == -1
+    assert labels.tolist().count(-1) >= 1
+
+
+def test_balanced_gmm_memberships_return_dense_core_mask():
+    rgb_samples = np.array(
+        [
+            [40, 0, 0],
+            [42, 0, 0],
+            [44, 0, 0],
+            [120, 0, 0],
+            [200, 0, 0],
+            [202, 0, 0],
+            [204, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    _labels, _centroids, _clusters, _covariances, _precisions, dense_core_mask = (
+        piece_seg_script.balanced_gmm_rgb_cluster_memberships_with_core_mask(
+            rgb_samples,
+            target_clusters=2,
+            min_brightness=1,
+            max_mahalanobis_distance=10000,
+            regularization=4,
+            dense_core_k_neighbors=2,
+            dense_core_quantile=0.25,
+            max_iterations=20,
+        )
+    )
+
+    assert dense_core_mask.dtype == bool
+    assert dense_core_mask.shape == (len(rgb_samples),)
+    assert dense_core_mask[3] == np.bool_(False)
+
+
+def test_rgb_plot_clusters_mark_gmm_dense_core_rejections_unknown():
+    classifier = piece_seg_script.BalancedGMMColorClassifier(
+        required_frames=1,
+        cluster_count=2,
+        min_brightness=1,
+        max_mahalanobis_distance=10000,
+        regularization=4,
+        dense_core_k_neighbors=2,
+        dense_core_quantile=0.25,
+        max_iterations=20,
+    )
+    bgr_samples = np.array(
+        [
+            [0, 0, 40],
+            [0, 0, 42],
+            [0, 0, 44],
+            [0, 0, 120],
+            [0, 0, 200],
+            [0, 0, 202],
+            [0, 0, 204],
+        ],
+        dtype=np.uint8,
+    )
+
+    cluster_indexes, _centroids = piece_seg_script.rgb_plot_clusters_for_samples(
+        bgr_samples,
+        classifier,
+    )
+
+    assert cluster_indexes is not None
+    assert cluster_indexes[3] == -1
+
+
+def test_balanced_gmm_responsibilities_prevent_mop_up_component():
+    log_probabilities = np.array(
+        [
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    vanilla = piece_seg_script._balanced_gmm_responsibilities(
+        log_probabilities,
+        assignment_balance=0.0,
+        balance_iterations=20,
+    )
+    balanced = piece_seg_script._balanced_gmm_responsibilities(
+        log_probabilities,
+        assignment_balance=1.0,
+        balance_iterations=30,
+    )
+
+    assert vanilla.sum(axis=0)[0] > 5.0
+    assert np.allclose(balanced.sum(axis=0), [2.0, 2.0, 2.0], atol=1e-3)
+    assert np.allclose(balanced.sum(axis=1), np.ones(6), atol=1e-6)
+
+
+def test_density_peak_clustering_splits_dense_modes_joined_by_bridge():
+    left = np.array(
+        [
+            [40, 0, 0],
+            [42, 1, 0],
+            [44, 0, 1],
+            [46, 2, 0],
+            [48, 0, 2],
+            [50, 1, 1],
+        ],
+        dtype=np.uint8,
+    )
+    right = np.array(
+        [
+            [140, 0, 0],
+            [142, 1, 0],
+            [144, 0, 1],
+            [146, 2, 0],
+            [148, 0, 2],
+            [150, 1, 1],
+        ],
+        dtype=np.uint8,
+    )
+    bridge = np.array([[70, 0, 0], [95, 0, 0], [120, 0, 0]], dtype=np.uint8)
+    samples = np.concatenate([left, bridge, right], axis=0)
+
+    labels, centroids, clusters = piece_seg_script.density_peak_rgb_cluster_memberships(
+        samples,
+        target_clusters=2,
+        min_brightness=1,
+        k_neighbors=3,
+        max_fit_samples=100,
+        min_peak_distance=40,
+    )
+
+    assert centroids.shape == (2, 3)
+    assert len(clusters) == 2
+    assert labels[0] != labels[-1]
+    assert len(set(labels.tolist())) == 2
+
+
+def test_density_peak_assignment_uses_basin_samples_not_compact_peaks():
+    points = np.array(
+        [
+            [0, 0, 0],
+            [100, 0, 0],
+            [102, 0, 0],
+        ],
+        dtype=np.float32,
+    )
+    peak_points = np.array(
+        [
+            [0, 0, 0],
+            [100, 0, 0],
+        ],
+        dtype=np.float32,
+    )
+    basin_samples = [
+        np.array([[0, 0, 0], [102, 0, 0]], dtype=np.float32),
+        np.array([[100, 0, 0]], dtype=np.float32),
+    ]
+
+    labels = piece_seg_script._assign_samples_to_density_peak_clusters(
+        points,
+        peak_points,
+        basin_samples,
+    )
+
+    assert labels.tolist() == [0, 1, 0]
+
+
+def test_density_peak_classifier_learns_rgb_modes():
+    classifier = piece_seg_script.DensityPeakColorClassifier(
+        required_frames=1,
+        cluster_count=3,
+        min_brightness=1,
+        k_neighbors=3,
+        max_fit_samples=100,
+        min_peak_distance=40,
+        max_cluster_distance=18,
+    )
+    rgb_samples = np.array(
+        [
+            [220, 0, 0],
+            [218, 2, 0],
+            [216, 0, 2],
+            [0, 220, 0],
+            [2, 218, 0],
+            [0, 216, 2],
+            [0, 0, 220],
+            [0, 2, 218],
+            [2, 0, 216],
+        ],
+        dtype=np.uint8,
+    )
+
+    classifier.observe_frame(rgb_samples[:, ::-1])
+
+    assert classifier.ready
+    assert len(classifier.cluster_samples) == 3
+    red_cluster = classifier.classify_bgr(np.array([0, 0, 219], dtype=np.uint8))
+    green_cluster = classifier.classify_bgr(np.array([0, 219, 0], dtype=np.uint8))
+    blue_cluster = classifier.classify_bgr(np.array([219, 0, 0], dtype=np.uint8))
+    assert len({red_cluster, green_cluster, blue_cluster}) == 3
+
+
+def test_dense_ray_anchor_points_choose_densest_separated_points():
+    samples = np.array(
+        [
+            [100, 0, 0],
+            [101, 0, 0],
+            [102, 0, 0],
+            [0, 100, 0],
+            [0, 101, 0],
+            [0, 102, 0],
+            [180, 180, 180],
+        ],
+        dtype=np.uint8,
+    )
+
+    anchors = piece_seg_script.dense_rgb_anchor_points(
+        samples,
+        target_clusters=2,
+        k_neighbors=2,
+        min_anchor_distance=40,
+    )
+
+    assert anchors.shape == (2, 3)
+    assert np.linalg.norm(anchors[0] - anchors[1]) >= 40
+    assert not np.any(np.all(anchors == [180, 180, 180], axis=1))
+
+
+def test_dense_ray_keeps_brightness_tail_on_same_origin_ray():
+    samples = np.array(
+        [
+            [40, 0, 0],
+            [80, 0, 0],
+            [160, 0, 0],
+            [0, 40, 0],
+            [0, 80, 0],
+            [0, 160, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    labels, centroids, clusters, ray_directions = piece_seg_script.dense_ray_rgb_cluster_memberships(
+        samples,
+        target_clusters=2,
+        min_brightness=1,
+        k_neighbors=1,
+        max_fit_samples=100,
+        min_anchor_distance=40,
+    )
+
+    assert centroids.shape == (2, 3)
+    assert len(clusters) == 2
+    assert ray_directions.shape == (2, 3)
+    assert len(set(labels[:3].tolist())) == 1
+    assert len(set(labels[3:].tolist())) == 1
+    assert labels[0] != labels[3]
+
+
+def test_dense_ray_classifier_uses_perpendicular_distance_to_ray():
+    classifier = piece_seg_script.DenseRayColorClassifier(
+        required_frames=1,
+        cluster_count=2,
+        min_brightness=1,
+        k_neighbors=1,
+        max_fit_samples=100,
+        min_anchor_distance=40,
+        max_ray_distance=5,
+    )
+    rgb_samples = np.array(
+        [
+            [50, 0, 0],
+            [150, 0, 0],
+            [0, 50, 0],
+            [0, 150, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    classifier.observe_frame(rgb_samples[:, ::-1])
+
+    assert classifier.ready
+    red_cluster = classifier.classify_bgr(np.array([0, 0, 220], dtype=np.uint8))
+    green_cluster = classifier.classify_bgr(np.array([0, 220, 0], dtype=np.uint8))
+    assert red_cluster is not None
+    assert green_cluster is not None
+    assert red_cluster != green_cluster
+    assert classifier.classify_bgr(np.array([20, 20, 220], dtype=np.uint8)) is None
+
+
+def test_balanced_cone_classifier_uses_angular_rgb_cones():
+    classifier = piece_seg_script.BalancedConeColorClassifier(
+        required_frames=1,
+        cluster_count=2,
+        min_brightness=1,
+        max_angle_radians=0.12,
+        assignment_balance=1.0,
+        assignment_sharpness=80,
+        max_iterations=20,
+    )
+    rgb_samples = np.array(
+        [
+            [40, 2, 0],
+            [120, 4, 0],
+            [220, 6, 0],
+            [2, 40, 0],
+            [4, 120, 0],
+            [6, 220, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    classifier.observe_frame(rgb_samples[:, ::-1])
+
+    assert classifier.ready
+    red_cluster = classifier.classify_bgr(np.array([0, 0, 20], dtype=np.uint8))
+    bright_red_cluster = classifier.classify_bgr(np.array([0, 0, 240], dtype=np.uint8))
+    green_cluster = classifier.classify_bgr(np.array([0, 240, 0], dtype=np.uint8))
+    assert red_cluster is not None
+    assert red_cluster == bright_red_cluster
+    assert green_cluster is not None
+    assert green_cluster != red_cluster
+    assert classifier.classify_bgr(np.array([0, 60, 60], dtype=np.uint8)) is None
+
+
+def test_balanced_cone_plot_clusters_are_raw_rgb_cone_assignments():
+    classifier = piece_seg_script.BalancedConeColorClassifier(
+        required_frames=1,
+        cluster_count=2,
+        min_brightness=1,
+        max_angle_radians=0.12,
+        assignment_balance=1.0,
+        assignment_sharpness=80,
+        max_iterations=20,
+    )
+    bgr_samples = np.array(
+        [
+            [0, 2, 40],
+            [0, 4, 120],
+            [0, 6, 220],
+            [0, 40, 2],
+            [0, 120, 4],
+            [0, 220, 6],
+            [60, 60, 0],
+        ],
+        dtype=np.uint8,
+    )
+    classifier.observe_frame(bgr_samples[:6])
+
+    cluster_indexes, cluster_centroids = piece_seg_script.rgb_plot_clusters_for_samples(
+        bgr_samples,
+        classifier,
+    )
+
+    assert cluster_indexes is not None
+    assert cluster_centroids is not None
+    assert cluster_centroids.shape == (2, 3)
+    assert len(set(cluster_indexes[:3].tolist())) == 1
+    assert len(set(cluster_indexes[3:6].tolist())) == 1
+    assert cluster_indexes[0] != cluster_indexes[3]
+    assert cluster_indexes[6] == -1
+
+
+def test_rgb_html_plot_keeps_original_point_colors_for_cone_clusters(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_save_rgb_samples_interactive_plot(*args, **kwargs):
+        calls.append((args, kwargs))
+        return str(args[1])
+
+    monkeypatch.setattr(
+        piece_seg_script,
+        "save_rgb_samples_interactive_plot",
+        fake_save_rgb_samples_interactive_plot,
+    )
+    classifier = piece_seg_script.BalancedConeColorClassifier(
+        required_frames=1,
+        cluster_count=2,
+        min_brightness=1,
+        max_angle_radians=0.12,
+        assignment_balance=1.0,
+        assignment_sharpness=80,
+        max_iterations=20,
+    )
+    bgr_samples = np.array(
+        [
+            [0, 2, 40],
+            [0, 4, 120],
+            [0, 40, 2],
+            [0, 120, 4],
+        ],
+        dtype=np.uint8,
+    )
+    classifier.observe_frame(bgr_samples)
+
+    piece_seg_script.save_rgb_html_plots(
+        bgr_samples,
+        tmp_path / "rgb.html",
+        title="RGB",
+        normalize_rgb=False,
+        args=SimpleNamespace(plotly_point_size=1.0),
+        color_classifier=classifier,
+    )
+
+    assert len(calls) == 2
+    for _args, kwargs in calls:
+        assert "color_by_cluster" not in kwargs
+        assert kwargs["cluster_indexes"] is not None
+        assert kwargs["cluster_centroids"] is not None
+
+
+def test_balanced_gmm_plot_clusters_fit_from_samples_when_classifier_is_not_ready():
+    classifier = piece_seg_script.BalancedGMMColorClassifier(
+        required_frames=90,
+        cluster_count=2,
+        min_brightness=1,
+        max_mahalanobis_distance=16,
+        regularization=9,
+        max_iterations=20,
+    )
+    bgr_samples = np.array(
+        [
+            [0, 5, 40],
+            [0, 8, 140],
+            [0, 10, 220],
+            [5, 40, 0],
+            [8, 140, 0],
+            [10, 220, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    cluster_indexes, cluster_centroids = piece_seg_script.rgb_plot_clusters_for_samples(
+        bgr_samples,
+        classifier,
+    )
+
+    assert cluster_indexes is not None
+    assert cluster_centroids is not None
+    assert len(set(cluster_indexes.tolist())) == 2
+    assert cluster_centroids.shape == (2, 3)
+    assert not classifier.ready
+
+
+def test_rgb_plot_clusters_fit_from_samples_when_classifier_is_not_ready():
+    classifier = piece_seg_script.ColorDensityClassifier(
+        required_frames=90,
+        cluster_count=2,
+        min_brightness=1,
+        density_cluster_eps=20,
+        density_cluster_min_neighbors=2,
+    )
+    bgr_samples = np.array(
+        [
+            [20, 20, 220],
+            [22, 18, 210],
+            [18, 22, 200],
+            [20, 220, 20],
+            [18, 210, 22],
+            [22, 200, 18],
+        ],
+        dtype=np.uint8,
+    )
+
+    cluster_indexes, cluster_centroids = piece_seg_script.rgb_plot_clusters_for_samples(
+        bgr_samples,
+        classifier,
+    )
+
+    assert cluster_indexes is not None
+    assert cluster_centroids is not None
+    assert len(set(cluster_indexes.tolist())) == 2
+    assert cluster_centroids.shape == (2, 3)
+    assert not classifier.ready
+
+
+def test_rgb_plot_clusters_show_density_outliers_as_unknown():
+    classifier = piece_seg_script.ColorDensityClassifier(
+        required_frames=90,
+        cluster_count=2,
+        min_brightness=1,
+        density_cluster_eps=1,
+        density_cluster_min_neighbors=2,
+        max_cluster_distance=50,
+    )
+    bgr_samples = np.array(
+        [
+            [0, 0, 10],
+            [0, 0, 10],
+            [0, 0, 30],
+        ],
+        dtype=np.uint8,
+    )
+
+    cluster_indexes, cluster_centroids = piece_seg_script.rgb_plot_clusters_for_samples(
+        bgr_samples,
+        classifier,
+    )
+
+    assert cluster_indexes is not None
+    assert cluster_centroids is not None
+    assert cluster_indexes.tolist() == [0, 0, -1]
+
+
+def test_rgb_plot_clusters_show_all_unknown_when_no_density_clusters_survive():
+    classifier = piece_seg_script.ColorDensityClassifier(
+        required_frames=90,
+        cluster_count=2,
+        min_brightness=1,
+        density_cluster_eps=1,
+        density_cluster_min_neighbors=2,
+    )
+    bgr_samples = np.array(
+        [
+            [0, 0, 10],
+            [0, 0, 30],
+            [0, 0, 50],
+        ],
+        dtype=np.uint8,
+    )
+
+    cluster_indexes, cluster_centroids = piece_seg_script.rgb_plot_clusters_for_samples(
+        bgr_samples,
+        classifier,
+    )
+
+    assert cluster_indexes is not None
+    assert cluster_centroids is not None
+    assert cluster_indexes.tolist() == [-1, -1, -1]
+    assert cluster_centroids.shape == (0, 3)
+
+
+def test_cluster_merge_weights_origin_ray_component_less_than_other_components():
+    off_ray_neighbor = np.array(
+        [[100.0, 28.0, 0.0], [102.0, 30.0, 0.0]],
+        dtype=np.float32,
+    )
+    source = np.array(
+        [[98.0, 20.0, 0.0], [102.0, 20.0, 0.0]],
+        dtype=np.float32,
+    )
+    ray_parallel_neighbor = np.array(
+        [[112.0, 22.4, 0.0], [114.0, 22.8, 0.0]],
+        dtype=np.float32,
+    )
+
+    nearest_index = piece_seg_script.nearest_cluster_index(
+        [off_ray_neighbor, source, ray_parallel_neighbor],
+        source_index=1,
+        ray_distance_divisor=4.0,
+    )
+
+    assert nearest_index == 2
+
+
+def test_cluster_merge_divisor_one_uses_unweighted_nearest_neighbor():
+    off_ray_neighbor = np.array(
+        [[100.0, 28.0, 0.0], [102.0, 30.0, 0.0]],
+        dtype=np.float32,
+    )
+    source = np.array(
+        [[98.0, 20.0, 0.0], [102.0, 20.0, 0.0]],
+        dtype=np.float32,
+    )
+    ray_parallel_neighbor = np.array(
+        [[112.0, 22.4, 0.0], [114.0, 22.8, 0.0]],
+        dtype=np.float32,
+    )
+
+    nearest_index = piece_seg_script.nearest_cluster_index(
+        [off_ray_neighbor, source, ray_parallel_neighbor],
+        source_index=1,
+        ray_distance_divisor=1.0,
+    )
+
+    assert nearest_index == 0
+
+
+def test_cluster_merging_compares_against_original_accepted_clusters():
+    accepted_a = np.array(
+        [[100.0, 0.0, 0.0], [101.0, 0.0, 0.0], [102.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    accepted_b = np.array(
+        [[200.0, 0.0, 0.0], [201.0, 0.0, 0.0], [202.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    subcluster_c = np.array([[130.0, 0.0, 0.0]], dtype=np.float32)
+    subcluster_d = np.array([[160.0, 0.0, 0.0]], dtype=np.float32)
+
+    clusters = piece_seg_script.merge_smallest_clusters_to_nearest_neighbor(
+        [accepted_a, accepted_b, subcluster_c, subcluster_d],
+        target_count=2,
+        ray_distance_divisor=1.0,
+    )
+
+    cluster_with_a = next(cluster for cluster in clusters if 100.0 in cluster[:, 0])
+    cluster_with_b = next(cluster for cluster in clusters if 200.0 in cluster[:, 0])
+    assert 130.0 in cluster_with_a[:, 0]
+    assert 160.0 not in cluster_with_a[:, 0]
+    assert 160.0 in cluster_with_b[:, 0]
+
+
+def test_density_cluster_eps_scales_with_rgb_distance_from_origin():
+    rgb_samples = np.array(
+        [
+            [150, 30, 0],
+            [170, 30, 0],
+            [40, 8, 0],
+            [60, 8, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    centroids, clusters = piece_seg_script.density_rgb_clusters(
+        rgb_samples,
+        target_clusters=6,
+        min_brightness=1,
+        eps=35.0,
+        eps_reference_rgb=150.0,
+        min_points=2,
+        merge_ray_distance_divisor=4.0,
+    )
+
+    assert len(clusters) == 1
+    assert centroids.shape == (1, 3)
+    assert np.allclose(centroids[0], [160.0, 30.0, 0.0])
+
+
+def test_density_cluster_eps_uses_reference_rgb_as_anchor():
+    rgb_samples = np.array(
+        [
+            [150, 30, 0],
+            [170, 30, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    centroids, clusters = piece_seg_script.density_rgb_clusters(
+        rgb_samples,
+        target_clusters=6,
+        min_brightness=1,
+        eps=15.0,
+        eps_reference_rgb=150.0,
+        min_points=2,
+        merge_ray_distance_divisor=4.0,
+    )
+
+    assert len(clusters) == 0
+    assert centroids.shape == (0, 3)
+
+    centroids, clusters = piece_seg_script.density_rgb_clusters(
+        rgb_samples,
+        target_clusters=6,
+        min_brightness=1,
+        eps=15.0,
+        eps_reference_rgb=60.0,
+        min_points=2,
+        merge_ray_distance_divisor=4.0,
+    )
+
+    assert len(clusters) == 1
+    assert centroids.shape == (1, 3)
+    assert np.allclose(centroids[0], [160.0, 30.0, 0.0])
+
+
+def test_density_cluster_eps_has_nonzero_origin_intercept():
+    labels = piece_seg_script.density_bin_labels(
+        np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.05, 0.0, 0.0],
+                [0.2, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        eps=20.0,
+        eps_reference_rgb=150.0,
+        min_points=2,
+    )
+
+    assert labels.tolist() == [0, 0, -1]
+
+
+def test_fixed_hsv_density_labels_wrap_hue_at_red_boundary():
+    hsv_samples = np.array(
+        [
+            [1.0, 220.0, 220.0],
+            [2.0, 218.0, 222.0],
+            [179.0, 219.0, 221.0],
+            [90.0, 220.0, 220.0],
+        ],
+        dtype=np.float32,
+    )
+
+    labels = piece_seg_script.density_fixed_hsv_labels(
+        hsv_samples,
+        eps=6,
+        min_points=3,
+    )
+
+    assert labels[:3].tolist() == [0, 0, 0]
+    assert labels[3] == -1
+
+
+def test_hsv_density_classifier_learns_hsv_clusters_from_bgr_samples():
+    classifier = piece_seg_script.HSVColorDensityClassifier(
+        required_frames=1,
+        cluster_count=2,
+        min_brightness=1,
+        density_cluster_eps=8,
+        density_cluster_min_neighbors=3,
+        max_cluster_distance=8,
+    )
+    hsv_samples = np.array(
+        [
+            [1, 220, 220],
+            [2, 218, 222],
+            [179, 219, 221],
+            [60, 220, 220],
+            [61, 218, 222],
+            [59, 219, 221],
+        ],
+        dtype=np.uint8,
+    )
+    bgr_samples = piece_seg_script.cv2.cvtColor(
+        hsv_samples.reshape(-1, 1, 3),
+        piece_seg_script.cv2.COLOR_HSV2BGR,
+    ).reshape(-1, 3)
+
+    classifier.observe_frame(bgr_samples)
+
+    assert classifier.ready
+    red_cluster = classifier.classify_bgr(bgr_samples[0])
+    green_cluster = classifier.classify_bgr(bgr_samples[-1])
+    assert red_cluster is not None
+    assert green_cluster is not None
+    assert red_cluster != green_cluster
+
+
+def test_cluster_merge_still_uses_nearest_neighbor_when_ray_distance_is_too_far():
+    nearby_off_ray = np.array(
+        [[100.0, 28.0, 0.0], [102.0, 30.0, 0.0]],
+        dtype=np.float32,
+    )
+    source = np.array(
+        [[98.0, 20.0, 0.0], [102.0, 20.0, 0.0]],
+        dtype=np.float32,
+    )
+    far_ray_parallel = np.array(
+        [[180.0, 36.0, 0.0], [190.0, 38.0, 0.0]],
+        dtype=np.float32,
+    )
+
+    nearest_index = piece_seg_script.nearest_cluster_index(
+        [nearby_off_ray, source, far_ray_parallel],
+        source_index=1,
+    )
+
+    assert nearest_index == 0
+
+
 def test_color_classifier_uses_raw_rgb_distance_not_brightness_normalization():
     classifier = piece_seg_script.ColorDensityClassifier(
         required_frames=1,
         cluster_count=1,
         min_brightness=1,
-        density_cluster_eps_radians=0.08,
+        density_cluster_eps=20,
         density_cluster_min_neighbors=1,
     )
     classifier.centroids = np.array([[220.0, 0.0, 0.0]], dtype=np.float32)
@@ -1816,6 +3137,24 @@ def test_color_classifier_uses_raw_rgb_distance_not_brightness_normalization():
 
     assert classifier.classify_bgr(np.array([0, 0, 220], dtype=np.uint8)) == 0
     assert classifier.classify_bgr(np.array([0, 0, 40], dtype=np.uint8)) is None
+
+
+def test_color_classifier_uses_dedicated_max_cluster_distance_for_classification():
+    classifier = piece_seg_script.ColorDensityClassifier(
+        required_frames=1,
+        cluster_count=1,
+        min_brightness=1,
+        density_cluster_eps=20,
+        density_cluster_min_neighbors=1,
+        max_cluster_distance=5.0,
+    )
+    classifier.centroids = np.array([[220.0, 0.0, 0.0]], dtype=np.float32)
+    classifier.cluster_samples = [
+        np.array([[220.0, 0.0, 0.0]], dtype=np.float32),
+    ]
+
+    assert classifier.classify_bgr(np.array([0, 0, 224], dtype=np.uint8)) == 0
+    assert classifier.classify_bgr(np.array([0, 0, 226], dtype=np.uint8)) is None
 
 
 def test_normalized_rgb_html_plot_path_uses_rgb_html_stem():

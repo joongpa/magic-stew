@@ -19,6 +19,7 @@ COLOR_DEBUG_CHROMA_CONTRAST = 1.55
 NORMALIZED_RGB_DENSITY_EPS_RADIANS = 0.08
 RAW_RGB_DENSITY_EPS = 24.0
 NORMALIZED_RGB_DENSITY_MIN_POINTS = 4
+CLUSTER_MERGE_RAY_DISTANCE_DIVISOR = 4.0
 
 
 def _normalize_rgb_brightness(rgb_samples: NDArray[np.uint8] | NDArray[np.float32]) -> NDArray[np.float32]:
@@ -206,6 +207,7 @@ def save_rgb_samples_plot(
     density_cluster_raw_eps: float = RAW_RGB_DENSITY_EPS,
     density_cluster_min_neighbors: int = NORMALIZED_RGB_DENSITY_MIN_POINTS,
     cluster_display_mode: str = "raw",
+    regression_polylines: list[NDArray[np.float32]] | None = None,
 ) -> list[str]:
     if len(bgr_samples) == 0:
         raise ValueError("No RGB samples available for plotting")
@@ -254,6 +256,13 @@ def save_rgb_samples_plot(
         plot_samples = _normalize_rgb_brightness(plot_samples)
         axis_limit = 1.0
         axis_label_prefix = "normalized "
+    if regression_polylines is not None:
+        regression_polylines = [
+            _normalize_rgb_brightness(polyline)
+            if normalize_rgb
+            else np.asarray(polyline, dtype=np.float32).reshape(-1, 3)
+            for polyline in regression_polylines
+        ]
 
     output_paths = _rgb_plot_output_paths(output_path)
     views = [
@@ -275,6 +284,17 @@ def save_rgb_samples_plot(
             linewidths=0,
             depthshade=False,
         )
+        if regression_polylines is not None:
+            for cluster_index, polyline in enumerate(regression_polylines):
+                if len(polyline) < 2:
+                    continue
+                axes.plot(
+                    polyline[:, 0],
+                    polyline[:, 1],
+                    polyline[:, 2],
+                    color=plt.cm.tab10(cluster_index % 10),
+                    linewidth=2.5,
+                )
         axes.set_xlim(0, axis_limit)
         axes.set_ylim(0, axis_limit)
         axes.set_zlim(0, axis_limit)
@@ -363,6 +383,8 @@ def save_rgb_samples_interactive_plot(
     cluster_display_mode: str = "raw",
     cluster_indexes: NDArray[np.int32] | None = None,
     cluster_centroids: NDArray[np.float32] | None = None,
+    regression_rays: NDArray[np.float32] | None = None,
+    regression_polylines: list[NDArray[np.float32]] | None = None,
 ) -> str:
     if len(bgr_samples) == 0:
         raise ValueError("No RGB samples available for plotting")
@@ -402,6 +424,13 @@ def save_rgb_samples_interactive_plot(
     else:
         cluster_indexes = np.full(len(rgb_samples), -1, dtype=np.int32)
         cluster_centroids = np.empty((0, 3), dtype=np.float32)
+    if regression_rays is not None:
+        regression_rays = np.asarray(regression_rays, dtype=np.float32).reshape(-1, 3)
+    if regression_polylines is not None:
+        regression_polylines = [
+            np.asarray(polyline, dtype=np.float32).reshape(-1, 3)
+            for polyline in regression_polylines
+        ]
     traces = _interactive_sample_traces(
         go,
         plot_samples,
@@ -409,7 +438,7 @@ def save_rgb_samples_interactive_plot(
         cluster_indexes,
         cluster_centroids,
         point_size=point_size,
-        color_by_cluster=color_by_cluster or use_raw_density_clusters,
+        color_by_cluster=color_by_cluster,
         hovertemplate=(
             f"{axis_prefix}R=%{{x:.3f}}<br>"
             f"{axis_prefix}G=%{{y:.3f}}<br>"
@@ -418,38 +447,22 @@ def save_rgb_samples_interactive_plot(
             "cluster=%{customdata[3]}<extra></extra>"
         ),
     )
-    if normalize_rgb and has_external_clusters:
+    if regression_rays is not None:
         traces.extend(
-            _normalized_rgb_cluster_perimeter_traces(
+            _rgb_regression_ray_traces(
                 go,
-                plot_samples,
-                cluster_indexes,
+                regression_rays,
                 cluster_centroids,
+                normalize_rgb=normalize_rgb,
             )
         )
-    elif use_raw_density_clusters:
+    if regression_polylines is not None:
         traces.extend(
-            _normalized_rgb_cluster_perimeter_traces(
+            _rgb_regression_polyline_traces(
                 go,
-                plot_samples,
-                cluster_indexes,
+                regression_polylines,
                 cluster_centroids,
-            )
-        )
-    elif normalize_rgb:
-        density_cluster_indexes, density_cluster_centroids = _density_rgb_sample_cluster_indexes(
-            rgb_samples,
-            cluster_count=cluster_count,
-            min_brightness=cluster_min_brightness,
-            eps_radians=density_cluster_eps_radians,
-            min_points=density_cluster_min_neighbors,
-        )
-        traces.extend(
-            _normalized_rgb_cluster_perimeter_traces(
-                go,
-                plot_samples,
-                density_cluster_indexes,
-                density_cluster_centroids,
+                normalize_rgb=normalize_rgb,
             )
         )
     figure = go.Figure(data=traces)
@@ -464,6 +477,10 @@ def save_rgb_samples_interactive_plot(
         margin={"l": 0, "r": 0, "b": 0, "t": 48},
     )
     figure.write_html(output_path, include_plotlyjs="cdn", full_html=True)
+    with open(output_path, "a", encoding="utf-8") as html_file:
+        html_file.write(
+            "\n<!-- live-recognition-rgb-html: cluster-toggle raw-point-colors regression-lines -->\n"
+        )
     return output_path
 
 
@@ -478,6 +495,8 @@ def save_hsv_samples_interactive_plot(
     cluster_min_brightness: float = 40.0,
     raw_density_filter_radius: float = 0.0,
     raw_density_filter_min_neighbors: int = 0,
+    cluster_indexes: NDArray[np.int32] | None = None,
+    cluster_centroids: NDArray[np.float32] | None = None,
 ) -> str:
     if len(bgr_samples) == 0:
         raise ValueError("No HSV samples available for plotting")
@@ -492,38 +511,285 @@ def save_hsv_samples_interactive_plot(
 
     rgb_samples = cv2.cvtColor(bgr_samples.reshape(-1, 1, 3), cv2.COLOR_BGR2RGB).reshape(-1, 3)
     hsv_samples = cv2.cvtColor(bgr_samples.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
-    cluster_indexes = np.full(len(rgb_samples), -1, dtype=np.int32)
-    cluster_centroids = np.empty((0, 3), dtype=np.float32)
+    if cluster_indexes is None or cluster_centroids is None:
+        cluster_indexes = np.full(len(rgb_samples), -1, dtype=np.int32)
+        cluster_centroids = np.empty((0, 3), dtype=np.float32)
+    else:
+        cluster_indexes = np.asarray(cluster_indexes, dtype=np.int32).reshape(-1)
+        if len(cluster_indexes) != len(rgb_samples):
+            raise ValueError("cluster_indexes must have one entry per HSV sample")
+        cluster_centroids = np.asarray(cluster_centroids, dtype=np.float32).reshape(-1, 3)
+
+    hue_degrees = hsv_samples[:, 0].astype(np.float32) * 2.0
+    saturation = hsv_samples[:, 1].astype(np.float32)
+    value = hsv_samples[:, 2].astype(np.float32)
+    hue_radians = np.radians(hue_degrees)
+    plot_samples = np.column_stack(
+        [
+            saturation * np.cos(hue_radians),
+            saturation * np.sin(hue_radians),
+            value,
+        ]
+    ).astype(np.float32)
+    hovertemplate = (
+        "H=%{customdata[4]:.0f} deg<br>"
+        "S=%{customdata[5]:.0f}<br>"
+        "V=%{customdata[6]:.0f}<br>"
+        "raw RGB=(%{customdata[0]}, %{customdata[1]}, %{customdata[2]})<br>"
+        "cluster=%{customdata[3]}<extra></extra>"
+    )
+
+    customdata = np.column_stack([rgb_samples, cluster_indexes + 1, hue_degrees, saturation, value])
     figure = go.Figure(
         data=_interactive_sample_traces(
             go,
-            hsv_samples.astype(np.float32),
+            plot_samples,
             rgb_samples,
             cluster_indexes,
             cluster_centroids,
             point_size=point_size,
             color_by_cluster=color_by_cluster,
-            hovertemplate=(
-                "H=%{x:.0f}<br>"
-                "S=%{y:.0f}<br>"
-                "V=%{z:.0f}<br>"
-                "raw RGB=(%{customdata[0]}, %{customdata[1]}, %{customdata[2]})<br>"
-                "cluster=%{customdata[3]}<extra></extra>"
-            ),
+            customdata=customdata,
+            hovertemplate=hovertemplate,
         )
     )
     figure.update_layout(
         title=title,
         scene={
-            "xaxis": {"title": "H", "range": [0, 179]},
-            "yaxis": {"title": "S", "range": [0, 255]},
+            "xaxis": {"title": "S cos(H)", "range": [-255, 255]},
+            "yaxis": {"title": "S sin(H)", "range": [-255, 255]},
             "zaxis": {"title": "V", "range": [0, 255]},
             "aspectmode": "cube",
         },
         margin={"l": 0, "r": 0, "b": 0, "t": 48},
     )
     figure.write_html(output_path, include_plotlyjs="cdn", full_html=True)
+    with open(output_path, "a", encoding="utf-8") as html_file:
+        html_file.write("\n<!-- live-recognition-hsv-html: cylinder raw-point-colors -->\n")
     return output_path
+
+
+def save_oklab_samples_interactive_plot(
+    bgr_samples: NDArray[np.uint8],
+    output_path: str,
+    *,
+    title: str = "Reliable pixels in Oklab",
+    point_size: float = 2,
+    color_by_cluster: bool = False,
+    cluster_trace_original_colors: bool = False,
+    cluster_indexes: NDArray[np.int32] | None = None,
+    cluster_centroids: NDArray[np.float32] | None = None,
+    oklab_samples: NDArray[np.float32] | None = None,
+    curve_points: list[NDArray[np.float32]] | None = None,
+    split_planes: list[tuple[NDArray[np.float32], float, NDArray[np.float32]]] | None = None,
+) -> str:
+    if len(bgr_samples) == 0:
+        raise ValueError("No Oklab samples available for plotting")
+    try:
+        import plotly.graph_objects as go
+    except ImportError as exc:
+        raise RuntimeError(
+            "Plotly is required for --oklab-html-plot. Install it in the Python "
+            "environment used to run this script."
+        ) from exc
+
+    rgb_samples = cv2.cvtColor(bgr_samples.reshape(-1, 1, 3), cv2.COLOR_BGR2RGB).reshape(-1, 3)
+    if oklab_samples is None:
+        raise ValueError("oklab_samples are required for an Oklab plot")
+    plot_samples = np.asarray(oklab_samples, dtype=np.float32).reshape(-1, 3)
+    if len(plot_samples) != len(rgb_samples):
+        raise ValueError("oklab_samples must have one entry per BGR sample")
+    if cluster_indexes is None or cluster_centroids is None:
+        cluster_indexes = np.full(len(rgb_samples), -1, dtype=np.int32)
+        cluster_centroids = np.empty((0, 3), dtype=np.float32)
+    else:
+        cluster_indexes = np.asarray(cluster_indexes, dtype=np.int32).reshape(-1)
+        if len(cluster_indexes) != len(rgb_samples):
+            raise ValueError("cluster_indexes must have one entry per Oklab sample")
+        cluster_centroids = np.asarray(cluster_centroids, dtype=np.float32).reshape(-1, 3)
+    customdata = np.column_stack([rgb_samples, cluster_indexes + 1, plot_samples])
+    traces = _interactive_sample_traces(
+        go,
+        plot_samples,
+        rgb_samples,
+        cluster_indexes,
+        cluster_centroids,
+        point_size=point_size,
+        color_by_cluster=color_by_cluster,
+        cluster_trace_original_colors=cluster_trace_original_colors,
+        customdata=customdata,
+        hovertemplate=(
+            "L=%{customdata[4]:.4f}<br>a=%{customdata[5]:.4f}<br>b=%{customdata[6]:.4f}<br>"
+            "raw RGB=(%{customdata[0]}, %{customdata[1]}, %{customdata[2]})<br>"
+            "cluster=%{customdata[3]}<extra></extra>"
+        ),
+    )
+    if curve_points is not None:
+        for cluster_index, curve in enumerate(curve_points):
+            curve = np.asarray(curve, dtype=np.float32).reshape(-1, 3)
+            if len(curve) < 2:
+                continue
+            curve_color = _cluster_hex_color(cluster_index, cluster_centroids)
+            traces.append(
+                go.Scatter3d(
+                    x=curve[:, 0],
+                    y=curve[:, 1],
+                    z=curve[:, 2],
+                    mode="lines",
+                    line={"color": curve_color, "width": 5},
+                    name=f"cluster {cluster_index + 1} curve",
+                    hovertemplate="cluster curve<extra></extra>",
+                )
+            )
+    if split_planes:
+        # Render each selected cut as a translucent quadrilateral spanning the
+        # visible Oklab cube.  The classifier stores planes as n·x = offset.
+        for plane_index, plane in enumerate(split_planes):
+            normal, offset = plane[:2]
+            plane_points = plane[2] if len(plane) >= 3 else None
+            normal = np.asarray(normal, dtype=np.float32).reshape(3)
+            norm = float(np.linalg.norm(normal))
+            if norm <= 1e-8:
+                continue
+            normal /= norm
+            anchor = normal * float(offset)
+            reference = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+            if abs(float(np.dot(reference, normal))) > 0.9:
+                reference = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+            basis_u = np.cross(normal, reference)
+            basis_u /= max(float(np.linalg.norm(basis_u)), 1e-8)
+            basis_v = np.cross(normal, basis_u)
+            if plane_points is not None and len(plane_points):
+                plane_points = np.asarray(plane_points, dtype=np.float32).reshape(-1, 3)
+                u = plane_points @ basis_u
+                v = plane_points @ basis_v
+                u_center = (float(u.min()) + float(u.max())) * 0.5
+                v_center = (float(v.min()) + float(v.max())) * 0.5
+                half_u = max((float(u.max()) - float(u.min())) * 0.5 * 1.08, 0.012)
+                half_v = max((float(v.max()) - float(v.min())) * 0.5 * 1.08, 0.012)
+                center = anchor + basis_u * u_center + basis_v * v_center
+            else:
+                half_u = half_v = 0.72
+                center = anchor
+            corners = np.asarray([
+                center - half_u * basis_u - half_v * basis_v,
+                center + half_u * basis_u - half_v * basis_v,
+                center + half_u * basis_u + half_v * basis_v,
+                center - half_u * basis_u + half_v * basis_v,
+            ], dtype=np.float32)
+            traces.append(
+                go.Mesh3d(
+                    x=corners[:, 0], y=corners[:, 1], z=corners[:, 2],
+                    i=[0, 0], j=[1, 2], k=[2, 3],
+                    color="#222222", opacity=0.18,
+                    name=f"density-plane split {plane_index + 1}",
+                    hovertemplate="density-plane split<extra></extra>",
+                    showscale=False,
+                )
+            )
+    figure = go.Figure(data=traces)
+    figure.update_layout(
+        title=title,
+        scene={
+            "xaxis": {"title": "L", "range": [0, 1]},
+            "yaxis": {"title": "a", "range": [-0.5, 0.5]},
+            "zaxis": {"title": "b", "range": [-0.5, 0.5]},
+            "aspectmode": "cube",
+        },
+        margin={"l": 0, "r": 0, "b": 0, "t": 48},
+    )
+    figure.write_html(output_path, include_plotlyjs="cdn", full_html=True)
+    with open(output_path, "a", encoding="utf-8") as html_file:
+        html_file.write("\n<!-- live-recognition-oklab-html: raw-point-colors -->\n")
+    return output_path
+
+
+def save_oklab_l_slice_interactive_plots(
+    bgr_samples: NDArray[np.uint8],
+    output_path: str,
+    *,
+    title: str = "Oklab L cross-section",
+    point_size: float = 2,
+    oklab_samples: NDArray[np.float32] | None = None,
+    slice_outline_points: list[list[NDArray[np.float32]]] | None = None,
+) -> list[str]:
+    """Save ten raw a/b cross-sections, one for each Oklab L tenth."""
+    if len(bgr_samples) == 0:
+        raise ValueError("No Oklab samples available for cross-section plots")
+    if oklab_samples is None:
+        raise ValueError("oklab_samples are required for Oklab cross-section plots")
+    try:
+        import plotly.graph_objects as go
+    except ImportError as exc:
+        raise RuntimeError(
+            "Plotly is required for --oklab-html-plot. Install it in the Python "
+            "environment used to run this script."
+        ) from exc
+
+    rgb_samples = cv2.cvtColor(bgr_samples.reshape(-1, 1, 3), cv2.COLOR_BGR2RGB).reshape(-1, 3)
+    samples = np.asarray(oklab_samples, dtype=np.float32).reshape(-1, 3)
+    if len(samples) != len(rgb_samples):
+        raise ValueError("oklab_samples must have one entry per BGR sample")
+    output = Path(output_path)
+    suffix = output.suffix or ".html"
+    paths = []
+    for slice_index in range(10):
+        lower = slice_index / 10.0
+        upper = (slice_index + 1) / 10.0
+        mask = (
+            (samples[:, 0] >= lower)
+            & ((samples[:, 0] <= upper) if slice_index == 9 else (samples[:, 0] < upper))
+        )
+        slice_samples = samples[mask]
+        slice_rgb = rgb_samples[mask]
+        figure = go.Figure()
+        if len(slice_samples):
+            colors = [
+                f"rgb({int(rgb[0])},{int(rgb[1])},{int(rgb[2])})"
+                for rgb in slice_rgb
+            ]
+            figure.add_trace(
+                go.Scattergl(
+                    x=slice_samples[:, 1],
+                    y=slice_samples[:, 2],
+                    mode="markers",
+                    marker={"size": point_size, "color": colors, "opacity": 0.7},
+                    customdata=np.column_stack([slice_samples[:, 0], slice_rgb]),
+                    hovertemplate=(
+                        "L=%{customdata[0]:.4f}<br>"
+                        "a=%{x:.4f}<br>b=%{y:.4f}<br>"
+                        "raw RGB=(%{customdata[1]}, %{customdata[2]}, %{customdata[3]})<extra></extra>"
+                    ),
+                    name="raw samples",
+                )
+            )
+        if slice_outline_points is not None and slice_index < len(slice_outline_points):
+            for outline_index, outline in enumerate(slice_outline_points[slice_index]):
+                outline = np.asarray(outline, dtype=np.float32).reshape(-1, 2)
+                if len(outline) < 2:
+                    continue
+                figure.add_trace(
+                    go.Scatter(
+                        x=outline[:, 0],
+                        y=outline[:, 1],
+                        mode="lines",
+                        line={"color": "#333333", "width": 2},
+                        name=f"6-NN outline {outline_index + 1}",
+                        hovertemplate="6-NN outline<extra></extra>",
+                    )
+                )
+        figure.update_layout(
+            title=f"{title} L {lower:.1f}-{upper:.1f}",
+            xaxis={"title": "a", "range": [-0.5, 0.5]},
+            yaxis={"title": "b", "range": [-0.5, 0.5], "scaleanchor": "x", "scaleratio": 1},
+            margin={"l": 48, "r": 12, "b": 48, "t": 48},
+        )
+        slice_path = output.with_name(
+            f"{output.stem}_L{lower:.1f}-{upper:.1f}{suffix}"
+        )
+        figure.write_html(str(slice_path), include_plotlyjs="cdn", full_html=True)
+        paths.append(str(slice_path))
+    return paths
 
 def _interactive_sample_traces(
     go,
@@ -534,9 +800,12 @@ def _interactive_sample_traces(
     *,
     point_size: float,
     color_by_cluster: bool,
+    cluster_trace_original_colors: bool = False,
     hovertemplate: str,
+    customdata: NDArray | None = None,
 ) -> list:
-    customdata = np.column_stack([rgb_samples, cluster_indexes + 1])
+    if customdata is None:
+        customdata = np.column_stack([rgb_samples, cluster_indexes + 1])
     if not color_by_cluster:
         return _raw_color_sample_traces(
             go,
@@ -552,6 +821,11 @@ def _interactive_sample_traces(
     for cluster_index in sorted(set(int(index) for index in cluster_indexes)):
         member_mask = cluster_indexes == cluster_index
         marker_color = _cluster_hex_color(cluster_index, cluster_centroids)
+        if cluster_trace_original_colors:
+            marker_color = [
+                f"rgb({int(rgb[0])},{int(rgb[1])},{int(rgb[2])})"
+                for rgb in rgb_samples[member_mask]
+            ]
         trace_name = (
             f"cluster {cluster_index + 1}"
             if cluster_index >= 0
@@ -576,37 +850,71 @@ def _interactive_sample_traces(
     return traces
 
 
-def _normalized_rgb_cluster_perimeter_traces(
+def _rgb_regression_ray_traces(
     go,
-    plot_samples: NDArray[np.float32],
-    cluster_indexes: NDArray[np.int32],
+    regression_rays: NDArray[np.float32],
     cluster_centroids: NDArray[np.float32],
+    *,
+    normalize_rgb: bool,
 ) -> list:
+    rays = np.asarray(regression_rays, dtype=np.float32).reshape(-1, 3)
     traces = []
-    for cluster_index in sorted(set(int(index) for index in cluster_indexes)):
-        if cluster_index < 0:
+    for ray_index, ray in enumerate(rays):
+        norm = float(np.linalg.norm(ray))
+        if norm <= 1e-6:
             continue
-        member_points = plot_samples[cluster_indexes == cluster_index]
-        if len(member_points) < 3:
-            continue
-
-        boundary_points = _projected_form_fit_boundary_points(member_points)
-        if len(boundary_points) < 3:
-            continue
-
-        boundary_points = np.vstack([boundary_points, boundary_points[0]])
+        direction = ray / norm
+        if normalize_rgb:
+            endpoint = direction
+        else:
+            positive = direction > 1e-6
+            if not bool(positive.any()):
+                continue
+            endpoint = direction * float(np.min(255.0 / direction[positive]))
+        color = _cluster_hex_color(ray_index, cluster_centroids)
         traces.append(
             go.Scatter3d(
-                x=boundary_points[:, 0],
-                y=boundary_points[:, 1],
-                z=boundary_points[:, 2],
+                x=[0.0, float(endpoint[0])],
+                y=[0.0, float(endpoint[1])],
+                z=[0.0, float(endpoint[2])],
                 mode="lines",
-                line={
-                    "color": _cluster_hex_color(cluster_index, cluster_centroids),
-                    "width": 7,
-                },
-                name=f"cluster {cluster_index + 1} perimeter",
-                hovertemplate=f"cluster {cluster_index + 1} perimeter<extra></extra>",
+                line={"color": color, "width": 6},
+                name=f"ray {ray_index + 1}",
+                hovertemplate=(
+                    "ray %{fullData.name}<br>"
+                    "R=%{x:.3f}<br>G=%{y:.3f}<br>B=%{z:.3f}<extra></extra>"
+                ),
+            )
+        )
+    return traces
+
+
+def _rgb_regression_polyline_traces(
+    go,
+    regression_polylines: list[NDArray[np.float32]],
+    cluster_centroids: NDArray[np.float32],
+    *,
+    normalize_rgb: bool,
+) -> list:
+    traces = []
+    for cluster_index, polyline in enumerate(regression_polylines):
+        points = np.asarray(polyline, dtype=np.float32).reshape(-1, 3)
+        if len(points) < 2:
+            continue
+        plot_points = _normalize_rgb_brightness(points) if normalize_rgb else points
+        color = _cluster_hex_color(cluster_index, cluster_centroids)
+        traces.append(
+            go.Scatter3d(
+                x=plot_points[:, 0],
+                y=plot_points[:, 1],
+                z=plot_points[:, 2],
+                mode="lines",
+                line={"color": color, "width": 6},
+                name=f"piecewise line {cluster_index + 1}",
+                hovertemplate=(
+                    "line %{fullData.name}<br>"
+                    "R=%{x:.3f}<br>G=%{y:.3f}<br>B=%{z:.3f}<extra></extra>"
+                ),
             )
         )
     return traces
@@ -619,6 +927,7 @@ def _density_rgb_sample_cluster_indexes(
     min_brightness: float,
     eps_radians: float = NORMALIZED_RGB_DENSITY_EPS_RADIANS,
     min_points: int = NORMALIZED_RGB_DENSITY_MIN_POINTS,
+    merge_ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
 ) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
     samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
     labels = np.full(len(samples), -1, dtype=np.int32)
@@ -648,6 +957,7 @@ def _density_rgb_sample_cluster_indexes(
         samples_for_distance=unit_samples,
         target_count=cluster_count,
         normalize_centroids=True,
+        ray_distance_divisor=merge_ray_distance_divisor,
     )
 
     centroids = []
@@ -665,6 +975,7 @@ def _raw_density_rgb_sample_cluster_indexes(
     min_brightness: float,
     eps: float = RAW_RGB_DENSITY_EPS,
     min_points: int = NORMALIZED_RGB_DENSITY_MIN_POINTS,
+    merge_ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
 ) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
     samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
     labels = np.full(len(samples), -1, dtype=np.int32)
@@ -692,6 +1003,7 @@ def _raw_density_rgb_sample_cluster_indexes(
         samples_for_distance=usable,
         target_count=cluster_count,
         normalize_centroids=False,
+        ray_distance_divisor=merge_ray_distance_divisor,
     )
 
     centroids = []
@@ -708,24 +1020,37 @@ def _merge_smallest_index_clusters_to_nearest_neighbor(
     samples_for_distance: NDArray[np.float32],
     target_count: int,
     normalize_centroids: bool,
+    ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
 ) -> list[NDArray[np.int32]]:
     clusters = [np.asarray(cluster, dtype=np.int32).reshape(-1) for cluster in clusters]
     clusters = [cluster for cluster in clusters if len(cluster) > 0]
-    while len(clusters) > target_count:
-        smallest_index = min(range(len(clusters)), key=lambda index: len(clusters[index]))
-        nearest_index = _nearest_index_cluster_index(
-            clusters,
-            smallest_index,
+    if target_count <= 0:
+        return []
+    clusters.sort(key=len, reverse=True)
+    if len(clusters) <= target_count:
+        return clusters
+
+    anchors = clusters[:target_count]
+    extras = clusters[target_count:]
+    pending_merges: list[list[NDArray[np.int32]]] = [[] for _ in anchors]
+    for extra in extras:
+        nearest_index = _nearest_anchor_index_cluster_index(
+            anchors,
+            extra,
             samples_for_distance=samples_for_distance,
             normalize_centroids=normalize_centroids,
+            ray_distance_divisor=ray_distance_divisor,
         )
-        clusters[nearest_index] = np.concatenate(
-            [clusters[nearest_index], clusters[smallest_index]],
-            axis=0,
-        )
-        del clusters[smallest_index]
-    clusters.sort(key=len, reverse=True)
-    return clusters
+        pending_merges[nearest_index].append(extra)
+
+    merged_clusters = []
+    for anchor, assigned_extras in zip(anchors, pending_merges):
+        if assigned_extras:
+            merged_clusters.append(np.concatenate([anchor, *assigned_extras], axis=0))
+        else:
+            merged_clusters.append(anchor)
+    merged_clusters.sort(key=len, reverse=True)
+    return merged_clusters
 
 
 def _nearest_index_cluster_index(
@@ -734,6 +1059,7 @@ def _nearest_index_cluster_index(
     *,
     samples_for_distance: NDArray[np.float32],
     normalize_centroids: bool,
+    ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
 ) -> int:
     source_centroid = _index_cluster_distance_centroid(
         clusters[source_index],
@@ -741,20 +1067,81 @@ def _nearest_index_cluster_index(
         normalize_centroids=normalize_centroids,
     )
     best_index = 0 if source_index != 0 else 1
-    best_distance = np.inf
+    best_score = np.inf
     for index, cluster in enumerate(clusters):
         if index == source_index:
             continue
-        centroid = _index_cluster_distance_centroid(
-            cluster,
+        score = _index_cluster_merge_score_from_origin_ray(
+            clusters[index],
+            source_centroid,
             samples_for_distance=samples_for_distance,
             normalize_centroids=normalize_centroids,
+            ray_distance_divisor=ray_distance_divisor,
         )
-        distance = float(np.linalg.norm(source_centroid - centroid))
-        if distance < best_distance:
-            best_distance = distance
+        if score < best_score:
+            best_score = score
             best_index = index
     return best_index
+
+
+def _nearest_anchor_index_cluster_index(
+    anchors: list[NDArray[np.int32]],
+    source_cluster: NDArray[np.int32],
+    *,
+    samples_for_distance: NDArray[np.float32],
+    normalize_centroids: bool,
+    ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
+) -> int:
+    source_centroid = _index_cluster_distance_centroid(
+        source_cluster,
+        samples_for_distance=samples_for_distance,
+        normalize_centroids=normalize_centroids,
+    )
+    best_index = 0
+    best_score = np.inf
+    for index, anchor in enumerate(anchors):
+        score = _index_cluster_merge_score_from_origin_ray(
+            anchor,
+            source_centroid,
+            samples_for_distance=samples_for_distance,
+            normalize_centroids=normalize_centroids,
+            ray_distance_divisor=ray_distance_divisor,
+        )
+        if score < best_score:
+            best_score = score
+            best_index = index
+    return best_index
+
+
+def _index_cluster_merge_score_from_origin_ray(
+    cluster: NDArray[np.int32],
+    source_centroid: NDArray[np.float32],
+    *,
+    samples_for_distance: NDArray[np.float32],
+    normalize_centroids: bool,
+    ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
+) -> float:
+    target_points = samples_for_distance[np.asarray(cluster, dtype=np.int32)]
+    source = np.asarray(source_centroid, dtype=np.float32).reshape(3)
+    if len(target_points) == 0:
+        return np.inf
+    if normalize_centroids:
+        target_points = _normalize_rgb_brightness(target_points)
+
+    source_norm = float(np.linalg.norm(source))
+    if source_norm <= 1e-6:
+        distances = np.linalg.norm(target_points - source[None, :], axis=1)
+        return float(distances.min())
+
+    ray_direction = source / source_norm
+    deltas = target_points - source[None, :]
+    parallel = deltas @ ray_direction
+    parallel_vectors = parallel[:, None] * ray_direction[None, :]
+    perpendicular_vectors = deltas - parallel_vectors
+    perpendicular_distances = np.linalg.norm(perpendicular_vectors, axis=1)
+    divisor = max(float(ray_distance_divisor), 1e-6)
+    weighted_distances = np.hypot(perpendicular_distances, parallel / divisor)
+    return float(weighted_distances.min())
 
 
 def _index_cluster_distance_centroid(
@@ -1107,10 +1494,17 @@ def _raw_color_sample_traces(
     hovertemplate: str,
 ) -> list:
     traces = []
-    for trace_name, member_mask in (
-        ("samples (raw color)", cluster_indexes >= 0),
-        ("cluster unknown", cluster_indexes < 0),
-    ):
+    trace_groups = []
+    known_cluster_indexes = sorted(set(int(index) for index in cluster_indexes if index >= 0))
+    if known_cluster_indexes:
+        trace_groups.extend(
+            (f"cluster {cluster_index + 1}", cluster_indexes == cluster_index)
+            for cluster_index in known_cluster_indexes
+        )
+        trace_groups.append(("cluster unknown", cluster_indexes < 0))
+    else:
+        trace_groups.append(("cluster unknown", np.ones(len(cluster_indexes), dtype=bool)))
+    for trace_name, member_mask in trace_groups:
         if not bool(member_mask.any()):
             continue
         member_rgb_samples = rgb_samples[member_mask]
