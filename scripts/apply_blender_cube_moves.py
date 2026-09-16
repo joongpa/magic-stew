@@ -45,11 +45,17 @@ FRONT_AXIS = "-Y"
 
 # Random scene defaults for synthetic data generation.
 DEFAULT_SCRAMBLE_LENGTH = 30
-CAMERA_DISTANCE_RANGE = (7.2, 9.2)
-CAMERA_ELEVATION_DEGREES = (12.0, 42.0)
 CAMERA_TARGET_JITTER = 0.25
-CAMERA_LENS_MM = 35.0
-CAMERA_ROLL_DEGREES = (-45.0, 45.0)
+CAMERA_VIEWPOINT_WEIGHTS = (
+    ("front", 0.24),
+    ("front_diagonal", 0.28),
+    ("over_shoulder", 0.18),
+    ("behind_diagonal", 0.18),
+    ("overhead", 0.12),
+)
+CAMERA_ROI_LENS_RANGE = (42.0, 49.0)
+CAMERA_ROI_SHIFT_X_RANGE = (-0.09, 0.09)
+CAMERA_ROI_SHIFT_Y_RANGE = (-0.07, 0.07)
 
 LIGHT_HEIGHT_RANGE = (6.0, 9.5)
 LIGHT_XY_JITTER_RANGE = (-2.2, 2.2)
@@ -76,6 +82,19 @@ BACKGROUND_ASSET_BLEND_CANDIDATES = (
     PROJECT / "syntheticAssets" / "BackgroundAssets.blend",
     PROJECT / "config" / "synthetic_assets" / "BackgroundAssets.blend",
 )
+SOLVE_STATION_ASSET_BLEND_CANDIDATES = (
+    PROJECT / "syntheticAssets" / "SolveStationAssets.blend",
+    PROJECT / "config" / "synthetic_assets" / "SolveStationAssets.blend",
+)
+SOLVE_STATION_COLLECTION_NAME = "SolveStation_Complete"
+SOLVE_STATION_SCALE = 1.85
+SOLVE_STATION_LAPTOP_PROBABILITY = 0.48
+SOLVE_STATION_PHONE_PROBABILITY = 0.72
+SOLVE_STATION_OTHER_CUBE_PROBABILITY = 0.58
+SOLVE_STATION_OTHER_CUBE_SOLVED_PROBABILITY = 0.68
+SOLVE_STATION_YAW_JITTER_DEGREES = (-7.0, 7.0)
+SOLVE_STATION_CLUTTER_PADDING = 0.22
+SOLVE_STATION_DESK_TOP_LOCAL_Z = -1.51
 BACKGROUND_TABLE_Z = -1.5
 BACKGROUND_TABLE_SIZE_RANGE = (18.0, 26.0)
 BACKGROUND_WALL_DISTANCE_RANGE = (5.5, 8.5)
@@ -319,12 +338,15 @@ def apply_global_pose(objects: list[bpy.types.Object], rotation: Quaternion, tra
     return transform
 
 
-def randomize_cube_global_pose(objects: list[bpy.types.Object]) -> dict[str, object]:
+def randomize_cube_global_pose(
+    objects: list[bpy.types.Object],
+    bounds_objects: list[bpy.types.Object] | None = None,
+) -> dict[str, object]:
     floating = random.random() < CUBE_FLOAT_PROBABILITY
     rotation, rotation_metadata = random_cube_pose_rotation(floating)
     clearance_range = CUBE_FLOAT_CLEARANCE_RANGE if floating else CUBE_TABLE_CLEARANCE_RANGE
     clearance = random.uniform(*clearance_range)
-    min_z = transformed_min_z(objects, rotation)
+    min_z = transformed_min_z(bounds_objects or objects, rotation)
     translation = Vector((
         random.uniform(*CUBE_POSE_XY_JITTER_RANGE),
         random.uniform(*CUBE_POSE_XY_JITTER_RANGE),
@@ -457,21 +479,6 @@ def look_at(obj: bpy.types.Object, target: Vector) -> None:
     obj.rotation_quaternion = direction.to_track_quat("-Z", "Y")
 
 
-def random_point_on_shell(
-    distance_range: tuple[float, float],
-    elevation_degrees: tuple[float, float],
-) -> Vector:
-    distance = random.uniform(*distance_range)
-    azimuth = random.uniform(0.0, math.tau)
-    elevation = math.radians(random.uniform(*elevation_degrees))
-    radius_xy = distance * math.cos(elevation)
-    return Vector((
-        radius_xy * math.cos(azimuth),
-        radius_xy * math.sin(azimuth),
-        distance * math.sin(elevation),
-    ))
-
-
 def random_point_on_unit_sphere() -> Vector:
     z = random.uniform(-1.0, 1.0)
     angle = random.uniform(0.0, math.tau)
@@ -497,21 +504,70 @@ def get_camera() -> bpy.types.Object:
 
 def randomize_camera() -> dict[str, object]:
     camera = get_camera()
-    camera.location = random_point_on_shell(CAMERA_DISTANCE_RANGE, CAMERA_ELEVATION_DEGREES)
+    viewpoint = random.choices(
+        [name for name, _weight in CAMERA_VIEWPOINT_WEIGHTS],
+        weights=[weight for _name, weight in CAMERA_VIEWPOINT_WEIGHTS],
+        k=1,
+    )[0]
+    if viewpoint == "front":
+        azimuth_degrees = -90.0 + random.uniform(-12.0, 12.0)
+        elevation_degrees = random.uniform(18.0, 36.0)
+        distance = random.uniform(10.0, 13.5)
+        roll_degrees = random.uniform(-6.0, 6.0)
+    elif viewpoint == "front_diagonal":
+        azimuth_degrees = random.choice((-45.0, -135.0)) + random.uniform(-9.0, 9.0)
+        elevation_degrees = random.uniform(20.0, 43.0)
+        distance = random.uniform(10.5, 14.0)
+        roll_degrees = random.uniform(-8.0, 8.0)
+    elif viewpoint == "over_shoulder":
+        azimuth_degrees = random.choice((58.0, 122.0)) + random.uniform(-6.0, 6.0)
+        elevation_degrees = random.uniform(57.0, 68.0)
+        distance = random.uniform(12.0, 15.5)
+        roll_degrees = random.uniform(-7.0, 7.0)
+    elif viewpoint == "behind_diagonal":
+        azimuth_degrees = random.choice((42.0, 138.0)) + random.uniform(-8.0, 8.0)
+        elevation_degrees = random.uniform(27.0, 48.0)
+        distance = random.uniform(10.5, 14.5)
+        roll_degrees = random.uniform(-8.0, 8.0)
+    else:
+        azimuth_degrees = random.choice((-135.0, -90.0, -45.0, 45.0, 90.0, 135.0))
+        azimuth_degrees += random.uniform(-10.0, 10.0)
+        elevation_degrees = random.uniform(64.0, 80.0)
+        distance = random.uniform(11.5, 15.5)
+        roll_degrees = random.uniform(-18.0, 18.0)
+
+    azimuth = math.radians(azimuth_degrees)
+    elevation = math.radians(elevation_degrees)
+    radius_xy = distance * math.cos(elevation)
+    camera.location = Vector((
+        radius_xy * math.cos(azimuth),
+        radius_xy * math.sin(azimuth),
+        distance * math.sin(elevation),
+    ))
     camera.data.type = "PERSP"
-    camera.data.lens = CAMERA_LENS_MM
+    camera.data.lens = random.uniform(*CAMERA_ROI_LENS_RANGE)
+    camera.data.shift_x = random.uniform(*CAMERA_ROI_SHIFT_X_RANGE)
+    camera.data.shift_y = random.uniform(*CAMERA_ROI_SHIFT_Y_RANGE)
     target = random_target()
-    roll_degrees = random.uniform(*CAMERA_ROLL_DEGREES)
     look_at(camera, target)
     camera.rotation_quaternion = camera.rotation_quaternion @ Quaternion(
         Vector((0.0, 0.0, -1.0)),
         math.radians(roll_degrees),
     )
     return {
+        "viewpoint": viewpoint,
         "location": [camera.location.x, camera.location.y, camera.location.z],
         "target": [target.x, target.y, target.z],
+        "azimuth_degrees": azimuth_degrees,
+        "elevation_degrees": elevation_degrees,
+        "distance": distance,
         "roll_degrees": roll_degrees,
         "lens_mm": camera.data.lens,
+        "roi_crop": {
+            "method": "camera_lens_and_sensor_shift",
+            "shift_x": camera.data.shift_x,
+            "shift_y": camera.data.shift_y,
+        },
     }
 
 
@@ -809,7 +865,7 @@ def clear_background_scene() -> None:
         if collection.name.startswith(BACKGROUND_ASSET_COLLECTION_PREFIX):
             bpy.data.collections.remove(collection)
     for material in list(bpy.data.materials):
-        if material.name.startswith(BACKGROUND_SCENE_MATERIAL_PREFIX):
+        if material.name.startswith(BACKGROUND_SCENE_MATERIAL_PREFIX) or material.name.startswith("SolveStation.Material."):
             bpy.data.materials.remove(material, do_unlink=True)
 
 
@@ -1476,75 +1532,853 @@ def add_realistic_background_prop(
     return add_primitive_clutter_prop(collection, index, table_forward, table_right)
 
 
+def solve_station_asset_blend_path() -> Path:
+    path = next((candidate for candidate in SOLVE_STATION_ASSET_BLEND_CANDIDATES if candidate.exists()), None)
+    if path is None:
+        candidates = ", ".join(str(candidate) for candidate in SOLVE_STATION_ASSET_BLEND_CANDIDATES)
+        raise FileNotFoundError(
+            "The solve-station asset library has not been built. "
+            f"Expected one of: {candidates}. Run scripts/build_solve_station_assets.py in Blender."
+        )
+    return path
+
+
+def scaled_color(
+    color: tuple[float, float, float, float],
+    factor: float,
+) -> tuple[float, float, float, float]:
+    return tuple(min(1.0, max(0.0, channel * factor)) for channel in color[:3]) + (1.0,)
+
+
+def configure_station_color_pattern(
+    material: bpy.types.Material,
+    base_color: tuple[float, float, float, float],
+    accent_color: tuple[float, float, float, float],
+    pattern: str,
+) -> None:
+    material.use_nodes = True
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    bsdf = nodes.get("Principled BSDF")
+    if bsdf is None:
+        return
+    for link in list(bsdf.inputs["Base Color"].links):
+        links.remove(link)
+    if pattern == "solid":
+        bsdf.inputs["Base Color"].default_value = base_color
+        return
+
+    texcoord = nodes.new("ShaderNodeTexCoord")
+    texcoord.name = f"SolveStation.Pattern.{pattern}.Coordinates"
+    ramp = nodes.new("ShaderNodeValToRGB")
+    ramp.name = f"SolveStation.Pattern.{pattern}.Colors"
+    ramp.color_ramp.elements[0].color = base_color
+    ramp.color_ramp.elements[1].color = accent_color
+
+    if pattern == "stripes":
+        texture = nodes.new("ShaderNodeTexWave")
+        texture.name = "SolveStation.Pattern.Stripes"
+        texture.wave_type = "BANDS"
+        texture.bands_direction = random.choice(("X", "Y", "Z"))
+        texture.inputs["Scale"].default_value = random.uniform(2.2, 6.5)
+        texture.inputs["Distortion"].default_value = random.uniform(0.0, 1.2)
+        ramp.color_ramp.interpolation = "CONSTANT"
+        ramp.color_ramp.elements[0].position = random.uniform(0.38, 0.48)
+        ramp.color_ramp.elements[1].position = random.uniform(0.52, 0.62)
+        links.new(texcoord.outputs["Generated"], texture.inputs["Vector"])
+        links.new(texture.outputs["Fac"], ramp.inputs["Fac"])
+    else:
+        texture = nodes.new("ShaderNodeTexNoise")
+        texture.name = f"SolveStation.Pattern.{pattern.title()}"
+        if pattern == "heather":
+            texture.inputs["Scale"].default_value = random.uniform(70.0, 145.0)
+            texture.inputs["Detail"].default_value = random.uniform(2.0, 5.0)
+            texture.inputs["Roughness"].default_value = random.uniform(0.55, 0.8)
+            ramp.color_ramp.elements[0].color = scaled_color(base_color, 0.7)
+            ramp.color_ramp.elements[1].color = scaled_color(base_color, 1.3)
+        else:
+            texture.inputs["Scale"].default_value = random.uniform(3.5, 9.0)
+            texture.inputs["Detail"].default_value = random.uniform(4.0, 9.0)
+            texture.inputs["Roughness"].default_value = random.uniform(0.62, 0.88)
+        links.new(texcoord.outputs["Generated"], texture.inputs["Vector"])
+        links.new(texture.outputs["Fac"], ramp.inputs["Fac"])
+    links.new(ramp.outputs["Color"], bsdf.inputs["Base Color"])
+
+
+def randomize_solve_station_materials(asset_collection: bpy.types.Collection) -> dict[str, object]:
+    shirt_color = random.choice((
+        (0.012, 0.015, 0.022, 1.0),
+        (0.055, 0.065, 0.08, 1.0),
+        (0.018, 0.055, 0.12, 1.0),
+        (0.32, 0.018, 0.015, 1.0),
+        (0.05, 0.22, 0.12, 1.0),
+        (0.34, 0.12, 0.38, 1.0),
+        (0.55, 0.53, 0.48, 1.0),
+    ))
+    shirt_accent_color = random.choice((
+        (0.015, 0.018, 0.024, 1.0),
+        (0.82, 0.78, 0.68, 1.0),
+        (0.03, 0.18, 0.36, 1.0),
+        (0.48, 0.035, 0.025, 1.0),
+        (0.03, 0.31, 0.16, 1.0),
+        (0.34, 0.08, 0.46, 1.0),
+    ))
+    shirt_pattern = random.choices(
+        ("solid", "heather", "stripes", "mottled"),
+        weights=(0.3, 0.28, 0.27, 0.15),
+        k=1,
+    )[0]
+    shirt_seam_color = tuple(max(0.0, channel * 0.72) for channel in shirt_color[:3]) + (1.0,)
+    skin_color = random_hand_skin_color()
+    wall_color = random.choice((
+        (0.22, 0.23, 0.24, 1.0),
+        (0.38, 0.36, 0.32, 1.0),
+        (0.28, 0.34, 0.36, 1.0),
+        (0.48, 0.47, 0.43, 1.0),
+    ))
+    mat_color, mat_print_color = random.choice((
+        ((0.018, 0.028, 0.045, 1.0), (0.02, 0.25, 0.48, 1.0)),
+        ((0.02, 0.11, 0.12, 1.0), (0.02, 0.48, 0.43, 1.0)),
+        ((0.095, 0.018, 0.025, 1.0), (0.58, 0.035, 0.025, 1.0)),
+        ((0.075, 0.065, 0.055, 1.0), (0.56, 0.34, 0.08, 1.0)),
+        ((0.055, 0.025, 0.09, 1.0), (0.36, 0.08, 0.58, 1.0)),
+        ((0.055, 0.06, 0.065, 1.0), (0.3, 0.34, 0.38, 1.0)),
+    ))
+    mat_pattern = random.choices(
+        ("solid", "heather", "stripes", "mottled"),
+        weights=(0.3, 0.2, 0.28, 0.22),
+        k=1,
+    )[0]
+    timer_color, timer_trim_color, sensor_color = random.choice((
+        (
+            (0.01, 0.012, 0.016, 1.0),
+            (0.025, 0.16, 0.31, 1.0),
+            (0.04, 0.22, 0.42, 1.0),
+        ),
+        (
+            (0.035, 0.038, 0.044, 1.0),
+            (0.32, 0.055, 0.035, 1.0),
+            (0.48, 0.085, 0.045, 1.0),
+        ),
+        (
+            (0.018, 0.022, 0.028, 1.0),
+            (0.06, 0.31, 0.16, 1.0),
+            (0.08, 0.46, 0.22, 1.0),
+        ),
+        (
+            (0.025, 0.022, 0.035, 1.0),
+            (0.28, 0.08, 0.4, 1.0),
+            (0.4, 0.13, 0.57, 1.0),
+        ),
+    ))
+    phone_color = random.choice((
+        (0.018, 0.021, 0.026, 1.0),
+        (0.24, 0.25, 0.27, 1.0),
+        (0.035, 0.075, 0.13, 1.0),
+        (0.22, 0.055, 0.045, 1.0),
+        (0.13, 0.055, 0.2, 1.0),
+    ))
+    phone_screen_color = random.choice((
+        (0.025, 0.08, 0.16, 1.0),
+        (0.12, 0.025, 0.18, 1.0),
+        (0.018, 0.14, 0.12, 1.0),
+        (0.18, 0.055, 0.018, 1.0),
+    ))
+    laptop_color = random.choice((
+        (0.12, 0.13, 0.15, 1.0),
+        (0.24, 0.25, 0.27, 1.0),
+        (0.055, 0.065, 0.08, 1.0),
+        (0.24, 0.21, 0.18, 1.0),
+    ))
+    laptop_screen_color = random.choice((
+        (0.02, 0.07, 0.14, 1.0),
+        (0.08, 0.025, 0.13, 1.0),
+        (0.015, 0.12, 0.15, 1.0),
+    ))
+    desk_color = random.choice((
+        (0.14, 0.045, 0.018, 1.0),
+        (0.24, 0.075, 0.025, 1.0),
+        (0.34, 0.16, 0.055, 1.0),
+        (0.12, 0.09, 0.065, 1.0),
+    ))
+    color_by_material = {
+        "SolveStation.Material.Shirt": shirt_color,
+        "SolveStation.Material.ShirtSeam": shirt_seam_color,
+        "SolveStation.Material.Skin": skin_color,
+        "SolveStation.Material.Wall": wall_color,
+        "SolveStation.Material.MatFabric": mat_color,
+        "SolveStation.Material.MatPrint": mat_print_color,
+        "SolveStation.Material.TimerBody": timer_color,
+        "SolveStation.Material.TimerTrim": timer_trim_color,
+        "SolveStation.Material.Sensor": sensor_color,
+        "SolveStation.Material.PhoneBody": phone_color,
+        "SolveStation.Material.PhoneScreen": phone_screen_color,
+        "SolveStation.Material.Metal": laptop_color,
+        "SolveStation.Material.LaptopScreen": laptop_screen_color,
+        "SolveStation.Material.DeskWood": desk_color,
+    }
+    emissive_materials = {
+        "SolveStation.Material.PhoneScreen",
+        "SolveStation.Material.LaptopScreen",
+    }
+    changed_materials: set[str] = set()
+    randomized_materials: dict[str, bpy.types.Material] = {}
+    for obj in asset_collection.all_objects:
+        if obj.type != "MESH":
+            continue
+        for mat in obj.data.materials:
+            if mat is None or mat.name in changed_materials:
+                continue
+            source_name = next(
+                (
+                    name
+                    for name in sorted(color_by_material, key=len, reverse=True)
+                    if mat.name.startswith(name)
+                ),
+                None,
+            )
+            if source_name is None:
+                continue
+            color = color_by_material[source_name]
+            mat.diffuse_color = color
+            set_principled_input(mat, "Base Color", color)
+            if source_name in emissive_materials:
+                set_principled_input(mat, "Emission Color", color)
+                set_principled_input(mat, "Emission", color)
+            changed_materials.add(mat.name)
+            randomized_materials[source_name] = mat
+    shirt_material = randomized_materials.get("SolveStation.Material.Shirt")
+    if shirt_material is not None:
+        configure_station_color_pattern(
+            shirt_material,
+            shirt_color,
+            shirt_accent_color,
+            shirt_pattern,
+        )
+    mat_material = randomized_materials.get("SolveStation.Material.MatFabric")
+    if mat_material is not None:
+        configure_station_color_pattern(
+            mat_material,
+            mat_color,
+            mat_print_color,
+            mat_pattern,
+        )
+    return {
+        "shirt_color": list(shirt_color),
+        "shirt_accent_color": list(shirt_accent_color),
+        "shirt_pattern": shirt_pattern,
+        "skin_color": list(skin_color),
+        "wall_color": list(wall_color),
+        "mat_color": list(mat_color),
+        "mat_print_color": list(mat_print_color),
+        "mat_pattern": mat_pattern,
+        "timer_color": list(timer_color),
+        "timer_trim_color": list(timer_trim_color),
+        "phone_color": list(phone_color),
+        "phone_screen_color": list(phone_screen_color),
+        "laptop_color": list(laptop_color),
+        "laptop_screen_color": list(laptop_screen_color),
+        "desk_color": list(desk_color),
+    }
+
+
+def solve_station_family_objects(
+    asset_collection: bpy.types.Collection,
+    families: tuple[str, ...],
+) -> list[bpy.types.Object]:
+    markers = tuple(f"SolveStation.{family}." for family in families)
+    return [
+        obj
+        for obj in asset_collection.all_objects
+        if obj.type == "MESH" and any(marker in obj.name for marker in markers)
+    ]
+
+
+def object_group_local_xy_bounds(
+    objects: list[bpy.types.Object],
+) -> tuple[float, float, float, float]:
+    parent = objects[0].parent if objects else None
+    parent_inverse = (
+        parent.matrix_world.inverted_safe()
+        if parent is not None
+        else Matrix.Identity(4)
+    )
+    points = [
+        parent_inverse @ obj.matrix_world @ Vector(corner)
+        for obj in objects
+        for corner in obj.bound_box
+    ]
+    if not points:
+        raise ValueError("Cannot calculate bounds for an empty solve-station family.")
+    return (
+        min(point.x for point in points),
+        max(point.x for point in points),
+        min(point.y for point in points),
+        max(point.y for point in points),
+    )
+
+
+def xy_bounds_overlap(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+    padding: float = 0.0,
+) -> bool:
+    return not (
+        first[1] + padding <= second[0]
+        or second[1] + padding <= first[0]
+        or first[3] + padding <= second[2]
+        or second[3] + padding <= first[2]
+    )
+
+
+def set_object_group_local_pose(
+    objects: list[bpy.types.Object],
+    base_matrices: dict[str, Matrix],
+    target_x: float,
+    target_y: float,
+    yaw_degrees: float,
+) -> tuple[float, float, float, float]:
+    for obj in objects:
+        obj.matrix_world = base_matrices[obj.name].copy()
+    bpy.context.view_layer.update()
+    bounds = object_group_local_xy_bounds(objects)
+    center = Vector(((bounds[0] + bounds[1]) * 0.5, (bounds[2] + bounds[3]) * 0.5, 0.0))
+    target = Vector((target_x, target_y, 0.0))
+    rotation = Matrix.Rotation(math.radians(yaw_degrees), 4, "Z")
+    local_transform = Matrix.Translation(target) @ rotation @ Matrix.Translation(-center)
+    parent = objects[0].parent if objects else None
+    if parent is None:
+        world_transform = local_transform
+    else:
+        world_transform = (
+            parent.matrix_world
+            @ local_transform
+            @ parent.matrix_world.inverted_safe()
+        )
+    for obj in objects:
+        obj.matrix_world = world_transform @ base_matrices[obj.name]
+    bpy.context.view_layer.update()
+    return object_group_local_xy_bounds(objects)
+
+
+def randomize_solve_station_layout(
+    asset_collection: bpy.types.Collection,
+) -> dict[str, object]:
+    """Jitter prop groups while keeping their footprints separated on the desk."""
+    placements: dict[str, object] = {}
+    occupied: list[tuple[str, tuple[float, float, float, float]]] = [
+        ("target_cube_keepout", (-1.3, 1.3, -1.3, 1.3)),
+    ]
+
+    mat_objects = solve_station_family_objects(asset_collection, ("Mat",))
+    if mat_objects:
+        base = {obj.name: obj.matrix_world.copy() for obj in mat_objects}
+        bounds = object_group_local_xy_bounds(mat_objects)
+        target_x = (bounds[0] + bounds[1]) * 0.5 + random.uniform(-0.24, 0.24)
+        target_y = (bounds[2] + bounds[3]) * 0.5 + random.uniform(-0.18, 0.18)
+        yaw = random.uniform(-2.5, 2.5)
+        set_object_group_local_pose(mat_objects, base, target_x, target_y, yaw)
+        placements["mat"] = {
+            "center": [target_x, target_y],
+            "yaw_degrees": yaw,
+        }
+
+    solver_objects = solve_station_family_objects(asset_collection, ("Shirt", "Arm"))
+    if solver_objects:
+        base = {obj.name: obj.matrix_world.copy() for obj in solver_objects}
+        bounds = object_group_local_xy_bounds(solver_objects)
+        target_x = (bounds[0] + bounds[1]) * 0.5 + random.uniform(-0.38, 0.38)
+        target_y = (bounds[2] + bounds[3]) * 0.5 + random.uniform(-0.16, 0.28)
+        yaw = random.uniform(-3.5, 3.5)
+        set_object_group_local_pose(solver_objects, base, target_x, target_y, yaw)
+        placements["solver"] = {
+            "center": [target_x, target_y],
+            "yaw_degrees": yaw,
+        }
+
+    timer_objects = solve_station_family_objects(asset_collection, ("Timer",))
+    if timer_objects:
+        base = {obj.name: obj.matrix_world.copy() for obj in timer_objects}
+        target_x = random.uniform(-0.28, 0.28)
+        target_y = random.uniform(2.55, 2.85)
+        yaw = random.uniform(-2.8, 2.8)
+        bounds = set_object_group_local_pose(
+            timer_objects,
+            base,
+            target_x,
+            target_y,
+            yaw,
+        )
+        occupied.append(("timer", bounds))
+        placements["timer"] = {
+            "center": [target_x, target_y],
+            "yaw_degrees": yaw,
+            "bounds": list(bounds),
+        }
+
+    laptop_side = random.choice((-1.0, 1.0))
+    laptop_objects = solve_station_family_objects(asset_collection, ("Laptop",))
+    if laptop_objects:
+        base = {obj.name: obj.matrix_world.copy() for obj in laptop_objects}
+        accepted = False
+        for _attempt in range(30):
+            target_x = laptop_side * random.uniform(4.25, 4.75)
+            target_y = random.uniform(-3.45, -3.15)
+            yaw = random.uniform(-4.5, 4.5)
+            bounds = set_object_group_local_pose(
+                laptop_objects,
+                base,
+                target_x,
+                target_y,
+                yaw,
+            )
+            if not any(
+                xy_bounds_overlap(bounds, other, SOLVE_STATION_CLUTTER_PADDING)
+                for _name, other in occupied
+            ):
+                accepted = True
+                break
+        if not accepted:
+            target_x = laptop_side * 4.65
+            target_y = -3.5
+            yaw = 0.0
+            bounds = set_object_group_local_pose(
+                laptop_objects,
+                base,
+                target_x,
+                target_y,
+                yaw,
+            )
+        occupied.append(("laptop", bounds))
+        placements["laptop"] = {
+            "center": [target_x, target_y],
+            "yaw_degrees": yaw,
+            "bounds": list(bounds),
+            "opposite_solver_side": True,
+        }
+
+    phone_objects = solve_station_family_objects(asset_collection, ("Phone",))
+    if phone_objects:
+        base = {obj.name: obj.matrix_world.copy() for obj in phone_objects}
+        accepted = False
+        preferred_side = -laptop_side if laptop_objects else random.choice((-1.0, 1.0))
+        for attempt in range(60):
+            side = preferred_side if attempt < 42 else -preferred_side
+            target_x = side * random.uniform(4.55, 5.35)
+            target_y = random.uniform(-0.25, 0.75)
+            yaw = random.uniform(-28.0, 28.0)
+            bounds = set_object_group_local_pose(
+                phone_objects,
+                base,
+                target_x,
+                target_y,
+                yaw,
+            )
+            if not any(
+                xy_bounds_overlap(bounds, other, SOLVE_STATION_CLUTTER_PADDING)
+                for _name, other in occupied
+            ):
+                accepted = True
+                break
+        if not accepted:
+            for obj in phone_objects:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            placements["phone"] = {"visible": False, "reason": "no_clear_placement"}
+        else:
+            occupied.append(("phone", bounds))
+            placements["phone"] = {
+                "visible": True,
+                "center": [target_x, target_y],
+                "yaw_degrees": yaw,
+                "bounds": list(bounds),
+            }
+
+    placements["occupied_bounds"] = {
+        name: list(bounds) for name, bounds in occupied
+    }
+    return placements
+
+
+def set_solve_station_family_visible(
+    asset_collection: bpy.types.Collection,
+    family: str,
+    visible: bool,
+) -> None:
+    marker = f"SolveStation.{family}."
+    for obj in list(asset_collection.all_objects):
+        if marker not in obj.name:
+            continue
+        if not visible:
+            bpy.data.objects.remove(obj, do_unlink=True)
+            continue
+        obj.hide_render = False
+        obj.hide_viewport = False
+        obj.hide_set(False)
+
+
+def add_solve_station_background() -> dict[str, object]:
+    path = solve_station_asset_blend_path()
+    instance_name = f"{BACKGROUND_ASSET_COLLECTION_PREFIX}.SolveStation"
+    asset_collection = append_background_asset_collection(
+        path,
+        SOLVE_STATION_COLLECTION_NAME,
+        instance_name,
+    )
+    if asset_collection is None:
+        raise RuntimeError(
+            f"Could not append {SOLVE_STATION_COLLECTION_NAME!r} from {path}"
+        )
+
+    parent_collection = background_scene_collection()
+    link_collection_to_collection(asset_collection, parent_collection)
+    root = collection_asset_root(asset_collection)
+    if root is None:
+        raise RuntimeError(f"The solve-station collection in {path} has no root object")
+
+    yaw_jitter = math.radians(random.uniform(*SOLVE_STATION_YAW_JITTER_DEGREES))
+    rotation = Quaternion(Vector((0.0, 0.0, 1.0)), yaw_jitter)
+    station_scale = SOLVE_STATION_SCALE
+    table_anchor_offset = (
+        BACKGROUND_TABLE_Z - station_scale * SOLVE_STATION_DESK_TOP_LOCAL_Z
+    )
+    root.matrix_world = (
+        Matrix.Translation(Vector((0.0, 0.0, table_anchor_offset)))
+        @ rotation.to_matrix().to_4x4()
+        @ Matrix.Diagonal((station_scale, station_scale, station_scale, 1.0))
+    )
+    bpy.context.view_layer.update()
+
+    laptop_visible = random.random() < SOLVE_STATION_LAPTOP_PROBABILITY
+    phone_visible = random.random() < SOLVE_STATION_PHONE_PROBABILITY
+    other_cube_visible = random.random() < SOLVE_STATION_OTHER_CUBE_PROBABILITY
+    set_solve_station_family_visible(asset_collection, "Laptop", laptop_visible)
+    set_solve_station_family_visible(asset_collection, "Phone", phone_visible)
+    layout_metadata = randomize_solve_station_layout(asset_collection)
+    phone_layout = layout_metadata.get("phone")
+    if isinstance(phone_layout, dict) and phone_layout.get("visible") is False:
+        phone_visible = False
+    material_metadata = randomize_solve_station_materials(asset_collection)
+
+    objects = list(asset_collection.all_objects)
+    for obj in objects:
+        if obj == root:
+            continue
+        obj.name = f"{BACKGROUND_SCENE_PREFIX}.solve_station.{obj.name}"
+    root.name = f"{BACKGROUND_SCENE_PREFIX}.solve_station.ROOT"
+    bpy.context.view_layer.update()
+
+    return {
+        "family": "solve_station",
+        "source_file": str(path),
+        "source_collection": SOLVE_STATION_COLLECTION_NAME,
+        "collection": asset_collection.name,
+        "root": root.name,
+        "object_count": len([obj for obj in objects if obj.type == "MESH"]),
+        "laptop_visible": laptop_visible,
+        "phone_visible": phone_visible,
+        "other_cube_visible": other_cube_visible,
+        "other_cube": None,
+        "scale": station_scale,
+        "yaw_jitter_degrees": math.degrees(yaw_jitter),
+        "layout": layout_metadata,
+        "materials": material_metadata,
+    }
+
+
+def object_tree(source: bpy.types.Object) -> list[bpy.types.Object]:
+    result = [source]
+    for child in source.children:
+        result.extend(object_tree(child))
+    return result
+
+
+def duplicate_object_hierarchies(
+    roots: list[bpy.types.Object],
+    collection: bpy.types.Collection,
+    name_family: str,
+) -> tuple[list[bpy.types.Object], list[bpy.types.Object]]:
+    sources = []
+    seen: set[int] = set()
+    for root in roots:
+        for source in object_tree(root):
+            pointer = source.as_pointer()
+            if pointer in seen:
+                continue
+            seen.add(pointer)
+            sources.append(source)
+
+    duplicates: dict[bpy.types.Object, bpy.types.Object] = {}
+    for index, source in enumerate(sources):
+        duplicate = source.copy()
+        if source.data is not None:
+            duplicate.data = source.data
+        duplicate.name = (
+            f"{BACKGROUND_SCENE_PREFIX}.secondary_cube.{name_family}.{index:03d}"
+        )
+        duplicate.pass_index = 0
+        collection.objects.link(duplicate)
+        duplicates[source] = duplicate
+
+    for source, duplicate in duplicates.items():
+        if source.parent in duplicates:
+            duplicate.parent = duplicates[source.parent]
+            duplicate.matrix_parent_inverse = source.matrix_parent_inverse.copy()
+            duplicate.matrix_basis = source.matrix_basis.copy()
+        else:
+            duplicate.parent = None
+            duplicate.matrix_world = source.matrix_world.copy()
+
+    duplicate_roots = [duplicates[root] for root in roots]
+    return duplicate_roots, list(duplicates.values())
+
+
+def transformed_object_group_bounds(
+    objects: list[bpy.types.Object],
+    transform: Matrix,
+) -> tuple[float, float, float, float, float, float]:
+    points = [
+        transform @ obj.matrix_world @ Vector(corner)
+        for obj in objects
+        if obj.type == "MESH"
+        for corner in obj.bound_box
+    ]
+    if not points:
+        raise ValueError("Cannot calculate bounds for an empty object group.")
+    return (
+        min(point.x for point in points),
+        max(point.x for point in points),
+        min(point.y for point in points),
+        max(point.y for point in points),
+        min(point.z for point in points),
+        max(point.z for point in points),
+    )
+
+
+def projected_object_group_bounds(
+    objects: list[bpy.types.Object],
+    transform: Matrix,
+) -> tuple[float, float, float, float] | None:
+    scene = bpy.context.scene
+    camera = get_camera()
+    projected = []
+    for obj in objects:
+        if obj.type != "MESH":
+            continue
+        for corner in obj.bound_box:
+            point = transform @ obj.matrix_world @ Vector(corner)
+            coordinate = world_to_camera_view(scene, camera, point)
+            if coordinate.z <= 0.0:
+                return None
+            projected.append((coordinate.x, coordinate.y))
+    if not projected:
+        return None
+    return (
+        min(point[0] for point in projected),
+        max(point[0] for point in projected),
+        min(point[1] for point in projected),
+        max(point[1] for point in projected),
+    )
+
+
+def duplicate_secondary_cube(
+    objects: list[bpy.types.Object],
+    core_objects: list[bpy.types.Object],
+    background_randomization: dict[str, object],
+) -> dict[str, object] | None:
+    station_objects = background_randomization.get("objects", [])
+    if not station_objects or not isinstance(station_objects[0], dict):
+        return None
+    station_metadata = station_objects[0]
+    if not station_metadata.get("other_cube_visible"):
+        return None
+
+    collection = background_scene_collection()
+    duplicate_objects, duplicate_cube_parts = duplicate_object_hierarchies(
+        objects,
+        collection,
+        "cubie_part",
+    )
+    duplicate_core_objects, duplicate_core_parts = duplicate_object_hierarchies(
+        core_objects,
+        collection,
+        "core_part",
+    )
+
+    reset_cube(duplicate_objects)
+    reset_core_fill_objects(duplicate_core_objects)
+    secondary_solved = (
+        random.random() < SOLVE_STATION_OTHER_CUBE_SOLVED_PROBABILITY
+    )
+    faces = list("RLUDBF")
+    secondary_moves = []
+    secondary_move_count = 0 if secondary_solved else random.randint(8, 22)
+    for _ in range(secondary_move_count):
+        choices = [face for face in faces if not secondary_moves or face != secondary_moves[-1]]
+        move = random.choice(choices)
+        secondary_moves.append(move)
+        rotate_face(duplicate_objects, move)
+
+    table_forward, table_right = camera_table_basis()
+    rotation = (
+        Quaternion(Vector((0.0, 0.0, 1.0)), random.uniform(0.0, math.tau))
+        @ Quaternion(Vector((1.0, 0.0, 0.0)), math.radians(random.uniform(-9.0, 9.0)))
+        @ Quaternion(Vector((0.0, 1.0, 0.0)), math.radians(random.uniform(-9.0, 9.0)))
+    )
+    pose_roots = duplicate_objects + duplicate_core_objects
+    render_parts = duplicate_cube_parts + duplicate_core_parts
+    min_z = transformed_min_z(render_parts, rotation)
+    preferred_side = random.choice((-1.0, 1.0))
+    layout = station_metadata.get("layout")
+    if isinstance(layout, dict):
+        phone_layout = layout.get("phone")
+        if isinstance(phone_layout, dict):
+            phone_center = phone_layout.get("center")
+            if isinstance(phone_center, list) and phone_center:
+                preferred_side = -1.0 if phone_center[0] > 0.0 else 1.0
+    side = preferred_side
+    initial_right_distance = random.uniform(5.6, 6.4)
+    depth_offset = random.uniform(0.0, 0.65)
+    placement_zone = "mat_left" if side < 0.0 else "mat_right"
+    clearance = random.uniform(0.02, 0.08)
+    cropped_candidate = None
+    for crop_attempt in range(48):
+        right_distance = initial_right_distance + crop_attempt * 0.08
+        right_offset = side * right_distance
+        horizontal_location = (
+            table_right * right_offset + table_forward * depth_offset
+        )
+        translation = Vector((
+            horizontal_location.x,
+            horizontal_location.y,
+            BACKGROUND_TABLE_Z + clearance - min_z,
+        ))
+        candidate_transform = (
+            Matrix.Translation(translation) @ rotation.to_matrix().to_4x4()
+        )
+        projected_bounds = projected_object_group_bounds(
+            render_parts,
+            candidate_transform,
+        )
+        if projected_bounds is None:
+            continue
+        fully_in_frame = (
+            projected_bounds[0] >= 0.0
+            and projected_bounds[1] <= 1.0
+            and projected_bounds[2] >= 0.0
+            and projected_bounds[3] <= 1.0
+        )
+        intersects_frame = (
+            projected_bounds[1] > 0.0
+            and projected_bounds[0] < 1.0
+            and projected_bounds[3] > 0.0
+            and projected_bounds[2] < 1.0
+        )
+        if intersects_frame and not fully_in_frame:
+            cropped_candidate = (
+                crop_attempt + 1,
+                right_offset,
+                translation,
+                candidate_transform,
+                projected_bounds,
+            )
+            break
+    if cropped_candidate is None:
+        for duplicate in render_parts:
+            bpy.data.objects.remove(duplicate, do_unlink=True)
+        station_metadata["other_cube_visible"] = False
+        station_metadata["other_cube"] = {
+            "model": "duplicate_of_main_cube",
+            "placement": "rejected",
+            "reason": "no_partial_frame_placement",
+        }
+        return None
+    (
+        crop_attempts,
+        right_offset,
+        translation,
+        candidate_transform,
+        projected_bounds,
+    ) = cropped_candidate
+    world_bounds = transformed_object_group_bounds(render_parts, candidate_transform)
+
+    transform = apply_global_pose(
+        pose_roots,
+        rotation,
+        translation,
+    )
+    actual_projected_bounds = projected_object_group_bounds(
+        render_parts,
+        Matrix.Identity(4),
+    )
+    metadata = {
+        "model": "duplicate_of_main_cube",
+        "object_count": len(duplicate_objects),
+        "core_object_count": len(duplicate_core_objects),
+        "mesh_part_count": len(render_parts),
+        "child_mesh_part_count": len(render_parts) - len(pose_roots),
+        "all_parts_in_frame": (
+            actual_projected_bounds is not None
+            and actual_projected_bounds[0] >= 0.0
+            and actual_projected_bounds[1] <= 1.0
+            and actual_projected_bounds[2] >= 0.0
+            and actual_projected_bounds[3] <= 1.0
+        ),
+        "partially_in_frame": (
+            actual_projected_bounds is not None
+            and actual_projected_bounds[1] > 0.0
+            and actual_projected_bounds[0] < 1.0
+            and actual_projected_bounds[3] > 0.0
+            and actual_projected_bounds[2] < 1.0
+        ),
+        "solved": secondary_solved,
+        "moves": secondary_moves,
+        "placement_zone": placement_zone,
+        "crop_attempts": crop_attempts,
+        "right_offset": right_offset,
+        "depth_offset": depth_offset,
+        "projected_bounds": (
+            list(projected_bounds)
+            if projected_bounds is not None
+            else None
+        ),
+        "actual_projected_bounds": (
+            list(actual_projected_bounds) if actual_projected_bounds is not None else None
+        ),
+        "world_bounds": list(world_bounds),
+        "transform": matrix_rows(transform),
+    }
+    station_metadata["other_cube"] = metadata
+    return metadata
+
+
 def randomize_3d_background(object_count: int) -> dict[str, object]:
     clear_background_scene()
     hide_flat_background()
     world_color = configure_world_background()
 
-    table_forward, table_right = camera_table_basis()
-    collection = background_scene_collection()
-
-    table_color = random_table_color()
-    table_material = noisy_material(f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.table", table_color)
-    wall_material = noisy_material(f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.wall")
-    table_size = random.uniform(*BACKGROUND_TABLE_SIZE_RANGE)
-    wall_size = random.uniform(*BACKGROUND_WALL_SIZE_RANGE)
-    wall_distance = random.uniform(*BACKGROUND_WALL_DISTANCE_RANGE)
-    wall_location = (table_forward * wall_distance) + Vector((0.0, 0.0, BACKGROUND_TABLE_Z + wall_size / 2.0))
-    wall_normal = -table_forward
-    wall_rotation = wall_normal.to_track_quat("Z", "Y")
-
-    table = add_background_plane(
-        collection,
-        f"{BACKGROUND_SCENE_PREFIX}.table",
-        Vector((0.0, 0.0, BACKGROUND_TABLE_Z)),
-        None,
-        table_size,
-        table_material,
-    )
-    wall = add_background_plane(
-        collection,
-        f"{BACKGROUND_SCENE_PREFIX}.wall",
-        wall_location,
-        wall_rotation,
-        wall_size,
-        wall_material,
-    )
-
-    placed = []
-    used_asset_sources: set[str] = set()
-    scene_object_count = round(max(0, object_count) * random.uniform(*BACKGROUND_OBJECT_COUNT_JITTER))
-    for index in range(scene_object_count):
-        if random.random() < BACKGROUND_REALISTIC_PROP_PROBABILITY:
-            placed.append(
-                add_realistic_background_prop(
-                    collection,
-                    index,
-                    table_forward,
-                    table_right,
-                    wall_distance,
-                    used_asset_sources,
-                )
-            )
-        else:
-            placed.append(add_primitive_clutter_prop(collection, index, table_forward, table_right))
+    station = add_solve_station_background()
 
     bpy.context.view_layer.update()
     return {
-        "mode": "3d",
+        "mode": "solve_station",
         "world_color": list(world_color),
-        "table": {"name": table.name, "z": BACKGROUND_TABLE_Z, "size": table_size, "color": list(table_color)},
-        "wall": {"name": wall.name, "distance": wall_distance, "size": wall_size},
+        "table": {"z": BACKGROUND_TABLE_Z, "source": "SolveStation.Desk.Top"},
         "requested_object_count": object_count,
-        "object_count": len(placed),
-        "blend_asset_count": sum(1 for obj in placed if obj.get("family") == "blend_asset"),
-        "blend_asset_sources": [
-            obj.get("source_name")
-            for obj in placed
-            if obj.get("family") == "blend_asset"
+        "object_count": station["object_count"],
+        "blend_asset_count": 1,
+        "blend_asset_sources": [station["source_collection"]],
+        "families": [
+            "room",
+            "desk",
+            "mat",
+            "stackmat_timer",
+            "shirt",
+            "arms",
+            "phone",
+            "laptop",
+            "other_cube",
         ],
-        "families": [obj.get("family") for obj in placed],
-        "objects": placed,
+        "objects": [station],
     }
 
 
@@ -1727,10 +2561,20 @@ def randomize_scene(
     for move in moves:
         rotate_face(objects, move)
 
+    duplicate_secondary_cube(objects, core_objects, background_randomization)
     layer_state = randomize_layer_render_state(objects)
 
     pose_objects = list(objects) + core_objects
-    cube_pose = randomize_cube_global_pose(pose_objects)
+    pose_bounds = []
+    pose_bound_pointers: set[int] = set()
+    for root in pose_objects:
+        for part in object_tree(root):
+            pointer = part.as_pointer()
+            if pointer in pose_bound_pointers:
+                continue
+            pose_bound_pointers.add(pointer)
+            pose_bounds.append(part)
+    cube_pose = randomize_cube_global_pose(pose_objects, bounds_objects=pose_bounds)
     return (
         moves,
         layer_state,
