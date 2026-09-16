@@ -56,18 +56,31 @@ CAMERA_VIEWPOINT_WEIGHTS = (
 CAMERA_ROI_LENS_RANGE = (42.0, 49.0)
 CAMERA_ROI_SHIFT_X_RANGE = (-0.09, 0.09)
 CAMERA_ROI_SHIFT_Y_RANGE = (-0.07, 0.07)
-
-LIGHT_HEIGHT_RANGE = (6.0, 9.5)
-LIGHT_XY_JITTER_RANGE = (-2.2, 2.2)
-LIGHT_TARGET_JITTER_RANGE = (-1.2, 1.2)
-LIGHT_ENERGY_BUCKETS = (
-    (0.18, (300.0, 650.0)),
-    (0.62, (650.0, 1250.0)),
-    (0.20, (1250.0, 2200.0)),
+# The existing framing is calibrated around four feet from the cube. Varying
+# distance and focal length together produces different perspective compression
+# without making the cube substantially larger or smaller in the image.
+CAMERA_SCENE_UNITS_PER_FOOT = 3.0
+CAMERA_DISTANCE_BUCKETS_FEET = (
+    ("near", 0.35, (3.0, 6.0)),
+    ("medium", 0.40, (6.0, 10.0)),
+    ("far", 0.25, (10.0, 15.0)),
 )
-LIGHT_SIZE_RANGE = (5.5, 9.5)
+
+SYNTHETIC_LIGHT_PREFIX = "SyntheticDataLight"
+SYNTHETIC_WINDOW_BLOCKER_PREFIX = "SyntheticWindowBlocker"
+LIGHTING_SETUP_WEIGHTS = (
+    ("ceiling_lights", 0.76),
+    ("desk_lamp", 0.24),
+)
+SUNLIGHT_WINDOW_PROBABILITY = 0.42
+LIGHT_TEMPERATURE_PROFILES = (
+    # name, probability, indoor sources, window daylight
+    ("warm_yellow", 0.30, (2700.0, 3600.0), (3500.0, 4800.0)),
+    ("neutral_white", 0.50, (4000.0, 5600.0), (5000.0, 6500.0)),
+    ("cool_blue", 0.20, (6500.0, 8500.0), (7000.0, 10000.0)),
+)
+LIGHT_TARGET_JITTER_RANGE = (-0.35, 0.35)
 LIGHT_TEMPERATURE_KELVIN_RANGE = (2700.0, 7500.0)
-LIGHT_EXPOSURE_RANGE = (-0.45, 0.35)
 WORLD_AMBIENT_LEVEL_RANGE = (0.045, 0.18)
 BACKGROUND_NAME = "SyntheticDataBackground"
 BACKGROUND_MATERIAL_NAME = "SyntheticDataBackgroundMaterial"
@@ -502,6 +515,16 @@ def get_camera() -> bpy.types.Object:
     return camera
 
 
+def random_camera_distance() -> tuple[str, float, float]:
+    bucket_name, _weight, distance_range = random.choices(
+        CAMERA_DISTANCE_BUCKETS_FEET,
+        weights=[weight for _name, weight, _range in CAMERA_DISTANCE_BUCKETS_FEET],
+        k=1,
+    )[0]
+    distance_feet = random.uniform(*distance_range)
+    return bucket_name, distance_feet, distance_feet * CAMERA_SCENE_UNITS_PER_FOOT
+
+
 def randomize_camera() -> dict[str, object]:
     camera = get_camera()
     viewpoint = random.choices(
@@ -512,30 +535,31 @@ def randomize_camera() -> dict[str, object]:
     if viewpoint == "front":
         azimuth_degrees = -90.0 + random.uniform(-12.0, 12.0)
         elevation_degrees = random.uniform(18.0, 36.0)
-        distance = random.uniform(10.0, 13.5)
+        reference_distance = 11.75
         roll_degrees = random.uniform(-6.0, 6.0)
     elif viewpoint == "front_diagonal":
         azimuth_degrees = random.choice((-45.0, -135.0)) + random.uniform(-9.0, 9.0)
         elevation_degrees = random.uniform(20.0, 43.0)
-        distance = random.uniform(10.5, 14.0)
+        reference_distance = 12.25
         roll_degrees = random.uniform(-8.0, 8.0)
     elif viewpoint == "over_shoulder":
         azimuth_degrees = random.choice((58.0, 122.0)) + random.uniform(-6.0, 6.0)
         elevation_degrees = random.uniform(57.0, 68.0)
-        distance = random.uniform(12.0, 15.5)
+        reference_distance = 13.75
         roll_degrees = random.uniform(-7.0, 7.0)
     elif viewpoint == "behind_diagonal":
         azimuth_degrees = random.choice((42.0, 138.0)) + random.uniform(-8.0, 8.0)
         elevation_degrees = random.uniform(27.0, 48.0)
-        distance = random.uniform(10.5, 14.5)
+        reference_distance = 12.5
         roll_degrees = random.uniform(-8.0, 8.0)
     else:
         azimuth_degrees = random.choice((-135.0, -90.0, -45.0, 45.0, 90.0, 135.0))
         azimuth_degrees += random.uniform(-10.0, 10.0)
         elevation_degrees = random.uniform(64.0, 80.0)
-        distance = random.uniform(11.5, 15.5)
+        reference_distance = 13.5
         roll_degrees = random.uniform(-18.0, 18.0)
 
+    distance_bucket, distance_feet, distance = random_camera_distance()
     azimuth = math.radians(azimuth_degrees)
     elevation = math.radians(elevation_degrees)
     radius_xy = distance * math.cos(elevation)
@@ -545,7 +569,8 @@ def randomize_camera() -> dict[str, object]:
         distance * math.sin(elevation),
     ))
     camera.data.type = "PERSP"
-    camera.data.lens = random.uniform(*CAMERA_ROI_LENS_RANGE)
+    framing_lens = random.uniform(*CAMERA_ROI_LENS_RANGE)
+    camera.data.lens = framing_lens * distance / reference_distance
     camera.data.shift_x = random.uniform(*CAMERA_ROI_SHIFT_X_RANGE)
     camera.data.shift_y = random.uniform(*CAMERA_ROI_SHIFT_Y_RANGE)
     target = random_target()
@@ -561,35 +586,18 @@ def randomize_camera() -> dict[str, object]:
         "azimuth_degrees": azimuth_degrees,
         "elevation_degrees": elevation_degrees,
         "distance": distance,
+        "distance_feet": distance_feet,
+        "distance_bucket": distance_bucket,
+        "reference_distance": reference_distance,
         "roll_degrees": roll_degrees,
         "lens_mm": camera.data.lens,
+        "framing_lens_mm": framing_lens,
         "roi_crop": {
             "method": "camera_lens_and_sensor_shift",
             "shift_x": camera.data.shift_x,
             "shift_y": camera.data.shift_y,
         },
     }
-
-
-def get_light() -> bpy.types.Object:
-    lights = [obj for obj in bpy.data.objects if obj.type == "LIGHT"]
-    if lights:
-        return lights[0]
-
-    data = bpy.data.lights.new("SyntheticDataLight", type="AREA")
-    light = bpy.data.objects.new("SyntheticDataLight", data)
-    bpy.context.collection.objects.link(light)
-    return light
-
-
-def random_light_energy() -> float:
-    bucket = random.random()
-    cumulative = 0.0
-    for weight, energy_range in LIGHT_ENERGY_BUCKETS:
-        cumulative += weight
-        if bucket <= cumulative:
-            return random.uniform(*energy_range)
-    return random.uniform(*LIGHT_ENERGY_BUCKETS[-1][1])
 
 
 def kelvin_to_rgb(temperature_kelvin: float) -> tuple[float, float, float]:
@@ -605,42 +613,276 @@ def kelvin_to_rgb(temperature_kelvin: float) -> tuple[float, float, float]:
     return tuple(max(0.0, min(channel / 255.0, 1.0)) for channel in (red, green, blue))
 
 
-def randomize_light() -> dict[str, object]:
-    light = get_light()
-    light.data.type = "AREA"
-    light.location = Vector((
-        random.uniform(*LIGHT_XY_JITTER_RANGE),
-        random.uniform(*LIGHT_XY_JITTER_RANGE),
-        random.uniform(*LIGHT_HEIGHT_RANGE),
-    ))
-    target = Vector((
+def clear_scene_lights() -> None:
+    """Remove authored and previously generated lights so each rig is self-contained."""
+    for obj in list(bpy.data.objects):
+        if obj.name.startswith(SYNTHETIC_WINDOW_BLOCKER_PREFIX):
+            mesh_data = obj.data
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if mesh_data.users == 0:
+                bpy.data.meshes.remove(mesh_data)
+            continue
+        if obj.type != "LIGHT":
+            continue
+        light_data = obj.data
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if light_data.users == 0:
+            bpy.data.lights.remove(light_data)
+
+
+def lighting_target(z_range: tuple[float, float] = (-0.35, 0.45)) -> Vector:
+    return Vector((
         random.uniform(*LIGHT_TARGET_JITTER_RANGE),
         random.uniform(*LIGHT_TARGET_JITTER_RANGE),
-        random.uniform(-0.5, 0.4),
+        random.uniform(*z_range),
     ))
+
+
+def add_light_source(
+    role: str,
+    light_type: str,
+    location: Vector,
+    target: Vector,
+    energy: float,
+    temperature_kelvin: float,
+    *,
+    size: float | None = None,
+    size_y: float | None = None,
+    sun_angle_degrees: float | None = None,
+) -> dict[str, object]:
+    """Create one intentionally placed source and return reproducibility metadata."""
+    name = f"{SYNTHETIC_LIGHT_PREFIX}.{role}"
+    data = bpy.data.lights.new(name, type=light_type)
+    light = bpy.data.objects.new(name, data)
+    bpy.context.scene.collection.objects.link(light)
+    light.location = location
     look_at(light, target)
-    temperature_kelvin = random.uniform(*LIGHT_TEMPERATURE_KELVIN_RANGE)
+
     color = kelvin_to_rgb(temperature_kelvin)
-    light.data.energy = random_light_energy()
-    light.data.color = color
-    if hasattr(light.data, "size"):
-        light.data.size = random.uniform(*LIGHT_SIZE_RANGE)
-    if hasattr(light.data, "shape"):
-        light.data.shape = "RECTANGLE"
-    if hasattr(light.data, "size_y"):
-        light.data.size_y = random.uniform(*LIGHT_SIZE_RANGE)
-    bpy.context.scene.view_settings.exposure = random.uniform(*LIGHT_EXPOSURE_RANGE)
+    data.energy = energy
+    data.color = color
+    data.use_shadow = True
+    if light_type == "AREA":
+        data.shape = "RECTANGLE"
+        data.size = size if size is not None else 1.0
+        data.size_y = size_y if size_y is not None else data.size
+    elif light_type == "SUN":
+        data.angle = math.radians(sun_angle_degrees if sun_angle_degrees is not None else 1.0)
 
     return {
-        "type": light.data.type,
-        "location": [light.location.x, light.location.y, light.location.z],
-        "target": [target.x, target.y, target.z],
-        "energy": light.data.energy,
+        "name": light.name,
+        "role": role,
+        "type": data.type,
+        "location": list(location),
+        "target": list(target),
+        "energy": energy,
         "temperature_kelvin": temperature_kelvin,
         "color": list(color),
-        "exposure": bpy.context.scene.view_settings.exposure,
-        "size": getattr(light.data, "size", None),
-        "size_y": getattr(light.data, "size_y", None),
+        "size": getattr(data, "size", None) if light_type == "AREA" else None,
+        "size_y": getattr(data, "size_y", None) if light_type == "AREA" else None,
+        "sun_angle_degrees": sun_angle_degrees if light_type == "SUN" else None,
+    }
+
+
+def add_window_aperture(
+    source_location: Vector,
+    patch_target: Vector,
+    opening_width: float,
+    opening_height: float,
+) -> dict[str, object]:
+    """Add camera-invisible shadow casters that form a rectangular window opening."""
+    direction = (patch_target - source_location).normalized()
+    rotation = direction.to_track_quat("Z", "Y")
+    aperture_fraction = random.uniform(0.28, 0.38)
+    aperture_center = source_location.lerp(patch_target, aperture_fraction)
+    surround = 10.0
+    thickness = 0.08
+    panels = (
+        (-(opening_width + surround) / 2.0, 0.0, surround, opening_height + 2.0 * surround),
+        ((opening_width + surround) / 2.0, 0.0, surround, opening_height + 2.0 * surround),
+        (0.0, -(opening_height + surround) / 2.0, opening_width, surround),
+        (0.0, (opening_height + surround) / 2.0, opening_width, surround),
+    )
+    panel_names = []
+    for index, (offset_x, offset_y, width, height) in enumerate(panels, start=1):
+        bpy.ops.mesh.primitive_cube_add(size=1.0)
+        panel = bpy.context.object
+        panel.name = f"{SYNTHETIC_WINDOW_BLOCKER_PREFIX}.{index}"
+        panel.location = aperture_center + rotation @ Vector((offset_x, offset_y, 0.0))
+        panel.rotation_mode = "QUATERNION"
+        panel.rotation_quaternion = rotation
+        panel.scale = Vector((width, height, thickness))
+        panel.visible_camera = False
+        panel_names.append(panel.name)
+
+    return {
+        "opening_width": opening_width,
+        "opening_height": opening_height,
+        "center": list(aperture_center),
+        "patch_target": list(patch_target),
+        "approximate_projected_width": opening_width / aperture_fraction,
+        "approximate_projected_height": opening_height / aperture_fraction,
+        "blockers": panel_names,
+    }
+
+
+def configure_world_lighting(
+    strength_range: tuple[float, float],
+    temperature_range: tuple[float, float],
+) -> dict[str, object]:
+    world = bpy.context.scene.world or bpy.data.worlds.new("SyntheticDataWorld")
+    bpy.context.scene.world = world
+    strength = random.uniform(*strength_range)
+    temperature_kelvin = random.uniform(*temperature_range)
+    tint = kelvin_to_rgb(temperature_kelvin)
+    color = tuple(channel * random.uniform(0.92, 1.08) for channel in tint)
+    world.color = tuple(strength * channel for channel in color)
+
+    # Cycles and Eevee use the node background when nodes are enabled. Set both
+    # representations so this behaves consistently across source .blend files.
+    world.use_nodes = True
+    background_node = world.node_tree.nodes.get("Background")
+    if background_node is not None:
+        background_node.inputs["Color"].default_value = (*color, 1.0)
+        background_node.inputs["Strength"].default_value = strength
+    return {
+        "strength": strength,
+        "temperature_kelvin": temperature_kelvin,
+        "color": list(color),
+        "display_color": list(world.color),
+    }
+
+
+def randomize_light() -> dict[str, object]:
+    """Build broad room lighting with an optional physical window aperture."""
+    clear_scene_lights()
+    setup = random.choices(
+        [name for name, _weight in LIGHTING_SETUP_WEIGHTS],
+        weights=[weight for _name, weight in LIGHTING_SETUP_WEIGHTS],
+        k=1,
+    )[0]
+    temperature_profile, _profile_weight, room_temperature_range, window_temperature_range = random.choices(
+        LIGHT_TEMPERATURE_PROFILES,
+        weights=[weight for _name, weight, _room_range, _window_range in LIGHT_TEMPERATURE_PROFILES],
+        k=1,
+    )[0]
+    base_temperature = random.uniform(*room_temperature_range)
+    target = lighting_target()
+    sources: list[dict[str, object]] = []
+
+    if setup == "ceiling_lights":
+        fixture_count = random.choice((2, 3, 3, 4))
+        axis = random.choice((0, 1))
+        for index in range(fixture_count):
+            along = (index - (fixture_count - 1) / 2.0) * random.uniform(2.2, 3.2)
+            across = random.uniform(-1.8, 1.8)
+            location = Vector((along, across, random.uniform(5.0, 7.5)))
+            if axis == 1:
+                location.x, location.y = location.y, location.x
+            downward_target = Vector((location.x, location.y, BACKGROUND_TABLE_Z))
+            sources.append(add_light_source(
+                f"ceiling_{index + 1}", "AREA", location, downward_target,
+                random.uniform(260.0, 560.0), base_temperature + random.uniform(-180.0, 180.0),
+                size=random.uniform(1.8, 3.0), size_y=random.uniform(3.5, 5.5),
+            ))
+        world_ranges = ((0.12, 0.25), room_temperature_range)
+        exposure_range = (-0.20, 0.18)
+
+    else:  # desk_lamp
+        table_forward, table_right = camera_table_basis()
+        side = random.choice((-1.0, 1.0))
+        location = target + table_right * side * random.uniform(2.0, 4.0)
+        location -= table_forward * random.uniform(-0.5, 2.2)
+        location.z = random.uniform(2.0, 4.2)
+        lamp_target = Vector((
+            target.x + random.uniform(-0.8, 0.8),
+            target.y + random.uniform(-0.8, 0.8),
+            random.uniform(BACKGROUND_TABLE_Z, 0.0),
+        ))
+        sources.append(add_light_source(
+            "lamp", "AREA", location, lamp_target,
+            random.uniform(260.0, 580.0), base_temperature + random.uniform(-180.0, 180.0),
+            size=random.uniform(1.2, 2.2), size_y=random.uniform(1.2, 2.2),
+        ))
+        sources.append(add_light_source(
+            "room_fill", "AREA",
+            Vector((random.uniform(-1.5, 1.5), random.uniform(-1.5, 1.5), random.uniform(4.5, 6.5))),
+            Vector((0.0, 0.0, BACKGROUND_TABLE_Z)),
+            random.uniform(140.0, 280.0), base_temperature + random.uniform(-300.0, 300.0),
+            size=random.uniform(5.0, 8.0), size_y=random.uniform(5.0, 8.0),
+        ))
+        world_ranges = ((0.10, 0.22), room_temperature_range)
+        exposure_range = (-0.05, 0.28)
+
+    window_metadata = None
+    if random.random() < SUNLIGHT_WINDOW_PROBABILITY:
+        side_angle = random.choice((0.0, math.pi / 2.0, math.pi, 3.0 * math.pi / 2.0))
+        side_angle += math.radians(random.uniform(-10.0, 10.0))
+        patch_target = Vector((
+            random.uniform(-0.55, 0.55),
+            random.uniform(-0.55, 0.55),
+            BACKGROUND_TABLE_Z,
+        ))
+        distance = random.uniform(3.5, 4.5)
+        window_location = Vector((
+            patch_target.x + distance * math.cos(side_angle),
+            patch_target.y + distance * math.sin(side_angle),
+            random.uniform(2.5, 4.0),
+        ))
+        opening_width = random.uniform(2.8, 4.2)
+        opening_height = opening_width * random.uniform(0.92, 1.08)
+        aperture = add_window_aperture(
+            window_location,
+            patch_target,
+            opening_width,
+            opening_height,
+        )
+        sources.append(add_light_source(
+            "window_sun", "AREA", window_location, patch_target,
+            random.uniform(900.0, 1700.0), random.uniform(*window_temperature_range),
+            size=random.uniform(0.22, 0.42), size_y=random.uniform(0.22, 0.42),
+        ))
+        window_metadata = {
+            "enabled": True,
+            "probability": SUNLIGHT_WINDOW_PROBABILITY,
+            "aperture": aperture,
+            "effect": "rectangular_sun_patch",
+        }
+        world_ranges = ((0.14, 0.28), room_temperature_range)
+        exposure_range = (exposure_range[0] - 0.16, exposure_range[1] - 0.08)
+
+    world = configure_world_lighting(*world_ranges)
+
+    exposure = random.uniform(*exposure_range)
+    bpy.context.scene.view_settings.exposure = exposure
+    bpy.context.view_layer.update()
+    primary = sources[0]
+    return {
+        "setup": setup,
+        "source_count": len(sources),
+        "sources": sources,
+        "conditions": [setup] + (["sunlight_window"] if window_metadata else []),
+        "temperature_profile": {
+            "name": temperature_profile,
+            "base_kelvin": base_temperature,
+            "room_range_kelvin": list(room_temperature_range),
+            "window_range_kelvin": list(window_temperature_range),
+        },
+        "sunlight_window": window_metadata or {
+            "enabled": False,
+            "probability": SUNLIGHT_WINDOW_PROBABILITY,
+        },
+        "world": world,
+        "exposure": exposure,
+        # Preserve the former single-light fields for downstream metadata readers.
+        "type": primary["type"],
+        "location": primary["location"],
+        "target": primary["target"],
+        "energy": primary["energy"],
+        "temperature_kelvin": primary["temperature_kelvin"],
+        "color": primary["color"],
+        "size": primary["size"],
+        "size_y": primary["size_y"],
     }
 
 
@@ -2549,8 +2791,12 @@ def randomize_scene(
     reset_core_fill_objects(core_objects)
 
     camera_randomization = randomize_camera()
-    light_randomization = randomize_light()
     background_randomization = randomize_background(background_object_count)
+    # Build the rig after appending the background so lights bundled in an asset
+    # cannot accidentally leak into, or conflict with, the selected setup.
+    light_randomization = randomize_light()
+    background_randomization["world_color"] = light_randomization["world"]["display_color"]
+    background_randomization["world_lighting"] = light_randomization["world"]
 
     faces = list("RLUDBF")
     moves = []
@@ -2588,6 +2834,7 @@ def randomize_scene(
 
 def configure_render(width: int, height: int) -> None:
     scene = bpy.context.scene
+    scene.render.engine = "CYCLES"
     scene.render.resolution_x = width
     scene.render.resolution_y = height
     scene.render.resolution_percentage = 100
@@ -3119,7 +3366,10 @@ def object_occluding_point(
         traveled += hit_distance
         if traveled >= point_distance - distance_tolerance:
             return None
-        if hit_object.name not in ignored_object_names:
+        if (
+            hit_object.name not in ignored_object_names
+            and not hit_object.name.startswith(SYNTHETIC_WINDOW_BLOCKER_PREFIX)
+        ):
             return str(hit_object.name)
 
         origin = location + (direction * epsilon)
