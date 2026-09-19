@@ -51,6 +51,7 @@ CAMERA_VIEWPOINT_WEIGHTS = (
     ("front_diagonal", 0.28),
     ("over_shoulder", 0.18),
     ("behind_diagonal", 0.18),
+    ("low_behind_diagonal", 0.12),
     ("overhead", 0.12),
 )
 CAMERA_ROI_LENS_RANGE = (42.0, 49.0)
@@ -64,6 +65,10 @@ CAMERA_DISTANCE_BUCKETS_FEET = (
     ("near", 0.35, (3.0, 6.0)),
     ("medium", 0.40, (6.0, 10.0)),
     ("far", 0.25, (10.0, 15.0)),
+)
+CAMERA_LOW_BEHIND_DISTANCE_BUCKETS_FEET = (
+    ("medium", 0.35, (8.0, 11.0)),
+    ("far", 0.65, (11.0, 15.0)),
 )
 
 SYNTHETIC_LIGHT_PREFIX = "SyntheticDataLight"
@@ -81,6 +86,10 @@ LIGHT_TEMPERATURE_PROFILES = (
 )
 LIGHT_TARGET_JITTER_RANGE = (-0.35, 0.35)
 LIGHT_TEMPERATURE_KELVIN_RANGE = (2700.0, 7500.0)
+FLOOR_LAMP_DISTANCE_FEET_RANGE = (10.0, 15.0)
+FLOOR_LAMP_HEIGHT_FEET_RANGE = (5.5, 7.0)
+FLOOR_LAMP_ENERGY_RANGE = (12000.0, 28000.0)
+FLOOR_LAMP_SIZE_RANGE = (4.5, 7.0)
 WORLD_AMBIENT_LEVEL_RANGE = (0.045, 0.18)
 BACKGROUND_NAME = "SyntheticDataBackground"
 BACKGROUND_MATERIAL_NAME = "SyntheticDataBackgroundMaterial"
@@ -102,6 +111,16 @@ SOLVE_STATION_ASSET_BLEND_CANDIDATES = (
 SOLVE_STATION_COLLECTION_NAME = "SolveStation_Complete"
 SOLVE_STATION_SCALE = 1.85
 SOLVE_STATION_LAPTOP_PROBABILITY = 0.48
+LAPTOP_GLOW_PROBABILITY = 0.10
+LAPTOP_GLOW_COLOR_PROFILES = (
+    ("electric_blue", 0.18, (0.12, 0.38, 1.0, 1.0)),
+    ("cyan", 0.16, (0.05, 0.88, 1.0, 1.0)),
+    ("violet", 0.15, (0.52, 0.14, 1.0, 1.0)),
+    ("magenta", 0.13, (1.0, 0.10, 0.48, 1.0)),
+    ("amber", 0.13, (1.0, 0.38, 0.05, 1.0)),
+    ("green", 0.12, (0.08, 1.0, 0.30, 1.0)),
+    ("cool_white", 0.13, (0.82, 0.92, 1.0, 1.0)),
+)
 SOLVE_STATION_PHONE_PROBABILITY = 0.72
 SOLVE_STATION_OTHER_CUBE_PROBABILITY = 0.58
 SOLVE_STATION_OTHER_CUBE_SOLVED_PROBABILITY = 0.68
@@ -155,15 +174,18 @@ LAYER_RENDER_STATE_WEIGHTS = (
     ("mid_turn", 0.40),
     ("corner_cut", 0.20),
 )
+CUBE_MISALIGNMENT_ENABLED = False
 MID_TURN_DEGREES_RANGE = (5.0, 45.0)
 CORNER_CUT_SMALL_DEGREES_RANGE = (0.0, 10.0)
 CORNER_CUT_ADJACENT_DEGREES_RANGE = (5.0, 45.0)
 CUBE_FLOAT_PROBABILITY = 0.55
+CUBE_DESK_NO_HANDS_PROBABILITY = 0.10
+CUBE_HANDS_TABLE_LIFT = 0.35
 CUBE_TABLE_CLEARANCE_RANGE = (0.02, 0.18)
 CUBE_FLOAT_CLEARANCE_RANGE = (0.12, 0.55)
-CUBE_TABLE_TILT_DEGREES = (-14.0, 14.0)
-CUBE_FLOAT_TILT_DEGREES = (-32.0, 32.0)
+CUBE_FLOAT_TILT_DEGREES = (-15.0, 15.0)
 CUBE_POSE_XY_JITTER_RANGE = (-0.28, 0.28)
+CUBE_POSE_ROTATION_DEGREES = (-15.0, 15.0)
 DEFAULT_CUBE_ROTATIONAL_BLUR_PROBABILITY = 0.0
 DEFAULT_MAX_CUBE_ROTATIONAL_BLUR_DEGREES = 8.0
 DEFAULT_CUBE_ROTATIONAL_BLUR_SAMPLES = 7
@@ -174,20 +196,42 @@ DEGRADE_NOISE_PROBABILITY = 0.7
 DEGRADE_COMPRESSION_PROBABILITY = 0.8
 DEGRADE_RESCALE_PROBABILITY = 0.35
 HAND_NAMES = ("left-hand", "right-hand")
+# Normal samples always show hands.  The separate desk_no_hands probability
+# controls the approximately 10% no-hand population.
 HAND_VISIBILITY_WEIGHTS = (
-    # ("none", 0.3),
-    # ("left", 0.1),
-    # ("right", 0.1),
-    # ("both", 0.5),
-    ("none", 1),
-    ("left", 0),
-    ("right", 0),
-    ("both", 0),
+    ("onehandgrip", 0.10),
+    ("both", 0.90),
 )
-HAND_X_OFFSET_RANGE = (-0.2, 0.2)
-HAND_Z_OFFSET_RANGE = (-1.0, 1.0)
-HAND_X_ROTATION_DEGREES = (-90.0, 0.0, 90.0)
-HAND_SKIN_MATERIAL_NAME = "SyntheticHandSkinMaterial"
+HAND_X_OFFSET_RANGE = (-0.1, 0.1)
+HAND_Z_OFFSET_RANGE = (-0.5, 0.5)
+HAND_SOLVER_FACING_ROTATION_DEGREES = 180.0
+HAND_ORIGIN_X_ROTATION_DEGREES = (-90.0, 0.0, 90.0)
+HAND_POSES_WITHOUT_ORIGIN_X_ROTATION = (
+    "HandPose.StandardHold",
+    "HandPose.OneHandGrip",
+)
+HAND_POSE_ACTION_NAMES = (
+    "HandPose.StandardHold",
+    "HandPose.OneHandGrip",
+    "HandPose.StandardGrip",
+    "HandPose.PostD",
+    "HandPose.PostS",
+    "HandPose.PostU",
+)
+HAND_TEXTURE_DIR = PROJECT / "syntheticAssets" / "rigged_hand_textures"
+HAND_TEXTURE_SOURCE_BLEND_CANDIDATES = (
+    PROJECT / "rigged_hand_textured_direct.blend",
+    PROJECT / "syntheticAssets" / "rigged_hand_textured_direct.blend",
+)
+HAND_TEXTURE_UV_LAYER_NAME = "SkinUV"
+HAND_ASSET_OBJECT_NAMES = (
+    "left-hand",
+    "left-hand-rig",
+    "right-hand",
+    "right-hand-rig",
+)
+HAND_ASSET_BLEND_PATH = PROJECT / "syntheticAssets" / "rigged_hand.blend"
+HAND_SKIN_MATERIAL_NAME = "SyntheticHandTexturedMaterial"
 DEFAULT_MIN_VISIBLE_KEYPOINTS_WITH_HANDS = 8
 DEFAULT_MAX_HAND_PLACEMENT_ATTEMPTS = 12
 HAND_SKIN_TONE_RANGES = (
@@ -199,11 +243,15 @@ HAND_SKIN_TONE_RANGES = (
     ((0.12, 0.07, 0.045), (0.28, 0.16, 0.10)),
 )
 ACTIVE_RANDOM_SEED: int | None = None
+HAND_ASSET_IMPORTED = False
 
 SOLVED_LOCATION_PROP = "synthetic_solved_location"
 SOLVED_ROTATION_PROP = "synthetic_solved_rotation"
 DEFAULT_OUTPUT_DIR = "data/synthetic_cube_dataset"
 DEFAULT_IMAGE_SIZE = 512
+DEFAULT_CYCLES_SAMPLES = 128
+CYCLES_ADAPTIVE_THRESHOLD = 0.03
+CYCLES_ADAPTIVE_MIN_SAMPLES = 16
 CLASS_NAMES = ["corner", "corner-edge", "corner-edge-center", "center"]
 CORNER_CLASS_ID = 0
 CORNER_EDGE_CLASS_ID = 1
@@ -303,10 +351,16 @@ def reset_core_fill_objects(objects: list[bpy.types.Object]) -> None:
 
 
 def random_cube_pose_rotation(floating: bool) -> tuple[Quaternion, dict[str, float]]:
-    tilt_range = CUBE_FLOAT_TILT_DEGREES if floating else CUBE_TABLE_TILT_DEGREES
-    yaw_degrees = random.uniform(0.0, 360.0)
-    pitch_degrees = random.uniform(*tilt_range)
-    roll_degrees = random.uniform(*tilt_range)
+    yaw_degrees = random.uniform(*CUBE_POSE_ROTATION_DEGREES)
+    if floating:
+        pitch_degrees = random.uniform(*CUBE_FLOAT_TILT_DEGREES)
+        roll_degrees = random.uniform(*CUBE_FLOAT_TILT_DEGREES)
+    else:
+        # A tabletop cube may spin around the table normal, but it must not
+        # pitch or roll.  Otherwise the later clearance correction can leave a
+        # raised corner that looks like a floating cube.
+        pitch_degrees = 0.0
+        roll_degrees = 0.0
     rotation = (
         Quaternion(Vector((0.0, 0.0, 1.0)), math.radians(yaw_degrees))
         @ Quaternion(Vector((1.0, 0.0, 0.0)), math.radians(pitch_degrees))
@@ -354,20 +408,30 @@ def apply_global_pose(objects: list[bpy.types.Object], rotation: Quaternion, tra
 def randomize_cube_global_pose(
     objects: list[bpy.types.Object],
     bounds_objects: list[bpy.types.Object] | None = None,
+    apply: bool = True,
+    force_on_table: bool = False,
 ) -> dict[str, object]:
-    floating = random.random() < CUBE_FLOAT_PROBABILITY
+    floating = not force_on_table and random.random() < CUBE_FLOAT_PROBABILITY
     rotation, rotation_metadata = random_cube_pose_rotation(floating)
-    clearance_range = CUBE_FLOAT_CLEARANCE_RANGE if floating else CUBE_TABLE_CLEARANCE_RANGE
-    clearance = random.uniform(*clearance_range)
+    if force_on_table:
+        clearance = 0.0
+    else:
+        clearance_range = CUBE_FLOAT_CLEARANCE_RANGE if floating else CUBE_TABLE_CLEARANCE_RANGE
+        clearance = random.uniform(*clearance_range)
     min_z = transformed_min_z(bounds_objects or objects, rotation)
     translation = Vector((
         random.uniform(*CUBE_POSE_XY_JITTER_RANGE),
         random.uniform(*CUBE_POSE_XY_JITTER_RANGE),
         BACKGROUND_TABLE_Z + clearance - min_z,
     ))
-    transform = apply_global_pose(objects, rotation, translation)
+    transform = (
+        apply_global_pose(objects, rotation, translation)
+        if apply
+        else Matrix.Translation(translation) @ rotation.to_matrix().to_4x4()
+    )
     return {
-        "mode": "floating" if floating else "near_table",
+        "mode": "on_table" if force_on_table else ("floating" if floating else "near_table"),
+        "desk_no_hands": force_on_table,
         "clearance": clearance,
         "table_z": BACKGROUND_TABLE_Z,
         "translation": [translation.x, translation.y, translation.z],
@@ -382,6 +446,35 @@ def objects_on_face(objects: list[bpy.types.Object], axis: Vector) -> list[bpy.t
 
 def snap_to_cube_grid(location: Vector) -> Vector:
     return Vector((round(location.x), round(location.y), round(location.z)))
+
+
+SCRAMBLE_MOVE_NAMES = tuple("RLUDBFxyz")
+
+
+def whole_cube_move_axis(move: str) -> Vector:
+    """Return the axis for a Singmaster whole-cube quarter turn.
+
+    The existing face turns use -90 degrees around the named face normal.
+    With that convention, x is R L' M', y is U D' E', and z is F B' S.
+    """
+    if move == "x":
+        return Vector((1.0, 0.0, 0.0))
+    if move == "y":
+        return Vector((0.0, 0.0, 1.0))
+    if move == "z":
+        return face_specs()["F"]
+    raise ValueError(f"Unsupported whole-cube move {move!r}; expected x, y, or z.")
+
+
+def rotate_whole_cube(objects: list[bpy.types.Object], move: str) -> None:
+    """Apply a whole-cube turn to every cubie, including the six centers."""
+    axis = whole_cube_move_axis(move)
+    turn = Quaternion(axis, -math.pi / 2.0)
+    for obj in objects:
+        obj.rotation_mode = "QUATERNION"
+        obj.location = snap_to_cube_grid(turn @ obj.location)
+        obj.rotation_quaternion = turn @ obj.rotation_quaternion
+    bpy.context.view_layer.update()
 
 
 def rotate_face(objects: list[bpy.types.Object], move: str) -> None:
@@ -401,6 +494,27 @@ def rotate_face(objects: list[bpy.types.Object], move: str) -> None:
         obj.rotation_quaternion = turn @ obj.rotation_quaternion
 
     bpy.context.view_layer.update()
+
+
+def apply_scramble_move(objects: list[bpy.types.Object], move: str) -> None:
+    if move in "RLUDBF":
+        rotate_face(objects, move)
+    elif move in "xyz":
+        rotate_whole_cube(objects, move)
+    else:
+        raise ValueError(f"Unsupported scramble move {move!r}.")
+
+
+def random_scramble_moves(length: int) -> list[str]:
+    moves = []
+    for _ in range(length):
+        choices = [
+            move
+            for move in SCRAMBLE_MOVE_NAMES
+            if not moves or move != moves[-1]
+        ]
+        moves.append(random.choice(choices))
+    return moves
 
 
 def adjacent_faces(face: str) -> list[str]:
@@ -438,6 +552,9 @@ def rotate_face_continuous(
 
 
 def randomize_layer_render_state(objects: list[bpy.types.Object]) -> dict[str, object]:
+    if not CUBE_MISALIGNMENT_ENABLED:
+        return {"mode": "none"}
+
     state = random.choices(
         [mode for mode, _weight in LAYER_RENDER_STATE_WEIGHTS],
         weights=[weight for _mode, weight in LAYER_RENDER_STATE_WEIGHTS],
@@ -515,21 +632,28 @@ def get_camera() -> bpy.types.Object:
     return camera
 
 
-def random_camera_distance() -> tuple[str, float, float]:
+def random_camera_distance(
+    distance_buckets: tuple[tuple[str, float, tuple[float, float]], ...] | None = None,
+) -> tuple[str, float, float]:
+    distance_buckets = distance_buckets or CAMERA_DISTANCE_BUCKETS_FEET
     bucket_name, _weight, distance_range = random.choices(
-        CAMERA_DISTANCE_BUCKETS_FEET,
-        weights=[weight for _name, weight, _range in CAMERA_DISTANCE_BUCKETS_FEET],
+        distance_buckets,
+        weights=[weight for _name, weight, _range in distance_buckets],
         k=1,
     )[0]
     distance_feet = random.uniform(*distance_range)
     return bucket_name, distance_feet, distance_feet * CAMERA_SCENE_UNITS_PER_FOOT
 
 
-def randomize_camera() -> dict[str, object]:
+def randomize_camera(
+    viewpoint_weights: tuple[tuple[str, float], ...] | None = None,
+    distance_buckets: tuple[tuple[str, float, tuple[float, float]], ...] | None = None,
+) -> dict[str, object]:
     camera = get_camera()
+    viewpoint_weights = viewpoint_weights or CAMERA_VIEWPOINT_WEIGHTS
     viewpoint = random.choices(
-        [name for name, _weight in CAMERA_VIEWPOINT_WEIGHTS],
-        weights=[weight for _name, weight in CAMERA_VIEWPOINT_WEIGHTS],
+        [name for name, _weight in viewpoint_weights],
+        weights=[weight for _name, weight in viewpoint_weights],
         k=1,
     )[0]
     if viewpoint == "front":
@@ -552,6 +676,11 @@ def randomize_camera() -> dict[str, object]:
         elevation_degrees = random.uniform(27.0, 48.0)
         reference_distance = 12.5
         roll_degrees = random.uniform(-8.0, 8.0)
+    elif viewpoint == "low_behind_diagonal":
+        azimuth_degrees = random.choice((32.0, 148.0)) + random.uniform(-7.0, 7.0)
+        elevation_degrees = random.uniform(34.0, 50.0)
+        reference_distance = 16.0
+        roll_degrees = random.uniform(-6.0, 6.0)
     else:
         azimuth_degrees = random.choice((-135.0, -90.0, -45.0, 45.0, 90.0, 135.0))
         azimuth_degrees += random.uniform(-10.0, 10.0)
@@ -559,7 +688,9 @@ def randomize_camera() -> dict[str, object]:
         reference_distance = 13.5
         roll_degrees = random.uniform(-18.0, 18.0)
 
-    distance_bucket, distance_feet, distance = random_camera_distance()
+    if viewpoint == "low_behind_diagonal" and distance_buckets is None:
+        distance_buckets = CAMERA_LOW_BEHIND_DISTANCE_BUCKETS_FEET
+    distance_bucket, distance_feet, distance = random_camera_distance(distance_buckets)
     azimuth = math.radians(azimuth_degrees)
     elevation = math.radians(elevation_degrees)
     radius_xy = distance * math.cos(elevation)
@@ -598,6 +729,109 @@ def randomize_camera() -> dict[str, object]:
             "shift_y": camera.data.shift_y,
         },
     }
+
+
+def camera_cube_visibility_probe(objects: list[bpy.types.Object]) -> dict[str, object]:
+    """Check whether room geometry blocks rays from the camera to the cube."""
+    scene = bpy.context.scene
+    camera = get_camera()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    origin = camera.matrix_world.translation
+    visible_rays = 0
+    missed_rays = 0
+    rays_cast = 0
+    blocker_counts: dict[str, int] = {}
+    required_visible_rays = max(3, len(objects) // 8)
+
+    for obj in objects:
+        target = obj.matrix_world.translation
+        offset = target - origin
+        if offset.length <= 1e-6:
+            continue
+        rays_cast += 1
+        hit, _location, _normal, _polygon_index, hit_object, _matrix = scene.ray_cast(
+            depsgraph,
+            origin,
+            offset.normalized(),
+            distance=offset.length + 0.05,
+        )
+        if not hit or hit_object is None:
+            missed_rays += 1
+        elif is_cubie(hit_object):
+            visible_rays += 1
+            if visible_rays >= required_visible_rays:
+                break
+        else:
+            blocker_counts[hit_object.name] = blocker_counts.get(hit_object.name, 0) + 1
+
+    dominant_blocker = max(blocker_counts, key=blocker_counts.get) if blocker_counts else None
+    return {
+        "accepted": visible_rays >= required_visible_rays,
+        "visible_cube_rays": visible_rays,
+        "required_visible_cube_rays": required_visible_rays,
+        "rays_cast": rays_cast,
+        "missed_rays": missed_rays,
+        "dominant_blocker": dominant_blocker,
+        "dominant_blocker_rays": blocker_counts.get(dominant_blocker, 0) if dominant_blocker else 0,
+        "blockers": blocker_counts,
+    }
+
+
+def ensure_camera_has_clear_cube_view(
+    objects: list[bpy.types.Object],
+    initial_randomization: dict[str, object],
+    max_general_attempts: int = 12,
+    max_fallback_attempts: int = 12,
+) -> dict[str, object]:
+    """Retry cameras hidden behind room geometry, favoring known-open views as fallback."""
+    camera = get_camera()
+    best: tuple[int, Matrix, float, float, float, dict[str, object], dict[str, object]] | None = None
+    attempt = 0
+    randomization = initial_randomization
+
+    fallback_viewpoints = (("front", 0.55), ("front_diagonal", 0.45))
+    fallback_distances = (("near_fallback", 1.0, (3.0, 4.5)),)
+    total_attempts = max_general_attempts + max_fallback_attempts
+    while attempt < total_attempts:
+        attempt += 1
+        bpy.context.view_layer.update()
+        probe = camera_cube_visibility_probe(objects)
+        score = int(probe["visible_cube_rays"])
+        if best is None or score > best[0]:
+            best = (
+                score,
+                camera.matrix_world.copy(),
+                camera.data.lens,
+                camera.data.shift_x,
+                camera.data.shift_y,
+                dict(randomization),
+                probe,
+            )
+        if probe["accepted"]:
+            randomization["blocking_retries"] = attempt - 1
+            randomization["visibility_probe"] = probe
+            return randomization
+
+        if attempt < max_general_attempts:
+            randomization = randomize_camera()
+        else:
+            randomization = randomize_camera(
+                viewpoint_weights=fallback_viewpoints,
+                distance_buckets=fallback_distances,
+            )
+
+    if best is None:
+        raise RuntimeError("Camera visibility probing produced no candidates.")
+    _score, matrix_world, lens, shift_x, shift_y, randomization, probe = best
+    camera.matrix_world = matrix_world
+    camera.data.lens = lens
+    camera.data.shift_x = shift_x
+    camera.data.shift_y = shift_y
+    bpy.context.view_layer.update()
+    randomization["blocking_retries"] = total_attempts - 1
+    randomization["visibility_probe"] = probe
+    randomization["visibility_fallback_exhausted"] = True
+    return randomization
 
 
 def kelvin_to_rgb(temperature_kelvin: float) -> tuple[float, float, float]:
@@ -649,6 +883,7 @@ def add_light_source(
     size: float | None = None,
     size_y: float | None = None,
     sun_angle_degrees: float | None = None,
+    color_override: tuple[float, float, float] | None = None,
 ) -> dict[str, object]:
     """Create one intentionally placed source and return reproducibility metadata."""
     name = f"{SYNTHETIC_LIGHT_PREFIX}.{role}"
@@ -658,7 +893,7 @@ def add_light_source(
     light.location = location
     look_at(light, target)
 
-    color = kelvin_to_rgb(temperature_kelvin)
+    color = color_override or kelvin_to_rgb(temperature_kelvin)
     data.energy = energy
     data.color = color
     data.use_shadow = True
@@ -726,6 +961,42 @@ def add_window_aperture(
     }
 
 
+def add_floor_lamp_source(
+    target: Vector,
+    temperature_kelvin: float,
+) -> dict[str, object]:
+    """Add a broad, elevated lamp-like key light 10–15 feet from the cube."""
+    table_forward, table_right = camera_table_basis()
+    side = random.choice((-1.0, 1.0))
+    distance_feet = random.uniform(*FLOOR_LAMP_DISTANCE_FEET_RANGE)
+    distance = distance_feet * CAMERA_SCENE_UNITS_PER_FOOT
+    horizontal_direction = (
+        table_right * side * random.uniform(0.82, 1.0)
+        + table_forward * random.uniform(-0.35, 0.35)
+    ).normalized()
+    location = target + horizontal_direction * distance
+    location.z = (
+        BACKGROUND_TABLE_Z
+        + random.uniform(*FLOOR_LAMP_HEIGHT_FEET_RANGE)
+        * CAMERA_SCENE_UNITS_PER_FOOT
+    )
+    lamp_target = Vector((
+        target.x + random.uniform(-0.4, 0.4),
+        target.y + random.uniform(-0.4, 0.4),
+        random.uniform(BACKGROUND_TABLE_Z, 0.1),
+    ))
+    return add_light_source(
+        "floor_lamp",
+        "AREA",
+        location,
+        lamp_target,
+        random.uniform(*FLOOR_LAMP_ENERGY_RANGE),
+        temperature_kelvin + random.uniform(-220.0, 220.0),
+        size=random.uniform(*FLOOR_LAMP_SIZE_RANGE),
+        size_y=random.uniform(*FLOOR_LAMP_SIZE_RANGE),
+    )
+
+
 def configure_world_lighting(
     strength_range: tuple[float, float],
     temperature_range: tuple[float, float],
@@ -753,7 +1024,111 @@ def configure_world_lighting(
     }
 
 
-def randomize_light() -> dict[str, object]:
+def solve_station_metadata(background_randomization: dict[str, object] | None) -> dict[str, object] | None:
+    if not background_randomization:
+        return None
+    objects = background_randomization.get("objects")
+    if not isinstance(objects, list):
+        return None
+    return next(
+        (
+            item
+            for item in objects
+            if isinstance(item, dict) and item.get("family") == "solve_station"
+        ),
+        None,
+    )
+
+
+def laptop_screen_objects() -> list[bpy.types.Object]:
+    return [
+        obj
+        for obj in bpy.data.objects
+        if obj.type == "MESH"
+        and not obj.hide_render
+        and any(
+            material is not None
+            and material.name.startswith("SolveStation.Material.LaptopScreen")
+            for material in obj.data.materials
+        )
+    ]
+
+
+def add_laptop_screen_glow(
+    background_randomization: dict[str, object] | None,
+    target: Vector,
+) -> tuple[dict[str, object] | None, dict[str, object]]:
+    station = solve_station_metadata(background_randomization)
+    requested = bool(station and station.get("laptop_glow_enabled"))
+    metadata: dict[str, object] = {
+        "enabled": False,
+        "probability": LAPTOP_GLOW_PROBABILITY,
+    }
+    if not requested:
+        return None, metadata
+
+    screens = laptop_screen_objects()
+    if not screens:
+        metadata["reason"] = "laptop_screen_not_found"
+        return None, metadata
+
+    screen = screens[0]
+    corners = [screen.matrix_world @ Vector(corner) for corner in screen.bound_box]
+    minimum = Vector((
+        min(point.x for point in corners),
+        min(point.y for point in corners),
+        min(point.z for point in corners),
+    ))
+    maximum = Vector((
+        max(point.x for point in corners),
+        max(point.y for point in corners),
+        max(point.z for point in corners),
+    ))
+    screen_center = (minimum + maximum) * 0.5
+    glow_target = Vector((
+        target.x + random.uniform(-0.35, 0.35),
+        target.y + random.uniform(-0.35, 0.35),
+        target.z + random.uniform(-0.25, 0.35),
+    ))
+    toward_cube = glow_target - screen_center
+    if toward_cube.length <= 1e-6:
+        toward_cube = Vector((0.0, 1.0, 0.0))
+    light_location = screen_center + toward_cube.normalized() * 0.16
+    extents = sorted((maximum.x - minimum.x, maximum.y - minimum.y, maximum.z - minimum.z))
+    stored_glow_color = station.get("laptop_glow_color") if station else None
+    glow_color = (
+        tuple(float(channel) for channel in stored_glow_color[:3])
+        if isinstance(stored_glow_color, list) and len(stored_glow_color) >= 3
+        else kelvin_to_rgb(8000.0)
+    )
+    source = add_light_source(
+        "laptop_screen",
+        "AREA",
+        light_location,
+        glow_target,
+        random.uniform(1600.0, 3000.0),
+        random.uniform(6500.0, 10000.0),
+        size=max(0.8, extents[-1] * random.uniform(0.55, 0.78)),
+        size_y=max(0.5, extents[-2] * random.uniform(0.55, 0.78)),
+        color_override=glow_color,
+    )
+    metadata.update({
+        "enabled": True,
+        "screen_object": screen.name,
+        "screen_center": list(screen_center),
+        "target": list(glow_target),
+        "emission_strength": station.get("laptop_emission_strength") if station else None,
+        "color_name": station.get("laptop_glow_color_name") if station else None,
+        "color": list(glow_color),
+    })
+    if station is not None:
+        station["laptop_glow"] = metadata
+    return source, metadata
+
+
+def randomize_light(
+    background_randomization: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Build broad room lighting with an optional physical window aperture."""
     clear_scene_lights()
     setup = random.choices(
@@ -769,6 +1144,7 @@ def randomize_light() -> dict[str, object]:
     base_temperature = random.uniform(*room_temperature_range)
     target = lighting_target()
     sources: list[dict[str, object]] = []
+    sources.append(add_floor_lamp_source(target, base_temperature))
 
     if setup == "ceiling_lights":
         fixture_count = random.choice((2, 3, 3, 4))
@@ -837,9 +1213,10 @@ def randomize_light() -> dict[str, object]:
             opening_width,
             opening_height,
         )
+        window_temperature = random.uniform(*window_temperature_range)
         sources.append(add_light_source(
             "window_sun", "AREA", window_location, patch_target,
-            random.uniform(900.0, 1700.0), random.uniform(*window_temperature_range),
+            random.uniform(900.0, 1700.0), window_temperature,
             size=random.uniform(0.22, 0.42), size_y=random.uniform(0.22, 0.42),
         ))
         window_metadata = {
@@ -851,6 +1228,12 @@ def randomize_light() -> dict[str, object]:
         world_ranges = ((0.14, 0.28), room_temperature_range)
         exposure_range = (exposure_range[0] - 0.16, exposure_range[1] - 0.08)
 
+    laptop_source, laptop_glow_metadata = add_laptop_screen_glow(
+        background_randomization,
+        target,
+    )
+    if laptop_source is not None:
+        sources.append(laptop_source)
     world = configure_world_lighting(*world_ranges)
 
     exposure = random.uniform(*exposure_range)
@@ -872,6 +1255,7 @@ def randomize_light() -> dict[str, object]:
             "enabled": False,
             "probability": SUNLIGHT_WINDOW_PROBABILITY,
         },
+        "laptop_glow": laptop_glow_metadata,
         "world": world,
         "exposure": exposure,
         # Preserve the former single-light fields for downstream metadata readers.
@@ -2105,6 +2489,7 @@ def set_object_group_local_pose(
 
 def randomize_solve_station_layout(
     asset_collection: bpy.types.Collection,
+    laptop_glow_enabled: bool = False,
 ) -> dict[str, object]:
     """Jitter prop groups while keeping their footprints separated on the desk."""
     placements: dict[str, object] = {}
@@ -2164,9 +2549,14 @@ def randomize_solve_station_layout(
         base = {obj.name: obj.matrix_world.copy() for obj in laptop_objects}
         accepted = False
         for _attempt in range(30):
-            target_x = laptop_side * random.uniform(4.25, 4.75)
-            target_y = random.uniform(-3.45, -3.15)
-            yaw = random.uniform(-4.5, 4.5)
+            if laptop_glow_enabled:
+                target_x = laptop_side * random.uniform(3.3, 4.0)
+                target_y = random.uniform(-2.9, -2.4)
+                yaw = laptop_side * random.uniform(32.0, 50.0)
+            else:
+                target_x = laptop_side * random.uniform(4.25, 4.75)
+                target_y = random.uniform(-3.45, -3.15)
+                yaw = random.uniform(-4.5, 4.5)
             bounds = set_object_group_local_pose(
                 laptop_objects,
                 base,
@@ -2181,9 +2571,14 @@ def randomize_solve_station_layout(
                 accepted = True
                 break
         if not accepted:
-            target_x = laptop_side * 4.65
-            target_y = -3.5
-            yaw = 0.0
+            if laptop_glow_enabled:
+                target_x = laptop_side * 3.8
+                target_y = -2.8
+                yaw = laptop_side * 40.0
+            else:
+                target_x = laptop_side * 4.65
+                target_y = -3.5
+                yaw = 0.0
             bounds = set_object_group_local_pose(
                 laptop_objects,
                 base,
@@ -2197,6 +2592,7 @@ def randomize_solve_station_layout(
             "yaw_degrees": yaw,
             "bounds": list(bounds),
             "opposite_solver_side": True,
+            "glow_facing_cube": laptop_glow_enabled,
         }
 
     phone_objects = solve_station_family_objects(asset_collection, ("Phone",))
@@ -2258,6 +2654,18 @@ def set_solve_station_family_visible(
         obj.hide_set(False)
 
 
+def remove_solve_station_forearm_stubs(
+    asset_collection: bpy.types.Collection,
+) -> list[str]:
+    """Remove the authored skin forearm pieces now replaced by rigged hands."""
+    removed = []
+    for obj in list(asset_collection.all_objects):
+        if obj.name.startswith("SolveStation.Arm."):
+            removed.append(obj.name)
+            bpy.data.objects.remove(obj, do_unlink=True)
+    return removed
+
+
 def add_solve_station_background() -> dict[str, object]:
     path = solve_station_asset_blend_path()
     instance_name = f"{BACKGROUND_ASSET_COLLECTION_PREFIX}.SolveStation"
@@ -2290,16 +2698,39 @@ def add_solve_station_background() -> dict[str, object]:
     )
     bpy.context.view_layer.update()
 
-    laptop_visible = random.random() < SOLVE_STATION_LAPTOP_PROBABILITY
+    removed_forearm_stubs = remove_solve_station_forearm_stubs(asset_collection)
+
+    laptop_glow_enabled = random.random() < LAPTOP_GLOW_PROBABILITY
+    laptop_visible = laptop_glow_enabled or random.random() < SOLVE_STATION_LAPTOP_PROBABILITY
     phone_visible = random.random() < SOLVE_STATION_PHONE_PROBABILITY
     other_cube_visible = random.random() < SOLVE_STATION_OTHER_CUBE_PROBABILITY
     set_solve_station_family_visible(asset_collection, "Laptop", laptop_visible)
     set_solve_station_family_visible(asset_collection, "Phone", phone_visible)
-    layout_metadata = randomize_solve_station_layout(asset_collection)
+    layout_metadata = randomize_solve_station_layout(
+        asset_collection,
+        laptop_glow_enabled=laptop_glow_enabled,
+    )
     phone_layout = layout_metadata.get("phone")
     if isinstance(phone_layout, dict) and phone_layout.get("visible") is False:
         phone_visible = False
     material_metadata = randomize_solve_station_materials(asset_collection)
+    laptop_emission_strength = 0.0
+    laptop_glow_color = None
+    laptop_glow_color_name = None
+    if laptop_glow_enabled:
+        laptop_emission_strength = random.uniform(4.5, 8.5)
+        laptop_glow_color_name, _color_weight, laptop_glow_color = random.choices(
+            LAPTOP_GLOW_COLOR_PROFILES,
+            weights=[weight for _name, weight, _color in LAPTOP_GLOW_COLOR_PROFILES],
+            k=1,
+        )[0]
+        for laptop_object in solve_station_family_objects(asset_collection, ("Laptop",)):
+            for material in laptop_object.data.materials:
+                if material is not None and material.name.startswith("SolveStation.Material.LaptopScreen"):
+                    set_principled_input(material, "Base Color", laptop_glow_color)
+                    set_principled_input(material, "Emission Color", laptop_glow_color)
+                    set_principled_input(material, "Emission", laptop_glow_color)
+                    set_principled_input(material, "Emission Strength", laptop_emission_strength)
 
     objects = list(asset_collection.all_objects)
     for obj in objects:
@@ -2316,7 +2747,12 @@ def add_solve_station_background() -> dict[str, object]:
         "collection": asset_collection.name,
         "root": root.name,
         "object_count": len([obj for obj in objects if obj.type == "MESH"]),
+        "removed_forearm_stubs": removed_forearm_stubs,
         "laptop_visible": laptop_visible,
+        "laptop_glow_enabled": laptop_glow_enabled,
+        "laptop_emission_strength": laptop_emission_strength,
+        "laptop_glow_color": list(laptop_glow_color) if laptop_glow_color else None,
+        "laptop_glow_color_name": laptop_glow_color_name,
         "phone_visible": phone_visible,
         "other_cube_visible": other_cube_visible,
         "other_cube": None,
@@ -2451,14 +2887,11 @@ def duplicate_secondary_cube(
     secondary_solved = (
         random.random() < SOLVE_STATION_OTHER_CUBE_SOLVED_PROBABILITY
     )
-    faces = list("RLUDBF")
-    secondary_moves = []
     secondary_move_count = 0 if secondary_solved else random.randint(8, 22)
-    for _ in range(secondary_move_count):
-        choices = [face for face in faces if not secondary_moves or face != secondary_moves[-1]]
-        move = random.choice(choices)
-        secondary_moves.append(move)
-        rotate_face(duplicate_objects, move)
+    secondary_moves = random_scramble_moves(secondary_move_count)
+    secondary_scramble_objects = duplicate_objects + duplicate_core_objects
+    for move in secondary_moves:
+        apply_scramble_move(secondary_scramble_objects, move)
 
     table_forward, table_right = camera_table_basis()
     rotation = (
@@ -2639,6 +3072,113 @@ def cubie_world_center(objects: list[bpy.types.Object]) -> Vector:
     return center / len(objects)
 
 
+def hand_texture_source_blend_path() -> Path | None:
+    return next(
+        (path for path in HAND_TEXTURE_SOURCE_BLEND_CANDIDATES if path.exists()),
+        None,
+    )
+
+
+def ensure_hand_texture_uvs() -> bool:
+    """Copy the baked asset's UV layout onto both imported rigged hands."""
+    targets = [bpy.data.objects.get(name) for name in HAND_NAMES]
+    if not all(target is not None for target in targets):
+        return False
+    if all(target.data.uv_layers.get(HAND_TEXTURE_UV_LAYER_NAME) for target in targets):
+        return True
+
+    source_path = hand_texture_source_blend_path()
+    if source_path is None:
+        return False
+
+    with bpy.data.libraries.load(str(source_path), link=False) as (data_from, data_to):
+        if "hand" not in data_from.objects:
+            return False
+        data_to.objects = ["hand"]
+
+    source = data_to.objects[0] if data_to.objects else None
+    if source is None or source.type != "MESH":
+        return False
+    source_uv = source.data.uv_layers.get(HAND_TEXTURE_UV_LAYER_NAME)
+    if source_uv is None:
+        bpy.data.objects.remove(source, do_unlink=True)
+        return False
+
+    try:
+        for target in targets:
+            if len(target.data.loops) != len(source.data.loops):
+                raise RuntimeError(
+                    "The rigged hand mesh topology does not match the baked hand UV asset."
+                )
+            target_uv = target.data.uv_layers.get(HAND_TEXTURE_UV_LAYER_NAME)
+            if target_uv is None:
+                target_uv = target.data.uv_layers.new(name=HAND_TEXTURE_UV_LAYER_NAME)
+            for index, source_loop in enumerate(source_uv.data):
+                target_uv.data[index].uv = source_loop.uv
+            target.data.uv_layers.active_index = target.data.uv_layers.find(
+                HAND_TEXTURE_UV_LAYER_NAME
+            )
+    finally:
+        source_mesh = source.data
+        bpy.data.objects.remove(source, do_unlink=True)
+        if source_mesh.users == 0:
+            bpy.data.meshes.remove(source_mesh)
+    return True
+
+
+def ensure_hand_assets_loaded() -> None:
+    """Replace cube.blend's static hand meshes with the rigged pose asset."""
+    global HAND_ASSET_IMPORTED
+    if HAND_ASSET_IMPORTED:
+        return
+
+    existing_asset = all(
+        bpy.data.objects.get(name) is not None for name in HAND_ASSET_OBJECT_NAMES
+    ) and all(
+        bpy.data.actions.get(name) is not None for name in HAND_POSE_ACTION_NAMES
+    )
+    if existing_asset:
+        ensure_hand_texture_uvs()
+        HAND_ASSET_IMPORTED = True
+        return
+
+    if not HAND_ASSET_BLEND_PATH.exists():
+        raise FileNotFoundError(
+            f"Rigged hand asset not found: {HAND_ASSET_BLEND_PATH}. "
+            "Place rigged_hand.blend in syntheticAssets."
+        )
+
+    for name in HAND_ASSET_OBJECT_NAMES:
+        obj = bpy.data.objects.get(name)
+        if obj is not None:
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+    object_names = set(HAND_ASSET_OBJECT_NAMES)
+    with bpy.data.libraries.load(str(HAND_ASSET_BLEND_PATH), link=False) as (data_from, data_to):
+        data_to.objects = [name for name in data_from.objects if name in object_names]
+        data_to.actions = [
+            name for name in data_from.actions if name in HAND_POSE_ACTION_NAMES
+        ]
+
+    target_collection = bpy.context.scene.collection
+    for obj in data_to.objects:
+        if obj is not None and not obj.users_collection:
+            target_collection.objects.link(obj)
+
+    missing_objects = [name for name in HAND_ASSET_OBJECT_NAMES if bpy.data.objects.get(name) is None]
+    missing_actions = [name for name in HAND_POSE_ACTION_NAMES if bpy.data.actions.get(name) is None]
+    if missing_objects or missing_actions:
+        details = []
+        if missing_objects:
+            details.append(f"objects: {', '.join(missing_objects)}")
+        if missing_actions:
+            details.append(f"actions: {', '.join(missing_actions)}")
+        raise RuntimeError(f"Could not import rigged hand asset ({'; '.join(details)}).")
+
+    ensure_hand_texture_uvs()
+    HAND_ASSET_IMPORTED = True
+
+
 def hand_objects() -> dict[str, bpy.types.Object]:
     objects = {
         name: obj
@@ -2651,16 +3191,40 @@ def hand_objects() -> dict[str, bpy.types.Object]:
     return objects
 
 
+def hand_rig_objects() -> dict[str, bpy.types.Object]:
+    rigs = {
+        name: bpy.data.objects.get(f"{name}-rig")
+        for name in HAND_NAMES
+    }
+    if any(rig is None for rig in rigs.values()):
+        missing = [name for name, rig in rigs.items() if rig is None]
+        raise ValueError(f"Missing hand armatures: {', '.join(missing)}")
+    if any(rig.type != "ARMATURE" for rig in rigs.values() if rig is not None):
+        raise ValueError("Imported hand rig objects must be armatures.")
+    return {name: rig for name, rig in rigs.items() if rig is not None}
+
+
 def hand_object_states(
     objects: dict[str, bpy.types.Object],
 ) -> dict[str, dict[str, object]]:
+    rigs = hand_rig_objects()
     return {
         name: {
             "matrix_world": obj.matrix_world.copy(),
+            "rig_matrix_world": rigs[name].matrix_world.copy(),
             "rotation_mode": obj.rotation_mode,
+            "rig_rotation_mode": rigs[name].rotation_mode,
             "hide_render": obj.hide_render,
             "hide_viewport": obj.hide_viewport,
             "hide": obj.hide_get(),
+            "rig_hide_render": rigs[name].hide_render,
+            "rig_hide_viewport": rigs[name].hide_viewport,
+            "rig_hide": rigs[name].hide_get(),
+            "action": (
+                rigs[name].animation_data.action
+                if rigs[name].animation_data is not None
+                else None
+            ),
             "materials": [material for material in obj.data.materials],
         }
         for name, obj in objects.items()
@@ -2671,8 +3235,18 @@ def restore_hand_objects(
     objects: dict[str, bpy.types.Object],
     states: dict[str, dict[str, object]],
 ) -> None:
+    rigs = hand_rig_objects()
     for name, obj in objects.items():
         state = states[name]
+        rig = rigs[name]
+        if rig.animation_data is None:
+            rig.animation_data_create()
+        rig.animation_data.action = state["action"]
+        rig.matrix_world = state["rig_matrix_world"]
+        rig.rotation_mode = state["rig_rotation_mode"]
+        rig.hide_render = state["rig_hide_render"]
+        rig.hide_viewport = state["rig_hide_viewport"]
+        rig.hide_set(state["rig_hide"])
         obj.matrix_world = state["matrix_world"]
         obj.rotation_mode = state["rotation_mode"]
         obj.hide_render = state["hide_render"]
@@ -2684,17 +3258,200 @@ def restore_hand_objects(
     bpy.context.view_layer.update()
 
 
+def assign_hand_pose(rig: bpy.types.Object, action_name: str) -> None:
+    action = bpy.data.actions.get(action_name)
+    if action is None:
+        raise ValueError(f"Hand pose action not found: {action_name}")
+    if rig.animation_data is None:
+        rig.animation_data_create()
+    rig.animation_data.action = action
+
+
+def hand_pose_assignments(
+    visibility: str,
+    one_hand_side: str | None = None,
+) -> dict[str, str]:
+    standard_hold = "HandPose.StandardHold"
+    one_handgrip = "HandPose.OneHandGrip"
+    other_poses = tuple(
+        name
+        for name in HAND_POSE_ACTION_NAMES
+        if name not in (standard_hold, one_handgrip)
+    )
+
+    if visibility == "both":
+        standard_side = random.choice(HAND_NAMES)
+        other_side = next(name for name in HAND_NAMES if name != standard_side)
+        return {
+            standard_side: standard_hold,
+            other_side: random.choice(other_poses),
+        }
+
+    if visibility == "onehandgrip":
+        visible_side = one_hand_side or random.choice(HAND_NAMES)
+        if visible_side not in HAND_NAMES:
+            raise ValueError(f"Unknown one-hand side: {visible_side}")
+        hidden_side = next(name for name in HAND_NAMES if name != visible_side)
+        return {visible_side: one_handgrip, hidden_side: standard_hold}
+
+    return {
+        "left-hand": standard_hold,
+        "right-hand": "HandPose.StandardGrip",
+    }
+
+
+def apply_shared_cube_pose(
+    cube_objects_to_transform: list[bpy.types.Object],
+    hand_rigs_to_transform: dict[str, bpy.types.Object],
+    cube_pose: dict[str, object],
+) -> Matrix:
+    rows = cube_pose.get("transform")
+    if not isinstance(rows, list):
+        raise ValueError("Cube pose is missing its shared transform matrix.")
+    transform = matrix_from_rows(rows)
+    for obj in [*cube_objects_to_transform, *hand_rigs_to_transform.values()]:
+        obj.matrix_world = transform @ obj.matrix_world
+        obj.rotation_mode = "QUATERNION"
+    bpy.context.view_layer.update()
+    return transform
+
+
+def cube_pose_with_hand_lift(
+    cube_pose: dict[str, object],
+    lift: float,
+) -> dict[str, object]:
+    if lift <= 0.0:
+        return cube_pose
+    rows = cube_pose.get("transform")
+    translation = cube_pose.get("translation")
+    if not isinstance(rows, list) or not isinstance(translation, list):
+        raise ValueError("Cube pose is missing its transform or translation metadata.")
+    lifted = dict(cube_pose)
+    lifted_rows = [list(row) for row in rows]
+    lifted_rows[2][3] += lift
+    lifted_translation = list(translation)
+    lifted_translation[2] += lift
+    lifted["transform"] = lifted_rows
+    lifted["translation"] = lifted_translation
+    lifted["hands_table_lift"] = lift
+    lifted["effective_clearance"] = float(cube_pose.get("clearance", 0.0)) + lift
+    return lifted
+
+
+def cube_pose_on_table(cube_pose: dict[str, object]) -> dict[str, object]:
+    """Move an existing cube pose down until its lowest point touches the table."""
+    clearance = max(0.0, float(cube_pose.get("clearance", 0.0)))
+    on_table = dict(cube_pose)
+    rows = cube_pose.get("transform")
+    translation = cube_pose.get("translation")
+    if clearance > 0.0:
+        if not isinstance(rows, list) or not isinstance(translation, list):
+            raise ValueError("Cube pose is missing its transform or translation metadata.")
+        on_table_rows = [list(row) for row in rows]
+        on_table_rows[2][3] -= clearance
+        on_table_translation = list(translation)
+        on_table_translation[2] -= clearance
+        on_table["transform"] = on_table_rows
+        on_table["translation"] = on_table_translation
+    on_table["mode"] = "on_table"
+    on_table["clearance"] = 0.0
+    on_table.pop("effective_clearance", None)
+    return on_table
+
+
 def hand_skin_material(color: tuple[float, float, float, float]) -> bpy.types.Material:
+    texture_paths = {
+        "base_color": HAND_TEXTURE_DIR / "hand_basecolor.png",
+        "roughness": HAND_TEXTURE_DIR / "hand_roughness.png",
+        "normal": HAND_TEXTURE_DIR / "hand_normal.png",
+    }
+    missing = [str(path) for path in texture_paths.values() if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing rigged hand texture asset(s): " + ", ".join(missing)
+        )
+
     material = bpy.data.materials.get(HAND_SKIN_MATERIAL_NAME)
     if material is None:
         material = bpy.data.materials.new(HAND_SKIN_MATERIAL_NAME)
     material.use_nodes = True
     material.diffuse_color = color
-    set_principled_input(material, "Base Color", color)
-    set_principled_input(material, "Roughness", random.uniform(0.58, 0.88))
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    nodes.clear()
+
+    output = nodes.new("ShaderNodeOutputMaterial")
+    output.name = "Hand Material Output"
+    output.location = (620, 80)
+    shader = nodes.new("ShaderNodeBsdfPrincipled")
+    shader.name = "Principled BSDF"
+    shader.location = (340, 80)
     set_principled_input(material, "Metallic", 0.0)
-    set_principled_input(material, "Specular IOR Level", random.uniform(0.18, 0.36))
-    set_principled_input(material, "Specular", random.uniform(0.18, 0.36))
+    set_principled_input(material, "Specular IOR Level", 0.28)
+    set_principled_input(material, "Specular", 0.28)
+    set_principled_input(material, "IOR", 1.4)
+    set_principled_input(material, "Subsurface Weight", 0.08)
+    set_principled_input(material, "Subsurface Radius", (1.0, 0.44, 0.22))
+    set_principled_input(material, "Subsurface Scale", 0.007)
+    links.new(shader.outputs["BSDF"], output.inputs["Surface"])
+
+    uv_layer_available = all(
+        obj.data.uv_layers.get(HAND_TEXTURE_UV_LAYER_NAME) is not None
+        for obj in bpy.data.objects
+        if obj.name in HAND_NAMES and obj.type == "MESH"
+    )
+    if uv_layer_available:
+        coordinates = nodes.new("ShaderNodeUVMap")
+        coordinates.uv_map = HAND_TEXTURE_UV_LAYER_NAME
+    else:
+        coordinates = nodes.new("ShaderNodeTexCoord")
+    coordinates.name = "Hand Texture Coordinates"
+    coordinates.location = (-900, 80)
+
+    def add_texture(
+        name: str,
+        path: Path,
+        colorspace: str,
+        location: tuple[float, float],
+    ) -> bpy.types.ShaderNodeTexImage:
+        image = bpy.data.images.load(str(path), check_existing=True)
+        image.colorspace_settings.name = colorspace
+        texture = nodes.new("ShaderNodeTexImage")
+        texture.name = name
+        texture.image = image
+        texture.location = location
+        links.new(
+            coordinates.outputs["UV"] if uv_layer_available else coordinates.outputs["Generated"],
+            texture.inputs["Vector"],
+        )
+        return texture
+
+    base_texture = add_texture(
+        "Hand Base Color Texture",
+        texture_paths["base_color"],
+        "sRGB",
+        (-620, 280),
+    )
+    roughness_texture = add_texture(
+        "Hand Roughness Texture",
+        texture_paths["roughness"],
+        "Non-Color",
+        (-620, 40),
+    )
+    normal_texture = add_texture(
+        "Hand Normal Texture",
+        texture_paths["normal"],
+        "Non-Color",
+        (-620, -220),
+    )
+    normal_map = nodes.new("ShaderNodeNormalMap")
+    normal_map.name = "Hand Normal Map"
+    normal_map.location = (80, -180)
+    normal_map.inputs["Strength"].default_value = 0.72
+    links.new(base_texture.outputs["Color"], shader.inputs["Base Color"])
+    links.new(roughness_texture.outputs["Color"], shader.inputs["Roughness"])
+    links.new(normal_texture.outputs["Color"], normal_map.inputs["Color"])
+    links.new(normal_map.outputs["Normal"], shader.inputs["Normal"])
     return material
 
 
@@ -2709,65 +3466,96 @@ def apply_hand_material(objects: dict[str, bpy.types.Object], material: bpy.type
 def randomize_hands(
     objects: dict[str, bpy.types.Object],
     states: dict[str, dict[str, object]],
-    cube_pose: dict[str, object] | None = None,
     forced_visibility: str | None = None,
 ) -> dict[str, object] | None:
     if not objects:
         return None
 
-    visibility = forced_visibility or random.choices(
-        [mode for mode, _weight in HAND_VISIBILITY_WEIGHTS],
-        weights=[weight for _mode, weight in HAND_VISIBILITY_WEIGHTS],
-        k=1,
-    )[0]
-    visible_hands = set()
-    if visibility in ("left", "both"):
-        visible_hands.add("left-hand")
-    if visibility in ("right", "both"):
-        visible_hands.add("right-hand")
+    one_hand_side = None
+    if forced_visibility in ("left", "right"):
+        # Keep old forced-side values as compatibility aliases, but make the
+        # resulting render state explicitly OneHandGrip-only.
+        visibility = "onehandgrip"
+        one_hand_side = f"{forced_visibility}-hand"
+    else:
+        visibility = forced_visibility or random.choices(
+            [mode for mode, _weight in HAND_VISIBILITY_WEIGHTS],
+            weights=[weight for _mode, weight in HAND_VISIBILITY_WEIGHTS],
+            k=1,
+        )[0]
+    assignments = hand_pose_assignments(visibility, one_hand_side=one_hand_side)
+    visible_hands = (
+        set(HAND_NAMES)
+        if visibility == "both"
+        else {
+            name
+            for name, pose_name in assignments.items()
+            if pose_name == "HandPose.OneHandGrip"
+        }
+    )
     randomization: dict[str, object] = {
         "visibility": visibility,
         "objects": {},
     }
+    if visibility == "onehandgrip":
+        randomization["one_hand_side"] = next(iter(visible_hands))
     skin_color = random_hand_skin_color()
     skin_material = hand_skin_material(skin_color)
     apply_hand_material(objects, skin_material)
     randomization["skin_color"] = list(skin_color)
     randomization["skin_material"] = skin_material.name
-    cube_transform = None
-    if cube_pose is not None and isinstance(cube_pose.get("transform"), list):
-        cube_transform = matrix_from_rows(cube_pose["transform"])
-        randomization["follows_cube_pose"] = True
-    else:
-        randomization["follows_cube_pose"] = False
+    randomization["follows_cube_pose"] = False
+    rigs = hand_rig_objects()
 
     for name, obj in objects.items():
-        base_matrix = states[name]["matrix_world"]
+        rig = rigs[name]
+        pose_name = assignments[name]
+        assign_hand_pose(rig, pose_name)
+        base_matrix = states[name]["rig_matrix_world"]
         x_offset = random.uniform(*HAND_X_OFFSET_RANGE)
         z_offset = random.uniform(*HAND_Z_OFFSET_RANGE)
-        x_rotation_degrees = random.choice(HAND_X_ROTATION_DEGREES)
+        x_rotation_degrees = (
+            0.0
+            if pose_name in HAND_POSES_WITHOUT_ORIGIN_X_ROTATION
+            else random.choice(HAND_ORIGIN_X_ROTATION_DEGREES)
+        )
         hidden = name not in visible_hands
         location_offset = Vector((x_offset, 0.0, z_offset))
         global_rotation = Quaternion(
             Vector((1.0, 0.0, 0.0)),
             math.radians(x_rotation_degrees),
         ).to_matrix().to_4x4()
+        solver_facing_rotation = Quaternion(
+            Vector((0.0, 0.0, 1.0)),
+            math.radians(HAND_SOLVER_FACING_ROTATION_DEGREES),
+        ).to_matrix().to_4x4()
 
-        local_matrix = global_rotation @ Matrix.Translation(location_offset) @ base_matrix
-        obj.matrix_world = cube_transform @ local_matrix if cube_transform is not None else local_matrix
+        local_matrix = (
+            solver_facing_rotation
+            @ global_rotation
+            @ Matrix.Translation(location_offset)
+            @ base_matrix
+        )
+        rig.matrix_world = local_matrix
         obj.rotation_mode = "QUATERNION"
         obj.hide_render = hidden
         obj.hide_viewport = hidden
         obj.hide_set(hidden)
+        rig.hide_render = hidden
+        rig.hide_viewport = hidden
+        rig.hide_set(hidden)
 
         randomization["objects"][name] = {
             "visible": not hidden,
+            "pose": pose_name,
             "x_offset": x_offset,
             "z_offset": z_offset,
             "x_rotation_degrees": x_rotation_degrees,
-            "location": [obj.location.x, obj.location.y, obj.location.z],
+            "solver_facing_rotation_degrees": HAND_SOLVER_FACING_ROTATION_DEGREES,
+            "location": [rig.location.x, rig.location.y, rig.location.z],
         }
 
+    bpy.context.scene.frame_set(1)
     bpy.context.view_layer.update()
     return randomization
 
@@ -2775,6 +3563,7 @@ def randomize_hands(
 def randomize_scene(
     scramble_length: int = DEFAULT_SCRAMBLE_LENGTH,
     background_object_count: int = DEFAULT_BACKGROUND_OBJECT_COUNT,
+    desk_no_hands: bool = False,
 ) -> tuple[
     list[str],
     dict[str, object],
@@ -2792,20 +3581,23 @@ def randomize_scene(
 
     camera_randomization = randomize_camera()
     background_randomization = randomize_background(background_object_count)
+    # Background walls and large props do not exist when the first camera is
+    # sampled. Probe after loading them and retry cameras whose cube rays are
+    # blocked before any expensive rendering begins.
+    clear_scene_lights()
+    camera_randomization = ensure_camera_has_clear_cube_view(
+        objects,
+        camera_randomization,
+    )
     # Build the rig after appending the background so lights bundled in an asset
     # cannot accidentally leak into, or conflict with, the selected setup.
-    light_randomization = randomize_light()
+    light_randomization = randomize_light(background_randomization)
     background_randomization["world_color"] = light_randomization["world"]["display_color"]
     background_randomization["world_lighting"] = light_randomization["world"]
-
-    faces = list("RLUDBF")
-    moves = []
-    for _ in range(scramble_length):
-        choices = [face for face in faces if not moves or face != moves[-1]]
-        moves.append(random.choice(choices))
-
+    moves = random_scramble_moves(scramble_length)
+    scramble_objects = objects + core_objects
     for move in moves:
-        rotate_face(objects, move)
+        apply_scramble_move(scramble_objects, move)
 
     duplicate_secondary_cube(objects, core_objects, background_randomization)
     layer_state = randomize_layer_render_state(objects)
@@ -2820,7 +3612,16 @@ def randomize_scene(
                 continue
             pose_bound_pointers.add(pointer)
             pose_bounds.append(part)
-    cube_pose = randomize_cube_global_pose(pose_objects, bounds_objects=pose_bounds)
+    # Keep the cube in its local pose until the hands have been placed. The
+    # shared transform is applied to both the cube and the hand armatures in
+    # generate_dataset(), so the hand placement remains authored at the cube's
+    # origin instead of being transformed around its own pivot.
+    cube_pose = randomize_cube_global_pose(
+        pose_objects,
+        bounds_objects=pose_bounds,
+        apply=False,
+        force_on_table=desk_no_hands,
+    )
     return (
         moves,
         layer_state,
@@ -2835,6 +3636,18 @@ def randomize_scene(
 def configure_render(width: int, height: int) -> None:
     scene = bpy.context.scene
     scene.render.engine = "CYCLES"
+    scene.cycles.samples = DEFAULT_CYCLES_SAMPLES
+    scene.cycles.use_adaptive_sampling = True
+    scene.cycles.adaptive_threshold = CYCLES_ADAPTIVE_THRESHOLD
+    scene.cycles.adaptive_min_samples = CYCLES_ADAPTIVE_MIN_SAMPLES
+    scene.cycles.use_denoising = True
+    scene.cycles.max_bounces = 6
+    scene.cycles.diffuse_bounces = 3
+    scene.cycles.glossy_bounces = 3
+    scene.cycles.transmission_bounces = 4
+    scene.cycles.transparent_max_bounces = 4
+    scene.cycles.use_light_tree = True
+    scene.render.use_persistent_data = True
     scene.render.resolution_x = width
     scene.render.resolution_y = height
     scene.render.resolution_percentage = 100
@@ -3807,10 +4620,12 @@ def generate_dataset(
         masks_dir.mkdir(parents=True, exist_ok=True)
     labels_dir.mkdir(parents=True, exist_ok=True)
 
+    ensure_hand_assets_loaded()
     configure_render(width, height)
 
     metadata = []
     for index in range(count):
+        desk_no_hands = random.random() < CUBE_DESK_NO_HANDS_PROBABILITY
         (
             moves,
             layer_state,
@@ -3822,9 +4637,15 @@ def generate_dataset(
         ) = randomize_scene(
             scramble_length,
             background_object_count=background_object_count,
+            desk_no_hands=desk_no_hands,
         )
+        base_cube_pose = cube_pose
         objects = cube_objects()
-        render_objects = list(objects)
+        core_objects = core_fill_objects()
+        cube_pose_objects = list(objects) + core_objects
+        cube_base_transforms = {
+            obj.name: obj.matrix_world.copy() for obj in cube_pose_objects
+        }
 
         stem = f"{(index):06d}"
         image_path = images_dir / f"{stem}.png"
@@ -3832,6 +4653,7 @@ def generate_dataset(
         label_path = labels_dir / f"{stem}.txt"
 
         hands = hand_objects()
+        hand_rigs = hand_rig_objects()
         hand_states = hand_object_states(hands)
         hand_attempts = []
         hand_randomization = None
@@ -3840,7 +4662,29 @@ def generate_dataset(
         accepted_hand_pose = False
         attempts = max(1, int(max_hand_placement_attempts))
         for attempt_index in range(1, attempts + 1):
-            hand_randomization = randomize_hands(hands, hand_states, cube_pose)
+            for obj in cube_pose_objects:
+                obj.matrix_world = cube_base_transforms[obj.name]
+            restore_hand_objects(hands, hand_states)
+            hand_randomization = randomize_hands(
+                hands,
+                hand_states,
+                forced_visibility="none" if desk_no_hands else None,
+            )
+            hand_lift = (
+                CUBE_HANDS_TABLE_LIFT
+                if hand_randomization.get("visibility") != "none" and not desk_no_hands
+                else 0.0
+            )
+            hand_visible = hand_randomization.get("visibility") != "none"
+            placement_cube_pose = (
+                base_cube_pose
+                if hand_visible
+                else cube_pose_on_table(base_cube_pose)
+            )
+            attempt_cube_pose = cube_pose_with_hand_lift(placement_cube_pose, hand_lift)
+            apply_shared_cube_pose(cube_pose_objects, hand_rigs, attempt_cube_pose)
+            hand_randomization["follows_cube_pose"] = True
+            hand_randomization["cube_vertical_lift"] = hand_lift
             _preflight_lines, preflight_pose_objects, preflight_pose_geometry = render_pose_keypoints(None)
             acceptable, visibility_summary = hand_pose_is_acceptable(
                 hand_randomization,
@@ -3854,12 +4698,20 @@ def generate_dataset(
                 "hands": hand_randomization,
             })
             if acceptable:
+                cube_pose = attempt_cube_pose
                 accepted_hand_pose = True
                 break
             restore_hand_objects(hands, hand_states)
 
         if not accepted_hand_pose:
-            hand_randomization = randomize_hands(hands, hand_states, cube_pose, forced_visibility="none")
+            for obj in cube_pose_objects:
+                obj.matrix_world = cube_base_transforms[obj.name]
+            restore_hand_objects(hands, hand_states)
+            hand_randomization = randomize_hands(hands, hand_states, forced_visibility="none")
+            cube_pose = cube_pose_on_table(base_cube_pose)
+            apply_shared_cube_pose(cube_pose_objects, hand_rigs, cube_pose)
+            hand_randomization["follows_cube_pose"] = True
+            hand_randomization["cube_vertical_lift"] = 0.0
             _preflight_lines, preflight_pose_objects, preflight_pose_geometry = render_pose_keypoints(None)
             _acceptable, visibility_summary = hand_pose_is_acceptable(
                 hand_randomization,
@@ -3875,6 +4727,7 @@ def generate_dataset(
             })
 
         try:
+            render_objects = list(objects) + list(hand_rigs.values())
             rotational_blur = render_cube_rotational_blur_png(
                 image_path,
                 render_objects,
@@ -3905,6 +4758,7 @@ def generate_dataset(
             "light": light_randomization,
             "background": background_randomization,
             "cube_pose": cube_pose,
+            "desk_no_hands": desk_no_hands,
             "sticker_materials": sticker_materials,
             "cube_rotational_blur": rotational_blur,
             "camera_degradation": camera_degradation,
