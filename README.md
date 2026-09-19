@@ -72,20 +72,6 @@ cube-net --source /path/to/frame.jpg --save-net runs/frame_net.png --save-graph 
 `cube-net` uses the sticker segmentations' average BGR colors directly. The net is a
 view-relative preview of the observed faces.
 
-The ROI segmentation test command can also save a center/edge cube net from the same
-graph evidence:
-
-```bash
-python scripts/test_piece_seg_roi.py --source /path/to/frame.jpg --save runs/frame_roi.jpg --save-net runs/frame_net.png
-```
-
-For video sources, `--save-net` replaces the previous net with the latest processed
-frame:
-
-```bash
-python scripts/test_piece_seg_roi.py --source /path/to/solve.mp4 --save-net runs/solve_net.png
-```
-
 Add `--display` if you want an OpenCV preview window. Press `q` to exit the video window.
 
 ```bash

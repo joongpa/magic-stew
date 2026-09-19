@@ -1,24 +1,25 @@
-"""Test YOLO sticker segmentation on a cube bounding-box ROI.
+"""Test YOLO cube pose estimation on a cube bounding-box ROI.
 
 Pipeline:
 1. Detect the whole cube with the existing bbox detector.
 2. Crop a padded square ROI around that bbox.
-3. Run the sticker segmentation model on the ROI.
-4. Draw segmented sticker masks back onto the original OpenCV frame.
+3. Run the independent one-point pose model on the ROI.
+4. Draw predicted keypoints color-coded by class and the fitted 55mm cube.
 """
 
 from __future__ import annotations
 
 import argparse
-import math
+import importlib.util
+import random
 import sys
-from dataclasses import dataclass, field
-from functools import lru_cache
-from itertools import combinations
+from collections import deque
+from dataclasses import dataclass
+from itertools import permutations, product
 from pathlib import Path
 from time import perf_counter
-from typing import Union
 
+import __main__
 import cv2
 import numpy as np
 
@@ -27,24 +28,54 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from live_recognition.cube_net import CubeNetState  # noqa: E402
-from live_recognition.cube_net import build_cube_net_from_graph, draw_cube_net
 from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
-from live_recognition.piece_graph import (PieceGraph, StickerNode,
-                                          _legal_mask_adjacencies)
-from live_recognition.piece_graph import \
-    draw_piece_graph as draw_sticker_graph  # noqa: E402
 from live_recognition.visualization import _reliable_color_mask  # noqa: E402
 from live_recognition.visualization import (save_hsv_samples_interactive_plot,
-                                            save_oklab_samples_interactive_plot,
                                             save_rgb_samples_interactive_plot,
                                             save_rgb_samples_plot)
 
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 DEFAULT_STICKER_MODEL = (
     ROOT
-    / "runs/segment/runs/cube_face_sticker_seg_local/runs/cube_face_sticker_yolo11n_seg-2/weights/best.pt"
+    / "runs/segment/runs/cube_face_seg_local/runs/cube_face_sticker_yolo11n_seg/weights/best.pt"
 )
+DEFAULT_POSE_MODEL = (
+    ROOT
+    / "runs/pose/runs/cube_independent_keypoints/runs/cube_independent_keypoints_yolo11n_pose/weights/best.pt"
+)
+ENABLE_STICKER_SEGMENTATION = False
+ENABLE_POSE_ESTIMATION = True
+ENABLE_POSE_GRAPH_CORRESPONDENCE = True
+DRAW_POSE_KEYPOINTS = True
+DRAW_PNP_CUBE = True
+DRAW_CORNER_ADJACENCY = False
+DRAW_POSE_GRAPH_COORDS = False
+DISPLAY_WINDOW_NAME = "cube sticker segmentations"
+DISPLAY_PREVIEW_BY_DEFAULT = True
+SHOW_ORIGINAL_UNDERLAY_BY_DEFAULT = True
+POSE_IMAGE_SIZE = 256
+POSE_OBJECT_CONFIDENCE = 0.5
+POSE_KEYPOINT_CONFIDENCE = 0.8
+ADJACENCY_REFERENCE_ROI_SIZE_PX = 600.0
+PNP_FOCAL_SCALE_MIN = 0.7
+PNP_FOCAL_SCALE_MAX = 1.8
+PNP_FOCAL_SCALE_STEPS = 5
+PNP_CAMERA_BOOTSTRAP_FRAME_COUNT = 12
+PNP_MAX_REPROJECTION_ERROR_PX = 7
+PNP_REFINEMENT_REPROJECTION_ERROR_PX = 24
+PNP_MAX_REFINEMENT_ATTEMPTS = 12
+PNP_INLIER_THRESHOLD_PX = 10.0
+PNP_MAX_OBSERVED_OUTLIER_FRACTION = 0.10
+PNP_PRUNE_REPROJECTION_ERROR_PX = 18.0
+ADJACENCY_CANNY_BLUR_KERNEL = 1
+ADJACENCY_CANNY_LOW = 30
+ADJACENCY_CANNY_HIGH = 180
+ADJACENCY_MIN_EDGE_LENGTH_PX = 32.0
+ADJACENCY_MIN_COVERAGE = 1
+ADJACENCY_MAX_UNCOVERED_GAP_RATIO = 0.03
+ADJACENCY_MAX_AVERAGE_LENGTH_RATIO = 1.5
+ADJACENCY_EDGE_DILATION_PX = 7
+ADJACENCY_KEYPOINT_INTERSECTION_DISTANCE_PX = 5
 DEFAULT_STICKER_MASK_COLOR = (150, 150, 150)
 FACE_INSTANCE_MASK_COLORS = (
     (255, 80, 80),
@@ -54,78 +85,123 @@ FACE_INSTANCE_MASK_COLORS = (
     (220, 120, 255),
     (80, 230, 230),
 )
-FACE_PARALLELOGRAM_COLORS = (
-    (255, 255, 255),
-    (40, 255, 255),
-    (255, 180, 40),
-    (120, 255, 120),
-    (255, 120, 255),
-    (120, 180, 255),
-)
 STICKER_CLASS_NAMES = {"face", "sticker", "u_sticker", "f_sticker", "r_sticker"}
-FACE_COVERAGE_PRUNE_THRESHOLD = 0.8
-MAX_FACE_COUNT = 3
-FACE_OUTER_CORNER_MIN_SLIDE_SCALE = 0.72
-FACE_OUTER_CORNER_SLIDE_STEPS = 29
-PROJECTED_FACE_GRID_COLOR = (255, 255, 255)
 STICKER_COLOR_SAMPLE_COUNT = 10
-DENSITY_CLUSTER_EPS = 20.0
-DENSITY_CLUSTER_EPS_REFERENCE_RGB = 150.0
-DENSITY_CLUSTER_EPS_ORIGIN = 0.1
+DENSITY_CLUSTER_EPS_RADIANS = 0.08
 DENSITY_CLUSTER_MIN_POINTS = 4
-HSV_DENSITY_CLUSTER_EPS = 20.0
-HSV_DENSITY_CLUSTER_MIN_POINTS = DENSITY_CLUSTER_MIN_POINTS
-OKLAB_GMM_COVARIANCE_REGULARIZATION = 0.0004
-OKLAB_GMM_MAX_ITERATIONS = 60
-OKLAB_GMM_TOLERANCE = 1e-3
-OKLAB_L_COMPRESSION_FACTOR = 3.0
-OKLAB_SLICE_STICKER_LINK_LAMBDA = 0.05
-OKLAB_SLICE_OVERLAP_LAMBDA = 0.05
-DENSITY_WEIGHT_POWER = 0.5
-DENSITY_WEIGHT_MAX = 4.0
-DENSITY_WEIGHT_MIX = 0.5
-POLYLINE_COVERAGE_MIX = 0.5
-POLYLINE_COVERAGE_BINS = 24
-POLYLINE_INSIDE_PENALTY = 6.0
-OKLAB_ANGULAR_MIN_CHROMA = 0.018
-OKLAB_ANGULAR_NEUTRAL_CHROMA = 0.035
-CLUSTER_MERGE_RAY_DISTANCE_DIVISOR = 4.0
-DENSITY_PEAK_K_NEIGHBORS = 16
-DENSITY_PEAK_MAX_FIT_SAMPLES = 5000
-DENSITY_PEAK_MIN_PEAK_DISTANCE = 18.0
-DENSE_RAY_K_NEIGHBORS = 16
-DENSE_RAY_MAX_FIT_SAMPLES = 5000
-DENSE_RAY_MIN_ANCHOR_DISTANCE = 18.0
-DENSE_RAY_MAX_DISTANCE = 18.0
-GMM_MAX_MAHALANOBIS_DISTANCE = 9.0
-GMM_REGULARIZATION = 36.0
-GMM_RAY_VARIANCE_FLOOR = 0.0
-GMM_CONSTRAIN_COVARIANCE_TO_RAY = False
-GMM_PERPENDICULAR_VARIANCE_FLOOR = 16.0
-GMM_PERPENDICULAR_VARIANCE_CEILING = 0.0
-GMM_DENSE_CORE_K_NEIGHBORS = 0
-GMM_DENSE_CORE_QUANTILE = 0.0
-GMM_COLOR_PRIORS = "white=255,255,255;yellow=255,255,0;red=255,0,0;orange=255,120,0;blue=0,0,255;green=0,255,0"
-GMM_PRIOR_STRENGTH = 1.0
-GMM_MIN_ASSIGNMENT_CONFIDENCE = 0.70
-GMM_ASSIGNMENT_BALANCE = 1.0
-GMM_BALANCE_ITERATIONS = 30
-GMM_MAX_ITERATIONS = 60
-GMM_TOLERANCE = 1e-3
-RAY_MAX_ANGLE_RADIANS = 0.28
-RAY_ASSIGNMENT_SHARPNESS = 80.0
-RAY_BALANCE_ITERATIONS = 30
-RAY_MAX_ITERATIONS = 30
-CONE_MAX_ANGLE_RADIANS = 0.28
-CONE_ASSIGNMENT_SHARPNESS = 80.0
-CONE_BALANCE_ITERATIONS = 30
-CONE_MAX_ITERATIONS = 30
-CUBE_GRID_FIT_SAMPLE_POINTS = 160
-CUBE_GRID_FIT_REFINE_CANDIDATES = 8
-CUBE_GRID_FIT_SUPPORTED_LINE_DISTANCE = 0.18
-CUBE_GRID_FIT_DIRECTION_TOLERANCE_RADIANS = 0.32
-EMPTY_SPACE_LINE_WIDTH_PX = 5
-BASIS_VECTOR_ANGLE_BUCKET_DEGREES = 5.0
+CUBE_SIZE_MM = 55.0
+CUBE_HALF_SIZE_MM = CUBE_SIZE_MM / 2.0
+CUBE_LAYER_SIZE_MM = CUBE_SIZE_MM / 3.0
+CUBE_CORNER_NAMES = ("UBL", "UBR", "UFR", "UFL", "DBL", "DBR", "DFR", "DFL")
+CUBE_CORNER_POINTS_MM = np.array(
+    [
+        [-CUBE_HALF_SIZE_MM, CUBE_HALF_SIZE_MM, CUBE_HALF_SIZE_MM],
+        [CUBE_HALF_SIZE_MM, CUBE_HALF_SIZE_MM, CUBE_HALF_SIZE_MM],
+        [CUBE_HALF_SIZE_MM, -CUBE_HALF_SIZE_MM, CUBE_HALF_SIZE_MM],
+        [-CUBE_HALF_SIZE_MM, -CUBE_HALF_SIZE_MM, CUBE_HALF_SIZE_MM],
+        [-CUBE_HALF_SIZE_MM, CUBE_HALF_SIZE_MM, -CUBE_HALF_SIZE_MM],
+        [CUBE_HALF_SIZE_MM, CUBE_HALF_SIZE_MM, -CUBE_HALF_SIZE_MM],
+        [CUBE_HALF_SIZE_MM, -CUBE_HALF_SIZE_MM, -CUBE_HALF_SIZE_MM],
+        [-CUBE_HALF_SIZE_MM, -CUBE_HALF_SIZE_MM, -CUBE_HALF_SIZE_MM],
+    ],
+    dtype=np.float32,
+)
+CUBE_CORNER_EDGES = (
+    (0, 1), (1, 2), (2, 3), (3, 0),
+    (4, 5), (5, 6), (6, 7), (7, 4),
+    (0, 4), (1, 5), (2, 6), (3, 7),
+)
+CUBE_EDGE_MIDPOINT_POINTS_MM = np.asarray(
+    [
+        (CUBE_CORNER_POINTS_MM[start] + CUBE_CORNER_POINTS_MM[end]) * 0.5
+        for start, end in CUBE_CORNER_EDGES
+    ],
+    dtype=np.float32,
+)
+CUBE_GRID_MAX_INDEX = 3
+CUBE_LATTICE_COORDS = tuple(
+    (x, y, z)
+    for x in range(CUBE_GRID_MAX_INDEX + 1)
+    for y in range(CUBE_GRID_MAX_INDEX + 1)
+    for z in range(CUBE_GRID_MAX_INDEX + 1)
+    if x in (0, CUBE_GRID_MAX_INDEX)
+    or y in (0, CUBE_GRID_MAX_INDEX)
+    or z in (0, CUBE_GRID_MAX_INDEX)
+)
+CUBE_LATTICE_POINTS_MM = np.asarray(
+    [
+        (
+            (coord[0] - (CUBE_GRID_MAX_INDEX * 0.5)) * CUBE_LAYER_SIZE_MM,
+            (coord[1] - (CUBE_GRID_MAX_INDEX * 0.5)) * CUBE_LAYER_SIZE_MM,
+            (coord[2] - (CUBE_GRID_MAX_INDEX * 0.5)) * CUBE_LAYER_SIZE_MM,
+        )
+        for coord in CUBE_LATTICE_COORDS
+    ],
+    dtype=np.float32,
+)
+CUBE_LATTICE_IDENTITY_TRANSFORM = ((0, 1, 2), (1, 1, 1))
+CUBE_LATTICE_AXIS_TRANSFORMS = tuple(
+    (axis_order, signs)
+    for axis_order in permutations(range(3))
+    for signs in product((-1, 1), repeat=3)
+)
+CUBE_EDGE_KEYPOINT_OFFSET = len(CUBE_CORNER_POINTS_MM)
+CUBE_KEYPOINT_EDGE_SEGMENTS = tuple(
+    segment
+    for edge_index, (start, end) in enumerate(CUBE_CORNER_EDGES)
+    for segment in (
+        (start, CUBE_EDGE_KEYPOINT_OFFSET + edge_index),
+        (CUBE_EDGE_KEYPOINT_OFFSET + edge_index, end),
+    )
+)
+POSE_CLASS_NAMES = {"corner", "corner-edge", "corner-edge-center", "center"}
+POSE_KEYPOINT_COLORS = {
+    "corner": (255, 255, 255),
+    "corner-edge": (0, 255, 255),
+    "corner-edge-center": (255, 120, 255),
+    "center": (255, 255, 0),
+}
+PNP_CUBE_LINE_COLOR = (255, 80, 30)
+PNP_CUBE_POINT_COLOR = (30, 180, 255)
+PNP_CUBE_STATIC_LINE_COLOR = (100, 100, 100)
+PNP_CUBE_SEAM_LINE_COLOR = (255, 220, 80)
+PNP_OBSERVED_MODEL_DISTANCE_COLOR = (0, 255, 255)
+PNP_OBSERVED_MODEL_DISTANCE_ALPHA = 0.35
+PNP_REFINEMENT_POINT_COLOR = (255, 0, 255)
+PNP_DEBUG_POSE_COLORS = (
+    (255, 80, 80),
+    (80, 220, 255),
+    (80, 255, 120),
+    (255, 120, 255),
+    (255, 220, 80),
+    (180, 120, 255),
+)
+PNP_DEBUG_POSE_ALPHA = 0.30
+POSE_GRAPH_CORRESPONDENCE_LINE_COLOR = (255, 80, 255)
+POSE_GRAPH_CORRESPONDENCE_TEXT_COLOR = (255, 255, 255)
+POSE_GRAPH_EDGE_STRIP_COLOR = (80, 220, 255)
+POSE_GRAPH_EDGE_STRIP_ALPHA = 0.22
+PNP_REPROJECTION_RESIDUAL_COLOR = (0, 255, 255)
+
+
+def register_training_checkpoint_classes() -> None:
+    """Expose custom training classes where torch expects them during checkpoint loading."""
+    training_path = ROOT / "scripts" / "train_yolo11n_piece_seg_local.py"
+    spec = importlib.util.spec_from_file_location("cube_pose_training_checkpoint_classes", training_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load training classes from {training_path}")
+    training = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = training
+    spec.loader.exec_module(training)
+
+    for name in (
+        "PerAnchorKeypointLoss",
+        "CubeSymmetricPoseLoss",
+        "CubeSymmetricPoseModel",
+        "CubeSymmetricPoseTrainer",
+    ):
+        if hasattr(training, name):
+            setattr(__main__, name, getattr(training, name))
 
 
 @dataclass
@@ -164,11 +240,13 @@ class RoiTracker:
         frame_height: int,
         tracking_gain: float = 1.0,
         tracking_padding: float = 0.0,
+        reset_on_missing: bool = True,
     ) -> None:
         if self.roi_xyxy is None:
             return
         if tracking_bounds_xyxy is None:
-            self.reset()
+            if reset_on_missing:
+                self.reset()
             return
 
         x1, y1, x2, y2 = self.roi_xyxy
@@ -197,302 +275,655 @@ class RoiTracker:
         )
 
 
+@dataclass
+class PosePnPResult:
+    error: float
+    inlier_count: int
+    matched_error: float
+    camera_matrix: np.ndarray
+    dist_coeffs: np.ndarray
+    rvec: np.ndarray
+    tvec: np.ndarray
+    image_points: np.ndarray
+    object_points: np.ndarray
+    display_points: np.ndarray
+    projected_object_points: np.ndarray
+    projected_display_points: np.ndarray
+    point_names: tuple[str, ...]
+    edge_indexes: tuple[tuple[int, int], ...] = tuple()
+    display_edge_indexes: tuple[tuple[int, int], ...] | None = None
+    pose_label: str = ""
+    lattice_transform: tuple[tuple[int, int, int], tuple[int, int, int]] = CUBE_LATTICE_IDENTITY_TRANSFORM
+    invisible_point_count: int = 0
+    observed_reprojection_error: float | None = None
+    correspondence_lattice_coords: tuple[tuple[int, int, int], ...] = tuple()
+    correspondence_face: tuple[int, int] | None = None
+    correspondence_face_normal_z: float | None = None
+    refinement_graph_index: int | None = None
+    refinement_lattice_coord: tuple[int, int, int] | None = None
+    debug_pose_candidates: tuple["PosePnPResult", ...] = tuple()
+
+
 @dataclass(frozen=True)
-class ProjectedCubeGridFit:
+class CornerAdjacency:
+    start_index: int
+    end_index: int
+    coverage: float
+    max_uncovered_gap: float
+    accepted: bool
+
+
+@dataclass(frozen=True)
+class PoseGraphPoint:
+    point_index: int
+    class_name: str
+    xy: tuple[float, float]
     score: float
-    line_edge_distance_score: float
-    coverage_ratio: float
-    hull_area_ratio: float
-    hull_points_xy: np.ndarray
-    line_segments_xy: list[tuple[tuple[float, float], tuple[float, float]]]
 
 
 @dataclass(frozen=True)
-class LowIntersectionLine:
-    score: float
-    intersection_px: int
-    length_px: int
-    angle_degrees: float
-    start_xy: tuple[float, float]
-    end_xy: tuple[float, float]
+class PoseGraphEdge:
+    start_index: int
+    end_index: int
+    coverage: float
+    max_uncovered_gap: float
+    accepted: bool
 
 
 @dataclass(frozen=True)
-class EmptySpaceLineOverlay:
-    lines: list[LowIntersectionLine]
-    sampled_points_xy: np.ndarray
-    line_width_px: int = EMPTY_SPACE_LINE_WIDTH_PX
-    quad_edge_segments_xy: np.ndarray = field(
-        default_factory=lambda: np.empty((0, 2, 2), dtype=np.float32)
-    )
-    basis_vectors_xy: np.ndarray = field(
-        default_factory=lambda: np.empty((0, 2), dtype=np.float32)
-    )
-    basis_center_xy: tuple[float, float] | None = None
+class PoseGraph:
+    points: tuple[PoseGraphPoint, ...]
+    edges: tuple[PoseGraphEdge, ...]
 
 
 @dataclass(frozen=True)
-class StickerEdgePointSample:
-    points_xy: np.ndarray
-    sticker_indexes: np.ndarray
+class FramePoseStats:
+    keypoint_count: int
+    valid_pose: bool
 
 
 @dataclass(frozen=True)
-class StickerQuadGeometry:
-    points_xy: np.ndarray
-    sticker_indexes: np.ndarray
-    edge_segments_xy: np.ndarray
-
-
-class HDBSCANDensityPlaneColorClassifier:
-    """Oklab HDBSCAN classifier with recursive 3D density-plane refinement."""
-
-    def __init__(self, *, required_frames=30, cluster_count=6, min_brightness=40.0,
-                 max_brightness=None, hdbscan_min_cluster_size=500, hdbscan_min_samples=5,
-                 cluster_ambiguity_distance=None,
-                 hdbscan_cluster_selection_method="eom", hdbscan_cluster_selection_epsilon=.01,
-                 hdbscan_alpha=1.0, hdbscan_metric="euclidean", hdbscan_core_dist_n_jobs=1,
-                 hdbscan_leave_noise=True, hdbscan_hierarchy_plot=None,
-                 plane_angle_count=36, plane_tilt_count=3,
-                 plane_max_tilt_degrees=15.0, plane_offset_count=25, plane_density_grid_size=48,
-                 plane_density_smoothing=1.5, plane_bandwidth=0.0, plane_min_child_size=10,
-                 plane_min_child_fraction=.15, plane_balance_penalty=.25,
-                 plane_relative_valley_weight=1.0, plane_min_side_mass=.12,
-                 plane_cut_mass_weight=.5, plane_cluster_size_weight=.25):
-        self.required_frames, self.cluster_count = max(1, int(required_frames)), max(1, int(cluster_count))
-        self.min_brightness = float(min_brightness)
-        self.max_brightness = float(max_brightness) if max_brightness is not None else None
-        self.hdbscan_params = dict(
-            min_cluster_size=hdbscan_min_cluster_size,
-            min_samples=hdbscan_min_samples,
-            cluster_selection_method=hdbscan_cluster_selection_method,
-            cluster_selection_epsilon=hdbscan_cluster_selection_epsilon,
-            alpha=hdbscan_alpha,
-            metric=hdbscan_metric,
-            allow_single_cluster=False,
-            core_dist_n_jobs=hdbscan_core_dist_n_jobs,
-        )
-        self.hdbscan_leave_noise = bool(hdbscan_leave_noise)
-        self.hdbscan_hierarchy_plot = Path(hdbscan_hierarchy_plot) if hdbscan_hierarchy_plot else None
-        self.plane_params = dict(
-            angle_count=plane_angle_count, tilt_count=plane_tilt_count,
-            max_tilt_degrees=plane_max_tilt_degrees, offset_count=plane_offset_count,
-            density_grid_size=plane_density_grid_size, density_smoothing=plane_density_smoothing,
-            plane_bandwidth=plane_bandwidth, min_child_size=plane_min_child_size,
-            min_child_fraction=plane_min_child_fraction, balance_penalty=plane_balance_penalty,
-            relative_valley_weight=plane_relative_valley_weight,
-            min_side_mass=plane_min_side_mass, cut_mass_weight=plane_cut_mass_weight,
-            cluster_size_weight=plane_cluster_size_weight,
-        )
-        self.detected_frames = 0
-        self._bgr_samples = []
-        self.centroids = np.empty((0, 3), dtype=np.float32)
-        self.oklab_centroids = np.empty((0, 3), dtype=np.float32)
-        self.cluster_samples = []
-        self.split_planes = []
-        self._fit_bgr_samples = np.empty((0, 3), dtype=np.uint8)
-        self.sample_labels = np.empty(0, dtype=np.int32)
+class PoseGraphCorrespondence:
+    image_points: np.ndarray
+    object_points: np.ndarray
+    graph_indexes: tuple[int, ...]
+    lattice_coords: tuple[tuple[int, int, int], ...]
 
     @property
-    def ready(self): return len(self.oklab_centroids) > 0
-
-    def observe_frame(self, bgr_samples):
-        if self.ready or len(bgr_samples) == 0: return
-        self._bgr_samples.extend(np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3))
-        self.detected_frames += 1
-        if self.detected_frames < self.required_frames: return
-        bgr = np.asarray(self._bgr_samples, dtype=np.uint8)
-        oklab = bgr_samples_to_oklab(bgr)
-        brightness = oklab[:, 0] * 255.0
-        mask = brightness >= self.min_brightness
-        if self.max_brightness is not None: mask &= brightness <= self.max_brightness
-        fit = oklab[mask]
-        # Use the shared implementation so the ROI path and standalone
-        # color-sample tool have identical selection, noise handling, and
-        # plane-splitting behavior.
-        from live_recognition.color_clustering import (
-            hdbscan_cluster_memberships,
-            recursive_density_plane_splits,
-        )
-        labels, _, _noise_mask = hdbscan_cluster_memberships(
-            fit,
-            cluster_count=self.cluster_count,
-            assign_noise=False,
-            hierarchy_plot=self.hdbscan_hierarchy_plot,
-            **self.hdbscan_params,
-        )
-        labels, self.oklab_centroids, self.split_planes = recursive_density_plane_splits(
-            fit,
-            labels,
-            target_clusters=self.cluster_count,
-            **self.plane_params,
-        )
-        if not self.hdbscan_leave_noise and np.any(labels < 0) and len(self.oklab_centroids):
-            noise = np.flatnonzero(labels < 0)
-            labels[noise] = np.linalg.norm(
-                fit[noise, None, :] - self.oklab_centroids[None, :, :], axis=2
-            ).argmin(axis=1)
-        self.cluster_samples = [fit[labels == i] for i in range(len(self.oklab_centroids))]
-        self.centroids = oklab_to_rgb(self.oklab_centroids)
-        self._fit_bgr_samples = bgr[mask].copy()
-        self.sample_labels = labels.copy()
-
-    def classify_bgr(self, bgr_sample):
-        if not self.ready: return None
-        lab = bgr_samples_to_oklab(np.asarray(bgr_sample, dtype=np.uint8).reshape(1, 3))[0]
-        lightness = float(lab[0] * 255.0)
-        if lightness < self.min_brightness or (self.max_brightness is not None and lightness > self.max_brightness): return None
-        return int(np.linalg.norm(self.oklab_centroids - lab, axis=1).argmin())
-
-    def classify_bgr_samples(self, bgr_samples):
-        votes = [i for sample in np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3) if (i := self.classify_bgr(sample)) is not None]
-        return int(np.bincount(np.asarray(votes, dtype=np.int32)).argmax()) if votes else None
+    def key(self) -> tuple[tuple[int, ...], tuple[tuple[int, int, int], ...]]:
+        return (tuple(self.graph_indexes), tuple(self.lattice_coords))
 
 
-class PiecewiseLinearColorClassifier(HDBSCANDensityPlaneColorClassifier):
-    """Classify RGB samples by distance to black-breakpoint-white polylines."""
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.polyline_models: list[np.ndarray] = []
-
-    def observe_frame(self, bgr_samples):
-        was_ready = self.ready
-        super().observe_frame(bgr_samples)
-        if was_ready or not self.ready or self.polyline_models:
-            return
-
-        oklab_samples = bgr_samples_to_oklab(self._fit_bgr_samples)
-        self.polyline_models = [
-            _fit_piecewise_oklab_line(oklab_samples[self.sample_labels == cluster_index])
-            for cluster_index in range(len(self.centroids))
-        ]
-
-    def classify_bgr(self, bgr_sample):
-        if not self.ready or not self.polyline_models:
-            return None
-        oklab = bgr_samples_to_oklab(np.asarray(bgr_sample, dtype=np.uint8).reshape(1, 3))
-        lightness = float(oklab[0, 0]) * 255.0
-        if lightness < self.min_brightness:
-            return None
-        if self.max_brightness is not None and lightness > self.max_brightness:
-            return None
-        distances = [
-            float(_piecewise_oklab_line_distances(oklab, breakpoint)[0])
-            for breakpoint in self.polyline_models
-        ]
-        if not distances:
-            return None
-        distances = np.asarray(distances, dtype=np.float32)
-        return int(np.argmin(distances))
+@dataclass(frozen=True)
+class PoseGraphNodeAssignment:
+    coord: tuple[int, int, int]
+    parent_index: int | None
+    local_to_global: dict[str, tuple[int, int, int]] | None
+    local_to_global_frames: tuple[dict[str, tuple[int, int, int]], ...]
+    path_faces: frozenset[tuple[int, int]]
+    depth: int
+    has_turn: bool
 
 
-class ClusterMembershipColorClassifier(HDBSCANDensityPlaneColorClassifier):
-    """Classify only samples that fall within a learned color cluster."""
+@dataclass
+class PoseGraphPnPSolver:
+    focal_min: float = 0.7
+    focal_max: float = 1.8
+    focal_steps: int = 5
+    camera_bootstrap_frames: int = PNP_CAMERA_BOOTSTRAP_FRAME_COUNT
+    max_reprojection_error_px: float = PNP_MAX_REPROJECTION_ERROR_PX
+    refinement_reprojection_error_px: float = PNP_REFINEMENT_REPROJECTION_ERROR_PX
+    max_refinement_attempts: int = PNP_MAX_REFINEMENT_ATTEMPTS
+    inlier_threshold_px: float = PNP_INLIER_THRESHOLD_PX
+    max_observed_outlier_fraction: float = PNP_MAX_OBSERVED_OUTLIER_FRACTION
+    prune_reprojection_error_px: float = PNP_PRUNE_REPROJECTION_ERROR_PX
+    camera_matrix: np.ndarray | None = None
+    lattice_transform: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
+    rejected_pose_result: PosePnPResult | None = None
+    last_tvec: np.ndarray | None = None
+    accepted_pose_count: int = 0
 
-    def __init__(self, *, cluster_ambiguity_distance: float = 0.01, **kwargs):
-        super().__init__(**kwargs)
-        self.cluster_ambiguity_distance = max(float(cluster_ambiguity_distance), 0.0)
-        self.cluster_samples_oklab: list[np.ndarray] = []
-        self.cluster_membership_radii = np.empty(0, dtype=np.float32)
-
-    def observe_frame(self, bgr_samples):
-        was_ready = self.ready
-        super().observe_frame(bgr_samples)
-        if was_ready or not self.ready or self.cluster_samples_oklab:
-            return
-
-        oklab_samples = bgr_samples_to_oklab(self._fit_bgr_samples)
-        self.cluster_samples_oklab = [
-            oklab_samples[self.sample_labels == cluster_index]
-            for cluster_index in range(len(self.centroids))
-        ]
-        self.cluster_membership_radii = np.asarray(
-            [
-                max(
-                    float(
-                        np.linalg.norm(
-                            samples - samples.mean(axis=0),
-                            axis=1,
-                        ).max()
-                    ),
-                    1e-4,
-                )
-                if len(samples)
-                else 1e-4
-                for samples in self.cluster_samples_oklab
-            ],
-            dtype=np.float32,
-        )
-
-    def classify_bgr(self, bgr_sample):
-        if not self.ready or not self.cluster_samples_oklab:
-            return None
-        oklab = bgr_samples_to_oklab(np.asarray(bgr_sample, dtype=np.uint8).reshape(1, 3))
-        lightness = float(oklab[0, 0]) * 255.0
-        if lightness < self.min_brightness:
-            return None
-        if self.max_brightness is not None and lightness > self.max_brightness:
-            return None
-
-        distances = np.asarray(
-            [
-                np.linalg.norm(samples - oklab[0], axis=1).min()
-                if len(samples)
-                else np.inf
-                for samples in self.cluster_samples_oklab
-            ],
-            dtype=np.float32,
-        )
-        inside = distances <= self.cluster_membership_radii
-        if not bool(inside.any()):
-            return None
-        if self.cluster_ambiguity_distance > 0.0:
-            nearest_cluster = int(np.argmin(distances))
-            other_distances = np.delete(distances, nearest_cluster)
-            if bool(
-                np.any(other_distances <= self.cluster_ambiguity_distance)
-            ):
-                return None
-        return int(np.argmin(np.where(inside, distances, np.inf)))
-
-
-def _fit_piecewise_oklab_line(oklab_samples: np.ndarray) -> np.ndarray:
-    points = np.asarray(oklab_samples, dtype=np.float32).reshape(-1, 3)
-    if len(points) == 0:
-        return np.asarray([[0.67, 0.0, 0.0], [0.33, 0.0, 0.0]], dtype=np.float32)
-    ordered = points[np.argsort(points[:, 0])[::-1]]
-    candidate_indexes = np.unique(
-        np.linspace(0, len(ordered) - 1, min(24, len(ordered)), dtype=np.int32)
-    )
-    candidates = ordered[candidate_indexes]
-    best_pair = np.asarray([candidates[0], candidates[-1]], dtype=np.float32)
-    best_score = np.inf
-    for first_index in range(len(candidates) - 1):
-        for second_index in range(first_index + 1, len(candidates)):
-            pair = np.asarray(
-                [candidates[first_index], candidates[second_index]],
-                dtype=np.float32,
+    def solve_correspondence_candidates(
+        self,
+        correspondences: tuple[PoseGraphCorrespondence, ...] | list[PoseGraphCorrespondence],
+        image_size: tuple[int, int],
+        observed_graph: PoseGraph | None = None,
+        profile: dict[str, float | int] | None = None,
+    ) -> PosePnPResult | None:
+        max_seed_attempts = max(0, int(self.max_refinement_attempts))
+        refinement_budget = {"remaining": max(0, int(self.max_refinement_attempts))}
+        self.rejected_pose_result = None
+        for correspondence in tuple(correspondences)[:max_seed_attempts]:
+            if profile is not None:
+                profile["seed_attempts"] = int(profile.get("seed_attempts", 0)) + 1
+            result = self.solve_correspondences(
+                correspondence,
+                image_size,
+                observed_graph=observed_graph,
+                profile=profile,
+                refinement_budget=refinement_budget,
+                clear_rejected=False,
             )
-            score = float(np.mean(_piecewise_oklab_line_distances(points, pair) ** 2))
-            if score < best_score:
-                best_score = score
-                best_pair = pair
-    return best_pair
+            if result is not None:
+                return result
+        self.clear_last_tvec()
+        return None
+
+    def solve_correspondences(
+        self,
+        correspondence: PoseGraphCorrespondence | None,
+        image_size: tuple[int, int],
+        observed_graph: PoseGraph | None = None,
+        profile: dict[str, float | int] | None = None,
+        refinement_budget: dict[str, int] | None = None,
+        clear_rejected: bool = True,
+    ) -> PosePnPResult | None:
+        if clear_rejected:
+            self.rejected_pose_result = None
+        if correspondence is None:
+            return self.miss_pose_result(clear_temporal=clear_rejected)
+
+        original_correspondence = correspondence
+        camera_matrix = (
+            self.camera_matrix
+            if self.camera_matrix is not None
+            and self.accepted_pose_count >= max(0, int(self.camera_bootstrap_frames))
+            else None
+        )
+        lattice_transforms = (
+            (self.lattice_transform,)
+            if camera_matrix is not None and self.lattice_transform is not None
+            else CUBE_LATTICE_AXIS_TRANSFORMS
+        )
+        result = solve_best_lattice_graph_pnp_current(
+            np.asarray(correspondence.image_points, dtype=np.float32).reshape(-1, 2),
+            tuple(correspondence.lattice_coords),
+            image_size,
+            focal_min=self.focal_min,
+            focal_max=self.focal_max,
+            focal_steps=self.focal_steps,
+            camera_matrix=camera_matrix,
+            lattice_transforms=lattice_transforms,
+            previous_tvec=self.last_tvec,
+            profile=profile,
+        )
+        if result is None:
+            return self.miss_pose_result(clear_temporal=clear_rejected)
+        self.remember_rejected_pose_result(result, correspondence)
+        backface_only_count = pose_correspondence_backface_only_point_count(
+            correspondence,
+            result,
+        )
+        if profile is not None:
+            profile["pnp_backface_only_correspondence_points"] = backface_only_count
+        if backface_only_count > 0:
+            return self.miss_pose_result(clear_temporal=clear_rejected)
+        if observed_graph is None:
+            observed_error, observed_inlier_count, observed_point_count = observed_pose_graph_reprojection_score(
+                correspondence,
+                result,
+                observed_graph,
+                all_correspondence=original_correspondence,
+                inlier_threshold_px=self.inlier_threshold_px,
+            )
+        else:
+            (
+                observed_error,
+                observed_inlier_count,
+                observed_point_count,
+                invisible_observed_count,
+            ) = observed_pose_model_nearest_same_class_score(
+                result,
+                observed_graph,
+                inlier_threshold_px=self.inlier_threshold_px,
+            )
+            if profile is not None:
+                profile["pnp_observed_invisible_points"] = invisible_observed_count
+            backface_fit_count, _backface_tested_count = observed_pose_model_backface_fit_count(
+                result,
+                observed_graph,
+                inlier_threshold_px=self.inlier_threshold_px,
+            )
+            if profile is not None:
+                profile["pnp_backface_fit_points"] = backface_fit_count
+            if backface_fit_count >= 3:
+                self.remember_rejected_pose_result(result, correspondence, observed_error)
+                return self.miss_pose_result(clear_temporal=clear_rejected)
+        if observed_point_count < 3:
+            return self.miss_pose_result(clear_temporal=clear_rejected)
+        self.remember_rejected_pose_result(result, correspondence, observed_error)
+        if observed_error <= self.max_reprojection_error_px:
+            refined = refine_pose_correspondence_with_visible_observed_points(
+                correspondence,
+                result,
+                observed_graph,
+                image_size,
+                focal_min=self.focal_min,
+                focal_max=self.focal_max,
+                focal_steps=self.focal_steps,
+                camera_matrix=camera_matrix,
+                lattice_transforms=lattice_transforms,
+                previous_tvec=self.last_tvec,
+                max_attempts=1,
+                refinement_budget=refinement_budget,
+                accept_error_px=self.max_reprojection_error_px,
+                inlier_threshold_px=self.inlier_threshold_px,
+                profile=profile,
+                return_first_result=True,
+            )
+            if refined is None:
+                return self.accept_pose_result(result, correspondence, observed_error)
+            refined_correspondence, refined_result, refined_error = refined
+            if refined_error < observed_error:
+                return self.accept_pose_result(refined_result, refined_correspondence, refined_error)
+            return self.accept_pose_result(result, correspondence, observed_error)
+        if observed_error > self.refinement_reprojection_error_px:
+            return self.miss_pose_result(clear_temporal=clear_rejected)
+
+        refined = refine_pose_correspondence_with_visible_observed_points(
+            correspondence,
+            result,
+            observed_graph,
+            image_size,
+            focal_min=self.focal_min,
+            focal_max=self.focal_max,
+            focal_steps=self.focal_steps,
+            camera_matrix=camera_matrix,
+            lattice_transforms=lattice_transforms,
+            previous_tvec=self.last_tvec,
+            max_attempts=self.max_refinement_attempts,
+            refinement_budget=refinement_budget,
+            accept_error_px=self.max_reprojection_error_px,
+            inlier_threshold_px=self.inlier_threshold_px,
+            profile=profile,
+        )
+        if refined is None:
+            return self.miss_pose_result(clear_temporal=clear_rejected)
+        refined_correspondence, refined_result, refined_error = refined
+        return self.accept_pose_result(refined_result, refined_correspondence, refined_error)
+
+    def clear_last_tvec(self) -> None:
+        self.last_tvec = None
+
+    def miss_pose_result(self, *, clear_temporal: bool = True) -> None:
+        if clear_temporal:
+            self.clear_last_tvec()
+        return None
+
+    def remember_rejected_pose_result(
+        self,
+        result: PosePnPResult,
+        correspondence: PoseGraphCorrespondence,
+        observed_error: float | None = None,
+    ) -> None:
+        result.observed_reprojection_error = observed_error
+        result.point_names = tuple(str(coord) for coord in correspondence.lattice_coords)
+        result.pose_label = "graph-rejected"
+        candidate_error = float(getattr(result, "matched_error", float("inf")))
+        current_error = (
+            float("inf")
+            if self.rejected_pose_result is None
+            else float(getattr(self.rejected_pose_result, "matched_error", float("inf")))
+        )
+        if candidate_error < current_error:
+            self.rejected_pose_result = result
+
+    def accept_pose_result(
+        self,
+        result: PosePnPResult,
+        correspondence: PoseGraphCorrespondence,
+        observed_error: float,
+    ) -> PosePnPResult:
+        self.rejected_pose_result = None
+        result.observed_reprojection_error = observed_error
+        result.point_names = tuple(str(coord) for coord in correspondence.lattice_coords)
+        result.pose_label = "graph"
+        if getattr(result, "camera_matrix", None) is not None:
+            self.camera_matrix = np.asarray(result.camera_matrix, dtype=np.float64).reshape(3, 3).copy()
+        if getattr(result, "tvec", None) is not None:
+            self.last_tvec = np.asarray(result.tvec, dtype=np.float64).reshape(3, 1).copy()
+        self.lattice_transform = getattr(result, "lattice_transform", CUBE_LATTICE_IDENTITY_TRANSFORM)
+        self.accepted_pose_count += 1
+        return result
+
+    def reset_temporal_tracking(self) -> None:
+        self.camera_matrix = None
+        self.lattice_transform = None
+        self.rejected_pose_result = None
+        self.last_tvec = None
+        self.accepted_pose_count = 0
 
 
-def _piecewise_oklab_line_distances(points: np.ndarray, breakpoint: np.ndarray) -> np.ndarray:
-    samples = np.asarray(points, dtype=np.float32).reshape(-1, 3)
-    pivots = np.asarray(breakpoint, dtype=np.float32).reshape(2, 3)
-    white = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
-    black = np.zeros(3, dtype=np.float32)
-    return np.minimum.reduce(
-        [
-            _oklab_point_to_segment_distances(samples, white, pivots[0]),
-            _oklab_point_to_segment_distances(samples, pivots[0], pivots[1]),
-            _oklab_point_to_segment_distances(samples, pivots[1], black),
-        ]
+def prune_high_error_pose_graph_correspondence(
+    correspondence: PoseGraphCorrespondence,
+    result: PosePnPResult,
+    *,
+    max_error_px: float,
+) -> PoseGraphCorrespondence | None:
+    image_points = np.asarray(correspondence.image_points, dtype=np.float32).reshape(-1, 2)
+    projected_object_points = getattr(result, "projected_object_points", None)
+    if projected_object_points is None:
+        return None
+    projected_points = np.asarray(projected_object_points, dtype=np.float32).reshape(-1, 2)
+    if len(image_points) != len(projected_points) or len(image_points) <= 3:
+        return None
+
+    reprojection_errors = np.linalg.norm(projected_points - image_points, axis=1)
+    keep_mask = reprojection_errors <= float(max_error_px)
+    if bool(np.all(keep_mask)):
+        return None
+    if int(np.count_nonzero(keep_mask)) < 3:
+        return None
+
+    return PoseGraphCorrespondence(
+        image_points=image_points[keep_mask],
+        object_points=np.asarray(correspondence.object_points, dtype=np.float32).reshape(-1, 3)[keep_mask],
+        graph_indexes=tuple(
+            graph_index
+            for graph_index, keep in zip(correspondence.graph_indexes, keep_mask)
+            if bool(keep)
+        ),
+        lattice_coords=tuple(
+            coord
+            for coord, keep in zip(correspondence.lattice_coords, keep_mask)
+            if bool(keep)
+        ),
     )
+
+
+def observed_pose_graph_reprojection_error(
+    correspondence: PoseGraphCorrespondence,
+    result: PosePnPResult,
+    observed_graph: PoseGraph | None,
+    all_correspondence: PoseGraphCorrespondence | None = None,
+) -> float:
+    return observed_pose_graph_reprojection_score(
+        correspondence,
+        result,
+        observed_graph,
+        all_correspondence=all_correspondence,
+        inlier_threshold_px=PNP_INLIER_THRESHOLD_PX,
+    )[0]
+
+
+def observed_pose_graph_reprojection_score(
+    correspondence: PoseGraphCorrespondence,
+    result: PosePnPResult,
+    observed_graph: PoseGraph | None,
+    *,
+    all_correspondence: PoseGraphCorrespondence | None = None,
+    inlier_threshold_px: float,
+) -> tuple[float, int, int]:
+    fallback_error = float(getattr(result, "matched_error", float("inf")))
+    if observed_graph is None:
+        fallback_inlier_count = int(fallback_error <= float(inlier_threshold_px)) * len(
+            correspondence.image_points
+        )
+        return fallback_error, fallback_inlier_count, len(correspondence.image_points)
+    if any(
+        getattr(result, attribute, None) is None
+        for attribute in ("rvec", "tvec", "camera_matrix", "dist_coeffs")
+    ):
+        return float("inf"), 0, len(correspondence.image_points)
+
+    retained_indexes = set(correspondence.graph_indexes)
+    source_correspondence = all_correspondence or correspondence
+    graph_indexes = []
+    object_points = []
+    transformed_object_points = cube_lattice_points_for_coords(
+        tuple(source_correspondence.lattice_coords),
+        lattice_transform=getattr(result, "lattice_transform", CUBE_LATTICE_IDENTITY_TRANSFORM),
+    )
+    for graph_index, object_point in zip(
+        source_correspondence.graph_indexes,
+        transformed_object_points,
+    ):
+        if graph_index not in retained_indexes:
+            continue
+        graph_indexes.append(graph_index)
+        object_points.append(object_point)
+    if not object_points:
+        return float("inf"), 0, 0
+
+    try:
+        projected_points, _ = cv2.projectPoints(
+            np.asarray(object_points, dtype=np.float32).reshape(-1, 3),
+            result.rvec,
+            result.tvec,
+            result.camera_matrix,
+            result.dist_coeffs,
+        )
+    except cv2.error:
+        return float("inf"), 0, len(object_points)
+    projected_points = projected_points.reshape(-1, 2)
+
+    observed_errors = []
+    for graph_index, projected_point in zip(graph_indexes, projected_points):
+        if graph_index < 0 or graph_index >= len(observed_graph.points):
+            continue
+        observed_point = np.asarray(observed_graph.points[graph_index].xy, dtype=np.float32)
+        observed_errors.append(float(np.linalg.norm(projected_point - observed_point)))
+    if not observed_errors:
+        return float("inf"), 0, len(object_points)
+    inlier_count = sum(error <= float(inlier_threshold_px) for error in observed_errors)
+    return float(np.mean(observed_errors)), int(inlier_count), len(observed_errors)
+
+
+def refine_pose_correspondence_with_visible_observed_points(
+    correspondence: PoseGraphCorrespondence,
+    result: PosePnPResult,
+    observed_graph: PoseGraph | None,
+    image_size: tuple[int, int],
+    *,
+    focal_min: float,
+    focal_max: float,
+    focal_steps: int,
+    camera_matrix: np.ndarray | None,
+    lattice_transforms: tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...],
+    max_attempts: int,
+    refinement_budget: dict[str, int] | None,
+    accept_error_px: float,
+    inlier_threshold_px: float,
+    previous_tvec: np.ndarray | None = None,
+    profile: dict[str, float | int] | None = None,
+    return_first_result: bool = False,
+) -> tuple[PoseGraphCorrespondence, PosePnPResult, float] | None:
+    if observed_graph is None:
+        return None
+
+    used_graph_indexes = set(correspondence.graph_indexes)
+    used_lattice_coords = set(correspondence.lattice_coords)
+    candidate_graph_indexes = [
+        index
+        for index, point in enumerate(observed_graph.points)
+        if index not in used_graph_indexes
+        and point.class_name in CUBE_LATTICE_COORDS_BY_CLASS
+    ]
+    candidate_graph_indexes.sort(
+        key=lambda index: (
+            -observed_point_distance_to_nearest_correspondence_point(
+                observed_graph.points[index],
+                correspondence,
+            ),
+            -observed_graph.points[index].score,
+            index,
+        )
+    )
+    remaining_attempts = max(0, int(max_attempts))
+    if refinement_budget is not None:
+        remaining_attempts = min(
+            remaining_attempts,
+            max(0, int(refinement_budget.get("remaining", 0))),
+        )
+    candidate_graph_indexes = candidate_graph_indexes[:remaining_attempts]
+    if profile is not None:
+        profile["refinement_candidates"] = len(candidate_graph_indexes)
+
+    for graph_index in candidate_graph_indexes:
+        if refinement_budget is not None:
+            if refinement_budget["remaining"] <= 0:
+                break
+            refinement_budget["remaining"] -= 1
+        observed_point = observed_graph.points[graph_index]
+        nearest_coord = nearest_visible_lattice_coord_for_observed_point(
+            observed_point,
+            result,
+            used_lattice_coords=used_lattice_coords,
+        )
+        if nearest_coord is None:
+            continue
+
+        augmented = append_pose_graph_correspondence(
+            correspondence,
+            graph_index,
+            observed_point.xy,
+            nearest_coord,
+        )
+        refined_result = solve_best_lattice_graph_pnp_current(
+            np.asarray(augmented.image_points, dtype=np.float32).reshape(-1, 2),
+            tuple(augmented.lattice_coords),
+            image_size,
+            focal_min=focal_min,
+            focal_max=focal_max,
+            focal_steps=focal_steps,
+            camera_matrix=camera_matrix,
+            lattice_transforms=lattice_transforms,
+            previous_tvec=previous_tvec,
+            profile=profile,
+        )
+        if refined_result is None:
+            continue
+        backface_only_count = pose_correspondence_backface_only_point_count(
+            augmented,
+            refined_result,
+        )
+        if profile is not None:
+            profile["refinement_backface_only_correspondence_points"] = backface_only_count
+        if backface_only_count > 0:
+            continue
+        refined_error, _inlier_count, refined_point_count, _invisible_count = (
+            observed_pose_model_nearest_same_class_score(
+                refined_result,
+                observed_graph,
+                inlier_threshold_px=inlier_threshold_px,
+            )
+        )
+        backface_fit_count, _backface_tested_count = observed_pose_model_backface_fit_count(
+            refined_result,
+            observed_graph,
+            inlier_threshold_px=inlier_threshold_px,
+        )
+        if profile is not None:
+            profile["refinement_attempts"] = int(profile.get("refinement_attempts", 0)) + 1
+            profile["refinement_backface_fit_points"] = backface_fit_count
+        if backface_fit_count >= 3:
+            continue
+        if refined_point_count >= 3 and (
+            refined_error <= float(accept_error_px) or bool(return_first_result)
+        ):
+            refined_result.refinement_graph_index = int(graph_index)
+            refined_result.refinement_lattice_coord = nearest_coord
+            return augmented, refined_result, refined_error
+    return None
+
+
+def observed_point_distance_to_nearest_correspondence_point(
+    point: PoseGraphPoint,
+    correspondence: PoseGraphCorrespondence,
+) -> float:
+    image_points = np.asarray(correspondence.image_points, dtype=np.float32).reshape(-1, 2)
+    if image_points.size == 0:
+        return 0.0
+    point_xy = np.asarray(point.xy, dtype=np.float32).reshape(1, 2)
+    distances = np.linalg.norm(image_points - point_xy, axis=1)
+    return float(np.min(distances))
+
+
+def append_pose_graph_correspondence(
+    correspondence: PoseGraphCorrespondence,
+    graph_index: int,
+    image_xy: tuple[float, float],
+    lattice_coord: tuple[int, int, int],
+) -> PoseGraphCorrespondence:
+    lattice_coords = (*correspondence.lattice_coords, lattice_coord)
+    image_points = np.concatenate(
+        [
+            np.asarray(correspondence.image_points, dtype=np.float32).reshape(-1, 2),
+            np.asarray(image_xy, dtype=np.float32).reshape(1, 2),
+        ],
+        axis=0,
+    )
+    return PoseGraphCorrespondence(
+        image_points=image_points,
+        object_points=cube_lattice_points_for_coords(lattice_coords),
+        graph_indexes=(*correspondence.graph_indexes, int(graph_index)),
+        lattice_coords=lattice_coords,
+    )
+
+
+def nearest_visible_lattice_coord_for_observed_point(
+    observed_point: PoseGraphPoint,
+    result: PosePnPResult,
+    *,
+    used_lattice_coords: set[tuple[int, int, int]],
+) -> tuple[int, int, int] | None:
+    entries = visible_projected_lattice_points_for_class(result, observed_point.class_name)
+    if not entries:
+        return None
+    observed_xy = np.asarray(observed_point.xy, dtype=np.float32)
+    usable_entries = [
+        (coord, projected_xy)
+        for coord, projected_xy in entries
+        if coord not in used_lattice_coords
+    ]
+    if not usable_entries:
+        return None
+    coord, _projected = min(
+        usable_entries,
+        key=lambda entry: float(np.linalg.norm(np.asarray(entry[1], dtype=np.float32) - observed_xy)),
+    )
+    return coord
+
+
+def visible_projected_lattice_points_for_class(
+    result: PosePnPResult,
+    class_name: str,
+) -> list[tuple[tuple[int, int, int], np.ndarray]]:
+    coords = CUBE_LATTICE_COORDS_BY_CLASS.get(class_name)
+    if not coords:
+        return []
+    if any(
+        getattr(result, attribute, None) is None
+        for attribute in ("rvec", "tvec", "camera_matrix", "dist_coeffs")
+    ):
+        return []
+
+    object_points = cube_lattice_points_for_coords(
+        coords,
+        lattice_transform=getattr(result, "lattice_transform", CUBE_LATTICE_IDENTITY_TRANSFORM),
+    )
+    visible = [
+        (coord, object_point)
+        for coord, object_point in zip(coords, object_points)
+        if result_object_point_has_visible_surface(object_point, result)
+    ]
+    if not visible:
+        return []
+    visible_coords, visible_object_points = zip(*visible)
+    try:
+        projected_points, _ = cv2.projectPoints(
+            np.asarray(visible_object_points, dtype=np.float32).reshape(-1, 3),
+            result.rvec,
+            result.tvec,
+            result.camera_matrix,
+            result.dist_coeffs,
+        )
+    except cv2.error:
+        return []
+    return [
+        (coord, projected_xy)
+        for coord, projected_xy in zip(visible_coords, projected_points.reshape(-1, 2))
+    ]
 
 
 class ColorDensityClassifier:
@@ -502,32 +933,14 @@ class ColorDensityClassifier:
         required_frames: int = 30,
         cluster_count: int = 6,
         min_brightness: float = 40.0,
-        max_brightness: float | None = None,
-        density_cluster_eps: float = DENSITY_CLUSTER_EPS,
-        density_cluster_eps_reference_rgb: float = DENSITY_CLUSTER_EPS_REFERENCE_RGB,
+        density_cluster_eps_radians: float = DENSITY_CLUSTER_EPS_RADIANS,
         density_cluster_min_neighbors: int = DENSITY_CLUSTER_MIN_POINTS,
-        max_cluster_distance: float | None = None,
-        cluster_merge_ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
     ) -> None:
         self.required_frames = max(1, required_frames)
         self.cluster_count = max(1, cluster_count)
         self.min_brightness = min_brightness
-        self.max_brightness = float(max_brightness) if max_brightness is not None else None
-        self.density_cluster_eps = max(float(density_cluster_eps), 1e-6)
-        self.density_cluster_eps_reference_rgb = max(
-            float(density_cluster_eps_reference_rgb),
-            1e-6,
-        )
+        self.density_cluster_eps_radians = density_cluster_eps_radians
         self.density_cluster_min_neighbors = max(1, density_cluster_min_neighbors)
-        self.cluster_merge_ray_distance_divisor = max(
-            float(cluster_merge_ray_distance_divisor),
-            1e-6,
-        )
-        self.max_cluster_distance = (
-            float(max_cluster_distance)
-            if max_cluster_distance is not None
-            else self.density_cluster_eps
-        )
         self.detected_frames = 0
         self._rgb_samples: list[np.ndarray] = []
         self.centroids = np.empty((0, 3), dtype=np.float32)
@@ -551,11 +964,8 @@ class ColorDensityClassifier:
             np.asarray(self._rgb_samples, dtype=np.uint8),
             target_clusters=self.cluster_count,
             min_brightness=self.min_brightness,
-            max_brightness=self.max_brightness,
-            eps=self.density_cluster_eps,
-            eps_reference_rgb=self.density_cluster_eps_reference_rgb,
+            eps_radians=self.density_cluster_eps_radians,
             min_points=self.density_cluster_min_neighbors,
-            merge_ray_distance_divisor=self.cluster_merge_ray_distance_divisor,
         )
 
     def classify_bgr(self, bgr_sample: np.ndarray) -> int | None:
@@ -563,17 +973,14 @@ class ColorDensityClassifier:
             return None
 
         rgb = np.asarray(bgr_sample, dtype=np.float32).reshape(3)[::-1]
-        brightness = float(np.linalg.norm(rgb))
-        if brightness < self.min_brightness:
-            return None
-        if self.max_brightness is not None and brightness > self.max_brightness:
+        if float(np.linalg.norm(rgb)) < self.min_brightness:
             return None
 
-        distances = distances_to_rgb_clusters(
+        distances = angular_distance_to_normalized_rgb_clusters(
             rgb,
             self.cluster_samples,
         )
-        if len(distances) == 0 or float(distances.min()) > self.max_cluster_distance:
+        if len(distances) == 0 or float(distances.min()) > self.density_cluster_eps_radians:
             return None
         return int(distances.argmin())
 
@@ -592,2885 +999,27 @@ class ColorDensityClassifier:
         return int(np.bincount(np.asarray(votes, dtype=np.int32)).argmax())
 
 
-class HSVColorDensityClassifier:
-    def __init__(
-        self,
-        *,
-        required_frames: int = 30,
-        cluster_count: int = 6,
-        min_brightness: float = 40.0,
-        max_brightness: float | None = None,
-        density_cluster_eps: float = HSV_DENSITY_CLUSTER_EPS,
-        density_cluster_min_neighbors: int = HSV_DENSITY_CLUSTER_MIN_POINTS,
-        max_cluster_distance: float | None = None,
-    ) -> None:
-        self.required_frames = max(1, required_frames)
-        self.cluster_count = max(1, cluster_count)
-        self.min_brightness = min_brightness
-        self.max_brightness = float(max_brightness) if max_brightness is not None else None
-        self.density_cluster_eps = max(float(density_cluster_eps), 1e-6)
-        self.density_cluster_min_neighbors = max(1, int(density_cluster_min_neighbors))
-        self.max_cluster_distance = (
-            float(max_cluster_distance)
-            if max_cluster_distance is not None
-            else self.density_cluster_eps
-        )
-        self.detected_frames = 0
-        self._bgr_samples: list[np.ndarray] = []
-        self.centroids = np.empty((0, 3), dtype=np.float32)
-        self.cluster_samples: list[np.ndarray] = []
-        self.hsv_cluster_samples: list[np.ndarray] = []
+def normalized_rgb_points(rgb_samples: np.ndarray) -> np.ndarray:
+    samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
+    brightness = np.maximum(np.linalg.norm(samples, axis=1, keepdims=True), 1.0)
+    return samples / brightness
 
-    @property
-    def ready(self) -> bool:
-        return len(self.hsv_cluster_samples) > 0
 
-    def observe_frame(self, bgr_samples: np.ndarray) -> None:
-        if self.ready or len(bgr_samples) == 0:
-            return
-
-        bgr_samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
-        self._bgr_samples.extend(bgr_samples)
-        self.detected_frames += 1
-        if self.detected_frames < self.required_frames:
-            return
-
-        _labels, self.centroids, self.cluster_samples, self.hsv_cluster_samples = (
-            density_hsv_cluster_memberships(
-                np.asarray(self._bgr_samples, dtype=np.uint8),
-                target_clusters=self.cluster_count,
-                min_brightness=self.min_brightness,
-                max_brightness=self.max_brightness,
-                eps=self.density_cluster_eps,
-                min_points=self.density_cluster_min_neighbors,
-            )
-        )
-
-    def classify_bgr(self, bgr_sample: np.ndarray) -> int | None:
-        if not self.ready:
-            return None
-
-        hsv = bgr_samples_to_hsv(np.asarray(bgr_sample, dtype=np.uint8).reshape(1, 3))[0]
-        brightness = float(hsv[2])
-        if brightness < self.min_brightness:
-            return None
-        if self.max_brightness is not None and brightness > self.max_brightness:
-            return None
-
-        distances = distances_to_hsv_clusters(hsv, self.hsv_cluster_samples)
-        if len(distances) == 0 or float(distances.min()) > self.max_cluster_distance:
-            return None
-        return int(distances.argmin())
-
-    def classify_bgr_samples(self, bgr_samples: np.ndarray) -> int | None:
-        if not self.ready:
-            return None
-
-        samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
-        votes = [
-            cluster_index
-            for sample in samples
-            if (cluster_index := self.classify_bgr(sample)) is not None
-        ]
-        if not votes:
-            return None
-        return int(np.bincount(np.asarray(votes, dtype=np.int32)).argmax())
-
-
-class OklabGMMColorClassifier:
-    """Fit a standard full-covariance GMM in Oklab after sample collection."""
-
-    def __init__(
-        self,
-        *,
-        required_frames: int = 30,
-        cluster_count: int = 6,
-        min_brightness: float = 40.0,
-        max_brightness: float | None = None,
-        l_compression_factor: float = OKLAB_L_COMPRESSION_FACTOR,
-    ) -> None:
-        self.required_frames = max(1, required_frames)
-        self.cluster_count = max(1, cluster_count)
-        self.min_brightness = float(min_brightness)
-        self.max_brightness = float(max_brightness) if max_brightness is not None else None
-        self.l_compression_factor = max(float(l_compression_factor), 1e-6)
-        self.detected_frames = 0
-        self._bgr_samples: list[np.ndarray] = []
-        self.centroids = np.empty((0, 3), dtype=np.float32)  # original RGB, for display
-        self.oklab_centroids = np.empty((0, 3), dtype=np.float32)
-        self.covariances = np.empty((0, 3, 3), dtype=np.float32)
-        self.weights = np.empty(0, dtype=np.float32)
-        self.cluster_samples: list[np.ndarray] = []
-        self.polyline_models: list[dict[str, np.ndarray | float]] = []
-
-    @property
-    def ready(self) -> bool:
-        return len(self.oklab_centroids) > 0
-
-    def observe_frame(self, bgr_samples: np.ndarray) -> None:
-        if self.ready or len(bgr_samples) == 0:
-            return
-        samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
-        self._bgr_samples.extend(samples)
-        self.detected_frames += 1
-        if self.detected_frames < self.required_frames:
-            return
-
-        bgr = np.asarray(self._bgr_samples, dtype=np.uint8)
-        oklab = bgr_samples_to_oklab(bgr)
-        compressed_oklab = compress_oklab_l(oklab, self.l_compression_factor)
-        (
-            _labels,
-            self.oklab_centroids,
-            self.cluster_samples,
-            self.polyline_models,
-            self.weights,
-        ) = oklab_polyline_cluster_memberships(
-            compressed_oklab,
-            original_oklab_samples=oklab,
-            target_clusters=self.cluster_count,
-            min_brightness=self.min_brightness / self.l_compression_factor,
-            max_brightness=(
-                self.max_brightness / self.l_compression_factor
-                if self.max_brightness is not None
-                else None
-            ),
-        )
-        self.centroids = oklab_to_rgb(self.oklab_centroids)
-
-    def classify_bgr(self, bgr_sample: np.ndarray) -> int | None:
-        if not self.ready:
-            return None
-        bgr = np.asarray(bgr_sample, dtype=np.uint8).reshape(1, 3)
-        oklab = bgr_samples_to_oklab(bgr)[0]
-        lightness = float(oklab[0]) * 255.0
-        if lightness < self.min_brightness:
-            return None
-        if self.max_brightness is not None and lightness > self.max_brightness:
-            return None
-        log_likelihoods = polyline_cluster_log_likelihoods(
-            oklab,
-            self.polyline_models,
-            self.weights,
-        )
-        if len(log_likelihoods) == 0 or not np.isfinite(log_likelihoods).any():
-            return None
-        return int(log_likelihoods.argmax())
-
-    def classify_bgr_samples(self, bgr_samples: np.ndarray) -> int | None:
-        if not self.ready:
-            return None
-        votes = [
-            cluster_index
-            for sample in np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
-            if (cluster_index := self.classify_bgr(sample)) is not None
-        ]
-        if not votes:
-            return None
-        return int(np.bincount(np.asarray(votes, dtype=np.int32)).argmax())
-
-
-class BalancedGMMColorClassifier:
-    def __init__(
-        self,
-        *,
-        required_frames: int = 30,
-        cluster_count: int = 6,
-        min_brightness: float = 40.0,
-        max_brightness: float | None = None,
-        max_mahalanobis_distance: float = GMM_MAX_MAHALANOBIS_DISTANCE,
-        regularization: float = GMM_REGULARIZATION,
-        ray_variance_floor: float = GMM_RAY_VARIANCE_FLOOR,
-        constrain_covariance_to_ray: bool = GMM_CONSTRAIN_COVARIANCE_TO_RAY,
-        perpendicular_variance_floor: float = GMM_PERPENDICULAR_VARIANCE_FLOOR,
-        perpendicular_variance_ceiling: float = GMM_PERPENDICULAR_VARIANCE_CEILING,
-        dense_core_k_neighbors: int = GMM_DENSE_CORE_K_NEIGHBORS,
-        dense_core_quantile: float = GMM_DENSE_CORE_QUANTILE,
-        prior_rgb_values: np.ndarray | None = None,
-        prior_strength: float = GMM_PRIOR_STRENGTH,
-        min_assignment_confidence: float = GMM_MIN_ASSIGNMENT_CONFIDENCE,
-        assignment_balance: float = GMM_ASSIGNMENT_BALANCE,
-        balance_iterations: int = GMM_BALANCE_ITERATIONS,
-        max_iterations: int = GMM_MAX_ITERATIONS,
-        tolerance: float = GMM_TOLERANCE,
-    ) -> None:
-        self.required_frames = max(1, required_frames)
-        self.cluster_count = max(1, cluster_count)
-        self.min_brightness = min_brightness
-        self.max_brightness = float(max_brightness) if max_brightness is not None else None
-        self.max_mahalanobis_distance = max(float(max_mahalanobis_distance), 1e-6)
-        self.regularization = max(float(regularization), 1e-6)
-        self.ray_variance_floor = max(float(ray_variance_floor), 0.0)
-        self.constrain_covariance_to_ray = bool(constrain_covariance_to_ray)
-        self.perpendicular_variance_floor = max(float(perpendicular_variance_floor), 1e-6)
-        self.perpendicular_variance_ceiling = max(float(perpendicular_variance_ceiling), 0.0)
-        self.dense_core_k_neighbors = max(0, int(dense_core_k_neighbors))
-        self.dense_core_quantile = float(np.clip(dense_core_quantile, 0.0, 0.9999))
-        self.prior_rgb_values = _valid_rgb_prior_values(prior_rgb_values)
-        self.prior_strength = float(np.clip(prior_strength, 0.0, 1.0))
-        self.min_assignment_confidence = float(np.clip(min_assignment_confidence, 0.0, 1.0))
-        self.assignment_balance = float(np.clip(assignment_balance, 0.0, 1.0))
-        self.balance_iterations = max(1, int(balance_iterations))
-        self.max_iterations = max(1, int(max_iterations))
-        self.tolerance = max(float(tolerance), 0.0)
-        self.detected_frames = 0
-        self._rgb_samples: list[np.ndarray] = []
-        self.centroids = np.empty((0, 3), dtype=np.float32)
-        self.covariances = np.empty((0, 3, 3), dtype=np.float32)
-        self.precisions = np.empty((0, 3, 3), dtype=np.float32)
-        self.cluster_samples: list[np.ndarray] = []
-
-    @property
-    def ready(self) -> bool:
-        return len(self.cluster_samples) > 0
-
-    def observe_frame(self, bgr_samples: np.ndarray) -> None:
-        if self.ready or len(bgr_samples) == 0:
-            return
-
-        bgr_samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
-        self._rgb_samples.extend(bgr_samples[:, ::-1])
-        self.detected_frames += 1
-        if self.detected_frames < self.required_frames:
-            return
-
-        memberships = balanced_gmm_rgb_cluster_memberships(
-            np.asarray(self._rgb_samples, dtype=np.uint8),
-            target_clusters=self.cluster_count,
-            min_brightness=self.min_brightness,
-            max_brightness=self.max_brightness,
-            max_mahalanobis_distance=self.max_mahalanobis_distance,
-            regularization=self.regularization,
-            ray_variance_floor=self.ray_variance_floor,
-            constrain_covariance_to_ray=self.constrain_covariance_to_ray,
-            perpendicular_variance_floor=self.perpendicular_variance_floor,
-            perpendicular_variance_ceiling=self.perpendicular_variance_ceiling,
-            dense_core_k_neighbors=self.dense_core_k_neighbors,
-            dense_core_quantile=self.dense_core_quantile,
-            prior_rgb_values=self.prior_rgb_values,
-            prior_strength=self.prior_strength,
-            min_assignment_confidence=self.min_assignment_confidence,
-            assignment_balance=self.assignment_balance,
-            balance_iterations=self.balance_iterations,
-            max_iterations=self.max_iterations,
-            tolerance=self.tolerance,
-        )
-        _labels, self.centroids, self.cluster_samples, self.covariances, self.precisions = memberships
-
-    def classify_bgr(self, bgr_sample: np.ndarray) -> int | None:
-        if not self.ready:
-            return None
-
-        rgb = np.asarray(bgr_sample, dtype=np.float32).reshape(3)[::-1]
-        brightness = float(np.linalg.norm(rgb))
-        if brightness < self.min_brightness:
-            return None
-        if self.max_brightness is not None and brightness > self.max_brightness:
-            return None
-
-        log_probabilities, _precisions = _gmm_log_probabilities(
-            rgb.reshape(1, 3),
-            self.centroids,
-            self.covariances,
-            regularization=self.regularization,
-        )
-        responsibilities = _gmm_unbalanced_responsibilities(log_probabilities)
-        if responsibilities.size == 0:
-            return None
-        cluster_index = int(responsibilities[0].argmax())
-        confidence = float(responsibilities[0, cluster_index])
-        if confidence < self.min_assignment_confidence:
-            return None
-
-        distances = mahalanobis_distances_to_rgb_clusters(rgb, self.centroids, self.precisions)
-        if len(distances) == 0 or float(distances[cluster_index]) > self.max_mahalanobis_distance:
-            return None
-        return cluster_index
-
-    def classify_bgr_samples(self, bgr_samples: np.ndarray) -> int | None:
-        if not self.ready:
-            return None
-
-        samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
-        votes = [
-            cluster_index
-            for sample in samples
-            if (cluster_index := self.classify_bgr(sample)) is not None
-        ]
-        if not votes:
-            return None
-        return int(np.bincount(np.asarray(votes, dtype=np.int32)).argmax())
-
-
-class BalancedRayColorClassifier:
-    def __init__(
-        self,
-        *,
-        required_frames: int = 30,
-        cluster_count: int = 6,
-        min_brightness: float = 40.0,
-        max_brightness: float | None = None,
-        max_angle_radians: float = RAY_MAX_ANGLE_RADIANS,
-        assignment_balance: float = GMM_ASSIGNMENT_BALANCE,
-        assignment_sharpness: float = RAY_ASSIGNMENT_SHARPNESS,
-        balance_iterations: int = RAY_BALANCE_ITERATIONS,
-        max_iterations: int = RAY_MAX_ITERATIONS,
-    ) -> None:
-        self.required_frames = max(1, required_frames)
-        self.cluster_count = max(1, cluster_count)
-        self.min_brightness = min_brightness
-        self.max_brightness = float(max_brightness) if max_brightness is not None else None
-        self.max_angle_radians = max(float(max_angle_radians), 1e-6)
-        self.assignment_balance = float(np.clip(assignment_balance, 0.0, 1.0))
-        self.assignment_sharpness = max(float(assignment_sharpness), 1e-6)
-        self.balance_iterations = max(1, int(balance_iterations))
-        self.max_iterations = max(1, int(max_iterations))
-        self.detected_frames = 0
-        self._rgb_samples: list[np.ndarray] = []
-        self.centroids = np.empty((0, 3), dtype=np.float32)
-        self.ray_directions = np.empty((0, 3), dtype=np.float32)
-        self.cluster_samples: list[np.ndarray] = []
-
-    @property
-    def ready(self) -> bool:
-        return len(self.cluster_samples) > 0
-
-    def observe_frame(self, bgr_samples: np.ndarray) -> None:
-        if self.ready or len(bgr_samples) == 0:
-            return
-
-        bgr_samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
-        self._rgb_samples.extend(bgr_samples[:, ::-1])
-        self.detected_frames += 1
-        if self.detected_frames < self.required_frames:
-            return
-
-        memberships = balanced_ray_rgb_cluster_memberships(
-            np.asarray(self._rgb_samples, dtype=np.uint8),
-            target_clusters=self.cluster_count,
-            min_brightness=self.min_brightness,
-            max_brightness=self.max_brightness,
-            max_angle_radians=self.max_angle_radians,
-            assignment_balance=self.assignment_balance,
-            assignment_sharpness=self.assignment_sharpness,
-            balance_iterations=self.balance_iterations,
-            max_iterations=self.max_iterations,
-        )
-        _labels, self.centroids, self.cluster_samples, self.ray_directions = memberships
-
-    def classify_bgr(self, bgr_sample: np.ndarray) -> int | None:
-        if not self.ready:
-            return None
-
-        rgb = np.asarray(bgr_sample, dtype=np.float32).reshape(3)[::-1]
-        brightness = float(np.linalg.norm(rgb))
-        if brightness < self.min_brightness:
-            return None
-        if self.max_brightness is not None and brightness > self.max_brightness:
-            return None
-
-        angles = angles_to_rgb_rays(rgb, self.ray_directions)
-        if len(angles) == 0 or float(angles.min()) > self.max_angle_radians:
-            return None
-        return int(angles.argmin())
-
-    def classify_bgr_samples(self, bgr_samples: np.ndarray) -> int | None:
-        if not self.ready:
-            return None
-
-        samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
-        votes = [
-            cluster_index
-            for sample in samples
-            if (cluster_index := self.classify_bgr(sample)) is not None
-        ]
-        if not votes:
-            return None
-        return int(np.bincount(np.asarray(votes, dtype=np.int32)).argmax())
-
-
-class DensityPeakColorClassifier:
-    def __init__(
-        self,
-        *,
-        required_frames: int = 30,
-        cluster_count: int = 6,
-        min_brightness: float = 40.0,
-        max_brightness: float | None = None,
-        k_neighbors: int = DENSITY_PEAK_K_NEIGHBORS,
-        max_fit_samples: int = DENSITY_PEAK_MAX_FIT_SAMPLES,
-        min_peak_distance: float = DENSITY_PEAK_MIN_PEAK_DISTANCE,
-        max_cluster_distance: float | None = None,
-    ) -> None:
-        self.required_frames = max(1, required_frames)
-        self.cluster_count = max(1, cluster_count)
-        self.min_brightness = min_brightness
-        self.max_brightness = float(max_brightness) if max_brightness is not None else None
-        self.k_neighbors = max(1, int(k_neighbors))
-        self.max_fit_samples = max(1, int(max_fit_samples))
-        self.min_peak_distance = max(float(min_peak_distance), 0.0)
-        self.max_cluster_distance = (
-            float(max_cluster_distance)
-            if max_cluster_distance is not None
-            else float(min_peak_distance) * 2.0
-        )
-        self.detected_frames = 0
-        self._rgb_samples: list[np.ndarray] = []
-        self.centroids = np.empty((0, 3), dtype=np.float32)
-        self.cluster_samples: list[np.ndarray] = []
-
-    @property
-    def ready(self) -> bool:
-        return len(self.cluster_samples) > 0
-
-    def observe_frame(self, bgr_samples: np.ndarray) -> None:
-        if self.ready or len(bgr_samples) == 0:
-            return
-
-        bgr_samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
-        self._rgb_samples.extend(bgr_samples[:, ::-1])
-        self.detected_frames += 1
-        if self.detected_frames < self.required_frames:
-            return
-
-        _labels, self.centroids, self.cluster_samples = density_peak_rgb_cluster_memberships(
-            np.asarray(self._rgb_samples, dtype=np.uint8),
-            target_clusters=self.cluster_count,
-            min_brightness=self.min_brightness,
-            max_brightness=self.max_brightness,
-            k_neighbors=self.k_neighbors,
-            max_fit_samples=self.max_fit_samples,
-            min_peak_distance=self.min_peak_distance,
-        )
-
-    def classify_bgr(self, bgr_sample: np.ndarray) -> int | None:
-        if not self.ready:
-            return None
-
-        rgb = np.asarray(bgr_sample, dtype=np.float32).reshape(3)[::-1]
-        brightness = float(np.linalg.norm(rgb))
-        if brightness < self.min_brightness:
-            return None
-        if self.max_brightness is not None and brightness > self.max_brightness:
-            return None
-
-        distances = distances_to_rgb_clusters(rgb, self.cluster_samples)
-        if len(distances) == 0 or float(distances.min()) > self.max_cluster_distance:
-            return None
-        return int(distances.argmin())
-
-    def classify_bgr_samples(self, bgr_samples: np.ndarray) -> int | None:
-        if not self.ready:
-            return None
-
-        samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
-        votes = [
-            cluster_index
-            for sample in samples
-            if (cluster_index := self.classify_bgr(sample)) is not None
-        ]
-        if not votes:
-            return None
-        return int(np.bincount(np.asarray(votes, dtype=np.int32)).argmax())
-
-
-class DenseRayColorClassifier:
-    def __init__(
-        self,
-        *,
-        required_frames: int = 30,
-        cluster_count: int = 6,
-        min_brightness: float = 40.0,
-        max_brightness: float | None = None,
-        k_neighbors: int = DENSE_RAY_K_NEIGHBORS,
-        max_fit_samples: int = DENSE_RAY_MAX_FIT_SAMPLES,
-        min_anchor_distance: float = DENSE_RAY_MIN_ANCHOR_DISTANCE,
-        max_ray_distance: float = DENSE_RAY_MAX_DISTANCE,
-    ) -> None:
-        self.required_frames = max(1, required_frames)
-        self.cluster_count = max(1, cluster_count)
-        self.min_brightness = min_brightness
-        self.max_brightness = float(max_brightness) if max_brightness is not None else None
-        self.k_neighbors = max(1, int(k_neighbors))
-        self.max_fit_samples = max(1, int(max_fit_samples))
-        self.min_anchor_distance = max(float(min_anchor_distance), 0.0)
-        self.max_ray_distance = max(float(max_ray_distance), 1e-6)
-        self.detected_frames = 0
-        self._rgb_samples: list[np.ndarray] = []
-        self.centroids = np.empty((0, 3), dtype=np.float32)
-        self.ray_directions = np.empty((0, 3), dtype=np.float32)
-        self.cluster_samples: list[np.ndarray] = []
-
-    @property
-    def ready(self) -> bool:
-        return len(self.cluster_samples) > 0
-
-    def observe_frame(self, bgr_samples: np.ndarray) -> None:
-        if self.ready or len(bgr_samples) == 0:
-            return
-
-        bgr_samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
-        self._rgb_samples.extend(bgr_samples[:, ::-1])
-        self.detected_frames += 1
-        if self.detected_frames < self.required_frames:
-            return
-
-        memberships = dense_ray_rgb_cluster_memberships(
-            np.asarray(self._rgb_samples, dtype=np.uint8),
-            target_clusters=self.cluster_count,
-            min_brightness=self.min_brightness,
-            max_brightness=self.max_brightness,
-            k_neighbors=self.k_neighbors,
-            max_fit_samples=self.max_fit_samples,
-            min_anchor_distance=self.min_anchor_distance,
-        )
-        _labels, self.centroids, self.cluster_samples, self.ray_directions = memberships
-
-    def classify_bgr(self, bgr_sample: np.ndarray) -> int | None:
-        if not self.ready:
-            return None
-
-        rgb = np.asarray(bgr_sample, dtype=np.float32).reshape(3)[::-1]
-        brightness = float(np.linalg.norm(rgb))
-        if brightness < self.min_brightness:
-            return None
-        if self.max_brightness is not None and brightness > self.max_brightness:
-            return None
-
-        distances = distances_to_rgb_rays(rgb, self.ray_directions).reshape(-1)
-        if len(distances) == 0 or float(distances.min()) > self.max_ray_distance:
-            return None
-        return int(distances.argmin())
-
-    def classify_bgr_samples(self, bgr_samples: np.ndarray) -> int | None:
-        if not self.ready:
-            return None
-
-        samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
-        votes = [
-            cluster_index
-            for sample in samples
-            if (cluster_index := self.classify_bgr(sample)) is not None
-        ]
-        if not votes:
-            return None
-        return int(np.bincount(np.asarray(votes, dtype=np.int32)).argmax())
-
-
-class BalancedConeColorClassifier(BalancedRayColorClassifier):
-    def __init__(
-        self,
-        *,
-        required_frames: int = 30,
-        cluster_count: int = 6,
-        min_brightness: float = 40.0,
-        max_brightness: float | None = None,
-        max_angle_radians: float = CONE_MAX_ANGLE_RADIANS,
-        assignment_balance: float = GMM_ASSIGNMENT_BALANCE,
-        assignment_sharpness: float = CONE_ASSIGNMENT_SHARPNESS,
-        balance_iterations: int = CONE_BALANCE_ITERATIONS,
-        max_iterations: int = CONE_MAX_ITERATIONS,
-    ) -> None:
-        super().__init__(
-            required_frames=required_frames,
-            cluster_count=cluster_count,
-            min_brightness=min_brightness,
-            max_brightness=max_brightness,
-            max_angle_radians=max_angle_radians,
-            assignment_balance=assignment_balance,
-            assignment_sharpness=assignment_sharpness,
-            balance_iterations=balance_iterations,
-            max_iterations=max_iterations,
-        )
-
-
-ColorClassifier = HDBSCANDensityPlaneColorClassifier
-
-
-def distances_to_rgb_clusters(
+def angular_distance_to_normalized_rgb_clusters(
     rgb_sample: np.ndarray,
     cluster_samples: list[np.ndarray],
 ) -> np.ndarray:
-    point = np.asarray(rgb_sample, dtype=np.float32).reshape(1, 3)
+    point = normalized_rgb_points(np.asarray(rgb_sample, dtype=np.float32).reshape(1, 3))[0]
     distances = []
     for samples in cluster_samples:
         samples = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
         if len(samples) == 0:
             distances.append(np.inf)
             continue
-        distances.append(float(np.min(np.linalg.norm(samples - point, axis=1))))
+        normalized_samples = normalized_rgb_points(samples)
+        max_cosine = float(np.max(np.clip(normalized_samples @ point, -1.0, 1.0)))
+        distances.append(float(np.arccos(max_cosine)))
     return np.asarray(distances, dtype=np.float32)
-
-
-def bgr_samples_to_hsv(bgr_samples: np.ndarray) -> np.ndarray:
-    samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 1, 3)
-    return cv2.cvtColor(samples, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float32)
-
-
-def bgr_samples_to_rgb(bgr_samples: np.ndarray) -> np.ndarray:
-    return np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)[:, ::-1].astype(np.float32)
-
-
-def rgb_to_oklab(rgb_samples: np.ndarray) -> np.ndarray:
-    """Convert sRGB 0..255 samples to Oklab (L 0..1, a/b approximately -0.4..0.4)."""
-    rgb = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3) / 255.0
-    rgb = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
-    lms = rgb @ np.asarray(
-        [[0.4122214708, 0.5363325363, 0.0514459929],
-         [0.2119034982, 0.6806995451, 0.1073969566],
-         [0.0883024619, 0.2817188376, 0.6299787005]], dtype=np.float32
-    ).T
-    lms_cbrt = np.cbrt(np.maximum(lms, 0.0))
-    return (lms_cbrt @ np.asarray(
-        [[0.2104542553, 0.7936177850, -0.0040720468],
-         [1.9779984951, -2.4285922050, 0.4505937099],
-         [0.0259040371, 0.7827717662, -0.8086757660]], dtype=np.float32
-    ).T).astype(np.float32)
-
-
-def oklab_to_rgb(oklab_samples: np.ndarray) -> np.ndarray:
-    lab = np.asarray(oklab_samples, dtype=np.float32).reshape(-1, 3)
-    lms_cbrt = lab @ np.asarray(
-        [[1.0, 0.3963377774, 0.2158037573],
-         [1.0, -0.1055613458, -0.0638541728],
-         [1.0, -0.0894841775, -1.2914855480]], dtype=np.float32
-    ).T
-    lms = lms_cbrt ** 3
-    rgb_linear = lms @ np.asarray(
-        [[4.0767416621, -3.3077115913, 0.2309699292],
-         [-1.2684380046, 2.6097574011, -0.3413193965],
-         [-0.0041960863, -0.7034186147, 1.7076147010]], dtype=np.float32
-    ).T
-    rgb = np.where(rgb_linear <= 0.0031308, 12.92 * rgb_linear,
-                   1.055 * np.maximum(rgb_linear, 0.0) ** (1.0 / 2.4) - 0.055)
-    return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.float32)
-
-
-def bgr_samples_to_oklab(bgr_samples: np.ndarray) -> np.ndarray:
-    return rgb_to_oklab(bgr_samples_to_rgb(bgr_samples))
-
-
-def oklab_l_slice_knn_outlines(
-    oklab_samples: np.ndarray,
-    *,
-    neighbor_count: int = 6,
-    cluster_count: int = 6,
-    sticker_ids: np.ndarray | None = None,
-    edge_pairs: np.ndarray | None = None,
-    cluster_labels: np.ndarray | None = None,
-    sticker_link_lambda: float = OKLAB_SLICE_STICKER_LINK_LAMBDA,
-    overlap_lambda: float = OKLAB_SLICE_OVERLAP_LAMBDA,
-) -> list[list[np.ndarray]]:
-    samples = np.asarray(oklab_samples, dtype=np.float32).reshape(-1, 3)
-    if sticker_ids is not None:
-        sticker_ids = np.asarray(sticker_ids).reshape(-1)
-        if len(sticker_ids) != len(samples):
-            raise ValueError("sticker_ids must have one entry per Oklab sample")
-    if cluster_labels is not None:
-        cluster_labels = np.asarray(cluster_labels, dtype=np.int32).reshape(-1)
-        if len(cluster_labels) != len(samples):
-            raise ValueError("cluster_labels must have one entry per Oklab sample")
-    all_ellipses = []
-    for slice_index in range(10):
-        lower = slice_index / 10.0
-        upper = (slice_index + 1) / 10.0
-        mask = (samples[:, 0] >= lower) & (
-            (samples[:, 0] <= upper) if slice_index == 9 else (samples[:, 0] < upper)
-        )
-        all_ellipses.append(
-            _fit_2d_knn_outlines(
-                samples[mask, 1:3],
-                neighbor_count=neighbor_count,
-                cluster_count=cluster_count,
-                sticker_ids=sticker_ids[mask] if sticker_ids is not None else None,
-                edge_pairs=_slice_edge_pairs(edge_pairs, np.flatnonzero(mask))
-                if edge_pairs is not None else None,
-                fixed_labels=cluster_labels[mask] if cluster_labels is not None else None,
-                sticker_link_lambda=sticker_link_lambda,
-                overlap_lambda=overlap_lambda,
-            )
-        )
-    return all_ellipses
-
-
-def oklab_graph_cluster_memberships(
-    oklab_samples: np.ndarray,
-    *,
-    cluster_count: int = 6,
-    sticker_ids: np.ndarray | None = None,
-    edge_pairs: np.ndarray | None = None,
-    edge_lambda: float = OKLAB_SLICE_STICKER_LINK_LAMBDA,
-    overlap_lambda: float = OKLAB_SLICE_OVERLAP_LAMBDA,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return one stable six-way graph-regularized labeling for the 3D plot."""
-    values = np.asarray(oklab_samples, dtype=np.float32).reshape(-1, 3)
-    if len(values) < max(1, int(cluster_count)):
-        return np.full(len(values), -1, dtype=np.int32), np.empty((0, 3), dtype=np.float32)
-    groups = None if sticker_ids is None else np.asarray(sticker_ids).reshape(-1)
-    if groups is not None and len(groups) != len(values):
-        raise ValueError("sticker_ids must have one entry per Oklab sample")
-    labels = _graph_regularized_point_labels(
-        values,
-        groups,
-        cluster_count=max(1, int(cluster_count)),
-        sticker_link_lambda=float(edge_lambda),
-        overlap_lambda=float(overlap_lambda),
-        edge_pairs=edge_pairs,
-        edge_lambda=float(edge_lambda),
-    )
-    centers = np.asarray(
-        [
-            values[labels == index].mean(axis=0)
-            if np.any(labels == index) else values.mean(axis=0)
-            for index in range(max(1, int(cluster_count)))
-        ],
-        dtype=np.float32,
-    )
-    return labels, centers
-
-
-def _fit_2d_knn_outlines(
-    points: np.ndarray,
-    *,
-    neighbor_count: int,
-    cluster_count: int = 6,
-    sticker_ids: np.ndarray | None = None,
-    edge_pairs: np.ndarray | None = None,
-    fixed_labels: np.ndarray | None = None,
-    sticker_link_lambda: float = OKLAB_SLICE_STICKER_LINK_LAMBDA,
-    overlap_lambda: float = OKLAB_SLICE_OVERLAP_LAMBDA,
-) -> list[np.ndarray]:
-    values = np.asarray(points, dtype=np.float32).reshape(-1, 2)
-    group_ids = None if sticker_ids is None else np.asarray(sticker_ids).reshape(-1)
-    if group_ids is not None and len(group_ids) != len(values):
-        raise ValueError("sticker_ids must have one entry per point")
-    if fixed_labels is not None:
-        fixed_labels = np.asarray(fixed_labels, dtype=np.int32).reshape(-1)
-        if len(fixed_labels) != len(values):
-            raise ValueError("fixed_labels must have one entry per point")
-    if edge_pairs is not None:
-        edge_pairs = _normalize_edge_pairs(edge_pairs, len(values))
-    cluster_count = max(1, int(cluster_count))
-    if len(values) < cluster_count:
-        return []
-    max_points = 2500
-    if len(values) > max_points:
-        keep_indexes = np.linspace(0, len(values) - 1, max_points, dtype=np.int32)
-        values = values[keep_indexes]
-        if group_ids is not None:
-            group_ids = group_ids[keep_indexes]
-        if fixed_labels is not None:
-            fixed_labels = fixed_labels[keep_indexes]
-        if edge_pairs is not None:
-            edge_pairs = _remap_edge_pairs(edge_pairs, keep_indexes)
-
-    # Remove the least locally supported 10% before partitioning the slice.
-    # A larger neighbor radius means lower density.  This is intentionally a
-    # visualization-only denoising pass; the original samples and classifier
-    # inputs are left untouched.
-    prefilter_neighbor_count = min(max(1, int(neighbor_count)), len(values) - 1)
-    prefilter_distances = np.linalg.norm(
-        values[:, None, :] - values[None, :, :], axis=2
-    )
-    prefilter_distances.sort(axis=1)
-    density_radius = prefilter_distances[:, prefilter_neighbor_count]
-    keep_count = max(cluster_count, int(math.ceil(len(values) * 0.9)))
-    keep_count = min(len(values), keep_count)
-    keep_indexes = np.argsort(density_radius, kind="stable")[:keep_count]
-    values = values[keep_indexes]
-    if group_ids is not None:
-        group_ids = group_ids[keep_indexes]
-    if fixed_labels is not None:
-        fixed_labels = fixed_labels[keep_indexes]
-    if edge_pairs is not None:
-        edge_pairs = _remap_edge_pairs(edge_pairs, keep_indexes)
-
-    # KNN supplies the local support measure; this small k-means step only
-    # prevents support masks from different regions being merged into one
-    # contour.  It is deliberately limited to this visualization path.
-    if fixed_labels is not None:
-        labels = fixed_labels
-    elif edge_pairs is not None and len(edge_pairs) and sticker_link_lambda > 0:
-        labels = _graph_regularized_point_labels(
-            values,
-            cluster_count=cluster_count,
-            edge_pairs=edge_pairs,
-            edge_lambda=sticker_link_lambda,
-            overlap_lambda=overlap_lambda,
-        )
-    elif group_ids is not None and len(np.unique(group_ids)) >= cluster_count and sticker_link_lambda > 0:
-        labels = _graph_regularized_point_labels(
-            values,
-            group_ids,
-            cluster_count=cluster_count,
-            sticker_link_lambda=sticker_link_lambda,
-            overlap_lambda=overlap_lambda,
-        )
-    else:
-        _compactness, labels, _centers = cv2.kmeans(
-            values,
-            cluster_count,
-            None,
-            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4),
-            3,
-            cv2.KMEANS_PP_CENTERS,
-        )
-        labels = labels.reshape(-1)
-    neighbor_count = max(1, int(neighbor_count))
-    outlines = []
-    for cluster_index in range(cluster_count):
-        cluster_values = values[labels == cluster_index]
-        if len(cluster_values) == 0:
-            # K-means can leave a center empty when several samples coincide.
-            # Reuse a representative point so the requested six visualization
-            # slots remain visible rather than silently disappearing.
-            cluster_values = values[cluster_index % len(values) : cluster_index % len(values) + 1]
-        if len(cluster_values) < 3:
-            outlines.append(_convex_hull_outline(cluster_values))
-            continue
-        local_neighbor_count = min(neighbor_count, len(cluster_values) - 1)
-        distances = np.linalg.norm(
-            cluster_values[:, None, :] - cluster_values[None, :, :], axis=2
-        )
-        distances.sort(axis=1)
-        kth_distances = distances[:, local_neighbor_count]
-        keep = kth_distances <= float(np.quantile(kth_distances, 0.95))
-        cluster_values = cluster_values[keep]
-        kth_distances = kth_distances[keep]
-        if len(cluster_values) < 3:
-            outlines.append(_convex_hull_outline(values[labels == cluster_index]))
-            continue
-
-        grid_size = 320
-        canvas = np.zeros((grid_size, grid_size), dtype=np.uint8)
-        pixels = np.clip(
-            np.rint((cluster_values + 0.5) * (grid_size - 1)),
-            0,
-            grid_size - 1,
-        ).astype(np.int32)
-        coordinate_scale = grid_size - 1
-        for pixel, radius in zip(pixels, kth_distances):
-            radius_pixels = int(np.clip(radius * coordinate_scale * 1.25, 2.0, 18.0))
-            cv2.circle(
-                canvas,
-                (int(pixel[0]), int(grid_size - 1 - pixel[1])),
-                radius_pixels,
-                255,
-                -1,
-            )
-        canvas = cv2.GaussianBlur(canvas, (0, 0), 1.5)
-        _, binary = cv2.threshold(canvas, 32, 255, cv2.THRESH_BINARY)
-        contours, _hierarchy = cv2.findContours(
-            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        contour = max(contours, key=cv2.contourArea, default=None)
-        if contour is None or cv2.contourArea(contour) < 4.0:
-            outlines.append(_convex_hull_outline(cluster_values))
-            continue
-        contour = contour.reshape(-1, 2).astype(np.float32)
-        outlines.append(
-            np.column_stack([
-                contour[:, 0] / coordinate_scale - 0.5,
-                0.5 - contour[:, 1] / coordinate_scale,
-            ]).astype(np.float32)
-        )
-    return outlines
-
-
-def _graph_regularized_point_labels(
-    values: np.ndarray,
-    group_ids: np.ndarray | None = None,
-    *,
-    cluster_count: int,
-    sticker_link_lambda: float,
-    overlap_lambda: float,
-    edge_pairs: np.ndarray | None = None,
-    edge_lambda: float | None = None,
-) -> np.ndarray:
-    """Cluster points with a compactness plus same-sticker-edge penalty."""
-    _compactness, labels, _centers = cv2.kmeans(
-        values,
-        cluster_count,
-        None,
-        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4),
-        3,
-        cv2.KMEANS_PP_CENTERS,
-    )
-    labels = labels.reshape(-1).astype(np.int32)
-    if edge_pairs is None:
-        if group_ids is None:
-            return labels
-        groups = [np.flatnonzero(group_ids == group_id) for group_id in np.unique(group_ids)]
-        adjacency = None
-        penalty = float(sticker_link_lambda)
-    else:
-        adjacency = [[] for _ in range(len(values))]
-        for left, right in _normalize_edge_pairs(edge_pairs, len(values)):
-            adjacency[int(left)].append(int(right))
-            adjacency[int(right)].append(int(left))
-        groups = []
-        penalty = float(sticker_link_lambda if edge_lambda is None else edge_lambda)
-    for _ in range(12):
-        centers = np.asarray(
-            [
-                values[labels == cluster_index].mean(axis=0)
-                if np.any(labels == cluster_index)
-                else values.mean(axis=0)
-                for cluster_index in range(cluster_count)
-            ],
-            dtype=np.float32,
-        )
-        support_radii = np.asarray(
-            [
-                np.quantile(
-                    np.linalg.norm(values[labels == cluster_index] - centers[cluster_index], axis=1),
-                    0.90,
-                )
-                if np.any(labels == cluster_index)
-                else 0.0
-                for cluster_index in range(cluster_count)
-            ],
-            dtype=np.float32,
-        )
-        center_distances = np.linalg.norm(
-            centers[:, None, :] - centers[None, :, :], axis=2
-        )
-        overlap_amount = np.maximum(
-            0.0,
-            support_radii[:, None] + support_radii[None, :] - center_distances,
-        )
-        np.fill_diagonal(overlap_amount, 0.0)
-        support_diameter = np.maximum(
-            support_radii[:, None] + support_radii[None, :],
-            1e-6,
-        )
-        # Use a dimensionless overlap fraction rather than squared Oklab
-        # distances.  This keeps the CLI lambda meaningful across slices.
-        overlap_fraction = overlap_amount / support_diameter
-        overlap_cost = np.sum(overlap_fraction**2, axis=1)
-        changed = False
-        for indexes in groups:
-            if len(indexes) < 2:
-                continue
-            current_labels = labels[indexes].copy()
-            point_indexes = indexes
-            for point_index in point_indexes:
-                distances = np.sum((centers - values[point_index]) ** 2, axis=1)
-                if adjacency is not None:
-                    neighbors = adjacency[int(point_index)]
-                    disagreement = np.asarray(
-                        [sum(labels[n] != cluster_index for n in neighbors) for cluster_index in range(cluster_count)],
-                        dtype=np.float32,
-                    )
-                else:
-                    disagreement = np.asarray(
-                        [np.mean(current_labels != cluster_index) for cluster_index in range(cluster_count)],
-                        dtype=np.float32,
-                    )
-                new_label = int(
-                    np.argmin(
-                        distances
-                        + penalty * disagreement
-                        + float(overlap_lambda) * overlap_cost
-                    )
-                )
-                local_index = int(np.flatnonzero(indexes == point_index)[0])
-                if labels[point_index] != new_label:
-                    labels[point_index] = new_label
-                    current_labels[local_index] = new_label
-                    changed = True
-        if not changed:
-            break
-    return labels
-
-
-def _normalize_edge_pairs(edge_pairs: np.ndarray, point_count: int) -> np.ndarray:
-    edges = np.asarray(edge_pairs, dtype=np.int64).reshape(-1, 2)
-    valid = (
-        (edges[:, 0] >= 0) & (edges[:, 0] < point_count)
-        & (edges[:, 1] >= 0) & (edges[:, 1] < point_count)
-        & (edges[:, 0] != edges[:, 1])
-    ) if len(edges) else np.zeros(0, dtype=bool)
-    edges = edges[valid]
-    if len(edges) == 0:
-        return np.empty((0, 2), dtype=np.int64)
-    return np.unique(np.sort(edges, axis=1), axis=0)
-
-
-def _remap_edge_pairs(edge_pairs: np.ndarray, keep_indexes: np.ndarray) -> np.ndarray:
-    remap = np.full(int(np.max(keep_indexes)) + 1, -1, dtype=np.int64)
-    remap[keep_indexes] = np.arange(len(keep_indexes), dtype=np.int64)
-    edges = _normalize_edge_pairs(edge_pairs, len(remap))
-    edges = edges[(remap[edges[:, 0]] >= 0) & (remap[edges[:, 1]] >= 0)]
-    return np.column_stack([remap[edges[:, 0]], remap[edges[:, 1]]]) if len(edges) else np.empty((0, 2), dtype=np.int64)
-
-
-def _slice_edge_pairs(edge_pairs: np.ndarray, slice_indexes: np.ndarray) -> np.ndarray:
-    return _remap_edge_pairs(edge_pairs, np.asarray(slice_indexes, dtype=np.int64))
-
-
-def _convex_hull_outline(points: np.ndarray) -> np.ndarray:
-    values = np.asarray(points, dtype=np.float32).reshape(-1, 2)
-    if len(values) == 0:
-        return np.empty((0, 2), dtype=np.float32)
-    if len(values) < 3:
-        if len(values) == 1:
-            center = values[0]
-            radius = 0.006
-            return np.asarray(
-                [
-                    [center[0] - radius, center[1] - radius],
-                    [center[0] + radius, center[1] - radius],
-                    [center[0] + radius, center[1] + radius],
-                    [center[0] - radius, center[1] + radius],
-                    [center[0] - radius, center[1] - radius],
-                ],
-                dtype=np.float32,
-            )
-        return np.vstack([values, values[:1]]).astype(np.float32)
-    hull = cv2.convexHull(values.reshape(-1, 1, 2)).reshape(-1, 2)
-    return np.vstack([hull, hull[:1]]).astype(np.float32)
-
-
-def compress_oklab_l(oklab_samples: np.ndarray, factor: float) -> np.ndarray:
-    samples = np.asarray(oklab_samples, dtype=np.float32).reshape(-1, 3).copy()
-    samples[:, 0] /= max(float(factor), 1e-6)
-    return samples
-
-
-def oklab_curve_points_for_models(
-    models: list[dict[str, np.ndarray | float]],
-    point_count: int = 160,
-) -> list[np.ndarray]:
-    curves = []
-    for model in models:
-        breakpoint = np.asarray(model["breakpoint"], dtype=np.float32).reshape(3)
-        half_count = max(2, int(point_count) // 2)
-        first = np.linspace(
-            np.zeros(3, dtype=np.float32), breakpoint, half_count, dtype=np.float32
-        )
-        second = np.linspace(
-            breakpoint,
-            np.array([1.0, 0.0, 0.0], dtype=np.float32),
-            half_count,
-            dtype=np.float32,
-        )
-        curves.append(np.vstack([first, second[1:]]).astype(np.float32))
-    return curves
-
-
-def distances_to_nearest_oklab_cluster_points(
-    oklab_sample: np.ndarray,
-    cluster_samples: list[np.ndarray],
-) -> np.ndarray:
-    point = np.asarray(oklab_sample, dtype=np.float32).reshape(1, 3)
-    distances = []
-    for samples in cluster_samples:
-        members = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-        distances.append(
-            float(np.linalg.norm(members - point, axis=1).min())
-            if len(members)
-            else np.inf
-        )
-    return np.asarray(distances, dtype=np.float32)
-
-
-def oklab_gmm_cluster_memberships(
-    oklab_samples: np.ndarray,
-    *,
-    target_clusters: int,
-    min_brightness: float,
-    max_brightness: float | None = None,
-) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], np.ndarray, np.ndarray]:
-    samples = np.asarray(oklab_samples, dtype=np.float32).reshape(-1, 3)
-    labels = np.full(len(samples), -1, dtype=np.int32)
-    lightness = samples[:, 0] * 255.0
-    usable_mask = lightness >= float(min_brightness)
-    if max_brightness is not None:
-        usable_mask &= lightness <= float(max_brightness)
-    usable_indexes = np.flatnonzero(usable_mask)
-    if len(usable_indexes) == 0 or target_clusters <= 0:
-        empty = np.empty((0, 3), dtype=np.float32)
-        empty_cov = np.empty((0, 3, 3), dtype=np.float32)
-        return labels, empty, [], empty_cov, np.empty(0, dtype=np.float32)
-    points = samples[usable_indexes]
-    component_count = min(int(target_clusters), len(points))
-    means = _initialize_standard_gmm_means(points, component_count)
-    covariance = _regularized_covariance(
-        points,
-        regularization=OKLAB_GMM_COVARIANCE_REGULARIZATION,
-    )
-    covariances = np.repeat(covariance[None, :, :], component_count, axis=0)
-    weights = np.full(component_count, 1.0 / component_count, dtype=np.float32)
-    previous_log_likelihood = -np.inf
-    for _ in range(OKLAB_GMM_MAX_ITERATIONS):
-        log_probabilities, _precisions = _gmm_log_probabilities(
-            points,
-            means,
-            covariances,
-            regularization=OKLAB_GMM_COVARIANCE_REGULARIZATION,
-        )
-        weighted_log_probabilities = log_probabilities + np.log(
-            np.maximum(weights, 1e-12)
-        )[None, :]
-        log_likelihood = float(np.sum(_logsumexp(weighted_log_probabilities, axis=1)))
-        responsibilities = _gmm_unbalanced_responsibilities(weighted_log_probabilities)
-        effective_counts = np.maximum(responsibilities.sum(axis=0), 1e-6)
-        means = (responsibilities.T @ points) / effective_counts[:, None]
-        weights = (effective_counts / len(points)).astype(np.float32)
-        deltas = points[:, None, :] - means[None, :, :]
-        covariances = np.einsum(
-            "nk,nki,nkj->kij", responsibilities, deltas, deltas
-        ) / effective_counts[:, None, None]
-        covariances += np.eye(3, dtype=np.float32)[None, :, :] * OKLAB_GMM_COVARIANCE_REGULARIZATION
-        if abs(log_likelihood - previous_log_likelihood) <= OKLAB_GMM_TOLERANCE * len(points):
-            break
-        previous_log_likelihood = log_likelihood
-
-    final_log_probabilities, _precisions = _gmm_log_probabilities(
-        points,
-        means,
-        covariances,
-        regularization=OKLAB_GMM_COVARIANCE_REGULARIZATION,
-    )
-    final_log_probabilities += np.log(np.maximum(weights, 1e-12))[None, :]
-    usable_labels = np.argmax(final_log_probabilities, axis=1).astype(np.int32)
-    labels[usable_indexes] = usable_labels
-    cluster_members = [points[usable_labels == index] for index in range(component_count)]
-    return labels, means.astype(np.float32), cluster_members, covariances, weights
-
-
-def _initialize_standard_gmm_means(
-    samples: np.ndarray,
-    component_count: int,
-) -> np.ndarray:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    if component_count <= 0 or len(points) == 0:
-        return np.empty((0, 3), dtype=np.float32)
-    selected = [int(np.argmax(points[:, 0]))]
-    while len(selected) < component_count:
-        distances = np.min(
-            np.linalg.norm(points[:, None, :] - points[selected][None, :, :], axis=2),
-            axis=1,
-        )
-        distances[selected] = -1.0
-        selected.append(int(np.argmax(distances)))
-    return points[np.asarray(selected, dtype=np.int32)].copy()
-
-
-def oklab_angular_cluster_memberships(
-    compressed_oklab_samples: np.ndarray,
-    *,
-    original_oklab_samples: np.ndarray,
-    target_clusters: int,
-    min_brightness: float,
-    max_brightness: float | None = None,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    list[np.ndarray],
-    list[dict[str, np.ndarray | float | str]],
-    np.ndarray,
-]:
-    fit_samples = np.asarray(compressed_oklab_samples, dtype=np.float32).reshape(-1, 3)
-    original = np.asarray(original_oklab_samples, dtype=np.float32).reshape(-1, 3)
-    labels = np.full(len(fit_samples), -1, dtype=np.int32)
-    lightness = fit_samples[:, 0] * 255.0
-    usable_mask = lightness >= float(min_brightness)
-    if max_brightness is not None:
-        usable_mask &= lightness <= float(max_brightness)
-    usable_indexes = np.flatnonzero(usable_mask)
-    if len(usable_indexes) == 0 or target_clusters <= 0:
-        return labels, np.empty((0, 3), dtype=np.float32), [], [], np.empty(0, dtype=np.float32)
-
-    points = original[usable_indexes]
-    chroma_vectors = points[:, 1:3]
-    chroma = np.linalg.norm(chroma_vectors, axis=1)
-    component_count = min(int(target_clusters), len(points))
-    neutral_count = 1 if component_count > 1 else component_count
-    chromatic_count = component_count - neutral_count
-    neutral_candidates = np.flatnonzero(
-        (chroma <= max(OKLAB_ANGULAR_NEUTRAL_CHROMA, float(np.quantile(chroma, 0.20))))
-        & (points[:, 0] >= float(np.median(points[:, 0])))
-    )
-    if len(neutral_candidates) == 0:
-        neutral_candidates = np.asarray([int(np.argmin(chroma))], dtype=np.int32)
-    labels[usable_indexes[neutral_candidates]] = 0
-
-    chromatic_indexes = np.flatnonzero(labels[usable_indexes] < 0)
-    chromatic_indexes = chromatic_indexes[chroma[chromatic_indexes] >= OKLAB_ANGULAR_MIN_CHROMA]
-    if chromatic_count > 0 and len(chromatic_indexes) > 0:
-        angular_labels = _circular_kmeans_labels(
-            chroma_vectors[chromatic_indexes],
-            chromatic_count,
-        )
-        labels[usable_indexes[chromatic_indexes]] = angular_labels + neutral_count
-
-    remaining = np.flatnonzero(labels[usable_indexes] < 0)
-    if len(remaining):
-        labels[usable_indexes[remaining]] = neutral_count
-
-    for _ in range(8):
-        models = _fit_angular_models(points, labels[usable_indexes], component_count)
-        scores = angular_cluster_log_likelihoods(points, models)
-        next_labels = scores.argmax(axis=1).astype(np.int32)
-        if np.array_equal(next_labels, labels[usable_indexes]):
-            break
-        labels[usable_indexes] = next_labels
-
-    final_labels = labels[usable_indexes]
-    models = _fit_angular_models(points, final_labels, component_count)
-    clusters = [points[final_labels == index] for index in range(component_count)]
-    centroids = np.asarray(
-        [cluster.mean(axis=0) if len(cluster) else np.zeros(3) for cluster in clusters],
-        dtype=np.float32,
-    )
-    return (
-        labels,
-        centroids,
-        clusters,
-        models,
-        np.full(component_count, 1.0 / component_count, dtype=np.float32),
-    )
-
-
-def _circular_kmeans_labels(chroma_vectors: np.ndarray, cluster_count: int) -> np.ndarray:
-    vectors = np.asarray(chroma_vectors, dtype=np.float32).reshape(-1, 2)
-    unit = vectors / np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-6)
-    selected = [int(np.argmax(np.linalg.norm(vectors, axis=1)))]
-    while len(selected) < cluster_count:
-        separation = 1.0 - np.max(unit @ unit[selected].T, axis=1)
-        separation[selected] = -1.0
-        selected.append(int(np.argmax(separation)))
-    directions = unit[np.asarray(selected, dtype=np.int32)].copy()
-    labels = np.zeros(len(unit), dtype=np.int32)
-    for _ in range(20):
-        labels = np.argmax(unit @ directions.T, axis=1).astype(np.int32)
-        next_directions = directions.copy()
-        for index in range(cluster_count):
-            members = unit[labels == index]
-            if len(members):
-                direction = members.mean(axis=0)
-                next_directions[index] = direction / max(float(np.linalg.norm(direction)), 1e-6)
-        if np.allclose(next_directions, directions, atol=1e-4):
-            break
-        directions = next_directions
-    return labels
-
-
-def _fit_angular_models(
-    points: np.ndarray,
-    labels: np.ndarray,
-    component_count: int,
-) -> list[dict[str, np.ndarray | float | str]]:
-    values = np.asarray(points, dtype=np.float32).reshape(-1, 3)
-    assignments = np.asarray(labels, dtype=np.int32).reshape(-1)
-    models = []
-    for index in range(component_count):
-        members = values[assignments == index]
-        if len(members) == 0:
-            members = values
-        chroma_vectors = members[:, 1:3]
-        chroma = np.linalg.norm(chroma_vectors, axis=1)
-        if index == 0:
-            models.append({
-                "kind": "neutral",
-                "lightness": float(np.median(members[:, 0])),
-                "sigma_chroma": max(float(np.median(chroma) * 1.4826), 0.012),
-                "sigma_lightness": max(float(np.median(np.abs(members[:, 0] - np.median(members[:, 0]))) * 1.4826), 0.04),
-            })
-            continue
-        direction = chroma_vectors.mean(axis=0)
-        if float(np.linalg.norm(direction)) <= 1e-6:
-            direction = chroma_vectors[int(np.argmax(chroma))]
-        direction /= max(float(np.linalg.norm(direction)), 1e-6)
-        perpendicular = chroma_vectors - (chroma_vectors @ direction)[:, None] * direction[None, :]
-        models.append({
-            "kind": "chromatic",
-            "direction": direction.astype(np.float32),
-            "sigma_perpendicular": max(float(np.median(np.linalg.norm(perpendicular, axis=1)) * 1.4826), 0.008),
-        })
-    return models
-
-
-def angular_cluster_log_likelihoods(
-    samples: np.ndarray,
-    models: list[dict[str, np.ndarray | float | str]],
-    weights: np.ndarray | None = None,
-) -> np.ndarray:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    if len(points) == 0 or not models:
-        return np.empty((len(points), 0), dtype=np.float32)
-    if weights is None:
-        weights = np.full(len(models), 1.0 / len(models), dtype=np.float32)
-    scores = []
-    chroma_vectors = points[:, 1:3]
-    chroma = np.linalg.norm(chroma_vectors, axis=1)
-    for model, weight in zip(models, np.asarray(weights, dtype=np.float32)):
-        if model["kind"] == "neutral":
-            sigma_c = float(model["sigma_chroma"])
-            sigma_l = float(model["sigma_lightness"])
-            scores.append(
-                -0.5 * (chroma / sigma_c) ** 2
-                -0.5 * ((points[:, 0] - float(model["lightness"])) / sigma_l) ** 2
-                -math.log(sigma_c * sigma_l)
-                + math.log(max(float(weight), 1e-12))
-            )
-            continue
-        direction = np.asarray(model["direction"], dtype=np.float32)
-        projected = chroma_vectors @ direction
-        perpendicular = chroma_vectors - projected[:, None] * direction[None, :]
-        sigma = float(model["sigma_perpendicular"])
-        scores.append(
-            -0.5 * np.sum(perpendicular * perpendicular, axis=1) / (sigma * sigma)
-            -math.log(sigma)
-            + math.log(max(float(weight), 1e-12))
-        )
-    return np.asarray(scores, dtype=np.float32).T
-
-
-def oklab_polyline_cluster_memberships(
-    compressed_oklab_samples: np.ndarray,
-    *,
-    original_oklab_samples: np.ndarray,
-    target_clusters: int,
-    min_brightness: float,
-    max_brightness: float | None = None,
-    sticker_ids: np.ndarray | None = None,
-    edge_pairs: np.ndarray | None = None,
-    edge_lambda: float = 0.25,
-    max_iterations: int = 12,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    list[np.ndarray],
-    list[dict[str, np.ndarray | float]],
-    np.ndarray,
-]:
-    """Fit density-weighted black-to-white two-segment polylines."""
-    fit_samples = np.asarray(compressed_oklab_samples, dtype=np.float32).reshape(-1, 3)
-    original = np.asarray(original_oklab_samples, dtype=np.float32).reshape(-1, 3)
-    if len(original) != len(fit_samples):
-        raise ValueError("original_oklab_samples must align with compressed samples")
-    labels = np.full(len(fit_samples), -1, dtype=np.int32)
-    lightness = fit_samples[:, 0] * 255.0
-    usable_mask = lightness >= float(min_brightness)
-    if max_brightness is not None:
-        usable_mask &= lightness <= float(max_brightness)
-    usable_indexes = np.flatnonzero(usable_mask)
-    if len(usable_indexes) == 0 or target_clusters <= 0:
-        return labels, np.empty((0, 3), dtype=np.float32), [], [], np.empty(0, dtype=np.float32)
-
-    fit_points = fit_samples[usable_indexes]
-    original_points = original[usable_indexes]
-    if sticker_ids is not None:
-        sticker_ids = np.asarray(sticker_ids).reshape(-1)
-        if len(sticker_ids) != len(fit_samples):
-            raise ValueError("sticker_ids must align with Oklab samples")
-    if edge_pairs is None and sticker_ids is not None:
-        edge_pairs = _consecutive_same_group_edges(sticker_ids)
-    local_edges = (
-        _remap_edge_pairs(edge_pairs, usable_indexes)
-        if edge_pairs is not None else np.empty((0, 2), dtype=np.int64)
-    )
-    adjacency = [[] for _ in range(len(fit_points))]
-    for left, right in local_edges:
-        adjacency[int(left)].append(int(right))
-        adjacency[int(right)].append(int(left))
-    component_count = min(int(target_clusters), len(fit_points))
-    means = _initialize_standard_gmm_means(fit_points, component_count)
-    labels[usable_indexes] = np.linalg.norm(
-        fit_points[:, None, :] - means[None, :, :], axis=2
-    ).argmin(axis=1)
-
-    density_weights = _local_density_weights(original_points)
-    for _ in range(max(1, int(max_iterations))):
-        fit_models = _fit_polyline_models(
-            original_points,
-            labels[usable_indexes],
-            component_count,
-            density_weights,
-        )
-        scores = polyline_cluster_log_likelihoods(original_points, fit_models)
-        if len(local_edges) and float(edge_lambda) > 0.0:
-            for point_index, neighbors in enumerate(adjacency):
-                if not neighbors:
-                    continue
-                neighbor_labels = labels[usable_indexes][neighbors]
-                scores[point_index] += float(edge_lambda) * np.asarray(
-                    [np.mean(neighbor_labels == cluster_index) for cluster_index in range(component_count)],
-                    dtype=np.float32,
-                )
-        next_labels = scores.argmax(axis=1).astype(np.int32)
-        if np.array_equal(next_labels, labels[usable_indexes]):
-            break
-        labels[usable_indexes] = next_labels
-
-    final_labels = labels[usable_indexes]
-    models = _fit_polyline_models(
-        original_points,
-        final_labels,
-        component_count,
-        density_weights,
-    )
-    clusters = [original_points[final_labels == index] for index in range(component_count)]
-    centroids = np.asarray(
-        [cluster.mean(axis=0) if len(cluster) else np.zeros(3) for cluster in clusters],
-        dtype=np.float32,
-    )
-    counts = np.bincount(final_labels, minlength=component_count).astype(np.float32)
-    weights = counts / max(float(counts.sum()), 1.0)
-    return labels, centroids, clusters, models, weights
-
-
-def _fit_polyline_models(
-    samples: np.ndarray,
-    labels: np.ndarray,
-    component_count: int,
-    density_weights: np.ndarray,
-) -> list[dict[str, np.ndarray | float]]:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    assignments = np.asarray(labels, dtype=np.int32).reshape(-1)
-    models = []
-    for index in range(component_count):
-        members = points[assignments == index]
-        member_indexes = np.flatnonzero(assignments == index)
-        if len(member_indexes) == 0:
-            member_indexes = np.arange(len(points), dtype=np.int32)
-        members = points[member_indexes]
-        member_weights = density_weights[member_indexes]
-        density_candidate_indexes = np.argsort(member_weights)[-min(32, len(members)):]
-        radial_order = np.argsort(np.linalg.norm(members, axis=1))
-        radial_candidate_indexes = radial_order[
-            np.linspace(
-                0,
-                len(radial_order) - 1,
-                min(64, len(radial_order)),
-                dtype=np.int32,
-            )
-        ]
-        candidate_indexes = np.unique(
-            np.concatenate([density_candidate_indexes, radial_candidate_indexes])
-        )
-        candidates = members[candidate_indexes]
-        best_breakpoint = candidates[0]
-        best_score = np.inf
-        for breakpoint in candidates:
-            score = _one_sided_spine_fit_score(members, breakpoint, member_weights)
-            if score < best_score:
-                best_score = score
-                best_breakpoint = breakpoint
-        residuals = _polyline_distances(members, best_breakpoint)
-        models.append({
-            "breakpoint": np.asarray(best_breakpoint, dtype=np.float32),
-            "sigma": max(
-                float(np.sqrt(np.average(residuals * residuals, weights=member_weights))),
-                0.005,
-            ),
-            "inside_penalty": POLYLINE_INSIDE_PENALTY,
-        })
-    return models
-
-
-def polyline_cluster_log_likelihoods(
-    samples: np.ndarray,
-    models: list[dict[str, np.ndarray | float]],
-    weights: np.ndarray | None = None,
-) -> np.ndarray:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    if len(points) == 0 or not models:
-        return np.empty((len(points), 0), dtype=np.float32)
-    if weights is None:
-        weights = np.full(len(models), 1.0 / len(models), dtype=np.float32)
-    scores = []
-    for model, weight in zip(models, np.asarray(weights, dtype=np.float32)):
-        distances = _polyline_distances(
-            points,
-            np.asarray(model["breakpoint"], dtype=np.float32),
-        )
-        sigma = float(model["sigma"])
-        radial_gaps = _radial_spine_gaps(
-            points,
-            np.asarray(model["breakpoint"], dtype=np.float32),
-        )
-        inside_scale = max(float(model["inside_penalty"]), 1.0)
-        distance_score = -0.5 * (distances / sigma) ** 2
-        inside_score = np.where(
-            radial_gaps < 0.0,
-            -0.5 * inside_scale * (radial_gaps / sigma) ** 2,
-            0.0,
-        )
-        scores.append(
-            distance_score
-            + inside_score
-            -math.log(sigma)
-            + math.log(max(float(weight), 1e-12))
-        )
-    return np.asarray(scores, dtype=np.float32).T
-
-
-def _polyline_distances(points: np.ndarray, breakpoint: np.ndarray) -> np.ndarray:
-    source = np.zeros(3, dtype=np.float32)
-    destination = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-    return np.minimum(
-        _oklab_point_to_segment_distances(points, source, breakpoint),
-        _oklab_point_to_segment_distances(points, breakpoint, destination),
-    )
-
-
-def _polyline_fit_score(
-    points: np.ndarray,
-    breakpoint: np.ndarray,
-    density_weights: np.ndarray,
-) -> float:
-    distances = _polyline_distances(points, breakpoint)
-    point_score = float(
-        np.average(distances * distances, weights=density_weights)
-    )
-    radii = np.linalg.norm(points, axis=1)
-    order = np.argsort(radii)
-    bin_count = min(POLYLINE_COVERAGE_BINS, len(order))
-    coverage_scores = []
-    for bin_indexes in np.array_split(order, bin_count):
-        if len(bin_indexes):
-            coverage_scores.append(float(np.mean(distances[bin_indexes] ** 2)))
-    coverage_score = float(np.mean(coverage_scores)) if coverage_scores else point_score
-    return (
-        (1.0 - POLYLINE_COVERAGE_MIX) * point_score
-        + POLYLINE_COVERAGE_MIX * coverage_score
-    )
-
-
-def _one_sided_spine_fit_score(
-    points: np.ndarray,
-    breakpoint: np.ndarray,
-    density_weights: np.ndarray,
-) -> float:
-    distances = _polyline_distances(points, breakpoint)
-    point_score = float(np.average(distances * distances, weights=density_weights))
-    gaps = _radial_spine_gaps(points, breakpoint)
-    inside = np.minimum(gaps, 0.0)
-    outside = np.maximum(gaps, 0.0)
-    inside_score = float(np.average(inside * inside, weights=density_weights))
-    outside_score = float(np.average(outside * outside, weights=density_weights))
-    one_sided_score = POLYLINE_INSIDE_PENALTY * inside_score + outside_score
-    coverage_score = _radial_coverage_score(points, breakpoint, distances)
-    return (
-        (1.0 - POLYLINE_COVERAGE_MIX) * (point_score + one_sided_score)
-        + POLYLINE_COVERAGE_MIX * coverage_score
-    )
-
-
-def _radial_coverage_score(
-    points: np.ndarray,
-    breakpoint: np.ndarray,
-    distances: np.ndarray,
-) -> float:
-    radii = np.linalg.norm(points, axis=1)
-    order = np.argsort(radii)
-    bin_count = min(POLYLINE_COVERAGE_BINS, len(order))
-    coverage_scores = []
-    for bin_indexes in np.array_split(order, bin_count):
-        if len(bin_indexes):
-            gaps = _radial_spine_gaps(points[bin_indexes], breakpoint)
-            coverage_scores.append(
-                float(np.mean(distances[bin_indexes] ** 2))
-                + POLYLINE_INSIDE_PENALTY
-                * float(np.mean(np.minimum(gaps, 0.0) ** 2))
-            )
-    return float(np.mean(coverage_scores)) if coverage_scores else float(np.mean(distances**2))
-
-
-def _radial_spine_gaps(points: np.ndarray, breakpoint: np.ndarray) -> np.ndarray:
-    values = np.asarray(points, dtype=np.float32).reshape(-1, 3)
-    pivot = np.asarray(breakpoint, dtype=np.float32).reshape(3)
-    lightness = np.clip(values[:, 0], 0.0, 1.0)
-    pivot_lightness = float(np.clip(pivot[0], 1e-4, 1.0 - 1e-4))
-    pivot_chroma = float(np.linalg.norm(pivot[1:3]))
-    spine_chroma = np.where(
-        lightness <= pivot_lightness,
-        pivot_chroma * lightness / pivot_lightness,
-        pivot_chroma * (1.0 - lightness) / (1.0 - pivot_lightness),
-    )
-    sample_chroma = np.linalg.norm(values[:, 1:3], axis=1)
-    return (sample_chroma - spine_chroma).astype(np.float32)
-
-
-def _oklab_point_to_segment_distances(
-    points: np.ndarray,
-    start: np.ndarray,
-    end: np.ndarray,
-) -> np.ndarray:
-    values = np.asarray(points, dtype=np.float32).reshape(-1, 3)
-    direction = np.asarray(end, dtype=np.float32) - np.asarray(start, dtype=np.float32)
-    denominator = max(float(direction @ direction), 1e-8)
-    projection = np.clip(
-        ((values - start[None, :]) @ direction) / denominator,
-        0.0,
-        1.0,
-    )
-    closest = start[None, :] + projection[:, None] * direction[None, :]
-    return np.linalg.norm(values - closest, axis=1).astype(np.float32)
-
-
-def _local_density_weights(points: np.ndarray) -> np.ndarray:
-    """Estimate local ridge density and return capped fitting weights."""
-    values = np.asarray(points, dtype=np.float32).reshape(-1, 3)
-    if len(values) == 0:
-        return np.empty(0, dtype=np.float32)
-    quantized = np.floor(values / 0.015).astype(np.int32)
-    _unique, inverse, counts = np.unique(
-        quantized,
-        axis=0,
-        return_inverse=True,
-        return_counts=True,
-    )
-    density = counts[inverse].astype(np.float32)
-    density_weights = np.power(density, DENSITY_WEIGHT_POWER)
-    density_weights /= max(float(density_weights.mean()), 1e-6)
-    weights = (1.0 - DENSITY_WEIGHT_MIX) + DENSITY_WEIGHT_MIX * density_weights
-    return np.clip(weights, 1.0 / DENSITY_WEIGHT_MAX, DENSITY_WEIGHT_MAX)
-
-
-def rgb_brightness_mask(
-    rgb_samples: np.ndarray,
-    *,
-    min_brightness: float,
-    max_brightness: float | None,
-) -> np.ndarray:
-    samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
-    brightness = np.linalg.norm(samples, axis=1)
-    mask = brightness >= float(min_brightness)
-    if max_brightness is not None:
-        mask &= brightness <= float(max_brightness)
-    return mask
-
-
-def hsv_value_mask(
-    hsv_samples: np.ndarray,
-    *,
-    min_brightness: float,
-    max_brightness: float | None,
-) -> np.ndarray:
-    samples = np.asarray(hsv_samples, dtype=np.float32).reshape(-1, 3)
-    values = samples[:, 2]
-    mask = values >= float(min_brightness)
-    if max_brightness is not None:
-        mask &= values <= float(max_brightness)
-    return mask
-
-
-def hsv_distance_matrix(samples: np.ndarray, centers: np.ndarray) -> np.ndarray:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    reference = np.asarray(centers, dtype=np.float32).reshape(-1, 3)
-    if len(points) == 0 or len(reference) == 0:
-        return np.empty((len(points), len(reference)), dtype=np.float32)
-    deltas = np.abs(points[:, None, :] - reference[None, :, :])
-    hue_delta = np.minimum(deltas[:, :, 0], 180.0 - deltas[:, :, 0])
-    distances = np.sqrt(hue_delta * hue_delta + deltas[:, :, 1] ** 2 + deltas[:, :, 2] ** 2)
-    return distances.astype(np.float32)
-
-
-def distances_to_hsv_clusters(
-    hsv_sample: np.ndarray,
-    cluster_samples: list[np.ndarray],
-) -> np.ndarray:
-    point = np.asarray(hsv_sample, dtype=np.float32).reshape(1, 3)
-    distances = []
-    for samples in cluster_samples:
-        samples = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-        if len(samples) == 0:
-            distances.append(np.inf)
-            continue
-        distances.append(float(hsv_distance_matrix(point, samples).min()))
-    return np.asarray(distances, dtype=np.float32)
-
-
-def dense_ray_rgb_cluster_memberships(
-    rgb_samples: np.ndarray,
-    *,
-    target_clusters: int,
-    min_brightness: float,
-    max_brightness: float | None = None,
-    k_neighbors: int = DENSE_RAY_K_NEIGHBORS,
-    max_fit_samples: int = DENSE_RAY_MAX_FIT_SAMPLES,
-    min_anchor_distance: float = DENSE_RAY_MIN_ANCHOR_DISTANCE,
-) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], np.ndarray]:
-    samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
-    sample_cluster_indexes = np.full(len(samples), -1, dtype=np.int32)
-    if len(samples) == 0 or target_clusters <= 0:
-        return (
-            sample_cluster_indexes,
-            np.empty((0, 3), dtype=np.float32),
-            [],
-            np.empty((0, 3), dtype=np.float32),
-        )
-
-    usable_indexes = np.flatnonzero(
-        rgb_brightness_mask(
-            samples,
-            min_brightness=min_brightness,
-            max_brightness=max_brightness,
-        )
-    )
-    usable = samples[usable_indexes]
-    component_count = min(int(target_clusters), len(usable))
-    if component_count <= 0:
-        return (
-            sample_cluster_indexes,
-            np.empty((0, 3), dtype=np.float32),
-            [],
-            np.empty((0, 3), dtype=np.float32),
-        )
-
-    fit_local_indexes = _evenly_spaced_indexes(len(usable), max_fit_samples)
-    fit = usable[fit_local_indexes]
-    anchors = dense_rgb_anchor_points(
-        fit,
-        target_clusters=component_count,
-        k_neighbors=k_neighbors,
-        min_anchor_distance=min_anchor_distance,
-    )
-    if len(anchors) == 0:
-        return (
-            sample_cluster_indexes,
-            np.empty((0, 3), dtype=np.float32),
-            [],
-            np.empty((0, 3), dtype=np.float32),
-        )
-
-    ray_directions = _normalize_rgb_vectors(anchors)
-    distances = distances_to_rgb_rays(usable, ray_directions)
-    labels = distances.argmin(axis=1).astype(np.int32)
-    sample_cluster_indexes[usable_indexes] = labels
-
-    centroids = []
-    cluster_samples = []
-    retained_rays = []
-    remapped_indexes = np.full(len(samples), -1, dtype=np.int32)
-    for cluster_index in range(len(ray_directions)):
-        member_indexes = usable_indexes[labels == cluster_index]
-        if len(member_indexes) == 0:
-            continue
-        members = samples[member_indexes]
-        centroids.append(members.mean(axis=0))
-        cluster_samples.append(members)
-        retained_rays.append(ray_directions[cluster_index])
-        remapped_indexes[member_indexes] = len(centroids) - 1
-
-    if not centroids:
-        return (
-            sample_cluster_indexes,
-            np.empty((0, 3), dtype=np.float32),
-            [],
-            np.empty((0, 3), dtype=np.float32),
-        )
-    return (
-        remapped_indexes,
-        np.asarray(centroids, dtype=np.float32).reshape(-1, 3),
-        cluster_samples,
-        np.asarray(retained_rays, dtype=np.float32).reshape(-1, 3),
-    )
-
-
-def dense_rgb_anchor_points(
-    rgb_samples: np.ndarray,
-    *,
-    target_clusters: int,
-    k_neighbors: int,
-    min_anchor_distance: float,
-) -> np.ndarray:
-    samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
-    if len(samples) == 0 or target_clusters <= 0:
-        return np.empty((0, 3), dtype=np.float32)
-    if len(samples) == 1:
-        return samples.copy()
-
-    distances = _pairwise_rgb_distances(samples)
-    neighbor_count = min(max(1, int(k_neighbors)), len(samples) - 1)
-    nearest = np.partition(distances, neighbor_count, axis=1)[:, 1 : neighbor_count + 1]
-    density = 1.0 / np.maximum(nearest.mean(axis=1), 1e-6)
-    selected = []
-    for candidate in np.argsort(-density):
-        if len(selected) >= target_clusters:
-            break
-        if selected and min_anchor_distance > 0.0:
-            selected_points = samples[np.asarray(selected, dtype=np.int32)]
-            nearest_selected = float(
-                np.min(np.linalg.norm(selected_points - samples[candidate][None, :], axis=1))
-            )
-            if nearest_selected < min_anchor_distance:
-                continue
-        selected.append(int(candidate))
-
-    if len(selected) < target_clusters:
-        for candidate in np.argsort(-density):
-            if len(selected) >= target_clusters:
-                break
-            if int(candidate) not in selected:
-                selected.append(int(candidate))
-    return samples[np.asarray(selected, dtype=np.int32)].astype(np.float32, copy=True)
-
-
-def distances_to_rgb_rays(
-    rgb_samples: np.ndarray,
-    ray_directions: np.ndarray,
-) -> np.ndarray:
-    points = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
-    rays = np.asarray(ray_directions, dtype=np.float32).reshape(-1, 3)
-    if len(points) == 0 or len(rays) == 0:
-        return np.empty((len(points), len(rays)), dtype=np.float32)
-
-    rays = _normalize_rgb_vectors(rays)
-    parallel = points @ rays.T
-    projections = parallel[:, :, None] * rays[None, :, :]
-    perpendicular = points[:, None, :] - projections
-    distances = np.linalg.norm(perpendicular, axis=2)
-    return distances.astype(np.float32)
-
-
-def density_peak_rgb_cluster_memberships(
-    rgb_samples: np.ndarray,
-    *,
-    target_clusters: int,
-    min_brightness: float,
-    max_brightness: float | None = None,
-    k_neighbors: int = DENSITY_PEAK_K_NEIGHBORS,
-    max_fit_samples: int = DENSITY_PEAK_MAX_FIT_SAMPLES,
-    min_peak_distance: float = DENSITY_PEAK_MIN_PEAK_DISTANCE,
-) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
-    samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
-    sample_cluster_indexes = np.full(len(samples), -1, dtype=np.int32)
-    if len(samples) == 0 or target_clusters <= 0:
-        return sample_cluster_indexes, np.empty((0, 3), dtype=np.float32), []
-
-    usable_indexes = np.flatnonzero(
-        rgb_brightness_mask(
-            samples,
-            min_brightness=min_brightness,
-            max_brightness=max_brightness,
-        )
-    )
-    usable = samples[usable_indexes]
-    component_count = min(int(target_clusters), len(usable))
-    if component_count <= 0:
-        return sample_cluster_indexes, np.empty((0, 3), dtype=np.float32), []
-
-    fit_local_indexes = _evenly_spaced_indexes(len(usable), max_fit_samples)
-    fit = usable[fit_local_indexes]
-    fit_labels, peak_indexes = _density_peak_fit_labels(
-        fit,
-        target_clusters=component_count,
-        k_neighbors=k_neighbors,
-        min_peak_distance=min_peak_distance,
-    )
-    if len(peak_indexes) == 0:
-        return sample_cluster_indexes, np.empty((0, 3), dtype=np.float32), []
-
-    peak_points = fit[np.asarray(peak_indexes, dtype=np.int32)]
-    fit_cluster_samples = [
-        fit[fit_labels == cluster_index]
-        for cluster_index in range(len(peak_points))
-    ]
-    labels = _assign_samples_to_density_peak_clusters(
-        usable,
-        peak_points,
-        fit_cluster_samples,
-    )
-    sample_cluster_indexes[usable_indexes] = labels
-
-    centroids = []
-    cluster_samples = []
-    remapped_indexes = np.full(len(samples), -1, dtype=np.int32)
-    for cluster_index in range(len(peak_points)):
-        member_indexes = usable_indexes[labels == cluster_index]
-        if len(member_indexes) == 0:
-            continue
-        members = samples[member_indexes]
-        centroids.append(members.mean(axis=0))
-        cluster_samples.append(members)
-        remapped_indexes[member_indexes] = len(centroids) - 1
-
-    if not centroids:
-        return sample_cluster_indexes, np.empty((0, 3), dtype=np.float32), []
-    return remapped_indexes, np.asarray(centroids, dtype=np.float32).reshape(-1, 3), cluster_samples
-
-
-def _density_peak_fit_labels(
-    samples: np.ndarray,
-    *,
-    target_clusters: int,
-    k_neighbors: int,
-    min_peak_distance: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    labels = np.full(len(points), -1, dtype=np.int32)
-    if len(points) == 0 or target_clusters <= 0:
-        return labels, np.empty(0, dtype=np.int32)
-    if len(points) == 1:
-        return np.zeros(1, dtype=np.int32), np.zeros(1, dtype=np.int32)
-
-    distances = _pairwise_rgb_distances(points)
-    neighbor_count = min(max(1, int(k_neighbors)), len(points) - 1)
-    nearest = np.partition(distances, neighbor_count, axis=1)[:, 1 : neighbor_count + 1]
-    density = 1.0 / np.maximum(nearest.mean(axis=1), 1e-6)
-    peak_indexes = _density_peak_indexes(
-        points,
-        distances,
-        density,
-        target_clusters=target_clusters,
-        min_peak_distance=min_peak_distance,
-    )
-    if len(peak_indexes) == 0:
-        return labels, peak_indexes
-
-    for cluster_index, peak_index in enumerate(peak_indexes):
-        labels[peak_index] = cluster_index
-
-    order = np.argsort(-density)
-    for sample_index in order:
-        if labels[sample_index] >= 0:
-            continue
-        higher_density = order[density[order] > density[sample_index]]
-        if len(higher_density) == 0:
-            labels[sample_index] = int(np.argmin(distances[sample_index, peak_indexes]))
-            continue
-        nearest_higher = int(higher_density[np.argmin(distances[sample_index, higher_density])])
-        labels[sample_index] = labels[nearest_higher]
-        if labels[sample_index] < 0:
-            labels[sample_index] = int(np.argmin(distances[sample_index, peak_indexes]))
-    return labels, peak_indexes
-
-
-def _density_peak_indexes(
-    samples: np.ndarray,
-    distances: np.ndarray,
-    density: np.ndarray,
-    *,
-    target_clusters: int,
-    min_peak_distance: float,
-) -> np.ndarray:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    rho = np.asarray(density, dtype=np.float32).reshape(-1)
-    order = np.argsort(-rho)
-    higher_distance = np.empty(len(points), dtype=np.float32)
-    for rank, sample_index in enumerate(order):
-        if rank == 0:
-            higher_distance[sample_index] = float(distances[sample_index].max())
-            continue
-        higher = order[:rank]
-        higher_distance[sample_index] = float(distances[sample_index, higher].min())
-
-    scores = rho * higher_distance
-    peak_indexes = []
-    for candidate in np.argsort(-scores):
-        if len(peak_indexes) >= target_clusters:
-            break
-        if peak_indexes and min_peak_distance > 0.0:
-            nearest_peak_distance = float(distances[candidate, np.asarray(peak_indexes)].min())
-            if nearest_peak_distance < min_peak_distance:
-                continue
-        peak_indexes.append(int(candidate))
-
-    if len(peak_indexes) < target_clusters:
-        for candidate in order:
-            if len(peak_indexes) >= target_clusters:
-                break
-            if int(candidate) not in peak_indexes:
-                peak_indexes.append(int(candidate))
-    return np.asarray(peak_indexes, dtype=np.int32)
-
-
-def _assign_samples_to_density_peak_clusters(
-    samples: np.ndarray,
-    peak_points: np.ndarray,
-    fit_cluster_samples: list[np.ndarray],
-) -> np.ndarray:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    peaks = np.asarray(peak_points, dtype=np.float32).reshape(-1, 3)
-    if len(points) == 0 or len(peaks) == 0:
-        return np.full(len(points), -1, dtype=np.int32)
-
-    basin_samples = [
-        np.asarray(cluster, dtype=np.float32).reshape(-1, 3)
-        for cluster in fit_cluster_samples
-    ]
-    if not any(len(cluster) > 0 for cluster in basin_samples):
-        distances = np.linalg.norm(points[:, None, :] - peaks[None, :, :], axis=2)
-        return distances.argmin(axis=1).astype(np.int32)
-
-    labels = np.full(len(points), -1, dtype=np.int32)
-    chunk_size = 1024
-    for start in range(0, len(points), chunk_size):
-        chunk = points[start : start + chunk_size]
-        best_distances = np.full(len(chunk), np.inf, dtype=np.float32)
-        best_labels = np.full(len(chunk), -1, dtype=np.int32)
-        for cluster_index, cluster in enumerate(basin_samples):
-            if len(cluster) == 0:
-                continue
-            distances = np.linalg.norm(chunk[:, None, :] - cluster[None, :, :], axis=2)
-            nearest = distances.min(axis=1)
-            improved = nearest < best_distances
-            best_distances[improved] = nearest[improved]
-            best_labels[improved] = cluster_index
-        labels[start : start + len(chunk)] = best_labels
-    return labels
-
-
-def _pairwise_rgb_distances(samples: np.ndarray) -> np.ndarray:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    deltas = points[:, None, :] - points[None, :, :]
-    distances = np.linalg.norm(deltas, axis=2).astype(np.float32)
-    np.fill_diagonal(distances, np.inf)
-    return distances
-
-
-def _gmm_dense_core_local_indexes(
-    samples: np.ndarray,
-    *,
-    k_neighbors: int,
-    drop_quantile: float,
-    min_core_count: int = 1,
-) -> np.ndarray:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    if len(points) == 0:
-        return np.empty(0, dtype=np.int32)
-    if k_neighbors <= 0 or drop_quantile <= 0.0 or len(points) <= 2:
-        return np.arange(len(points), dtype=np.int32)
-
-    bin_size = max(1, int(k_neighbors))
-    bin_coords = np.floor(points / float(bin_size)).astype(np.int32)
-    unique_bins, inverse = np.unique(bin_coords, axis=0, return_inverse=True)
-    bin_counts = np.bincount(inverse).astype(np.float32)
-    bin_lookup = {
-        (int(coord[0]), int(coord[1]), int(coord[2])): index
-        for index, coord in enumerate(unique_bins)
-    }
-    bin_density = np.zeros(len(unique_bins), dtype=np.float32)
-    for index, coord in enumerate(unique_bins):
-        density = 0.0
-        base = (int(coord[0]), int(coord[1]), int(coord[2]))
-        for red_offset in (-1, 0, 1):
-            for green_offset in (-1, 0, 1):
-                for blue_offset in (-1, 0, 1):
-                    neighbor = (
-                        base[0] + red_offset,
-                        base[1] + green_offset,
-                        base[2] + blue_offset,
-                    )
-                    neighbor_index = bin_lookup.get(neighbor)
-                    if neighbor_index is not None:
-                        density += float(bin_counts[neighbor_index])
-        bin_density[index] = density
-    density = bin_density[inverse]
-    keep_fraction = 1.0 - float(np.clip(drop_quantile, 0.0, 0.9999))
-    keep_count = int(np.ceil(len(points) * keep_fraction - 1e-9))
-    keep_count = max(1, min(len(points), keep_count, len(points)))
-    keep_count = max(min(len(points), int(min_core_count)), keep_count)
-    order = np.lexsort((np.arange(len(points), dtype=np.int32), -density))
-    return order[:keep_count].astype(np.int32)
-
-
-def _evenly_spaced_indexes(length: int, max_count: int) -> np.ndarray:
-    if length <= 0 or max_count <= 0:
-        return np.empty(0, dtype=np.int32)
-    if length <= max_count:
-        return np.arange(length, dtype=np.int32)
-    return np.linspace(0, length - 1, int(max_count), dtype=np.int32)
-
-
-def _valid_rgb_prior_values(prior_rgb_values: np.ndarray | None) -> np.ndarray:
-    if prior_rgb_values is None:
-        return np.empty((0, 3), dtype=np.float32)
-    priors = np.asarray(prior_rgb_values, dtype=np.float32).reshape(-1, 3)
-    if len(priors) == 0:
-        return np.empty((0, 3), dtype=np.float32)
-    brightness = np.linalg.norm(priors, axis=1)
-    priors = priors[brightness > 1e-6]
-    if len(priors) == 0:
-        return np.empty((0, 3), dtype=np.float32)
-    return np.clip(priors, 0.0, 255.0).astype(np.float32)
-
-
-def _rgb_prior_directions(
-    prior_rgb_values: np.ndarray | None,
-    component_count: int,
-) -> np.ndarray:
-    priors = _valid_rgb_prior_values(prior_rgb_values)
-    if component_count <= 0 or len(priors) == 0:
-        return np.empty((0, 3), dtype=np.float32)
-    return _normalize_rgb_vectors(priors[:component_count])
-
-
-def _prior_gmm_centroids(
-    samples: np.ndarray,
-    prior_directions: np.ndarray,
-) -> np.ndarray:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    directions = np.asarray(prior_directions, dtype=np.float32).reshape(-1, 3)
-    if len(points) == 0 or len(directions) == 0:
-        return np.empty((0, 3), dtype=np.float32)
-
-    sample_directions = _normalize_rgb_vectors(points)
-    scores = sample_directions @ directions.T
-    nearest_prior = scores.argmax(axis=1)
-    fallback_radius = float(np.median(np.linalg.norm(points, axis=1)))
-    centroids = []
-    for index, prior_direction in enumerate(directions):
-        projections = points @ prior_direction
-        member_projections = projections[nearest_prior == index]
-        if len(member_projections) == 0:
-            radius = fallback_radius
-        else:
-            radius = float(np.mean(np.maximum(member_projections, 1e-6)))
-        centroids.append(prior_direction * max(radius, 1e-6))
-    return np.asarray(centroids, dtype=np.float32).reshape(-1, 3)
-
-
-def _apply_gmm_prior_to_centroids(
-    centroids: np.ndarray,
-    prior_directions: np.ndarray,
-    *,
-    prior_strength: float,
-) -> np.ndarray:
-    means = np.asarray(centroids, dtype=np.float32).reshape(-1, 3)
-    directions = np.asarray(prior_directions, dtype=np.float32).reshape(-1, 3)
-    strength = float(np.clip(prior_strength, 0.0, 1.0))
-    if strength <= 0.0 or len(means) == 0 or len(directions) == 0:
-        return means
-
-    adjusted = means.copy()
-    for index in range(min(len(adjusted), len(directions))):
-        prior_direction = directions[index]
-        radius = float(adjusted[index] @ prior_direction)
-        if radius <= 1e-6:
-            radius = float(np.linalg.norm(adjusted[index]))
-        prior_mean = prior_direction * max(radius, 1e-6)
-        adjusted[index] = adjusted[index] * (1.0 - strength) + prior_mean * strength
-    return adjusted.astype(np.float32)
-
-
-def balanced_gmm_rgb_cluster_memberships(
-    rgb_samples: np.ndarray,
-    *,
-    target_clusters: int,
-    min_brightness: float,
-    max_brightness: float | None = None,
-    max_mahalanobis_distance: float = GMM_MAX_MAHALANOBIS_DISTANCE,
-    regularization: float = GMM_REGULARIZATION,
-    ray_variance_floor: float = GMM_RAY_VARIANCE_FLOOR,
-    constrain_covariance_to_ray: bool = GMM_CONSTRAIN_COVARIANCE_TO_RAY,
-    perpendicular_variance_floor: float = GMM_PERPENDICULAR_VARIANCE_FLOOR,
-    perpendicular_variance_ceiling: float = GMM_PERPENDICULAR_VARIANCE_CEILING,
-    dense_core_k_neighbors: int = GMM_DENSE_CORE_K_NEIGHBORS,
-    dense_core_quantile: float = GMM_DENSE_CORE_QUANTILE,
-    dense_core_outliers_unknown: bool = False,
-    prior_rgb_values: np.ndarray | None = None,
-    prior_strength: float = GMM_PRIOR_STRENGTH,
-    min_assignment_confidence: float = GMM_MIN_ASSIGNMENT_CONFIDENCE,
-    assignment_balance: float = GMM_ASSIGNMENT_BALANCE,
-    balance_iterations: int = GMM_BALANCE_ITERATIONS,
-    max_iterations: int = GMM_MAX_ITERATIONS,
-    tolerance: float = GMM_TOLERANCE,
-) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], np.ndarray, np.ndarray]:
-    memberships = balanced_gmm_rgb_cluster_memberships_with_core_mask(
-        rgb_samples,
-        target_clusters=target_clusters,
-        min_brightness=min_brightness,
-        max_brightness=max_brightness,
-        max_mahalanobis_distance=max_mahalanobis_distance,
-        regularization=regularization,
-        ray_variance_floor=ray_variance_floor,
-        constrain_covariance_to_ray=constrain_covariance_to_ray,
-        perpendicular_variance_floor=perpendicular_variance_floor,
-        perpendicular_variance_ceiling=perpendicular_variance_ceiling,
-        dense_core_k_neighbors=dense_core_k_neighbors,
-        dense_core_quantile=dense_core_quantile,
-        dense_core_outliers_unknown=dense_core_outliers_unknown,
-        prior_rgb_values=prior_rgb_values,
-        prior_strength=prior_strength,
-        min_assignment_confidence=min_assignment_confidence,
-        assignment_balance=assignment_balance,
-        balance_iterations=balance_iterations,
-        max_iterations=max_iterations,
-        tolerance=tolerance,
-    )
-    labels, centroids, cluster_samples, covariances, precisions, _dense_core_mask = memberships
-    return labels, centroids, cluster_samples, covariances, precisions
-
-
-def balanced_gmm_rgb_cluster_memberships_with_core_mask(
-    rgb_samples: np.ndarray,
-    *,
-    target_clusters: int,
-    min_brightness: float,
-    max_brightness: float | None = None,
-    max_mahalanobis_distance: float = GMM_MAX_MAHALANOBIS_DISTANCE,
-    regularization: float = GMM_REGULARIZATION,
-    ray_variance_floor: float = GMM_RAY_VARIANCE_FLOOR,
-    constrain_covariance_to_ray: bool = GMM_CONSTRAIN_COVARIANCE_TO_RAY,
-    perpendicular_variance_floor: float = GMM_PERPENDICULAR_VARIANCE_FLOOR,
-    perpendicular_variance_ceiling: float = GMM_PERPENDICULAR_VARIANCE_CEILING,
-    dense_core_k_neighbors: int = GMM_DENSE_CORE_K_NEIGHBORS,
-    dense_core_quantile: float = GMM_DENSE_CORE_QUANTILE,
-    dense_core_outliers_unknown: bool = False,
-    prior_rgb_values: np.ndarray | None = None,
-    prior_strength: float = GMM_PRIOR_STRENGTH,
-    min_assignment_confidence: float = GMM_MIN_ASSIGNMENT_CONFIDENCE,
-    assignment_balance: float = GMM_ASSIGNMENT_BALANCE,
-    balance_iterations: int = GMM_BALANCE_ITERATIONS,
-    max_iterations: int = GMM_MAX_ITERATIONS,
-    tolerance: float = GMM_TOLERANCE,
-) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
-    samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
-    sample_cluster_indexes = np.full(len(samples), -1, dtype=np.int32)
-    dense_core_sample_mask = np.zeros(len(samples), dtype=bool)
-    if len(samples) == 0 or target_clusters <= 0:
-        empty_cov = np.empty((0, 3, 3), dtype=np.float32)
-        return (
-            sample_cluster_indexes,
-            np.empty((0, 3), dtype=np.float32),
-            [],
-            empty_cov,
-            empty_cov,
-            dense_core_sample_mask,
-        )
-
-    usable_indexes = np.flatnonzero(
-        rgb_brightness_mask(
-            samples,
-            min_brightness=min_brightness,
-            max_brightness=max_brightness,
-        )
-    )
-    usable = samples[usable_indexes]
-    fit_local_indexes = _gmm_dense_core_local_indexes(
-        usable,
-        k_neighbors=dense_core_k_neighbors,
-        drop_quantile=dense_core_quantile,
-        min_core_count=target_clusters,
-    )
-    fit_samples = usable[fit_local_indexes]
-    prior_values = _valid_rgb_prior_values(prior_rgb_values)
-    component_limit = len(prior_values) if len(prior_values) > 0 else int(target_clusters)
-    component_count = min(int(target_clusters), component_limit, len(fit_samples))
-    if component_count <= 0:
-        empty_cov = np.empty((0, 3, 3), dtype=np.float32)
-        return (
-            sample_cluster_indexes,
-            np.empty((0, 3), dtype=np.float32),
-            [],
-            empty_cov,
-            empty_cov,
-            dense_core_sample_mask,
-        )
-    dense_core_sample_mask[usable_indexes[fit_local_indexes]] = True
-
-    prior_directions = _rgb_prior_directions(prior_values, component_count)
-    centroids = (
-        _prior_gmm_centroids(fit_samples, prior_directions)
-        if len(prior_directions) == component_count
-        else _initial_ray_gmm_centroids(fit_samples, component_count)
-    )
-    covariance_ray_centroids = prior_directions if len(prior_directions) == component_count else None
-    covariances = _initial_gmm_covariances(
-        fit_samples,
-        centroids,
-        regularization=regularization,
-        ray_variance_floor=ray_variance_floor,
-        constrain_covariance_to_ray=constrain_covariance_to_ray,
-        perpendicular_variance_floor=perpendicular_variance_floor,
-        perpendicular_variance_ceiling=perpendicular_variance_ceiling,
-        covariance_ray_centroids=covariance_ray_centroids,
-    )
-    previous_log_likelihood = -np.inf
-    responsibilities = np.full(
-        (len(fit_samples), component_count),
-        1.0 / float(component_count),
-        dtype=np.float32,
-    )
-    for _ in range(max(1, int(max_iterations))):
-        log_probabilities, _precisions = _gmm_log_probabilities(
-            fit_samples,
-            centroids,
-            covariances,
-            regularization=regularization,
-        )
-        responsibilities = _balanced_gmm_responsibilities(
-            log_probabilities,
-            assignment_balance=assignment_balance,
-            balance_iterations=balance_iterations,
-        )
-        log_likelihood = float(np.sum(_logsumexp(log_probabilities, axis=1)))
-        if (
-            np.isfinite(previous_log_likelihood)
-            and abs(log_likelihood - previous_log_likelihood) <= float(tolerance) * len(fit_samples)
-        ):
-            break
-        previous_log_likelihood = log_likelihood
-
-        effective_counts = np.maximum(responsibilities.sum(axis=0), 1e-6)
-        centroids = (responsibilities.T @ fit_samples) / effective_counts[:, None]
-        centroids = _apply_gmm_prior_to_centroids(
-            centroids,
-            prior_directions,
-            prior_strength=prior_strength,
-        )
-        covariances = _responsibility_weighted_covariances(
-            fit_samples,
-            centroids,
-            responsibilities,
-            effective_counts,
-            regularization=regularization,
-            ray_variance_floor=ray_variance_floor,
-            constrain_covariance_to_ray=constrain_covariance_to_ray,
-            perpendicular_variance_floor=perpendicular_variance_floor,
-            perpendicular_variance_ceiling=perpendicular_variance_ceiling,
-            covariance_ray_centroids=covariance_ray_centroids,
-        )
-
-    final_log_probabilities, _precisions = _gmm_log_probabilities(
-        usable,
-        centroids,
-        covariances,
-        regularization=regularization,
-    )
-    responsibilities = _balanced_gmm_responsibilities(
-        final_log_probabilities,
-        assignment_balance=assignment_balance,
-        balance_iterations=balance_iterations,
-    )
-    distances = _mahalanobis_distance_matrix(usable, centroids, covariances)
-    labels = responsibilities.argmax(axis=1).astype(np.int32)
-    labels[distances[np.arange(len(distances)), labels] > max_mahalanobis_distance] = -1
-    unbalanced_responsibilities = _gmm_unbalanced_responsibilities(final_log_probabilities)
-    valid_labels = labels >= 0
-    selected_confidence = np.zeros(len(labels), dtype=np.float32)
-    selected_confidence[valid_labels] = unbalanced_responsibilities[
-        np.flatnonzero(valid_labels),
-        labels[valid_labels],
-    ]
-    labels[selected_confidence < float(np.clip(min_assignment_confidence, 0.0, 1.0))] = -1
-    if dense_core_outliers_unknown:
-        dense_core_mask = np.zeros(len(usable), dtype=bool)
-        dense_core_mask[fit_local_indexes] = True
-        labels[~dense_core_mask] = -1
-    sample_cluster_indexes[usable_indexes] = labels
-
-    retained_centroids = []
-    retained_covariances = []
-    cluster_samples = []
-    remapped_indexes = np.full(len(samples), -1, dtype=np.int32)
-    for cluster_index in range(component_count):
-        member_indexes = usable_indexes[labels == cluster_index]
-        if len(member_indexes) == 0:
-            continue
-        members = samples[member_indexes]
-        retained_centroids.append(
-            centroids[cluster_index]
-            if len(prior_directions) == component_count
-            else members.mean(axis=0)
-        )
-        retained_covariances.append(covariances[cluster_index])
-        cluster_samples.append(members)
-        remapped_indexes[member_indexes] = len(retained_centroids) - 1
-
-    if not retained_centroids:
-        empty_cov = np.empty((0, 3, 3), dtype=np.float32)
-        return (
-            sample_cluster_indexes,
-            np.empty((0, 3), dtype=np.float32),
-            [],
-            empty_cov,
-            empty_cov,
-            dense_core_sample_mask,
-        )
-
-    centroid_array = np.asarray(retained_centroids, dtype=np.float32).reshape(-1, 3)
-    covariance_array = np.asarray(retained_covariances, dtype=np.float32).reshape(-1, 3, 3)
-    precision_array = np.asarray(
-        [_stable_inverse(covariance, regularization=regularization) for covariance in covariance_array],
-        dtype=np.float32,
-    )
-    return (
-        remapped_indexes,
-        centroid_array,
-        cluster_samples,
-        covariance_array,
-        precision_array,
-        dense_core_sample_mask,
-    )
-
-
-def mahalanobis_distances_to_rgb_clusters(
-    rgb_sample: np.ndarray,
-    centroids: np.ndarray,
-    precisions: np.ndarray,
-) -> np.ndarray:
-    point = np.asarray(rgb_sample, dtype=np.float32).reshape(3)
-    means = np.asarray(centroids, dtype=np.float32).reshape(-1, 3)
-    precision_matrices = np.asarray(precisions, dtype=np.float32).reshape(-1, 3, 3)
-    if len(means) == 0:
-        return np.empty(0, dtype=np.float32)
-    deltas = point[None, :] - means
-    distances = np.einsum("ki,kij,kj->k", deltas, precision_matrices, deltas)
-    return np.maximum(distances, 0.0).astype(np.float32)
-
-
-def balanced_ray_rgb_cluster_memberships(
-    rgb_samples: np.ndarray,
-    *,
-    target_clusters: int,
-    min_brightness: float,
-    max_brightness: float | None = None,
-    max_angle_radians: float = RAY_MAX_ANGLE_RADIANS,
-    assignment_balance: float = GMM_ASSIGNMENT_BALANCE,
-    assignment_sharpness: float = RAY_ASSIGNMENT_SHARPNESS,
-    balance_iterations: int = RAY_BALANCE_ITERATIONS,
-    max_iterations: int = RAY_MAX_ITERATIONS,
-) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], np.ndarray]:
-    samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
-    sample_cluster_indexes = np.full(len(samples), -1, dtype=np.int32)
-    if len(samples) == 0 or target_clusters <= 0:
-        return (
-            sample_cluster_indexes,
-            np.empty((0, 3), dtype=np.float32),
-            [],
-            np.empty((0, 3), dtype=np.float32),
-        )
-
-    usable_indexes = np.flatnonzero(
-        rgb_brightness_mask(
-            samples,
-            min_brightness=min_brightness,
-            max_brightness=max_brightness,
-        )
-    )
-    usable = samples[usable_indexes]
-    component_count = min(int(target_clusters), len(usable))
-    if component_count <= 0:
-        return (
-            sample_cluster_indexes,
-            np.empty((0, 3), dtype=np.float32),
-            [],
-            np.empty((0, 3), dtype=np.float32),
-        )
-
-    directions = _normalize_rgb_vectors(usable)
-    ray_directions = _initial_ray_directions(usable, component_count)
-    responsibilities = np.full(
-        (len(usable), component_count),
-        1.0 / float(component_count),
-        dtype=np.float32,
-    )
-    for _ in range(max(1, int(max_iterations))):
-        cosine_scores = np.clip(directions @ ray_directions.T, -1.0, 1.0)
-        responsibilities = _balanced_gmm_responsibilities(
-            cosine_scores * float(assignment_sharpness),
-            assignment_balance=assignment_balance,
-            balance_iterations=balance_iterations,
-        )
-        next_ray_directions = _weighted_ray_directions(directions, responsibilities)
-        if np.allclose(next_ray_directions, ray_directions, atol=1e-4):
-            ray_directions = next_ray_directions
-            break
-        ray_directions = next_ray_directions
-
-    cosine_scores = np.clip(directions @ ray_directions.T, -1.0, 1.0)
-    responsibilities = _balanced_gmm_responsibilities(
-        cosine_scores * float(assignment_sharpness),
-        assignment_balance=assignment_balance,
-        balance_iterations=balance_iterations,
-    )
-    labels = responsibilities.argmax(axis=1).astype(np.int32)
-    angles = np.arccos(cosine_scores[np.arange(len(cosine_scores)), labels])
-    labels[angles > float(max_angle_radians)] = -1
-    sample_cluster_indexes[usable_indexes] = labels
-
-    retained_centroids = []
-    retained_directions = []
-    cluster_samples = []
-    remapped_indexes = np.full(len(samples), -1, dtype=np.int32)
-    for cluster_index in range(component_count):
-        member_indexes = usable_indexes[labels == cluster_index]
-        if len(member_indexes) == 0:
-            continue
-        members = samples[member_indexes]
-        retained_centroids.append(members.mean(axis=0))
-        retained_directions.append(ray_directions[cluster_index])
-        cluster_samples.append(members)
-        remapped_indexes[member_indexes] = len(retained_centroids) - 1
-
-    if not retained_centroids:
-        return (
-            sample_cluster_indexes,
-            np.empty((0, 3), dtype=np.float32),
-            [],
-            np.empty((0, 3), dtype=np.float32),
-        )
-    return (
-        remapped_indexes,
-        np.asarray(retained_centroids, dtype=np.float32).reshape(-1, 3),
-        cluster_samples,
-        np.asarray(retained_directions, dtype=np.float32).reshape(-1, 3),
-    )
-
-
-def angles_to_rgb_rays(rgb_sample: np.ndarray, ray_directions: np.ndarray) -> np.ndarray:
-    point = np.asarray(rgb_sample, dtype=np.float32).reshape(1, 3)
-    rays = np.asarray(ray_directions, dtype=np.float32).reshape(-1, 3)
-    if len(rays) == 0:
-        return np.empty(0, dtype=np.float32)
-    direction = _normalize_rgb_vectors(point)[0]
-    cosine = np.clip(rays @ direction, -1.0, 1.0)
-    return np.arccos(cosine).astype(np.float32)
-
-
-def _normalize_rgb_vectors(samples: np.ndarray) -> np.ndarray:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    norms = np.linalg.norm(points, axis=1, keepdims=True)
-    return points / np.maximum(norms, 1e-6)
-
-
-def _initial_ray_directions(samples: np.ndarray, component_count: int) -> np.ndarray:
-    centroids = _initial_ray_gmm_centroids(samples, component_count)
-    return _normalize_rgb_vectors(centroids)
-
-
-def _weighted_ray_directions(
-    directions: np.ndarray,
-    responsibilities: np.ndarray,
-) -> np.ndarray:
-    weighted = np.asarray(responsibilities, dtype=np.float32).T @ np.asarray(
-        directions,
-        dtype=np.float32,
-    )
-    norms = np.linalg.norm(weighted, axis=1, keepdims=True)
-    fallback_indexes = np.flatnonzero(norms[:, 0] <= 1e-6)
-    if len(fallback_indexes) > 0:
-        for index in fallback_indexes:
-            weighted[index] = directions[index % len(directions)]
-    return weighted / np.maximum(np.linalg.norm(weighted, axis=1, keepdims=True), 1e-6)
-
-
-def _balanced_gmm_responsibilities(
-    log_probabilities: np.ndarray,
-    *,
-    assignment_balance: float,
-    balance_iterations: int,
-) -> np.ndarray:
-    log_values = np.asarray(log_probabilities, dtype=np.float32)
-    if log_values.size == 0:
-        return np.empty(log_values.shape, dtype=np.float32)
-
-    log_responsibilities = log_values - _logsumexp(log_values, axis=1)[:, None]
-    responsibilities = np.exp(log_responsibilities).astype(np.float32)
-    strength = float(np.clip(assignment_balance, 0.0, 1.0))
-    if strength <= 0.0 or responsibilities.shape[1] <= 1:
-        return responsibilities
-
-    balanced = responsibilities.copy()
-    target_column_sum = float(len(balanced)) / float(balanced.shape[1])
-    for _ in range(max(1, int(balance_iterations))):
-        column_sums = np.maximum(balanced.sum(axis=0, keepdims=True), 1e-12)
-        balanced *= target_column_sum / column_sums
-        row_sums = np.maximum(balanced.sum(axis=1, keepdims=True), 1e-12)
-        balanced /= row_sums
-
-    if strength >= 1.0:
-        return balanced.astype(np.float32)
-    mixed = responsibilities * (1.0 - strength) + balanced * strength
-    mixed /= np.maximum(mixed.sum(axis=1, keepdims=True), 1e-12)
-    return mixed.astype(np.float32)
-
-
-def _gmm_unbalanced_responsibilities(log_probabilities: np.ndarray) -> np.ndarray:
-    log_values = np.asarray(log_probabilities, dtype=np.float32)
-    if log_values.size == 0:
-        return np.empty(log_values.shape, dtype=np.float32)
-    log_responsibilities = log_values - _logsumexp(log_values, axis=1)[:, None]
-    return np.exp(log_responsibilities).astype(np.float32)
-
-
-def _initial_ray_gmm_centroids(samples: np.ndarray, component_count: int) -> np.ndarray:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    if component_count <= 0:
-        return np.empty((0, 3), dtype=np.float32)
-    norms = np.linalg.norm(points, axis=1, keepdims=True)
-    directions = points / np.maximum(norms, 1e-6)
-    centroids = [directions[int(np.argmax(norms[:, 0]))]]
-    while len(centroids) < component_count:
-        existing = np.asarray(centroids, dtype=np.float32)
-        angular_distances = 1.0 - np.max(directions @ existing.T, axis=1)
-        centroids.append(directions[int(np.argmax(angular_distances))])
-
-    direction_centroids = np.asarray(centroids, dtype=np.float32)
-    for _ in range(12):
-        labels = np.argmax(directions @ direction_centroids.T, axis=1)
-        for index in range(component_count):
-            members = directions[labels == index]
-            if len(members) == 0:
-                continue
-            centroid = members.mean(axis=0)
-            norm = float(np.linalg.norm(centroid))
-            if norm > 1e-6:
-                direction_centroids[index] = centroid / norm
-
-    labels = np.argmax(directions @ direction_centroids.T, axis=1)
-    raw_centroids = []
-    for index in range(component_count):
-        members = points[labels == index]
-        if len(members) == 0:
-            nearest = int(np.argmax(directions @ direction_centroids[index]))
-            raw_centroids.append(points[nearest])
-        else:
-            raw_centroids.append(members.mean(axis=0))
-    return np.asarray(raw_centroids, dtype=np.float32).reshape(-1, 3)
-
-
-def _initial_gmm_covariances(
-    samples: np.ndarray,
-    centroids: np.ndarray,
-    *,
-    regularization: float,
-    ray_variance_floor: float,
-    constrain_covariance_to_ray: bool,
-    perpendicular_variance_floor: float,
-    perpendicular_variance_ceiling: float,
-    covariance_ray_centroids: np.ndarray | None = None,
-) -> np.ndarray:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    means = np.asarray(centroids, dtype=np.float32).reshape(-1, 3)
-    if len(means) == 0:
-        return np.empty((0, 3, 3), dtype=np.float32)
-    distances = np.linalg.norm(points[:, None, :] - means[None, :, :], axis=2)
-    labels = distances.argmin(axis=1)
-    covariances = []
-    fallback = _regularized_covariance(points, regularization=regularization)
-    ray_centroids = (
-        np.asarray(covariance_ray_centroids, dtype=np.float32).reshape(-1, 3)
-        if covariance_ray_centroids is not None
-        else means
-    )
-    for index in range(len(means)):
-        members = points[labels == index]
-        ray_centroid = ray_centroids[index] if index < len(ray_centroids) else centroids[index]
-        covariances.append(
-            _regularized_covariance(
-                members,
-                ray_centroid,
-                regularization=regularization,
-                ray_variance_floor=ray_variance_floor,
-                constrain_covariance_to_ray=constrain_covariance_to_ray,
-                perpendicular_variance_floor=perpendicular_variance_floor,
-                perpendicular_variance_ceiling=perpendicular_variance_ceiling,
-            )
-            if len(members) >= 2
-            else _shape_gmm_covariance_for_ray(
-                fallback,
-                ray_centroid,
-                ray_variance_floor=ray_variance_floor,
-                constrain_covariance_to_ray=constrain_covariance_to_ray,
-                perpendicular_variance_floor=perpendicular_variance_floor,
-                perpendicular_variance_ceiling=perpendicular_variance_ceiling,
-            )
-        )
-    return np.asarray(covariances, dtype=np.float32).reshape(-1, 3, 3)
-
-
-def _responsibility_weighted_covariances(
-    samples: np.ndarray,
-    centroids: np.ndarray,
-    responsibilities: np.ndarray,
-    effective_counts: np.ndarray,
-    *,
-    regularization: float,
-    ray_variance_floor: float,
-    constrain_covariance_to_ray: bool,
-    perpendicular_variance_floor: float,
-    perpendicular_variance_ceiling: float,
-    covariance_ray_centroids: np.ndarray | None = None,
-) -> np.ndarray:
-    covariances = []
-    means = np.asarray(centroids, dtype=np.float32).reshape(-1, 3)
-    ray_centroids = (
-        np.asarray(covariance_ray_centroids, dtype=np.float32).reshape(-1, 3)
-        if covariance_ray_centroids is not None
-        else means
-    )
-    for index, centroid in enumerate(means):
-        deltas = samples - centroid[None, :]
-        weighted = deltas * responsibilities[:, index][:, None]
-        covariance = (weighted.T @ deltas) / max(float(effective_counts[index]), 1e-6)
-        covariance += np.eye(3, dtype=np.float32) * float(regularization)
-        ray_centroid = ray_centroids[index] if index < len(ray_centroids) else centroid
-        covariance = _shape_gmm_covariance_for_ray(
-            covariance,
-            ray_centroid,
-            ray_variance_floor=ray_variance_floor,
-            constrain_covariance_to_ray=constrain_covariance_to_ray,
-            perpendicular_variance_floor=perpendicular_variance_floor,
-            perpendicular_variance_ceiling=perpendicular_variance_ceiling,
-        )
-        covariances.append(covariance)
-    return np.asarray(covariances, dtype=np.float32).reshape(-1, 3, 3)
-
-
-def _regularized_covariance(
-    samples: np.ndarray,
-    centroid: np.ndarray | None = None,
-    *,
-    regularization: float,
-    ray_variance_floor: float = 0.0,
-    constrain_covariance_to_ray: bool = False,
-    perpendicular_variance_floor: float = GMM_PERPENDICULAR_VARIANCE_FLOOR,
-    perpendicular_variance_ceiling: float = GMM_PERPENDICULAR_VARIANCE_CEILING,
-) -> np.ndarray:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    if len(points) < 2:
-        scale = max(float(regularization), 1e-6)
-        covariance = np.eye(3, dtype=np.float32) * scale
-        return _shape_gmm_covariance_for_ray(
-            covariance,
-            centroid,
-            ray_variance_floor=ray_variance_floor,
-            constrain_covariance_to_ray=constrain_covariance_to_ray,
-            perpendicular_variance_floor=perpendicular_variance_floor,
-            perpendicular_variance_ceiling=perpendicular_variance_ceiling,
-        )
-    covariance = np.cov(points, rowvar=False).astype(np.float32)
-    covariance = covariance + np.eye(3, dtype=np.float32) * float(regularization)
-    return _shape_gmm_covariance_for_ray(
-        covariance,
-        centroid,
-        ray_variance_floor=ray_variance_floor,
-        constrain_covariance_to_ray=constrain_covariance_to_ray,
-        perpendicular_variance_floor=perpendicular_variance_floor,
-        perpendicular_variance_ceiling=perpendicular_variance_ceiling,
-    )
-
-
-def _shape_gmm_covariance_for_ray(
-    covariance: np.ndarray,
-    centroid: np.ndarray | None,
-    *,
-    ray_variance_floor: float,
-    constrain_covariance_to_ray: bool = False,
-    perpendicular_variance_floor: float = GMM_PERPENDICULAR_VARIANCE_FLOOR,
-    perpendicular_variance_ceiling: float = GMM_PERPENDICULAR_VARIANCE_CEILING,
-) -> np.ndarray:
-    matrix = np.asarray(covariance, dtype=np.float32).reshape(3, 3).copy()
-    if centroid is None:
-        return matrix
-
-    center = np.asarray(centroid, dtype=np.float32).reshape(3)
-    norm = float(np.linalg.norm(center))
-    if norm <= 1e-6:
-        return matrix
-
-    ray = center / norm
-    radial_variance = max(float(ray @ matrix @ ray), float(ray_variance_floor), 1e-6)
-    if not constrain_covariance_to_ray:
-        if float(ray @ matrix @ ray) >= float(ray_variance_floor):
-            return matrix
-        return matrix + np.outer(ray, ray).astype(np.float32) * (
-            radial_variance - float(ray @ matrix @ ray)
-        )
-
-    perpendicular_basis = np.eye(3, dtype=np.float32) - np.outer(ray, ray).astype(np.float32)
-    perpendicular_variance = float(np.trace(perpendicular_basis @ matrix) / 2.0)
-    perpendicular_variance = max(perpendicular_variance, float(perpendicular_variance_floor))
-    if perpendicular_variance_ceiling > 0.0:
-        perpendicular_variance = min(perpendicular_variance, float(perpendicular_variance_ceiling))
-    if perpendicular_variance <= 1e-6:
-        perpendicular_variance = 1e-6
-    return (
-        np.outer(ray, ray).astype(np.float32) * radial_variance
-        + perpendicular_basis * perpendicular_variance
-    ).astype(np.float32)
-
-
-def _apply_ray_variance_floor(
-    covariance: np.ndarray,
-    centroid: np.ndarray | None,
-    *,
-    ray_variance_floor: float,
-) -> np.ndarray:
-    matrix = np.asarray(covariance, dtype=np.float32).reshape(3, 3).copy()
-    if centroid is None or float(ray_variance_floor) <= 0.0:
-        return matrix
-    return _shape_gmm_covariance_for_ray(
-        matrix,
-        centroid,
-        ray_variance_floor=ray_variance_floor,
-    )
-
-
-def _gmm_log_probabilities(
-    samples: np.ndarray,
-    centroids: np.ndarray,
-    covariances: np.ndarray,
-    *,
-    regularization: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    means = np.asarray(centroids, dtype=np.float32).reshape(-1, 3)
-    precision_matrices = []
-    log_probabilities = []
-    for mean, covariance in zip(means, np.asarray(covariances, dtype=np.float32).reshape(-1, 3, 3)):
-        stable_covariance = covariance + np.eye(3, dtype=np.float32) * float(regularization) * 1e-3
-        precision = _stable_inverse(stable_covariance, regularization=regularization)
-        sign, log_determinant = np.linalg.slogdet(stable_covariance)
-        if sign <= 0:
-            stable_covariance = stable_covariance + np.eye(3, dtype=np.float32) * float(regularization)
-            precision = _stable_inverse(stable_covariance, regularization=regularization)
-            _sign, log_determinant = np.linalg.slogdet(stable_covariance)
-        deltas = points - mean[None, :]
-        squared = np.einsum("ni,ij,nj->n", deltas, precision, deltas)
-        log_probabilities.append(-0.5 * (squared + float(log_determinant)))
-        precision_matrices.append(precision)
-    return (
-        np.asarray(log_probabilities, dtype=np.float32).T,
-        np.asarray(precision_matrices, dtype=np.float32).reshape(-1, 3, 3),
-    )
-
-
-def _mahalanobis_distance_matrix(
-    samples: np.ndarray,
-    centroids: np.ndarray,
-    covariances: np.ndarray,
-) -> np.ndarray:
-    _log_probabilities, precisions = _gmm_log_probabilities(
-        samples,
-        centroids,
-        covariances,
-        regularization=0.0,
-    )
-    points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    means = np.asarray(centroids, dtype=np.float32).reshape(-1, 3)
-    distances = []
-    for mean, precision in zip(means, precisions):
-        deltas = points - mean[None, :]
-        distances.append(np.einsum("ni,ij,nj->n", deltas, precision, deltas))
-    return np.maximum(np.asarray(distances, dtype=np.float32).T, 0.0)
-
-
-def _stable_inverse(matrix: np.ndarray, *, regularization: float) -> np.ndarray:
-    covariance = np.asarray(matrix, dtype=np.float32).reshape(3, 3)
-    try:
-        return np.linalg.inv(covariance).astype(np.float32)
-    except np.linalg.LinAlgError:
-        stabilized = covariance + np.eye(3, dtype=np.float32) * max(float(regularization), 1e-6)
-        return np.linalg.pinv(stabilized).astype(np.float32)
-
-
-def _logsumexp(values: np.ndarray, *, axis: int) -> np.ndarray:
-    array = np.asarray(values, dtype=np.float32)
-    max_values = np.max(array, axis=axis, keepdims=True)
-    return (
-        np.log(np.sum(np.exp(array - max_values), axis=axis, keepdims=True))
-        + max_values
-    ).squeeze(axis)
 
 
 def density_rgb_clusters(
@@ -3478,497 +1027,147 @@ def density_rgb_clusters(
     *,
     target_clusters: int,
     min_brightness: float,
-    max_brightness: float | None = None,
-    eps: float = DENSITY_CLUSTER_EPS,
-    eps_reference_rgb: float = DENSITY_CLUSTER_EPS_REFERENCE_RGB,
+    eps_radians: float = DENSITY_CLUSTER_EPS_RADIANS,
     min_points: int = DENSITY_CLUSTER_MIN_POINTS,
-    merge_ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
 ) -> tuple[np.ndarray, list[np.ndarray]]:
-    _, centroids, cluster_samples = density_rgb_cluster_memberships(
-        rgb_samples,
-        target_clusters=target_clusters,
-        min_brightness=min_brightness,
-        max_brightness=max_brightness,
-        eps=eps,
-        eps_reference_rgb=eps_reference_rgb,
-        min_points=min_points,
-        merge_ray_distance_divisor=merge_ray_distance_divisor,
-    )
-    return centroids, cluster_samples
-
-
-def density_rgb_cluster_memberships(
-    rgb_samples: np.ndarray,
-    *,
-    target_clusters: int,
-    min_brightness: float,
-    max_brightness: float | None = None,
-    eps: float = DENSITY_CLUSTER_EPS,
-    eps_reference_rgb: float = DENSITY_CLUSTER_EPS_REFERENCE_RGB,
-    min_points: int = DENSITY_CLUSTER_MIN_POINTS,
-    merge_ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
-) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
     samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
-    sample_cluster_indexes = np.full(len(samples), -1, dtype=np.int32)
     if len(samples) == 0 or target_clusters <= 0:
-        return sample_cluster_indexes, np.empty((0, 3), dtype=np.float32), []
+        return np.empty((0, 3), dtype=np.float32), []
 
-    usable_indexes = np.flatnonzero(
-        rgb_brightness_mask(
-            samples,
-            min_brightness=min_brightness,
-            max_brightness=max_brightness,
-        )
-    )
-    usable = samples[usable_indexes]
+    brightness = np.linalg.norm(samples, axis=1)
+    usable = samples[brightness >= min_brightness]
     if len(usable) < min_points:
-        return sample_cluster_indexes, np.empty((0, 3), dtype=np.float32), []
+        return np.empty((0, 3), dtype=np.float32), []
 
     labels = density_bin_labels(
-        usable,
-        eps=eps,
-        eps_reference_rgb=eps_reference_rgb,
+        normalized_rgb_points(usable),
+        eps_radians=eps_radians,
         min_points=min_points,
     )
 
     clusters = []
     for label in sorted(set(int(value) for value in labels if value >= 0)):
-        member_indexes = usable_indexes[labels == label]
-        if len(member_indexes) >= min_points:
-            clusters.append(member_indexes.astype(np.int32, copy=True))
-    clusters = merge_smallest_index_clusters_to_nearest_neighbor(
+        members = usable[labels == label]
+        if len(members) >= min_points:
+            clusters.append(members.astype(np.float32, copy=True))
+    clusters = merge_smallest_clusters_to_nearest_neighbor(
         clusters,
-        samples=samples,
         target_count=target_clusters,
-        ray_distance_divisor=merge_ray_distance_divisor,
     )
 
     centroids = []
     retained_clusters = []
-    for cluster_index, member_indexes in enumerate(clusters):
-        members = samples[member_indexes]
+    for members in clusters:
         centroid = members.mean(axis=0)
         if float(np.linalg.norm(centroid)) <= 1e-6:
             continue
         centroids.append(centroid)
         retained_clusters.append(members)
-        sample_cluster_indexes[member_indexes] = cluster_index
 
-    if len(centroids) == 0:
-        return sample_cluster_indexes, np.empty((0, 3), dtype=np.float32), retained_clusters
-    return (
-        sample_cluster_indexes,
-        np.asarray(centroids, dtype=np.float32).reshape(-1, 3),
-        retained_clusters,
-    )
-
-
-def density_hsv_clusters(
-    bgr_samples: np.ndarray,
-    *,
-    target_clusters: int,
-    min_brightness: float,
-    max_brightness: float | None = None,
-    eps: float = HSV_DENSITY_CLUSTER_EPS,
-    min_points: int = HSV_DENSITY_CLUSTER_MIN_POINTS,
-) -> tuple[np.ndarray, list[np.ndarray], list[np.ndarray]]:
-    _labels, centroids, rgb_cluster_samples, hsv_cluster_samples = density_hsv_cluster_memberships(
-        bgr_samples,
-        target_clusters=target_clusters,
-        min_brightness=min_brightness,
-        max_brightness=max_brightness,
-        eps=eps,
-        min_points=min_points,
-    )
-    return centroids, rgb_cluster_samples, hsv_cluster_samples
-
-
-def density_hsv_cluster_memberships(
-    bgr_samples: np.ndarray,
-    *,
-    target_clusters: int,
-    min_brightness: float,
-    max_brightness: float | None = None,
-    eps: float = HSV_DENSITY_CLUSTER_EPS,
-    min_points: int = HSV_DENSITY_CLUSTER_MIN_POINTS,
-) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray]]:
-    bgr = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
-    rgb = bgr_samples_to_rgb(bgr)
-    hsv = bgr_samples_to_hsv(bgr)
-    sample_cluster_indexes = np.full(len(hsv), -1, dtype=np.int32)
-    if len(hsv) == 0 or target_clusters <= 0:
-        return sample_cluster_indexes, np.empty((0, 3), dtype=np.float32), [], []
-
-    usable_indexes = np.flatnonzero(
-        hsv_value_mask(
-            hsv,
-            min_brightness=min_brightness,
-            max_brightness=max_brightness,
-        )
-    )
-    usable_hsv = hsv[usable_indexes]
-    if len(usable_hsv) < min_points:
-        return sample_cluster_indexes, np.empty((0, 3), dtype=np.float32), [], []
-
-    labels = density_fixed_hsv_labels(
-        usable_hsv,
-        eps=eps,
-        min_points=min_points,
-    )
-    clusters = []
-    for label in sorted(set(int(value) for value in labels if value >= 0)):
-        member_indexes = usable_indexes[labels == label]
-        if len(member_indexes) >= min_points:
-            clusters.append(member_indexes.astype(np.int32, copy=True))
-    clusters.sort(key=len, reverse=True)
-    clusters = clusters[: max(0, int(target_clusters))]
-
-    centroids = []
-    rgb_cluster_samples = []
-    hsv_cluster_samples = []
-    for cluster_index, member_indexes in enumerate(clusters):
-        rgb_members = rgb[member_indexes]
-        hsv_members = hsv[member_indexes]
-        if len(rgb_members) == 0:
-            continue
-        centroids.append(rgb_members.mean(axis=0))
-        rgb_cluster_samples.append(rgb_members)
-        hsv_cluster_samples.append(hsv_members)
-        sample_cluster_indexes[member_indexes] = cluster_index
-
-    if len(centroids) == 0:
-        return sample_cluster_indexes, np.empty((0, 3), dtype=np.float32), [], []
-    return (
-        sample_cluster_indexes,
-        np.asarray(centroids, dtype=np.float32).reshape(-1, 3),
-        rgb_cluster_samples,
-        hsv_cluster_samples,
-    )
+    return np.asarray(centroids, dtype=np.float32), retained_clusters
 
 
 def merge_smallest_clusters_to_nearest_neighbor(
     clusters: list[np.ndarray],
     *,
     target_count: int,
-    ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
 ) -> list[np.ndarray]:
     clusters = [np.asarray(cluster, dtype=np.float32).reshape(-1, 3) for cluster in clusters]
     clusters = [cluster for cluster in clusters if len(cluster) > 0]
-    if target_count <= 0:
-        return []
-    clusters.sort(key=len, reverse=True)
-    if len(clusters) <= target_count:
-        return clusters
-
-    anchors = clusters[:target_count]
-    extras = clusters[target_count:]
-    pending_merges: list[list[np.ndarray]] = [[] for _ in anchors]
-    for extra in extras:
-        nearest_index = nearest_anchor_cluster_index(
-            anchors,
-            extra,
-            ray_distance_divisor=ray_distance_divisor,
+    while len(clusters) > target_count:
+        smallest_index = min(range(len(clusters)), key=lambda index: len(clusters[index]))
+        nearest_index = nearest_cluster_index(clusters, smallest_index)
+        clusters[nearest_index] = np.concatenate(
+            [clusters[nearest_index], clusters[smallest_index]],
+            axis=0,
         )
-        pending_merges[nearest_index].append(extra)
-
-    merged_clusters = []
-    for anchor, assigned_extras in zip(anchors, pending_merges):
-        if assigned_extras:
-            merged_clusters.append(np.concatenate([anchor, *assigned_extras], axis=0))
-        else:
-            merged_clusters.append(anchor)
-    merged_clusters.sort(key=len, reverse=True)
-    return merged_clusters
-
-
-def merge_smallest_index_clusters_to_nearest_neighbor(
-    clusters: list[np.ndarray],
-    *,
-    samples: np.ndarray,
-    target_count: int,
-    ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
-) -> list[np.ndarray]:
-    clusters = [np.asarray(cluster, dtype=np.int32).reshape(-1) for cluster in clusters]
-    clusters = [cluster for cluster in clusters if len(cluster) > 0]
-    sample_points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    if target_count <= 0:
-        return []
+        del clusters[smallest_index]
     clusters.sort(key=len, reverse=True)
-    if len(clusters) <= target_count:
-        return clusters
-
-    anchors = clusters[:target_count]
-    extras = clusters[target_count:]
-    pending_merges: list[list[np.ndarray]] = [[] for _ in anchors]
-    for extra in extras:
-        nearest_index = nearest_anchor_index_cluster_index(
-            anchors,
-            extra,
-            samples=sample_points,
-            ray_distance_divisor=ray_distance_divisor,
-        )
-        pending_merges[nearest_index].append(extra)
-
-    merged_clusters = []
-    for anchor, assigned_extras in zip(anchors, pending_merges):
-        if assigned_extras:
-            merged_clusters.append(np.concatenate([anchor, *assigned_extras], axis=0))
-        else:
-            merged_clusters.append(anchor)
-    merged_clusters.sort(key=len, reverse=True)
-    return merged_clusters
+    return clusters
 
 
-def nearest_cluster_index(
-    clusters: list[np.ndarray],
-    source_index: int,
-    *,
-    ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
-) -> int:
-    source_centroid = np.asarray(clusters[source_index], dtype=np.float32).mean(axis=0)
+def nearest_cluster_index(clusters: list[np.ndarray], source_index: int) -> int:
+    source_centroid = normalized_rgb_points(clusters[source_index]).mean(axis=0)
     best_index = 0 if source_index != 0 else 1
-    best_score = np.inf
+    best_distance = np.inf
     for index, cluster in enumerate(clusters):
         if index == source_index:
             continue
-        score = cluster_merge_score_from_origin_ray(
-            np.asarray(cluster, dtype=np.float32),
-            source_centroid,
-            ray_distance_divisor=ray_distance_divisor,
-        )
-        if score < best_score:
-            best_score = score
+        centroid = normalized_rgb_points(cluster).mean(axis=0)
+        distance = float(np.linalg.norm(source_centroid - centroid))
+        if distance < best_distance:
+            best_distance = distance
             best_index = index
     return best_index
-
-
-def nearest_anchor_cluster_index(
-    anchors: list[np.ndarray],
-    source_cluster: np.ndarray,
-    *,
-    ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
-) -> int:
-    source_centroid = np.asarray(source_cluster, dtype=np.float32).reshape(-1, 3).mean(axis=0)
-    best_index = 0
-    best_score = np.inf
-    for index, anchor in enumerate(anchors):
-        score = cluster_merge_score_from_origin_ray(
-            np.asarray(anchor, dtype=np.float32),
-            source_centroid,
-            ray_distance_divisor=ray_distance_divisor,
-        )
-        if score < best_score:
-            best_score = score
-            best_index = index
-    return best_index
-
-
-def nearest_index_cluster_index(
-    clusters: list[np.ndarray],
-    source_index: int,
-    *,
-    samples: np.ndarray,
-    ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
-) -> int:
-    sample_points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    source_points = sample_points[np.asarray(clusters[source_index], dtype=np.int32)]
-    source_centroid = source_points.mean(axis=0)
-    best_index = 0 if source_index != 0 else 1
-    best_score = np.inf
-    for index, cluster in enumerate(clusters):
-        if index == source_index:
-            continue
-        target_points = sample_points[np.asarray(cluster, dtype=np.int32)]
-        score = cluster_merge_score_from_origin_ray(
-            target_points,
-            source_centroid,
-            ray_distance_divisor=ray_distance_divisor,
-        )
-        if score < best_score:
-            best_score = score
-            best_index = index
-    return best_index
-
-
-def nearest_anchor_index_cluster_index(
-    anchors: list[np.ndarray],
-    source_cluster: np.ndarray,
-    *,
-    samples: np.ndarray,
-    ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
-) -> int:
-    sample_points = np.asarray(samples, dtype=np.float32).reshape(-1, 3)
-    source_points = sample_points[np.asarray(source_cluster, dtype=np.int32)]
-    source_centroid = source_points.mean(axis=0)
-    best_index = 0
-    best_score = np.inf
-    for index, anchor in enumerate(anchors):
-        target_points = sample_points[np.asarray(anchor, dtype=np.int32)]
-        score = cluster_merge_score_from_origin_ray(
-            target_points,
-            source_centroid,
-            ray_distance_divisor=ray_distance_divisor,
-        )
-        if score < best_score:
-            best_score = score
-            best_index = index
-    return best_index
-
-
-def cluster_merge_score_from_origin_ray(
-    target_cluster: np.ndarray,
-    source_centroid: np.ndarray,
-    *,
-    ray_distance_divisor: float = CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
-) -> float:
-    target_points = np.asarray(target_cluster, dtype=np.float32).reshape(-1, 3)
-    source = np.asarray(source_centroid, dtype=np.float32).reshape(3)
-    if len(target_points) == 0:
-        return np.inf
-
-    source_norm = float(np.linalg.norm(source))
-    if source_norm <= 1e-6:
-        distances = np.linalg.norm(target_points - source[None, :], axis=1)
-        return float(distances.min())
-
-    ray_direction = source / source_norm
-    deltas = target_points - source[None, :]
-    parallel = deltas @ ray_direction
-    parallel_vectors = parallel[:, None] * ray_direction[None, :]
-    perpendicular_vectors = deltas - parallel_vectors
-    perpendicular_distances = np.linalg.norm(perpendicular_vectors, axis=1)
-    divisor = max(float(ray_distance_divisor), 1e-6)
-    weighted_distances = np.hypot(perpendicular_distances, parallel / divisor)
-    return float(weighted_distances.min())
 
 
 def density_bin_labels(
-    rgb_samples: np.ndarray,
+    unit_samples: np.ndarray,
     *,
-    eps: float,
-    eps_reference_rgb: float = DENSITY_CLUSTER_EPS_REFERENCE_RGB,
+    eps_radians: float,
     min_points: int,
 ) -> np.ndarray:
-    samples = np.asarray(rgb_samples, dtype=np.float32).reshape(-1, 3)
+    samples = np.asarray(unit_samples, dtype=np.float32).reshape(-1, 3)
     labels = np.full(len(samples), -1, dtype=np.int32)
     if len(samples) == 0:
         return labels
 
-    reference_radius = max(float(np.linalg.norm([eps_reference_rgb] * 3)), 1e-6)
-    sample_radii = np.linalg.norm(samples, axis=1)
-    origin_eps = DENSITY_CLUSTER_EPS_ORIGIN
-    reference_eps = max(float(eps), 1e-6)
-    sample_eps = origin_eps + (reference_eps - origin_eps) * sample_radii / reference_radius
-    sample_eps = np.maximum(sample_eps, 1e-6)
-    cell_size = max(float(sample_eps.max()), 1e-6)
-    sample_cell_keys = np.floor(samples / cell_size).astype(np.int32)
-    cell_lookup: dict[tuple[int, int, int], list[int]] = {}
-    for sample_index, cell_key in enumerate(sample_cell_keys):
-        cell_lookup.setdefault(tuple(int(value) for value in cell_key), []).append(sample_index)
-
-    dense_samples = np.zeros(len(samples), dtype=bool)
-    neighbor_indexes_by_sample: list[list[int]] = []
-    for sample_index, cell_key in enumerate(sample_cell_keys):
+    eps = max(float(eps_radians), 1e-6)
+    chord_radius = float(np.sqrt(max(0.0, 2.0 - 2.0 * np.cos(eps))))
+    cell_size = max(chord_radius, 1e-6)
+    cell_keys, sample_cell_indexes, cell_counts = np.unique(
+        np.floor(samples / cell_size).astype(np.int32),
+        axis=0,
+        return_inverse=True,
+        return_counts=True,
+    )
+    cell_lookup = {
+        tuple(int(value) for value in cell_key): cell_index
+        for cell_index, cell_key in enumerate(cell_keys)
+    }
+    cell_neighbor_counts = np.zeros(len(cell_keys), dtype=np.int32)
+    for cell_index, cell_key in enumerate(cell_keys):
         base_cell = tuple(int(value) for value in cell_key)
-        candidate_indexes = []
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
                 for dz in (-1, 0, 1):
-                    candidate_indexes.extend(
-                        cell_lookup.get(
-                            (base_cell[0] + dx, base_cell[1] + dy, base_cell[2] + dz),
-                            [],
-                        )
+                    neighbor_index = cell_lookup.get(
+                        (base_cell[0] + dx, base_cell[1] + dy, base_cell[2] + dz)
                     )
-        candidate_indexes_array = np.asarray(candidate_indexes, dtype=np.int32)
-        distances = np.linalg.norm(samples[candidate_indexes_array] - samples[sample_index], axis=1)
-        density_neighbors = candidate_indexes_array[distances <= sample_eps[sample_index]]
-        symmetric_eps = np.maximum(sample_eps[sample_index], sample_eps[candidate_indexes_array])
-        connected_neighbors = candidate_indexes_array[distances <= symmetric_eps]
-        neighbor_indexes = [int(index) for index in connected_neighbors]
-        neighbor_indexes_by_sample.append(neighbor_indexes)
-        dense_samples[sample_index] = len(density_neighbors) >= int(min_points)
+                    if neighbor_index is not None:
+                        cell_neighbor_counts[cell_index] += cell_counts[neighbor_index]
 
+    dense_cells = cell_neighbor_counts >= int(min_points)
+    cell_labels = np.full(len(cell_keys), -1, dtype=np.int32)
     cluster_id = 0
-    for start_sample in np.flatnonzero(dense_samples):
-        if labels[start_sample] >= 0:
+    for start_cell in np.flatnonzero(dense_cells):
+        if cell_labels[start_cell] >= 0:
             continue
-        queue = [int(start_sample)]
-        labels[start_sample] = cluster_id
+        queue = [int(start_cell)]
+        cell_labels[start_cell] = cluster_id
         while queue:
             current = queue.pop()
-            for neighbor_index in neighbor_indexes_by_sample[current]:
-                if not dense_samples[neighbor_index] or labels[neighbor_index] >= 0:
-                    continue
-                labels[neighbor_index] = cluster_id
-                queue.append(neighbor_index)
-        cluster_id += 1
-
-    return labels
-
-
-def density_fixed_hsv_labels(
-    hsv_samples: np.ndarray,
-    *,
-    eps: float,
-    min_points: int,
-) -> np.ndarray:
-    samples = np.asarray(hsv_samples, dtype=np.float32).reshape(-1, 3)
-    labels = np.full(len(samples), -1, dtype=np.int32)
-    if len(samples) == 0:
-        return labels
-
-    cell_size = max(float(eps), 1e-6)
-    hue_cell_count = max(1, int(np.ceil(180.0 / cell_size)))
-    sample_cell_keys = np.floor(samples / cell_size).astype(np.int32)
-    sample_cell_keys[:, 0] %= hue_cell_count
-    cell_lookup: dict[tuple[int, int, int], list[int]] = {}
-    for sample_index, cell_key in enumerate(sample_cell_keys):
-        cell_lookup.setdefault(tuple(int(value) for value in cell_key), []).append(sample_index)
-
-    dense_samples = np.zeros(len(samples), dtype=bool)
-    neighbor_indexes_by_sample: list[list[int]] = []
-    for sample_index, cell_key in enumerate(sample_cell_keys):
-        base_cell = tuple(int(value) for value in cell_key)
-        candidate_indexes = []
-        for dh in (-1, 0, 1):
-            for ds in (-1, 0, 1):
-                for dv in (-1, 0, 1):
-                    candidate_indexes.extend(
-                        cell_lookup.get(
-                            (
-                                (base_cell[0] + dh) % hue_cell_count,
-                                base_cell[1] + ds,
-                                base_cell[2] + dv,
-                            ),
-                            [],
+            base_cell = tuple(int(value) for value in cell_keys[current])
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        neighbor_index = cell_lookup.get(
+                            (base_cell[0] + dx, base_cell[1] + dy, base_cell[2] + dz)
                         )
-                    )
-        candidate_indexes_array = np.asarray(candidate_indexes, dtype=np.int32)
-        distances = hsv_distance_matrix(
-            samples[sample_index].reshape(1, 3),
-            samples[candidate_indexes_array],
-        ).reshape(-1)
-        neighbors = candidate_indexes_array[distances <= cell_size]
-        neighbor_indexes = [int(index) for index in neighbors]
-        neighbor_indexes_by_sample.append(neighbor_indexes)
-        dense_samples[sample_index] = len(neighbor_indexes) >= int(min_points)
-
-    cluster_id = 0
-    for start_sample in np.flatnonzero(dense_samples):
-        if labels[start_sample] >= 0:
-            continue
-        queue = [int(start_sample)]
-        labels[start_sample] = cluster_id
-        while queue:
-            current = queue.pop()
-            for neighbor_index in neighbor_indexes_by_sample[current]:
-                if not dense_samples[neighbor_index] or labels[neighbor_index] >= 0:
-                    continue
-                labels[neighbor_index] = cluster_id
-                queue.append(neighbor_index)
+                        if (
+                            neighbor_index is None
+                            or not dense_cells[neighbor_index]
+                            or cell_labels[neighbor_index] >= 0
+                        ):
+                            continue
+                        cell_labels[neighbor_index] = cluster_id
+                        queue.append(neighbor_index)
         cluster_id += 1
 
+    for sample_index, cell_index in enumerate(sample_cell_indexes):
+        label = cell_labels[cell_index]
+        if label >= 0:
+            labels[sample_index] = label
     return labels
 
 
@@ -4029,6 +1228,39 @@ def square_roi_from_center(
     return x1, y1, x1 + side_px, y1 + side_px
 
 
+def roi_side_px(roi_xyxy: tuple[int, int, int, int]) -> float:
+    x1, y1, x2, y2 = roi_xyxy
+    return float(max(1, max(x2 - x1, y2 - y1)))
+
+
+def adjacency_roi_scale(roi_side: float, args) -> float:
+    reference_side = max(
+        1.0,
+        float(getattr(args, "adjacency_reference_roi_size", ADJACENCY_REFERENCE_ROI_SIZE_PX)),
+    )
+    return max(1.0, float(roi_side)) / reference_side
+
+
+def scaled_adjacency_px(
+    value: float,
+    roi_side: float,
+    args,
+    *,
+    min_value: float = 0.0,
+) -> float:
+    return max(float(min_value), float(value) * adjacency_roi_scale(roi_side, args))
+
+
+def scaled_adjacency_int_px(
+    value: float,
+    roi_side: float,
+    args,
+    *,
+    min_value: int = 0,
+) -> int:
+    return max(int(min_value), int(round(scaled_adjacency_px(value, roi_side, args))))
+
+
 def apply_mask_padding(mask: np.ndarray, padding_px: int) -> np.ndarray:
     if padding_px == 0 or not bool(mask.any()):
         return mask
@@ -4057,2389 +1289,6 @@ def sticker_mask_bool(
     return mask > 0.5
 
 
-def low_intersection_sticker_lines(
-    sticker_masks: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-    line_width_px: int = EMPTY_SPACE_LINE_WIDTH_PX,
-    angle_bucket_degrees: float = BASIS_VECTOR_ANGLE_BUCKET_DEGREES,
-    **_: object,
-) -> EmptySpaceLineOverlay:
-    union_mask = _union_sticker_mask(sticker_masks, roi_shape)
-    if union_mask is None:
-        return EmptySpaceLineOverlay(lines=[], sampled_points_xy=np.empty((0, 2), dtype=np.float32))
-    line_width = max(1.0, float(line_width_px))
-    quad_geometry = _sticker_quad_geometry(
-        sticker_masks,
-        roi_shape=roi_shape,
-    )
-    quad_points = quad_geometry.points_xy
-    if len(quad_points) < 2 or len(quad_geometry.edge_segments_xy) == 0:
-        return EmptySpaceLineOverlay(
-            lines=[],
-            sampled_points_xy=quad_points,
-            line_width_px=int(round(line_width)),
-            quad_edge_segments_xy=quad_geometry.edge_segments_xy,
-        )
-
-    lines: list[LowIntersectionLine] = []
-    for edge_start, edge_end in quad_geometry.edge_segments_xy:
-        candidate = _infinite_line_from_points(edge_start, edge_end)
-        if candidate is None:
-            continue
-        point, direction, _normal = candidate
-        segment = _clip_infinite_line_to_roi(point, direction, roi_shape)
-        if segment is None:
-            continue
-        start, end = segment
-        length_px = int(round(float(np.linalg.norm(end - start))))
-        angle_degrees = float(np.degrees(np.arctan2(direction[1], direction[0])) % 180.0)
-        lines.append(
-            LowIntersectionLine(
-                score=0.0,
-                intersection_px=0,
-                length_px=length_px,
-                angle_degrees=angle_degrees,
-                start_xy=(float(start[0]), float(start[1])),
-                end_xy=(float(end[0]), float(end[1])),
-            )
-        )
-
-    basis_vectors = _basis_vectors_from_line_angle_histogram(
-        lines,
-        bucket_degrees=angle_bucket_degrees,
-    )
-    roi_height, roi_width = roi_shape
-    return EmptySpaceLineOverlay(
-        lines=lines,
-        sampled_points_xy=quad_points,
-        line_width_px=int(round(line_width)),
-        quad_edge_segments_xy=quad_geometry.edge_segments_xy,
-        basis_vectors_xy=basis_vectors,
-        basis_center_xy=((roi_width - 1) / 2.0, (roi_height - 1) / 2.0),
-    )
-
-
-def _basis_vectors_from_line_angle_histogram(
-    lines: list[LowIntersectionLine],
-    *,
-    bucket_degrees: float,
-    basis_count: int = 2,
-) -> np.ndarray:
-    if not lines or basis_count <= 0:
-        return np.empty((0, 2), dtype=np.float32)
-
-    bucket_size = max(float(bucket_degrees), 1e-6)
-    bucket_count = max(1, int(np.ceil(180.0 / bucket_size)))
-    angles = np.asarray([line.angle_degrees % 180.0 for line in lines], dtype=np.float32)
-    bucket_indexes = np.minimum(
-        np.floor(angles / bucket_size).astype(np.int32),
-        bucket_count - 1,
-    )
-    counts = np.bincount(bucket_indexes, minlength=bucket_count).astype(np.int32)
-    peak_scores = (
-        counts
-        + np.roll(counts, 1)
-        + np.roll(counts, -1)
-    )
-
-    vectors = []
-    suppressed = np.zeros(bucket_count, dtype=bool)
-    for _ in range(basis_count):
-        available_scores = peak_scores.copy()
-        available_scores[suppressed] = -1
-        peak_index = int(np.argmax(available_scores))
-        if available_scores[peak_index] <= 0:
-            break
-
-        center = (peak_index + 0.5) * bucket_size
-        lower = center - bucket_size * 1.5
-        upper = center + bucket_size * 1.5
-        nearby = np.asarray(
-            [_angle_in_half_open_axial_window(angle, lower, upper) for angle in angles],
-            dtype=bool,
-        )
-        vector = _average_axial_angle_vector(angles[nearby])
-        if vector is not None:
-            vectors.append(vector)
-
-        for neighbor_offset in (-1, 0, 1):
-            suppressed[(peak_index + neighbor_offset) % bucket_count] = True
-
-    if not vectors:
-        return np.empty((0, 2), dtype=np.float32)
-    return np.asarray(vectors, dtype=np.float32)
-
-
-def _angle_in_half_open_axial_window(angle_degrees: float, lower: float, upper: float) -> bool:
-    angle = float(angle_degrees) % 180.0
-    width = max(float(upper - lower), 0.0)
-    lower = float(lower) % 180.0
-    if width >= 180.0:
-        return True
-    return ((angle - lower) % 180.0) < width
-
-
-def _average_axial_angle_vector(angles_degrees: np.ndarray) -> np.ndarray | None:
-    angles = np.asarray(angles_degrees, dtype=np.float32).reshape(-1)
-    if len(angles) == 0:
-        return None
-    doubled = np.radians(angles * 2.0)
-    mean_x = float(np.cos(doubled).mean())
-    mean_y = float(np.sin(doubled).mean())
-    if float(np.hypot(mean_x, mean_y)) <= 1e-6:
-        return None
-    angle = 0.5 * float(np.arctan2(mean_y, mean_x))
-    return np.asarray((np.cos(angle), np.sin(angle)), dtype=np.float32)
-
-
-def _mask_convex_hull_points(mask: np.ndarray) -> np.ndarray | None:
-    points = cv2.findNonZero((np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8) * 255)
-    if points is None or len(points) < 3:
-        return None
-    return cv2.convexHull(points).reshape(-1, 2).astype(np.float32)
-
-
-def _form_fit_sticker_area_mask(union_mask: np.ndarray) -> np.ndarray | None:
-    binary = (np.asarray(union_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
-    bounds = _mask_bounds_xyxy(union_mask)
-    if bounds is None:
-        return None
-
-    x1, y1, x2, y2 = bounds
-    span = max(x2 - x1, y2 - y1)
-    radius = max(4, int(round(span * 0.08)))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
-    form = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
-    form = cv2.dilate(form, kernel, iterations=1)
-    contours, _ = cv2.findContours(form, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    filled = np.zeros_like(binary)
-    for contour in contours:
-        if cv2.contourArea(contour) > 0:
-            cv2.drawContours(filled, [contour], -1, 255, thickness=-1)
-    return filled > 0 if bool(filled.any()) else None
-
-
-def _normalized_sticker_masks(
-    sticker_masks: list[np.ndarray],
-    roi_shape: tuple[int, int],
-) -> list[np.ndarray]:
-    roi_height, roi_width = roi_shape
-    normalized = []
-    for mask in sticker_masks:
-        mask = np.asarray(mask, dtype=bool)
-        if mask.shape != (roi_height, roi_width):
-            mask = cv2.resize(
-                mask.astype(np.uint8),
-                (roi_width, roi_height),
-                interpolation=cv2.INTER_NEAREST,
-            ) > 0
-        if bool(mask.any()):
-            normalized.append(mask)
-    return normalized
-
-
-def _sample_empty_form_points(
-    union_mask: np.ndarray,
-    form_mask: np.ndarray,
-    sticker_masks: list[np.ndarray],
-    *,
-    sample_count: int,
-) -> np.ndarray:
-    if sample_count <= 0:
-        return np.empty((0, 2), dtype=np.float32)
-
-    empty_mask = _interior_gap_mask(union_mask, form_mask, sticker_masks)
-    ys, xs = np.nonzero(empty_mask)
-    if len(xs) == 0:
-        return np.empty((0, 2), dtype=np.float32)
-
-    seed = _mask_seed(empty_mask)
-    rng = np.random.default_rng(seed)
-    size = min(sample_count, len(xs))
-    indexes = rng.choice(len(xs), size=size, replace=False)
-    return np.stack([xs[indexes], ys[indexes]], axis=1).astype(np.float32)
-
-
-def _interior_gap_mask(
-    union_mask: np.ndarray,
-    form_mask: np.ndarray,
-    sticker_masks: list[np.ndarray],
-) -> np.ndarray:
-    empty_mask = form_mask & ~union_mask
-    if not bool(empty_mask.any()):
-        return empty_mask
-
-    form_u8 = form_mask.astype(np.uint8) * 255
-    union_u8 = union_mask.astype(np.uint8) * 255
-    distance_from_form_edge = cv2.distanceTransform(form_u8, cv2.DIST_L2, 3)
-    distance_from_stickers = cv2.distanceTransform(255 - union_u8, cv2.DIST_L2, 3)
-    form_edge_margin = max(3.0, min(form_mask.shape[:2]) * 0.035)
-    sticker_gap_reach = max(6.0, min(form_mask.shape[:2]) * 0.14)
-    multi_sticker_nearby = _near_multiple_stickers_mask(
-        sticker_masks,
-        max_distance=sticker_gap_reach,
-    )
-    gap_mask = (
-        empty_mask
-        & (distance_from_form_edge >= form_edge_margin)
-        & (distance_from_stickers <= sticker_gap_reach)
-        & multi_sticker_nearby
-    )
-    if int(gap_mask.sum()) >= 8:
-        return gap_mask
-
-    fallback = (
-        empty_mask
-        & (distance_from_form_edge >= form_edge_margin)
-        & (distance_from_stickers <= sticker_gap_reach)
-    )
-    return fallback if bool(fallback.any()) else empty_mask
-
-
-def _near_multiple_stickers_mask(
-    sticker_masks: list[np.ndarray],
-    *,
-    max_distance: float,
-) -> np.ndarray:
-    if not sticker_masks:
-        return np.zeros((0, 0), dtype=bool)
-
-    nearby_count = np.zeros(sticker_masks[0].shape, dtype=np.uint8)
-    for mask in sticker_masks:
-        source = np.where(mask, 0, 255).astype(np.uint8)
-        distances = cv2.distanceTransform(source, cv2.DIST_L2, 3)
-        nearby_count += (distances <= max_distance).astype(np.uint8)
-    return nearby_count >= 2 if len(sticker_masks) >= 2 else nearby_count >= 1
-
-
-def _mask_seed(mask: np.ndarray) -> int:
-    ys, xs = np.nonzero(mask)
-    return int(mask.sum() + ys.sum() * 31 + xs.sum() * 131) & 0xFFFFFFFF
-
-
-def _infinite_line_from_points(
-    start_xy: np.ndarray,
-    end_xy: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    start = np.asarray(start_xy, dtype=np.float32)
-    end = np.asarray(end_xy, dtype=np.float32)
-    vector = end - start
-    length = float(np.linalg.norm(vector))
-    if length <= 1e-6:
-        return None
-    direction = vector / length
-    normal = np.asarray((-direction[1], direction[0]), dtype=np.float32)
-    return start, direction, normal
-
-
-def _sample_segment_integer_points(start_xy: np.ndarray, end_xy: np.ndarray) -> np.ndarray:
-    start = np.asarray(start_xy, dtype=np.float32)
-    end = np.asarray(end_xy, dtype=np.float32)
-    length = int(round(float(np.linalg.norm(end - start))))
-    if length <= 0:
-        return np.empty((0, 2), dtype=np.int32)
-    t = np.linspace(0.0, 1.0, length + 1, dtype=np.float32)
-    points = start[None, :] * (1.0 - t[:, None]) + end[None, :] * t[:, None]
-    return np.round(points).astype(np.int32)
-
-
-def _line_intersectionality_profile(
-    line_points_xy: np.ndarray,
-    *,
-    union_mask: np.ndarray,
-    edge_distance_image: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    points = np.asarray(line_points_xy, dtype=np.int32).reshape(-1, 2)
-    if len(points) == 0:
-        return np.empty(0, dtype=np.float32), np.empty(0, dtype=bool)
-
-    height, width = union_mask.shape[:2]
-    xs = np.clip(points[:, 0], 0, width - 1)
-    ys = np.clip(points[:, 1], 0, height - 1)
-    intersects = union_mask[ys, xs]
-    edge_distances = edge_distance_image[ys, xs]
-    normalized_edge_distance = np.minimum(edge_distances / 9.0, 1.0)
-    scores = np.where(
-        intersects,
-        0.35 + 0.65 * normalized_edge_distance,
-        0.04 + 0.32 * normalized_edge_distance,
-    )
-    return scores.astype(np.float32), intersects.astype(bool)
-
-
-def _best_low_intersectionality_region_score(point_scores: np.ndarray) -> float:
-    scores = np.asarray(point_scores, dtype=np.float32).reshape(-1)
-    if len(scores) == 0:
-        return 1.0
-
-    window = min(len(scores), max(8, int(round(len(scores) * 0.35))))
-    if window == len(scores):
-        return float(scores.mean())
-    cumsum = np.concatenate([[0.0], np.cumsum(scores, dtype=np.float32)])
-    means = (cumsum[window:] - cumsum[:-window]) / float(window)
-    return float(np.min(means))
-
-
-def _clip_infinite_line_to_convex_polygon(
-    point_xy: np.ndarray,
-    direction_xy: np.ndarray,
-    polygon_xy: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray] | None:
-    direction = np.asarray(direction_xy, dtype=np.float32)
-    point = np.asarray(point_xy, dtype=np.float32)
-    polygon = np.asarray(polygon_xy, dtype=np.float32).reshape(-1, 2)
-    if len(polygon) < 3:
-        return None
-
-    intersections = []
-    for start, end in zip(polygon, np.roll(polygon, -1, axis=0)):
-        edge = end - start
-        denominator = _cross_2d(direction, edge)
-        if abs(denominator) <= 1e-6:
-            continue
-        delta = start - point
-        line_t = _cross_2d(delta, edge) / denominator
-        edge_t = _cross_2d(delta, direction) / denominator
-        if -1e-4 <= edge_t <= 1.0 + 1e-4:
-            intersections.append(point + direction * line_t)
-
-    unique = []
-    for intersection in intersections:
-        if not any(float(np.linalg.norm(intersection - existing)) < 1e-3 for existing in unique):
-            unique.append(intersection)
-    if len(unique) < 2:
-        return None
-    unique.sort(key=lambda value: float(value @ direction))
-    return unique[0], unique[-1]
-
-
-def _clip_infinite_line_to_mask(
-    point_xy: np.ndarray,
-    direction_xy: np.ndarray,
-    mask: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray] | None:
-    direction = np.asarray(direction_xy, dtype=np.float32)
-    point = np.asarray(point_xy, dtype=np.float32)
-    height, width = mask.shape[:2]
-    span = float(np.hypot(width, height) * 1.5)
-    sample_count = max(8, int(round(span * 2.0)))
-    t_values = np.linspace(-span, span, sample_count, dtype=np.float32)
-    points = point[None, :] + t_values[:, None] * direction[None, :]
-    xs = np.round(points[:, 0]).astype(np.int32)
-    ys = np.round(points[:, 1]).astype(np.int32)
-    valid = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
-    inside = np.zeros(len(points), dtype=bool)
-    inside[valid] = mask[ys[valid], xs[valid]]
-
-    runs = []
-    start_index: int | None = None
-    for index, is_inside in enumerate(inside):
-        if is_inside and start_index is None:
-            start_index = index
-        elif not is_inside and start_index is not None:
-            runs.append((start_index, index - 1))
-            start_index = None
-    if start_index is not None:
-        runs.append((start_index, len(inside) - 1))
-    if not runs:
-        return None
-
-    best_start, best_end = max(runs, key=lambda run: run[1] - run[0])
-    if best_end <= best_start:
-        return None
-    return points[best_start].astype(np.float32), points[best_end].astype(np.float32)
-
-
-def _clip_infinite_line_to_roi(
-    point_xy: np.ndarray,
-    direction_xy: np.ndarray,
-    roi_shape: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray] | None:
-    roi_height, roi_width = roi_shape
-    rect = np.asarray(
-        [
-            [0.0, 0.0],
-            [float(roi_width - 1), 0.0],
-            [float(roi_width - 1), float(roi_height - 1)],
-            [0.0, float(roi_height - 1)],
-        ],
-        dtype=np.float32,
-    )
-    segment = _clip_infinite_line_to_convex_polygon(point_xy, direction_xy, rect)
-    if segment is None:
-        return None
-    start, end = segment
-    start = np.asarray(
-        (
-            np.clip(start[0], 0.0, float(roi_width - 1)),
-            np.clip(start[1], 0.0, float(roi_height - 1)),
-        ),
-        dtype=np.float32,
-    )
-    end = np.asarray(
-        (
-            np.clip(end[0], 0.0, float(roi_width - 1)),
-            np.clip(end[1], 0.0, float(roi_height - 1)),
-        ),
-        dtype=np.float32,
-    )
-    return start, end
-
-
-def _cross_2d(left: np.ndarray, right: np.ndarray) -> float:
-    return float(left[0] * right[1] - left[1] * right[0])
-
-
-def _diverse_low_intersection_lines(
-    candidates: list[LowIntersectionLine],
-    *,
-    max_lines: int,
-) -> list[LowIntersectionLine]:
-    selected: list[LowIntersectionLine] = []
-    for candidate in candidates:
-        if any(
-            abs(candidate.angle_degrees - selected_line.angle_degrees) < 1e-6
-            and _segment_midpoint_distance(candidate, selected_line) < 8.0
-            for selected_line in selected
-        ):
-            continue
-        selected.append(candidate)
-        if len(selected) >= max_lines:
-            break
-    return selected
-
-
-def _segment_midpoint_distance(left: LowIntersectionLine, right: LowIntersectionLine) -> float:
-    left_midpoint = (
-        np.asarray(left.start_xy, dtype=np.float32)
-        + np.asarray(left.end_xy, dtype=np.float32)
-    ) * 0.5
-    right_midpoint = (
-        np.asarray(right.start_xy, dtype=np.float32)
-        + np.asarray(right.end_xy, dtype=np.float32)
-    ) * 0.5
-    return float(np.linalg.norm(left_midpoint - right_midpoint))
-
-
-def draw_low_intersection_lines(
-    frame: np.ndarray,
-    overlay: EmptySpaceLineOverlay | list[LowIntersectionLine],
-    *,
-    offset_xy: tuple[int, int],
-) -> None:
-    offset = np.asarray(offset_xy, dtype=np.float32)
-    if isinstance(overlay, EmptySpaceLineOverlay):
-        sampled_points = overlay.sampled_points_xy
-        lines = overlay.lines
-        line_width_px = overlay.line_width_px
-        quad_edge_segments = overlay.quad_edge_segments_xy
-        basis_vectors = overlay.basis_vectors_xy
-        basis_center = overlay.basis_center_xy
-    else:
-        sampled_points = np.empty((0, 2), dtype=np.float32)
-        lines = overlay
-        line_width_px = EMPTY_SPACE_LINE_WIDTH_PX
-        quad_edge_segments = np.empty((0, 2, 2), dtype=np.float32)
-        basis_vectors = np.empty((0, 2), dtype=np.float32)
-        basis_center = None
-
-    for segment in np.asarray(quad_edge_segments, dtype=np.float32).reshape(-1, 2, 2):
-        start = segment[0] + offset
-        end = segment[1] + offset
-        start_xy = (int(round(start[0])), int(round(start[1])))
-        end_xy = (int(round(end[0])), int(round(end[1])))
-        cv2.line(
-            frame,
-            start_xy,
-            end_xy,
-            (0, 0, 0),
-            4,
-            lineType=cv2.LINE_AA,
-        )
-        cv2.line(
-            frame,
-            start_xy,
-            end_xy,
-            (255, 0, 255),
-            2,
-            lineType=cv2.LINE_AA,
-        )
-
-    for index, line in enumerate(lines):
-        start = np.asarray(line.start_xy, dtype=np.float32) + offset
-        end = np.asarray(line.end_xy, dtype=np.float32) + offset
-        color = (0, 255, 255) if index < 8 else (255, 255, 255)
-        thickness = max(1, int(round(float(line_width_px))))
-        cv2.line(
-            frame,
-            (int(round(start[0])), int(round(start[1]))),
-            (int(round(end[0])), int(round(end[1]))),
-            (0, 0, 0),
-            thickness + 2,
-            lineType=cv2.LINE_AA,
-        )
-        cv2.line(
-            frame,
-            (int(round(start[0])), int(round(start[1]))),
-            (int(round(end[0])), int(round(end[1]))),
-            color,
-            thickness,
-            lineType=cv2.LINE_AA,
-        )
-
-    for point in np.asarray(sampled_points, dtype=np.float32).reshape(-1, 2):
-        xy = point + offset
-        center = (int(round(xy[0])), int(round(xy[1])))
-        cv2.circle(frame, center, 6, (0, 0, 0), -1, lineType=cv2.LINE_AA)
-        cv2.circle(frame, center, 4, (255, 0, 255), -1, lineType=cv2.LINE_AA)
-
-    if basis_center is not None:
-        center = np.asarray(basis_center, dtype=np.float32) + offset
-        vector_length = max(18.0, min(frame.shape[:2]) * 0.10)
-        for vector, color in zip(
-            np.asarray(basis_vectors, dtype=np.float32).reshape(-1, 2),
-            [(255, 0, 0), (0, 0, 255)],
-        ):
-            norm = float(np.linalg.norm(vector))
-            if norm <= 1e-6:
-                continue
-            unit = vector / norm
-            start = center - unit * vector_length
-            end = center + unit * vector_length
-            start_xy = (int(round(start[0])), int(round(start[1])))
-            end_xy = (int(round(end[0])), int(round(end[1])))
-            cv2.line(frame, start_xy, end_xy, (0, 0, 0), 6, lineType=cv2.LINE_AA)
-            cv2.line(frame, start_xy, end_xy, color, 4, lineType=cv2.LINE_AA)
-
-    if len(sampled_points) > 0 or lines:
-        label_origin = (int(offset[0]) + 6, int(offset[1]) + 18)
-        label = f"quad pts {len(sampled_points)} lines {len(lines)}"
-        cv2.putText(
-            frame,
-            label,
-            label_origin,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 0, 0),
-            3,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            label,
-            label_origin,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-
-
-def fit_projected_cube_grid(
-    sticker_masks: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-    line_thickness_px: int = 2,
-    minimum_coverage: float = 0.88,
-) -> ProjectedCubeGridFit | None:
-    union_mask = _union_sticker_mask(sticker_masks, roi_shape)
-    if union_mask is None:
-        return None
-
-    bounds = _mask_bounds_xyxy(union_mask)
-    if bounds is None:
-        return None
-
-    mask_area = max(float(union_mask.sum()), 1.0)
-    mask_points = _sample_mask_xy_points(
-        union_mask,
-        max_points=CUBE_GRID_FIT_SAMPLE_POINTS,
-    )
-    edge_mask = _sticker_edge_mask(
-        sticker_masks,
-        roi_shape=roi_shape,
-    )
-    if len(mask_points) == 0 or edge_mask is None:
-        return None
-    edge_distance_image = _distance_image_from_edge_mask(edge_mask)
-    edge_directions = _dominant_edge_direction_angles(edge_mask)
-    candidate_axes = _projected_cube_axis_candidates_for_edge_directions(edge_directions)
-
-    coarse_fits: list[tuple[float, np.ndarray, np.ndarray, list[tuple[tuple[float, float], tuple[float, float]]], np.ndarray]] = []
-    for axes in candidate_axes:
-        base_hull, base_lines = _projected_cube_grid_geometry(axes)
-        base_min = base_hull.min(axis=0)
-        base_max = base_hull.max(axis=0)
-        base_size = np.maximum(base_max - base_min, 1e-6)
-        bx1, by1, bx2, by2 = bounds
-        target_size = np.asarray((bx2 - bx1, by2 - by1), dtype=np.float32) * 1.08
-        base_scale = float(np.max(target_size / base_size))
-        base_center = (base_min + base_max) / 2.0
-        target_center = np.asarray(((bx1 + bx2) / 2.0, (by1 + by2) / 2.0), dtype=np.float32)
-        for scale_multiplier in (1.0, 1.15):
-            scale = base_scale * scale_multiplier
-            hull, lines = _transform_projected_cube_grid(
-                base_hull,
-                base_lines,
-                base_center=base_center,
-                scale=scale,
-                origin=target_center,
-            )
-            fit = _score_projected_cube_grid_from_edge_distance(
-                edge_distance_image,
-                coverage_points_xy=mask_points,
-                mask_area=mask_area,
-                hull_points_xy=hull,
-                line_segments_xy=lines,
-                line_thickness_px=line_thickness_px,
-                minimum_coverage=minimum_coverage,
-            )
-            coarse_fits.append((fit.score, base_hull, base_center, base_lines, target_center))
-
-    best_fit: ProjectedCubeGridFit | None = None
-    offset_step = max(float(max(target_size)) * 0.045, 1.0)
-    offset_candidates = (
-        (0.0, 0.0),
-        (-offset_step, 0.0),
-        (offset_step, 0.0),
-        (0.0, -offset_step),
-        (0.0, offset_step),
-    )
-    for _, base_hull, base_center, base_lines, target_center in sorted(
-        coarse_fits,
-        key=lambda item: item[0],
-    )[:CUBE_GRID_FIT_REFINE_CANDIDATES]:
-        base_min = base_hull.min(axis=0)
-        base_max = base_hull.max(axis=0)
-        base_size = np.maximum(base_max - base_min, 1e-6)
-        base_scale = float(np.max(target_size / base_size))
-        for scale_multiplier in (0.96, 1.08, 1.20):
-            scale = base_scale * scale_multiplier
-            for offset_x, offset_y in offset_candidates:
-                origin = target_center + np.asarray((offset_x, offset_y), dtype=np.float32)
-                hull, lines = _transform_projected_cube_grid(
-                    base_hull,
-                    base_lines,
-                    base_center=base_center,
-                    scale=scale,
-                    origin=origin,
-                )
-                fit = _score_projected_cube_grid_from_edge_distance(
-                    edge_distance_image,
-                    coverage_points_xy=mask_points,
-                    mask_area=mask_area,
-                    hull_points_xy=hull,
-                    line_segments_xy=lines,
-                    line_thickness_px=line_thickness_px,
-                    minimum_coverage=minimum_coverage,
-                )
-                if best_fit is None or fit.score < best_fit.score:
-                    best_fit = fit
-    return best_fit
-
-
-def _transform_projected_cube_grid(
-    base_hull: np.ndarray,
-    base_lines: list[tuple[tuple[float, float], tuple[float, float]]],
-    *,
-    base_center: np.ndarray,
-    scale: float,
-    origin: np.ndarray,
-) -> tuple[np.ndarray, list[tuple[tuple[float, float], tuple[float, float]]]]:
-    hull = (base_hull - base_center) * scale + origin
-    lines = [
-        (
-            tuple(((np.asarray(start) - base_center) * scale + origin).tolist()),
-            tuple(((np.asarray(end) - base_center) * scale + origin).tolist()),
-        )
-        for start, end in base_lines
-    ]
-    return hull, lines
-
-
-def _sample_mask_xy_points(mask: np.ndarray, *, max_points: int) -> np.ndarray:
-    ys, xs = np.nonzero(mask)
-    if len(xs) == 0:
-        return np.empty((0, 2), dtype=np.float32)
-
-    points = np.stack([xs, ys], axis=1).astype(np.float32)
-    if len(points) <= max_points:
-        return points
-
-    indexes = np.linspace(0, len(points) - 1, max_points, dtype=np.int32)
-    return points[indexes]
-
-
-def _sample_sticker_edge_xy_points(
-    sticker_masks: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-    max_points: int,
-) -> np.ndarray:
-    del max_points
-    return _sticker_quad_geometry(sticker_masks, roi_shape=roi_shape).points_xy
-
-
-def _sample_sticker_edge_points(
-    sticker_masks: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-    max_points: int,
-) -> StickerEdgePointSample:
-    del max_points
-    geometry = _sticker_quad_geometry(sticker_masks, roi_shape=roi_shape)
-    return StickerEdgePointSample(
-        points_xy=geometry.points_xy,
-        sticker_indexes=geometry.sticker_indexes,
-    )
-
-
-def _sticker_quad_geometry(
-    sticker_masks: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-) -> StickerQuadGeometry:
-    roi_height, roi_width = roi_shape
-    point_batches = []
-    sticker_index_batches = []
-    edge_batches = []
-    for sticker_index, mask in enumerate(sticker_masks):
-        quad = _sticker_mask_quad_points(mask, roi_shape=roi_shape)
-        if quad is None:
-            continue
-        point_batches.append(quad)
-        sticker_index_batches.append(
-            np.full(len(quad), sticker_index, dtype=np.int32)
-        )
-        edge_batches.append(np.stack([quad, np.roll(quad, -1, axis=0)], axis=1))
-
-    if not point_batches:
-        return StickerQuadGeometry(
-            points_xy=np.empty((0, 2), dtype=np.float32),
-            sticker_indexes=np.empty(0, dtype=np.int32),
-            edge_segments_xy=np.empty((0, 2, 2), dtype=np.float32),
-        )
-
-    return StickerQuadGeometry(
-        points_xy=np.concatenate(point_batches, axis=0).astype(np.float32),
-        sticker_indexes=np.concatenate(sticker_index_batches, axis=0),
-        edge_segments_xy=np.concatenate(edge_batches, axis=0).astype(np.float32),
-    )
-
-
-def _sticker_mask_quad_points(
-    mask: np.ndarray,
-    *,
-    roi_shape: tuple[int, int],
-) -> np.ndarray | None:
-    roi_height, roi_width = roi_shape
-    normalized = np.asarray(mask, dtype=bool)
-    if normalized.shape != (roi_height, roi_width):
-        normalized = cv2.resize(
-            normalized.astype(np.uint8),
-            (roi_width, roi_height),
-            interpolation=cv2.INTER_NEAREST,
-        ) > 0
-    points = cv2.findNonZero(normalized.astype(np.uint8) * 255)
-    if points is None or len(points) < 3:
-        return None
-
-    binary = normalized.astype(np.uint8) * 255
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    contour = max(contours, key=cv2.contourArea)
-    perimeter = cv2.arcLength(contour, closed=True)
-    if perimeter <= 1e-6:
-        return None
-
-    for epsilon_ratio in np.linspace(0.005, 0.12, 32):
-        approx = cv2.approxPolyDP(contour, epsilon_ratio * perimeter, closed=True)
-        if len(approx) == 4:
-            return _order_quad_points_clockwise(approx.reshape(-1, 2).astype(np.float32))
-
-    hull = cv2.convexHull(contour).reshape(-1, 2).astype(np.float32)
-    if len(hull) == 4:
-        return _order_quad_points_clockwise(hull)
-    if len(hull) > 4:
-        return _max_area_quad_from_hull_points(hull)
-    return None
-
-
-def _face_parallelogram_points(
-    mask: np.ndarray,
-    *,
-    roi_shape: tuple[int, int],
-) -> np.ndarray | None:
-    quad = _sticker_mask_quad_points(mask, roi_shape=roi_shape)
-    if quad is None:
-        return None
-    return _parallelogram_from_quad_points(quad)
-
-
-def _parallelogram_from_quad_points(points_xy: np.ndarray) -> np.ndarray:
-    points = _order_quad_points_clockwise(points_xy)
-    center = points.mean(axis=0)
-    horizontal = ((points[1] + points[2]) - (points[0] + points[3])) / 4.0
-    vertical = ((points[2] + points[3]) - (points[0] + points[1])) / 4.0
-    return np.asarray(
-        [
-            center - horizontal - vertical,
-            center + horizontal - vertical,
-            center + horizontal + vertical,
-            center - horizontal + vertical,
-        ],
-        dtype=np.float32,
-    )
-
-
-def _reconcile_shared_face_parallelogram_sides(
-    parallelograms: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-) -> list[np.ndarray]:
-    reconciled = [np.asarray(quad, dtype=np.float32).reshape(4, 2).copy() for quad in parallelograms]
-    if len(reconciled) < 2:
-        return reconciled
-
-    max_shared_edge_distance = max(10.0, min(roi_shape) * 0.12)
-    for left_index, right_index in combinations(range(len(reconciled)), 2):
-        match = _closest_compatible_quad_edges(
-            reconciled[left_index],
-            reconciled[right_index],
-            max_distance=max_shared_edge_distance,
-        )
-        if match is None:
-            continue
-
-        left_edge_index, right_edge_index, right_reversed = match
-        left_start, left_end = _quad_edge_points(reconciled[left_index], left_edge_index)
-        right_start, right_end = _quad_edge_points(reconciled[right_index], right_edge_index)
-        if right_reversed:
-            right_start, right_end = right_end, right_start
-
-        shared_start = (left_start + right_start) / 2.0
-        shared_end = (left_end + right_end) / 2.0
-        _set_parallelogram_edge_points(reconciled[left_index], left_edge_index, shared_start, shared_end)
-        if right_reversed:
-            _set_parallelogram_edge_points(reconciled[right_index], right_edge_index, shared_end, shared_start)
-        else:
-            _set_parallelogram_edge_points(reconciled[right_index], right_edge_index, shared_start, shared_end)
-    return reconciled
-
-
-def _closest_compatible_quad_edges(
-    left_quad: np.ndarray,
-    right_quad: np.ndarray,
-    *,
-    max_distance: float,
-) -> tuple[int, int, bool] | None:
-    best: tuple[float, int, int, bool] | None = None
-    for left_edge_index in range(4):
-        left_start, left_end = _quad_edge_points(left_quad, left_edge_index)
-        left_vector = left_end - left_start
-        left_length = float(np.linalg.norm(left_vector))
-        if left_length <= 1e-6:
-            continue
-        left_unit = left_vector / left_length
-        for right_edge_index in range(4):
-            right_start, right_end = _quad_edge_points(right_quad, right_edge_index)
-            right_vector = right_end - right_start
-            right_length = float(np.linalg.norm(right_vector))
-            if right_length <= 1e-6:
-                continue
-            right_unit = right_vector / right_length
-            if abs(float(left_unit @ right_unit)) < 0.78:
-                continue
-
-            same = float(np.linalg.norm(left_start - right_start) + np.linalg.norm(left_end - right_end))
-            reversed_distance = float(np.linalg.norm(left_start - right_end) + np.linalg.norm(left_end - right_start))
-            distance = min(same, reversed_distance) / 2.0
-            if distance > max_distance:
-                continue
-            right_reversed = reversed_distance < same
-            if best is None or distance < best[0]:
-                best = (distance, left_edge_index, right_edge_index, right_reversed)
-
-    if best is None:
-        return None
-    _distance, left_edge_index, right_edge_index, right_reversed = best
-    return left_edge_index, right_edge_index, right_reversed
-
-
-def _quad_edge_points(quad: np.ndarray, edge_index: int) -> tuple[np.ndarray, np.ndarray]:
-    return quad[edge_index], quad[(edge_index + 1) % 4]
-
-
-def _quad_edge_endpoint_indexes(edge_index: int) -> tuple[int, int]:
-    return edge_index, (edge_index + 1) % 4
-
-
-def _set_parallelogram_edge_points(
-    quad: np.ndarray,
-    edge_index: int,
-    start_xy: np.ndarray,
-    end_xy: np.ndarray,
-) -> None:
-    original = np.asarray(quad, dtype=np.float32).reshape(4, 2).copy()
-    start_index = edge_index
-    end_index = (edge_index + 1) % 4
-    opposite_end_index = (edge_index + 2) % 4
-    opposite_start_index = (edge_index - 1) % 4
-
-    start = np.asarray(start_xy, dtype=np.float32)
-    end = np.asarray(end_xy, dtype=np.float32)
-    opposite_offset = (
-        (original[opposite_start_index] - original[start_index])
-        + (original[opposite_end_index] - original[end_index])
-    ) / 2.0
-
-    quad[start_index] = start
-    quad[end_index] = end
-    quad[opposite_start_index] = start + opposite_offset
-    quad[opposite_end_index] = end + opposite_offset
-
-
-def face_quad_fits_for_masks(
-    face_masks: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-) -> list[tuple[np.ndarray, np.ndarray]]:
-    fitted = [
-        (np.asarray(mask, dtype=bool), parallelogram)
-        for mask in face_masks
-        if (parallelogram := _face_parallelogram_points(mask, roi_shape=roi_shape)) is not None
-    ]
-    if not fitted:
-        return []
-
-    masks = [mask for mask, _quad in fitted]
-    quads = _reconcile_shared_face_parallelogram_sides(
-        [quad for _mask, quad in fitted],
-        roi_shape=roi_shape,
-    )
-    quads = _adjust_face_triplet_quads_for_shared_corner_and_mask_fit(
-        masks,
-        quads,
-        roi_shape=roi_shape,
-    )
-    return list(zip(masks, quads))
-
-
-def _adjust_face_triplet_quads_for_shared_corner_and_mask_fit(
-    face_masks: list[np.ndarray],
-    quads: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-) -> list[np.ndarray]:
-    adjusted = [np.asarray(quad, dtype=np.float32).reshape(4, 2).copy() for quad in quads]
-    if len(adjusted) != MAX_FACE_COUNT:
-        return adjusted
-
-    max_shared_edge_distance = max(10.0, min(roi_shape) * 0.12)
-    edge_indexes_by_face: list[list[int]] = [[] for _ in range(MAX_FACE_COUNT)]
-    matches_by_pair = {}
-    for left_index, right_index in combinations(range(MAX_FACE_COUNT), 2):
-        match = _closest_compatible_quad_edges(
-            adjusted[left_index],
-            adjusted[right_index],
-            max_distance=max_shared_edge_distance,
-        )
-        if match is None:
-            return adjusted
-        left_edge_index, right_edge_index, right_reversed = match
-        edge_indexes_by_face[left_index].append(left_edge_index)
-        edge_indexes_by_face[right_index].append(right_edge_index)
-        matches_by_pair[(left_index, right_index)] = (left_edge_index, right_edge_index, right_reversed)
-
-    common_corner_indexes = []
-    for face_index, edge_indexes in enumerate(edge_indexes_by_face):
-        if len(edge_indexes) != 2:
-            return adjusted
-        corner_index = _quad_common_corner_index_for_adjacent_edges(edge_indexes[0], edge_indexes[1])
-        if corner_index is None:
-            return adjusted
-        common_corner_indexes.append(corner_index)
-
-    shared_center = np.mean(
-        np.asarray(
-            [
-                adjusted[face_index][corner_index]
-                for face_index, corner_index in enumerate(common_corner_indexes)
-            ],
-            dtype=np.float32,
-        ),
-        axis=0,
-    )
-    for face_index, corner_index in enumerate(common_corner_indexes):
-        adjusted[face_index][corner_index] = shared_center
-
-    adjusted = _fit_projected_cube_quads_from_shared_sides(
-        adjusted,
-        face_masks,
-        edge_indexes_by_face,
-        matches_by_pair,
-        common_corner_indexes,
-        shared_center,
-        roi_shape=roi_shape,
-    )
-
-    return _slide_triplet_outer_quad_corners_with_shared_scale(
-        adjusted,
-        face_masks,
-        common_corner_indexes,
-        roi_shape=roi_shape,
-    )
-
-
-def _fit_projected_cube_quads_from_shared_sides(
-    quads: list[np.ndarray],
-    face_masks: list[np.ndarray],
-    edge_indexes_by_face: list[list[int]],
-    matches_by_pair: dict[tuple[int, int], tuple[int, int, bool]],
-    common_corner_indexes: list[int],
-    shared_center: np.ndarray,
-    *,
-    roi_shape: tuple[int, int],
-) -> list[np.ndarray]:
-    axis_by_face_edge: list[dict[int, np.ndarray]] = [dict() for _ in quads]
-    axis_records = []
-    for (left_index, right_index), match in matches_by_pair.items():
-        left_edge_index, right_edge_index, _right_reversed = match
-        left_far = _quad_edge_far_point_from_common_corner(
-            quads[left_index],
-            left_edge_index,
-            common_corner_indexes[left_index],
-        )
-        right_far = _quad_edge_far_point_from_common_corner(
-            quads[right_index],
-            right_edge_index,
-            common_corner_indexes[right_index],
-        )
-        if left_far is None or right_far is None:
-            return quads
-        far_point = (left_far + right_far) / 2.0
-        vector = far_point - shared_center
-        length = float(np.linalg.norm(vector))
-        if length <= 1e-6:
-            return quads
-        axis_records.append((left_index, left_edge_index, right_index, right_edge_index, vector, length))
-
-    if len(axis_records) != MAX_FACE_COUNT:
-        return quads
-
-    basis_vectors = _orthographic_projected_cube_basis_vectors(
-        [record[4] for record in axis_records],
-    )
-    if basis_vectors is None:
-        return quads
-
-    for record, basis_vector in zip(axis_records, basis_vectors):
-        left_index, left_edge_index, right_index, right_edge_index, _vector, _length = record
-        axis_by_face_edge[left_index][left_edge_index] = basis_vector
-        axis_by_face_edge[right_index][right_edge_index] = basis_vector
-
-    observed_axis_vectors = [record[4] for record in axis_records]
-    scale = _projected_cube_anchor_scale(basis_vectors, observed_axis_vectors)
-    return _projected_cube_quads_for_scale(
-        edge_indexes_by_face,
-        axis_by_face_edge,
-        common_corner_indexes,
-        shared_center,
-        scale,
-        fallback_quads=quads,
-    )
-
-
-def _projected_cube_anchor_scale(
-    basis_vectors: list[np.ndarray],
-    observed_axis_vectors: list[np.ndarray],
-) -> float:
-    numerator = 0.0
-    denominator = 0.0
-    for basis_vector, observed_vector in zip(basis_vectors, observed_axis_vectors):
-        basis_vector = np.asarray(basis_vector, dtype=np.float32).reshape(2)
-        observed_vector = np.asarray(observed_vector, dtype=np.float32).reshape(2)
-        numerator += float(np.dot(basis_vector, observed_vector))
-        denominator += float(np.dot(basis_vector, basis_vector))
-    if denominator <= 1e-6:
-        return 1.0
-    return max(1.0, numerator / denominator)
-
-
-def _orthographic_projected_cube_basis_vectors(axis_vectors: list[np.ndarray]) -> list[np.ndarray] | None:
-    unit_vectors = []
-    angles = []
-    for vector in axis_vectors:
-        vector = np.asarray(vector, dtype=np.float32).reshape(2)
-        length = float(np.linalg.norm(vector))
-        if length <= 1e-6:
-            return None
-        unit_vector = vector / length
-        unit_vectors.append(unit_vector)
-        angles.append(float(np.arctan2(unit_vector[1], unit_vector[0])))
-
-    constraints = np.vstack(
-        [
-            np.cos(np.asarray(angles, dtype=np.float32) * 2.0),
-            np.sin(np.asarray(angles, dtype=np.float32) * 2.0),
-        ],
-    )
-    _u, _s, vh = np.linalg.svd(constraints)
-    squared_lengths = vh[-1].astype(np.float32)
-    if np.all(squared_lengths < 0):
-        squared_lengths = -squared_lengths
-    if np.any(squared_lengths <= 1e-5):
-        return None
-
-    lengths = np.sqrt(squared_lengths)
-    median_length = float(np.median(lengths))
-    if median_length <= 1e-6:
-        return None
-    lengths = lengths / median_length
-    return [
-        np.asarray(unit_vector * length, dtype=np.float32)
-        for unit_vector, length in zip(unit_vectors, lengths)
-    ]
-
-
-def _projected_cube_quads_for_scale(
-    edge_indexes_by_face: list[list[int]],
-    axis_by_face_edge: list[dict[int, np.ndarray]],
-    common_corner_indexes: list[int],
-    shared_center: np.ndarray,
-    scale: float,
-    *,
-    fallback_quads: list[np.ndarray],
-) -> list[np.ndarray]:
-    fitted = []
-    for face_index, edge_indexes in enumerate(edge_indexes_by_face):
-        if len(edge_indexes) != 2:
-            return fallback_quads
-        first_edge, second_edge = edge_indexes
-        first_axis = axis_by_face_edge[face_index].get(first_edge)
-        second_axis = axis_by_face_edge[face_index].get(second_edge)
-        if first_axis is None or second_axis is None:
-            return fallback_quads
-        quad = _quad_from_common_corner_axes(
-            common_corner_index=common_corner_indexes[face_index],
-            first_edge_index=first_edge,
-            first_axis=first_axis * scale,
-            second_edge_index=second_edge,
-            second_axis=second_axis * scale,
-            shared_center=shared_center,
-        )
-        fitted.append(quad)
-    return fitted
-
-
-def _quad_from_common_corner_axes(
-    *,
-    common_corner_index: int,
-    first_edge_index: int,
-    first_axis: np.ndarray,
-    second_edge_index: int,
-    second_axis: np.ndarray,
-    shared_center: np.ndarray,
-) -> np.ndarray:
-    quad = np.zeros((4, 2), dtype=np.float32)
-    first_far_index = _quad_edge_far_index_from_common_corner(first_edge_index, common_corner_index)
-    second_far_index = _quad_edge_far_index_from_common_corner(second_edge_index, common_corner_index)
-    if first_far_index is None or second_far_index is None:
-        return quad
-    outer_index = (common_corner_index + 2) % 4
-    quad[common_corner_index] = shared_center
-    quad[first_far_index] = shared_center + first_axis
-    quad[second_far_index] = shared_center + second_axis
-    quad[outer_index] = shared_center + first_axis + second_axis
-    return quad
-
-
-def _quad_edge_far_point_from_common_corner(
-    quad: np.ndarray,
-    edge_index: int,
-    common_corner_index: int,
-) -> np.ndarray | None:
-    far_index = _quad_edge_far_index_from_common_corner(edge_index, common_corner_index)
-    if far_index is None:
-        return None
-    return quad[far_index]
-
-
-def _quad_edge_far_index_from_common_corner(edge_index: int, common_corner_index: int) -> int | None:
-    start_index, end_index = _quad_edge_endpoint_indexes(edge_index)
-    if start_index == common_corner_index:
-        return end_index
-    if end_index == common_corner_index:
-        return start_index
-    return None
-
-def _slide_outer_quad_corner_toward_center_for_mask_fit(
-    quad: np.ndarray,
-    face_mask: np.ndarray,
-    *,
-    common_index: int,
-    outer_index: int,
-    roi_shape: tuple[int, int],
-) -> np.ndarray:
-    quad = np.asarray(quad, dtype=np.float32).reshape(4, 2).copy()
-    center = quad[common_index].copy()
-    original_outer = quad[outer_index].copy()
-    vector = original_outer - center
-    if float(np.linalg.norm(vector)) <= 1e-6:
-        return quad
-
-    best_quad = quad.copy()
-    best_score = _quad_mask_fit_score(best_quad, face_mask, roi_shape=roi_shape)
-    for scale in _outer_corner_slide_scales():
-        candidate = _quad_with_outer_corner_slide(
-            quad,
-            common_index=common_index,
-            outer_index=outer_index,
-            scale=float(scale),
-        )
-        score = _quad_mask_fit_score(candidate, face_mask, roi_shape=roi_shape)
-        if score > best_score:
-            best_score = score
-            best_quad = candidate
-    return best_quad
-
-
-def _slide_triplet_outer_quad_corners_with_shared_scale(
-    quads: list[np.ndarray],
-    face_masks: list[np.ndarray],
-    common_corner_indexes: list[int],
-    *,
-    roi_shape: tuple[int, int],
-) -> list[np.ndarray]:
-    best_quads = [np.asarray(quad, dtype=np.float32).reshape(4, 2).copy() for quad in quads]
-    best_score = _triplet_quad_mask_fit_score(
-        best_quads,
-        face_masks,
-        roi_shape=roi_shape,
-    )
-    for scale in _outer_corner_slide_scales():
-        candidate_quads = [
-            _quad_with_outer_corner_slide(
-                quad,
-                common_index=common_index,
-                outer_index=(common_index + 2) % 4,
-                scale=float(scale),
-            )
-            for quad, common_index in zip(quads, common_corner_indexes)
-        ]
-        score = _triplet_quad_mask_fit_score(
-            candidate_quads,
-            face_masks,
-            roi_shape=roi_shape,
-        )
-        if score > best_score:
-            best_score = score
-            best_quads = candidate_quads
-    return best_quads
-
-
-def _triplet_quad_mask_fit_score(
-    quads: list[np.ndarray],
-    face_masks: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-) -> float:
-    scores = [
-        _quad_mask_fit_score(quad, mask, roi_shape=roi_shape)
-        for quad, mask in zip(quads, face_masks)
-    ]
-    if any(not np.isfinite(score) for score in scores):
-        return float("-inf")
-    return float(sum(scores))
-
-
-def _orthogonal_quad_mask_fit_score(
-    quads: list[np.ndarray],
-    face_masks: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-) -> float:
-    face_scores = [
-        _quad_soft_fit_score(quad, mask, roi_shape=roi_shape)
-        for quad, mask in zip(quads, face_masks)
-    ]
-    if not face_scores:
-        return float("-inf")
-    return float(max(face_scores) * 20.0 + sum(face_scores) * 0.02)
-
-
-def _quad_soft_fit_score(
-    quad: np.ndarray,
-    face_mask: np.ndarray,
-    *,
-    roi_shape: tuple[int, int],
-) -> float:
-    polygon_mask = _quad_polygon_mask(quad, roi_shape=roi_shape)
-    mask = _normalized_bool_mask(face_mask, shape=polygon_mask.shape)
-    overlap = int(np.logical_and(polygon_mask, mask).sum())
-    spillover = int(np.logical_and(polygon_mask, ~mask).sum())
-    missed = int(np.logical_and(mask, ~polygon_mask).sum())
-    mask_area = max(1, int(mask.sum()))
-    polygon_area = max(1, int(polygon_mask.sum()))
-    coverage = float(overlap) / float(mask_area)
-    spillover_ratio = float(spillover) / float(polygon_area)
-    missed_ratio = float(missed) / float(mask_area)
-    full_coverage_bonus = 5000.0 if missed == 0 else 0.0
-    missed_penalty = missed_ratio * 5000.0 + missed
-    return float(full_coverage_bonus + coverage * 1000.0 - spillover_ratio * 700.0 - missed_penalty)
-
-
-def _quad_edge_length(quad: np.ndarray, edge_index: int) -> float:
-    start, end = _quad_edge_points(quad, edge_index)
-    return float(np.linalg.norm(end - start))
-
-
-def _quad_with_outer_corner_slide(
-    quad: np.ndarray,
-    *,
-    common_index: int,
-    outer_index: int,
-    scale: float,
-) -> np.ndarray:
-    candidate = np.asarray(quad, dtype=np.float32).reshape(4, 2).copy()
-    center = candidate[common_index].copy()
-    vector = candidate[outer_index] - center
-    candidate[outer_index] = center + vector * float(scale)
-    return candidate
-
-
-def _outer_corner_slide_scales() -> np.ndarray:
-    return np.linspace(
-        FACE_OUTER_CORNER_MIN_SLIDE_SCALE,
-        1.0,
-        FACE_OUTER_CORNER_SLIDE_STEPS,
-    )
-
-
-def _quad_mask_fit_score(
-    quad: np.ndarray,
-    face_mask: np.ndarray,
-    *,
-    roi_shape: tuple[int, int],
-) -> float:
-    polygon_mask = _quad_polygon_mask(quad, roi_shape=roi_shape)
-    mask = _normalized_bool_mask(face_mask, shape=polygon_mask.shape)
-    missed = int(np.logical_and(mask, ~polygon_mask).sum())
-    if missed > 0:
-        return float("-inf")
-    overlap = int(np.logical_and(polygon_mask, mask).sum())
-    spillover = int(np.logical_and(polygon_mask, ~mask).sum())
-    return float(overlap - spillover * 3.0)
-
-
-def _quad_fully_covers_mask(
-    quad: np.ndarray,
-    face_mask: np.ndarray,
-    *,
-    roi_shape: tuple[int, int],
-) -> bool:
-    polygon_mask = _quad_polygon_mask(quad, roi_shape=roi_shape)
-    mask = _normalized_bool_mask(face_mask, shape=polygon_mask.shape)
-    return not bool(np.logical_and(mask, ~polygon_mask).any())
-
-
-def _normalized_bool_mask(mask: np.ndarray, *, shape: tuple[int, int]) -> np.ndarray:
-    normalized = np.asarray(mask, dtype=bool)
-    if normalized.shape != shape:
-        normalized = cv2.resize(
-            normalized.astype(np.uint8),
-            (shape[1], shape[0]),
-            interpolation=cv2.INTER_NEAREST,
-        ) > 0
-    return normalized
-
-
-def _quad_polygon_mask(
-    quad: np.ndarray,
-    *,
-    roi_shape: tuple[int, int],
-) -> np.ndarray:
-    roi_height, roi_width = roi_shape
-    polygon_mask = np.zeros((roi_height, roi_width), dtype=np.uint8)
-    points = np.round(np.asarray(quad, dtype=np.float32).reshape(4, 2)).astype(np.int32)
-    cv2.fillConvexPoly(polygon_mask, points, 1)
-    return polygon_mask > 0
-
-
-def draw_face_parallelogram_hulls(
-    frame: np.ndarray,
-    face_masks: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-    offset_xy: tuple[int, int],
-) -> None:
-    fitted = face_quad_fits_for_masks(face_masks, roi_shape=roi_shape)
-    offset = np.asarray(offset_xy, dtype=np.float32)
-    for index, (_mask, quad) in enumerate(fitted):
-        points = np.round(quad + offset).astype(np.int32).reshape(-1, 1, 2)
-        color = FACE_PARALLELOGRAM_COLORS[index % len(FACE_PARALLELOGRAM_COLORS)]
-        cv2.polylines(frame, [points], isClosed=True, color=(0, 0, 0), thickness=5, lineType=cv2.LINE_AA)
-        cv2.polylines(frame, [points], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
-
-
-def face_parallelograms_for_masks(
-    face_masks: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-) -> list[np.ndarray]:
-    parallelograms = [
-        parallelogram
-        for mask in face_masks
-        if (parallelogram := _face_parallelogram_points(mask, roi_shape=roi_shape)) is not None
-    ]
-    return _reconcile_shared_face_parallelogram_sides(parallelograms, roi_shape=roi_shape)
-
-
-def covered_face_mask_indexes(
-    indexed_face_masks: list[tuple[int, np.ndarray]],
-    *,
-    coverage_threshold: float = FACE_COVERAGE_PRUNE_THRESHOLD,
-) -> set[int]:
-    face_areas = [
-        (index, np.asarray(mask, dtype=bool), int(np.asarray(mask, dtype=bool).sum()))
-        for index, mask in indexed_face_masks
-    ]
-    pruned_indexes: set[int] = set()
-    for index, mask, area in face_areas:
-        if area <= 0:
-            pruned_indexes.add(index)
-            continue
-        for other_index, other_mask, other_area in face_areas:
-            if other_index == index or other_area <= area:
-                continue
-            covered_fraction = float(np.logical_and(mask, other_mask).sum()) / float(area)
-            if covered_fraction >= coverage_threshold:
-                pruned_indexes.add(index)
-                break
-    return pruned_indexes
-
-
-def constrained_face_masks_by_index(
-    indexed_face_masks: list[tuple[int, np.ndarray]],
-    *,
-    roi_shape: tuple[int, int],
-) -> dict[int, np.ndarray]:
-    pruned_indexes = covered_face_mask_indexes(indexed_face_masks)
-    candidates = [
-        (index, np.asarray(mask, dtype=bool), int(np.asarray(mask, dtype=bool).sum()))
-        for index, mask in indexed_face_masks
-        if index not in pruned_indexes and bool(np.asarray(mask, dtype=bool).any())
-    ]
-    candidates.sort(key=lambda item: item[2], reverse=True)
-    if len(candidates) >= MAX_FACE_COUNT:
-        selected = _largest_valid_face_triplet(candidates, roi_shape=roi_shape)
-        if not selected:
-            return {}
-    else:
-        selected = candidates[:MAX_FACE_COUNT]
-
-    cleaned = _remove_shared_face_mask_pixels([(index, mask) for index, mask, _area in selected])
-    return {
-        index: mask
-        for index, mask in cleaned
-        if bool(mask.any())
-    }
-
-
-def _largest_valid_face_triplet(
-    candidates: list[tuple[int, np.ndarray, int]],
-    *,
-    roi_shape: tuple[int, int],
-) -> list[tuple[int, np.ndarray, int]]:
-    for triplet in combinations(candidates, MAX_FACE_COUNT):
-        if _face_triplet_constraints_met(
-            [mask for _index, mask, _area in triplet],
-            roi_shape=roi_shape,
-        ):
-            return list(triplet)
-    return []
-
-
-def _face_triplet_constraints_met(
-    face_masks: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-) -> bool:
-    if len(face_masks) != MAX_FACE_COUNT:
-        return False
-    quads = [
-        _face_parallelogram_points(mask, roi_shape=roi_shape)
-        for mask in face_masks
-    ]
-    if any(quad is None for quad in quads):
-        return False
-
-    max_shared_edge_distance = max(10.0, min(roi_shape) * 0.12)
-    edge_indexes_by_face: list[list[int]] = [[] for _ in range(MAX_FACE_COUNT)]
-    for left_index, right_index in combinations(range(MAX_FACE_COUNT), 2):
-        match = _closest_compatible_quad_edges(
-            quads[left_index],
-            quads[right_index],
-            max_distance=max_shared_edge_distance,
-        )
-        if match is None:
-            return False
-        left_edge_index, right_edge_index, _right_reversed = match
-        edge_indexes_by_face[left_index].append(left_edge_index)
-        edge_indexes_by_face[right_index].append(right_edge_index)
-
-    common_corners = []
-    for face_index, edge_indexes in enumerate(edge_indexes_by_face):
-        if len(edge_indexes) != 2:
-            return False
-        corner = _quad_common_corner_for_adjacent_edges(
-            quads[face_index],
-            edge_indexes[0],
-            edge_indexes[1],
-        )
-        if corner is None:
-            return False
-        common_corners.append(corner)
-
-    center = np.mean(np.asarray(common_corners, dtype=np.float32), axis=0)
-    max_corner_distance = max(12.0, min(roi_shape) * 0.12)
-    return all(float(np.linalg.norm(corner - center)) <= max_corner_distance for corner in common_corners)
-
-
-def _quad_common_corner_for_adjacent_edges(
-    quad: np.ndarray,
-    first_edge_index: int,
-    second_edge_index: int,
-) -> np.ndarray | None:
-    corner_index = _quad_common_corner_index_for_adjacent_edges(first_edge_index, second_edge_index)
-    if corner_index is None:
-        return None
-    return quad[corner_index]
-
-
-def _quad_common_corner_index_for_adjacent_edges(
-    first_edge_index: int,
-    second_edge_index: int,
-) -> int | None:
-    if (first_edge_index + 1) % 4 == second_edge_index:
-        return second_edge_index
-    if (second_edge_index + 1) % 4 == first_edge_index:
-        return first_edge_index
-    return None
-
-
-def _remove_shared_face_mask_pixels(
-    indexed_face_masks: list[tuple[int, np.ndarray]],
-) -> list[tuple[int, np.ndarray]]:
-    if len(indexed_face_masks) < 2:
-        return [(index, np.asarray(mask, dtype=bool).copy()) for index, mask in indexed_face_masks]
-
-    mask_stack = np.stack([np.asarray(mask, dtype=bool) for _index, mask in indexed_face_masks], axis=0)
-    shared_pixels = mask_stack.sum(axis=0) > 1
-    return [
-        (index, np.logical_and(mask_stack[mask_index], ~shared_pixels))
-        for mask_index, (index, _mask) in enumerate(indexed_face_masks)
-    ]
-
-
-def draw_projected_face_grid(
-    image: np.ndarray,
-    *,
-    color: tuple[int, int, int] = PROJECTED_FACE_GRID_COLOR,
-) -> None:
-    height, width = image.shape[:2]
-    for fraction in (1.0 / 3.0, 2.0 / 3.0):
-        x = int(round((width - 1) * fraction))
-        y = int(round((height - 1) * fraction))
-        cv2.line(image, (x, 0), (x, height - 1), (0, 0, 0), 3, lineType=cv2.LINE_8)
-        cv2.line(image, (0, y), (width - 1, y), (0, 0, 0), 3, lineType=cv2.LINE_8)
-        cv2.line(image, (x, 0), (x, height - 1), color, 1, lineType=cv2.LINE_8)
-        cv2.line(image, (0, y), (width - 1, y), color, 1, lineType=cv2.LINE_8)
-
-
-def face_projection_panel(
-    roi_bgr: np.ndarray,
-    face_masks: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-    output_height: int,
-) -> np.ndarray | None:
-    if not face_masks:
-        return None
-
-    fitted = face_quad_fits_for_masks(face_masks, roi_shape=roi_shape)
-    if not fitted:
-        return None
-
-    padding = 10
-    square_size = min(160, max(48, (int(output_height) - padding * (len(fitted) + 1)) // len(fitted)))
-    panel_width = square_size + padding * 2
-    panel = np.zeros((int(output_height), panel_width, 3), dtype=np.uint8)
-
-    for index, (mask, quad) in enumerate(fitted):
-        projection = project_masked_face_to_square(
-            roi_bgr,
-            mask,
-            quad,
-            square_size=square_size,
-        )
-        draw_projected_face_grid(projection)
-        y1 = padding + index * (square_size + padding)
-        y2 = min(y1 + square_size, panel.shape[0])
-        if y1 >= panel.shape[0]:
-            break
-        panel[y1:y2, padding : padding + square_size] = projection[: y2 - y1]
-        color = FACE_PARALLELOGRAM_COLORS[index % len(FACE_PARALLELOGRAM_COLORS)]
-        cv2.rectangle(
-            panel,
-            (padding, y1),
-            (padding + square_size - 1, y2 - 1),
-            color,
-            2,
-            lineType=cv2.LINE_AA,
-        )
-    return panel
-
-
-def project_masked_face_to_square(
-    roi_bgr: np.ndarray,
-    face_mask: np.ndarray,
-    quad_xy: np.ndarray,
-    *,
-    square_size: int,
-) -> np.ndarray:
-    roi_height, roi_width = roi_bgr.shape[:2]
-    mask = np.asarray(face_mask, dtype=bool)
-    if mask.shape != (roi_height, roi_width):
-        mask = cv2.resize(
-            mask.astype(np.uint8),
-            (roi_width, roi_height),
-            interpolation=cv2.INTER_NEAREST,
-        ) > 0
-
-    masked_roi = np.zeros_like(roi_bgr)
-    masked_roi[mask] = roi_bgr[mask]
-    source = np.asarray(quad_xy, dtype=np.float32).reshape(4, 2)
-    destination = np.asarray(
-        [
-            [0.0, 0.0],
-            [square_size - 1.0, 0.0],
-            [square_size - 1.0, square_size - 1.0],
-            [0.0, square_size - 1.0],
-        ],
-        dtype=np.float32,
-    )
-    transform = cv2.getPerspectiveTransform(source, destination)
-    return cv2.warpPerspective(
-        masked_roi,
-        transform,
-        (square_size, square_size),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0),
-    )
-
-
-def _max_area_quad_from_hull_points(hull_points_xy: np.ndarray) -> np.ndarray | None:
-    points = np.asarray(hull_points_xy, dtype=np.float32).reshape(-1, 2)
-    if len(points) < 4:
-        return None
-    if len(points) > 48:
-        indexes = np.linspace(0, len(points) - 1, 48, dtype=np.int32)
-        points = points[indexes]
-
-    best_quad = None
-    best_area = -1.0
-    for indexes in combinations(range(len(points)), 4):
-        quad = _order_quad_points_clockwise(points[list(indexes)])
-        area = float(cv2.contourArea(quad.reshape(-1, 1, 2)))
-        if area > best_area:
-            best_area = area
-            best_quad = quad
-    return best_quad
-
-
-def _order_quad_points_clockwise(points_xy: np.ndarray) -> np.ndarray:
-    points = np.asarray(points_xy, dtype=np.float32).reshape(-1, 2)
-    center = points.mean(axis=0)
-    angles = np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])
-    ordered = points[np.argsort(angles)]
-    start_index = int(np.lexsort((ordered[:, 0], ordered[:, 1]))[0])
-    return np.roll(ordered, -start_index, axis=0).astype(np.float32)
-
-
-def _sticker_edge_mask(
-    sticker_masks: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-) -> np.ndarray | None:
-    roi_height, roi_width = roi_shape
-    edge_mask = np.zeros((roi_height, roi_width), dtype=bool)
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    for mask in sticker_masks:
-        mask = np.asarray(mask, dtype=bool)
-        if mask.shape != edge_mask.shape:
-            mask = cv2.resize(
-                mask.astype(np.uint8),
-                (roi_width, roi_height),
-                interpolation=cv2.INTER_NEAREST,
-            ) > 0
-        if not bool(mask.any()):
-            continue
-        mask_u8 = mask.astype(np.uint8) * 255
-        eroded = cv2.erode(mask_u8, kernel, iterations=1)
-        edge_mask |= mask & (eroded == 0)
-    return edge_mask if bool(edge_mask.any()) else None
-
-
-def _sticker_edge_distance_image(
-    sticker_masks: list[np.ndarray],
-    *,
-    roi_shape: tuple[int, int],
-) -> np.ndarray | None:
-    edge_mask = _sticker_edge_mask(sticker_masks, roi_shape=roi_shape)
-    if edge_mask is None:
-        return None
-    return _distance_image_from_edge_mask(edge_mask)
-
-
-def _distance_image_from_edge_mask(edge_mask: np.ndarray) -> np.ndarray:
-    distance_source = np.where(edge_mask, 0, 255).astype(np.uint8)
-    return cv2.distanceTransform(distance_source, cv2.DIST_L2, 3).astype(np.float32)
-
-
-def _union_sticker_mask(
-    sticker_masks: list[np.ndarray],
-    roi_shape: tuple[int, int],
-) -> np.ndarray | None:
-    roi_height, roi_width = roi_shape
-    union_mask = np.zeros((roi_height, roi_width), dtype=bool)
-    for mask in sticker_masks:
-        mask = np.asarray(mask, dtype=bool)
-        if mask.shape != union_mask.shape:
-            mask = cv2.resize(
-                mask.astype(np.uint8),
-                (roi_width, roi_height),
-                interpolation=cv2.INTER_NEAREST,
-            ) > 0
-        union_mask |= mask
-    return union_mask if bool(union_mask.any()) else None
-
-
-def _mask_bounds_xyxy(mask: np.ndarray) -> tuple[int, int, int, int] | None:
-    ys, xs = np.nonzero(mask)
-    if len(xs) == 0:
-        return None
-    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
-
-
-@lru_cache(maxsize=1)
-def _projected_cube_axis_candidates() -> tuple[np.ndarray, ...]:
-    candidates_by_key: dict[tuple[int, ...], np.ndarray] = {}
-    for yaw_degrees in range(0, 360, 30):
-        for pitch_degrees in range(-50, 51, 25):
-            for roll_degrees in range(-50, 51, 25):
-                rotation = _rotation_matrix_xyz(
-                    np.radians(float(yaw_degrees)),
-                    np.radians(float(pitch_degrees)),
-                    np.radians(float(roll_degrees)),
-                )
-                axes = _visible_cube_axes_from_rotation(rotation)
-                if axes is None:
-                    continue
-                key = tuple(int(round(value * 1000)) for value in axes.reshape(-1))
-                candidates_by_key[key] = axes
-    return tuple(candidates_by_key.values())
-
-
-def _projected_cube_axis_candidates_for_edge_directions(
-    edge_direction_angles: np.ndarray,
-) -> tuple[np.ndarray, ...]:
-    candidates = _projected_cube_axis_candidates()
-    observed = np.asarray(edge_direction_angles, dtype=np.float32).reshape(-1)
-    if len(observed) < 2:
-        return candidates
-
-    scored = [
-        (_candidate_direction_alignment_cost(axes, observed), axes)
-        for axes in candidates
-    ]
-    filtered = [
-        axes
-        for cost, axes in scored
-        if cost <= CUBE_GRID_FIT_DIRECTION_TOLERANCE_RADIANS
-    ]
-    if filtered:
-        return tuple(filtered)
-
-    scored.sort(key=lambda item: item[0])
-    return tuple(axes for _, axes in scored[: min(12, len(scored))])
-
-
-def _dominant_edge_direction_angles(edge_mask: np.ndarray, *, max_directions: int = 3) -> np.ndarray:
-    edge_u8 = (np.asarray(edge_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
-    height, width = edge_u8.shape[:2]
-    min_line_length = max(6, int(round(min(height, width) / 12.0)))
-    lines = cv2.HoughLinesP(
-        edge_u8,
-        rho=1,
-        theta=np.pi / 180.0,
-        threshold=max(8, min_line_length),
-        minLineLength=min_line_length,
-        maxLineGap=3,
-    )
-    if lines is None:
-        return np.empty(0, dtype=np.float32)
-
-    angles = []
-    weights = []
-    for line in lines.reshape(-1, 4):
-        x1, y1, x2, y2 = (float(value) for value in line)
-        dx = x2 - x1
-        dy = y2 - y1
-        length = float(np.hypot(dx, dy))
-        if length < min_line_length:
-            continue
-        angle = float(np.arctan2(dy, dx) % np.pi)
-        angles.append(angle)
-        weights.append(length)
-
-    if not angles:
-        return np.empty(0, dtype=np.float32)
-    return _dominant_angles_from_weighted_samples(
-        np.asarray(angles, dtype=np.float32),
-        np.asarray(weights, dtype=np.float32),
-        max_directions=max_directions,
-    )
-
-
-def _dominant_angles_from_weighted_samples(
-    angles: np.ndarray,
-    weights: np.ndarray,
-    *,
-    max_directions: int,
-) -> np.ndarray:
-    bin_count = 36
-    bins = np.zeros(bin_count, dtype=np.float32)
-    indexes = np.floor((angles % np.pi) / np.pi * bin_count).astype(np.int32) % bin_count
-    for index, weight in zip(indexes, weights):
-        bins[index] += float(weight)
-
-    selected = []
-    suppressed = np.zeros(bin_count, dtype=bool)
-    separation_bins = 3
-    for _ in range(max_directions):
-        available = np.where(suppressed, -1.0, bins)
-        best_index = int(np.argmax(available))
-        if available[best_index] <= 0.0:
-            break
-        neighbor_indexes = [(best_index + offset) % bin_count for offset in (-1, 0, 1)]
-        neighbor_weights = bins[neighbor_indexes]
-        if float(neighbor_weights.sum()) <= 1e-6:
-            angle = (best_index + 0.5) / bin_count * np.pi
-        else:
-            neighbor_angles = np.asarray(
-                [(index + 0.5) / bin_count * np.pi for index in neighbor_indexes],
-                dtype=np.float32,
-            )
-            angle = _weighted_undirected_angle_mean(neighbor_angles, neighbor_weights)
-        selected.append(angle)
-        for offset in range(-separation_bins, separation_bins + 1):
-            suppressed[(best_index + offset) % bin_count] = True
-    return np.asarray(selected, dtype=np.float32)
-
-
-def _weighted_undirected_angle_mean(angles: np.ndarray, weights: np.ndarray) -> float:
-    doubled = np.asarray(angles, dtype=np.float32) * 2.0
-    weights = np.asarray(weights, dtype=np.float32)
-    vector = np.asarray(
-        [
-            float(np.sum(np.cos(doubled) * weights)),
-            float(np.sum(np.sin(doubled) * weights)),
-        ],
-        dtype=np.float32,
-    )
-    if float(np.linalg.norm(vector)) <= 1e-6:
-        return float(angles[0] % np.pi)
-    return float((np.arctan2(vector[1], vector[0]) / 2.0) % np.pi)
-
-
-def _candidate_direction_alignment_cost(axes_xy: np.ndarray, observed_angles: np.ndarray) -> float:
-    candidate_angles = _axis_direction_angles(axes_xy)
-    observed = np.asarray(observed_angles, dtype=np.float32).reshape(-1)
-    if len(observed) == 0:
-        return 0.0
-
-    observed_to_candidate = [
-        min(_undirected_angle_distance(observed_angle, candidate_angle) for candidate_angle in candidate_angles)
-        for observed_angle in observed
-    ]
-    candidate_to_observed = [
-        min(_undirected_angle_distance(candidate_angle, observed_angle) for observed_angle in observed)
-        for candidate_angle in candidate_angles
-    ]
-    if len(observed) >= 3:
-        return float(max(max(observed_to_candidate), max(candidate_to_observed)))
-    return float(max(observed_to_candidate))
-
-
-def _axis_direction_angles(axes_xy: np.ndarray) -> np.ndarray:
-    axes = np.asarray(axes_xy, dtype=np.float32).reshape(-1, 2)
-    return np.asarray([float(np.arctan2(axis[1], axis[0]) % np.pi) for axis in axes], dtype=np.float32)
-
-
-def _undirected_angle_distance(left: float, right: float) -> float:
-    delta = abs((float(left) - float(right)) % np.pi)
-    return float(min(delta, np.pi - delta))
-
-
-def _rotation_matrix_xyz(yaw: float, pitch: float, roll: float) -> np.ndarray:
-    cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
-    cos_pitch, sin_pitch = np.cos(pitch), np.sin(pitch)
-    cos_roll, sin_roll = np.cos(roll), np.sin(roll)
-    rotate_x = np.asarray(
-        [
-            [1.0, 0.0, 0.0],
-            [0.0, cos_roll, -sin_roll],
-            [0.0, sin_roll, cos_roll],
-        ],
-        dtype=np.float32,
-    )
-    rotate_y = np.asarray(
-        [
-            [cos_pitch, 0.0, sin_pitch],
-            [0.0, 1.0, 0.0],
-            [-sin_pitch, 0.0, cos_pitch],
-        ],
-        dtype=np.float32,
-    )
-    rotate_z = np.asarray(
-        [
-            [cos_yaw, -sin_yaw, 0.0],
-            [sin_yaw, cos_yaw, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-    return rotate_z @ rotate_y @ rotate_x
-
-
-def _visible_cube_axes_from_rotation(rotation: np.ndarray) -> np.ndarray | None:
-    axes_3d = np.asarray(rotation, dtype=np.float32).reshape(3, 3).T.copy()
-    for index in range(3):
-        if axes_3d[index, 2] > 0:
-            axes_3d[index] *= -1.0
-    depths = -axes_3d[:, 2]
-    if float(depths.min()) < 0.22:
-        return None
-    projected_axes = axes_3d[:, :2]
-    lengths = np.linalg.norm(projected_axes, axis=1)
-    if float(lengths.min()) < 0.28:
-        return None
-    axes = projected_axes / float(lengths.max())
-    if not _cube_projected_axes_are_possible(axes):
-        return None
-    return axes.astype(np.float32)
-
-
-def _cube_projected_axes_are_possible(axes_xy: np.ndarray, tolerance: float = 0.035) -> bool:
-    axes = np.asarray(axes_xy, dtype=np.float32).reshape(3, 2)
-    lengths = np.linalg.norm(axes, axis=1)
-    if float(lengths.min()) <= 1e-6:
-        return False
-    if not _projected_cube_silhouette_is_hexagonal(axes):
-        return False
-
-    edge_lengths_sq = []
-    for left_index in range(3):
-        for right_index in range(left_index + 1, 3):
-            dot_xy = float(axes[left_index] @ axes[right_index])
-            if dot_xy >= 0.0:
-                return False
-            left_length_sq = float(lengths[left_index] * lengths[left_index])
-            right_length_sq = float(lengths[right_index] * lengths[right_index])
-            discriminant = (
-                (left_length_sq + right_length_sq) ** 2
-                - 4.0 * (left_length_sq * right_length_sq - dot_xy * dot_xy)
-            )
-            if discriminant < 0.0:
-                return False
-            edge_length_sq = (
-                left_length_sq
-                + right_length_sq
-                + float(np.sqrt(discriminant))
-            ) / 2.0
-            edge_lengths_sq.append(edge_length_sq)
-
-    edge_lengths_sq = np.asarray(edge_lengths_sq, dtype=np.float32)
-    mean_edge_length_sq = float(edge_lengths_sq.mean())
-    if mean_edge_length_sq <= 1e-6:
-        return False
-    return bool(
-        np.all(np.abs(edge_lengths_sq - mean_edge_length_sq) <= tolerance * mean_edge_length_sq)
-    )
-
-
-def _projected_cube_silhouette_is_hexagonal(axes_xy: np.ndarray) -> bool:
-    hull_points, _ = _projected_cube_grid_geometry(axes_xy)
-    hull = cv2.convexHull(hull_points.astype(np.float32).reshape(-1, 1, 2)).reshape(-1, 2)
-    if len(hull) != 6:
-        return False
-
-    edges = np.roll(hull, -1, axis=0) - hull
-    edge_lengths = np.linalg.norm(edges, axis=1)
-    if float(edge_lengths.min()) < 0.12 * float(edge_lengths.max()):
-        return False
-
-    axes = np.asarray(axes_xy, dtype=np.float32).reshape(3, 2)
-    face_areas = [
-        abs(float(np.cross(axes[left_index], axes[right_index])))
-        for left_index, right_index in ((0, 1), (1, 2), (2, 0))
-    ]
-    return min(face_areas) >= 0.16 * max(face_areas)
-
-
-def _projected_cube_grid_geometry(
-    axes_xy: np.ndarray,
-) -> tuple[np.ndarray, list[tuple[tuple[float, float], tuple[float, float]]]]:
-    axes = np.asarray(axes_xy, dtype=np.float32).reshape(3, 2)
-    origin = np.zeros(2, dtype=np.float32)
-    hull_points = np.asarray(
-        [
-            axes[0],
-            axes[0] + axes[1],
-            axes[1],
-            axes[1] + axes[2],
-            axes[2],
-            axes[2] + axes[0],
-        ],
-        dtype=np.float32,
-    )
-
-    segments_by_key: dict[tuple[tuple[int, int], tuple[int, int]], tuple[tuple[float, float], tuple[float, float]]] = {}
-    for first_index, second_index in ((0, 1), (1, 2), (2, 0)):
-        first_axis = axes[first_index]
-        second_axis = axes[second_index]
-        for subdivision in range(4):
-            t = subdivision / 3.0
-            first_start = origin + first_axis * t
-            first_end = first_start + second_axis
-            second_start = origin + second_axis * t
-            second_end = second_start + first_axis
-            _add_unique_segment(segments_by_key, first_start, first_end)
-            _add_unique_segment(segments_by_key, second_start, second_end)
-
-    return hull_points, list(segments_by_key.values())
-
-
-def _add_unique_segment(
-    segments_by_key: dict[
-        tuple[tuple[int, int], tuple[int, int]],
-        tuple[tuple[float, float], tuple[float, float]],
-    ],
-    start: np.ndarray,
-    end: np.ndarray,
-) -> None:
-    start_key = tuple(int(round(value * 1000)) for value in start)
-    end_key = tuple(int(round(value * 1000)) for value in end)
-    key = tuple(sorted((start_key, end_key)))
-    segments_by_key[key] = (
-        (float(start[0]), float(start[1])),
-        (float(end[0]), float(end[1])),
-    )
-
-
-def _score_projected_cube_grid(
-    union_mask: np.ndarray,
-    *,
-    mask_area: float,
-    hull_points_xy: np.ndarray,
-    line_segments_xy: list[tuple[tuple[float, float], tuple[float, float]]],
-    line_thickness_px: int,
-    minimum_coverage: float,
-) -> ProjectedCubeGridFit:
-    hull_mask = np.zeros(union_mask.shape, dtype=np.uint8)
-    hull_contour = cv2.convexHull(np.round(hull_points_xy).astype(np.int32).reshape(-1, 1, 2))
-    cv2.fillConvexPoly(hull_mask, hull_contour, 255)
-    covered_pixels = float(np.count_nonzero(union_mask & (hull_mask > 0)))
-    coverage_ratio = covered_pixels / mask_area
-
-    line_mask = np.zeros(union_mask.shape, dtype=np.uint8)
-    thickness = max(1, int(line_thickness_px))
-    for start, end in line_segments_xy:
-        cv2.line(
-            line_mask,
-            (int(round(start[0])), int(round(start[1]))),
-            (int(round(end[0])), int(round(end[1]))),
-            255,
-            thickness,
-            lineType=cv2.LINE_AA,
-        )
-    line_intersection_ratio = float(np.count_nonzero(union_mask & (line_mask > 0))) / mask_area
-
-    hull_area = max(float(np.count_nonzero(hull_mask)), 1.0)
-    hull_area_ratio = hull_area / mask_area
-    bounds = _mask_bounds_xyxy(union_mask)
-    bbox_fill_penalty = 0.0
-    if bounds is not None:
-        bx1, by1, bx2, by2 = bounds
-        mask_bbox_area = max(float((bx2 - bx1) * (by2 - by1)), 1.0)
-        hx, hy, hw, hh = cv2.boundingRect(hull_contour)
-        hull_bbox_area = max(float(hw * hh), 1.0)
-        bbox_fill = mask_bbox_area / hull_bbox_area
-        bbox_fill_penalty = max(0.0, 0.58 - bbox_fill) * 0.9
-
-    coverage_penalty = max(0.0, minimum_coverage - coverage_ratio) * 4.0
-    size_penalty = max(0.0, hull_area_ratio - 2.85) * 0.10
-    score = line_intersection_ratio + coverage_penalty + bbox_fill_penalty + size_penalty
-    return ProjectedCubeGridFit(
-        score=float(score),
-        line_edge_distance_score=float(line_intersection_ratio),
-        coverage_ratio=float(coverage_ratio),
-        hull_area_ratio=float(hull_area_ratio),
-        hull_points_xy=np.asarray(hull_points_xy, dtype=np.float32),
-        line_segments_xy=line_segments_xy,
-    )
-
-
-def _score_projected_cube_grid_from_edge_distance(
-    edge_distance_image: np.ndarray,
-    *,
-    coverage_points_xy: np.ndarray,
-    mask_area: float,
-    hull_points_xy: np.ndarray,
-    line_segments_xy: list[tuple[tuple[float, float], tuple[float, float]]],
-    line_thickness_px: int,
-    minimum_coverage: float,
-) -> ProjectedCubeGridFit:
-    coverage_points = np.asarray(coverage_points_xy, dtype=np.float32).reshape(-1, 2)
-    hull_contour = cv2.convexHull(np.asarray(hull_points_xy, dtype=np.float32).reshape(-1, 1, 2))
-    hull = hull_contour.reshape(-1, 2).astype(np.float32)
-
-    inside_hull = _points_inside_convex_polygon(coverage_points, hull)
-    coverage_ratio = float(inside_hull.mean()) if len(coverage_points) else 0.0
-
-    line_scores = _line_edge_distance_scores(
-        edge_distance_image,
-        line_segments_xy,
-        line_thickness_px=line_thickness_px,
-    )
-    line_distance_score = _robust_line_edge_distance_score(line_scores, line_segments_xy)
-
-    hull_area = max(float(cv2.contourArea(hull_contour)), 1.0)
-    hull_area_ratio = hull_area / mask_area
-    point_min = coverage_points.min(axis=0) if len(coverage_points) else np.zeros(2, dtype=np.float32)
-    point_max = coverage_points.max(axis=0) if len(coverage_points) else np.ones(2, dtype=np.float32)
-    mask_bbox_area = max(float(np.prod(point_max - point_min + 1.0)), 1.0)
-    hx, hy, hw, hh = cv2.boundingRect(hull_contour)
-    hull_bbox_area = max(float(hw * hh), 1.0)
-    bbox_fill = mask_bbox_area / hull_bbox_area
-    bbox_fill_penalty = max(0.0, 0.58 - bbox_fill) * 0.9
-
-    coverage_penalty = max(0.0, minimum_coverage - coverage_ratio) * 4.0
-    size_penalty = max(0.0, hull_area_ratio - 2.85) * 0.10
-    score = line_distance_score + coverage_penalty + bbox_fill_penalty + size_penalty
-    return ProjectedCubeGridFit(
-        score=float(score),
-        line_edge_distance_score=float(line_distance_score),
-        coverage_ratio=float(coverage_ratio),
-        hull_area_ratio=float(hull_area_ratio),
-        hull_points_xy=np.asarray(hull_points_xy, dtype=np.float32),
-        line_segments_xy=line_segments_xy,
-    )
-
-
-def _line_edge_distance_scores(
-    edge_distance_image: np.ndarray,
-    line_segments_xy: list[tuple[tuple[float, float], tuple[float, float]]],
-    *,
-    line_thickness_px: int,
-) -> np.ndarray:
-    segments = np.asarray(line_segments_xy, dtype=np.float32).reshape(-1, 2, 2)
-    if len(segments) == 0:
-        return np.empty(0, dtype=np.float32)
-
-    line_radius = max(0.5, float(line_thickness_px) * 0.5 + 0.5)
-    scores = []
-    for segment in segments:
-        length = float(np.linalg.norm(segment[1] - segment[0]))
-        sample_count = max(4, min(12, int(round(length / 8.0))))
-        t = np.linspace(0.0, 1.0, sample_count, dtype=np.float32)
-        points = segment[0][None, :] * (1.0 - t[:, None]) + segment[1][None, :] * t[:, None]
-        distances = _distance_image_values(edge_distance_image, points)
-        adjusted_distances = np.maximum(distances - line_radius, 0.0)
-        scores.append(float(np.mean(np.minimum(adjusted_distances, 12.0)) / 12.0))
-    return np.asarray(scores, dtype=np.float32)
-
-
-def _robust_line_edge_distance_score(
-    line_scores: np.ndarray,
-    line_segments_xy: list[tuple[tuple[float, float], tuple[float, float]]] | None = None,
-) -> float:
-    scores = np.asarray(line_scores, dtype=np.float32).reshape(-1)
-    if len(scores) == 0:
-        return 1.0
-
-    if line_segments_xy is None:
-        return _robust_score_subset(scores, minimum_supported=6)
-
-    groups = _line_direction_groups(line_segments_xy)
-    if not groups:
-        return _robust_score_subset(scores, minimum_supported=6)
-
-    group_scores = []
-    for indexes in groups:
-        group_scores.append(
-            _robust_score_subset(
-                scores[np.asarray(indexes, dtype=np.int32)],
-                minimum_supported=2,
-            )
-        )
-    return float(np.mean(group_scores))
-
-
-def _robust_score_subset(line_scores: np.ndarray, *, minimum_supported: int) -> float:
-    scores = np.asarray(line_scores, dtype=np.float32).reshape(-1)
-    if len(scores) == 0:
-        return 1.0
-
-    supported_target = min(len(scores), max(minimum_supported, int(np.ceil(len(scores) * 0.40))))
-    best_scores = np.sort(scores)[:supported_target]
-    supported_count = int(np.count_nonzero(scores <= CUBE_GRID_FIT_SUPPORTED_LINE_DISTANCE))
-    support_penalty = max(0, supported_target - supported_count) / supported_target * 0.35
-    return float(np.mean(best_scores) + support_penalty)
-
-
-def _line_direction_groups(
-    line_segments_xy: list[tuple[tuple[float, float], tuple[float, float]]],
-) -> list[list[int]]:
-    segments = np.asarray(line_segments_xy, dtype=np.float32).reshape(-1, 2, 2)
-    groups: list[list[int]] = []
-    group_axes: list[np.ndarray] = []
-    for index, segment in enumerate(segments):
-        vector = segment[1] - segment[0]
-        length = float(np.linalg.norm(vector))
-        if length <= 1e-6:
-            continue
-        axis = vector / length
-        if axis[0] < 0.0 or (abs(float(axis[0])) < 1e-6 and axis[1] < 0.0):
-            axis *= -1.0
-
-        matched = False
-        for group_index, group_axis in enumerate(group_axes):
-            if abs(float(axis @ group_axis)) >= 0.985:
-                groups[group_index].append(index)
-                matched = True
-                break
-        if not matched:
-            group_axes.append(axis)
-            groups.append([index])
-    return groups
-
-
-def _sample_line_segment_xy_points(
-    line_segments_xy: list[tuple[tuple[float, float], tuple[float, float]]],
-    *,
-    max_points: int,
-) -> np.ndarray:
-    segments = np.asarray(line_segments_xy, dtype=np.float32).reshape(-1, 2, 2)
-    if len(segments) == 0 or max_points <= 0:
-        return np.empty((0, 2), dtype=np.float32)
-
-    lengths = np.linalg.norm(segments[:, 1, :] - segments[:, 0, :], axis=1)
-    total_length = float(lengths.sum())
-    if total_length <= 1e-6:
-        return np.empty((0, 2), dtype=np.float32)
-
-    points = []
-    for segment, length in zip(segments, lengths):
-        sample_count = max(2, int(round(max_points * float(length) / total_length)))
-        t = np.linspace(0.0, 1.0, sample_count, dtype=np.float32)
-        points.append(segment[0][None, :] * (1.0 - t[:, None]) + segment[1][None, :] * t[:, None])
-    sampled = np.concatenate(points, axis=0)
-    if len(sampled) <= max_points:
-        return sampled
-    indexes = np.linspace(0, len(sampled) - 1, max_points, dtype=np.int32)
-    return sampled[indexes]
-
-
-def _distance_image_values(distance_image: np.ndarray, points_xy: np.ndarray) -> np.ndarray:
-    points = np.asarray(points_xy, dtype=np.float32).reshape(-1, 2)
-    if len(points) == 0:
-        return np.empty(0, dtype=np.float32)
-
-    height, width = distance_image.shape[:2]
-    xs = np.clip(np.round(points[:, 0]).astype(np.int32), 0, width - 1)
-    ys = np.clip(np.round(points[:, 1]).astype(np.int32), 0, height - 1)
-    return distance_image[ys, xs].astype(np.float32)
-
-
-def _points_inside_convex_polygon(points_xy: np.ndarray, polygon_xy: np.ndarray) -> np.ndarray:
-    points = np.asarray(points_xy, dtype=np.float32).reshape(-1, 2)
-    polygon = np.asarray(polygon_xy, dtype=np.float32).reshape(-1, 2)
-    if len(points) == 0 or len(polygon) < 3:
-        return np.zeros(len(points), dtype=bool)
-
-    edges = np.roll(polygon, -1, axis=0) - polygon
-    point_vectors = points[:, None, :] - polygon[None, :, :]
-    crosses = edges[None, :, 0] * point_vectors[:, :, 1] - edges[None, :, 1] * point_vectors[:, :, 0]
-    return np.all(crosses >= -1e-4, axis=1) | np.all(crosses <= 1e-4, axis=1)
-
-
-def _point_to_segment_distances(points_xy: np.ndarray, segments_xy: np.ndarray) -> np.ndarray:
-    points = np.asarray(points_xy, dtype=np.float32).reshape(-1, 2)
-    segments = np.asarray(segments_xy, dtype=np.float32).reshape(-1, 2, 2)
-    if len(points) == 0 or len(segments) == 0:
-        return np.empty((len(points), len(segments)), dtype=np.float32)
-
-    start = segments[:, 0, :]
-    end = segments[:, 1, :]
-    segment_vectors = end - start
-    segment_lengths_sq = np.maximum(np.sum(segment_vectors * segment_vectors, axis=1), 1e-6)
-    point_vectors = points[:, None, :] - start[None, :, :]
-    projection_t = np.sum(point_vectors * segment_vectors[None, :, :], axis=2) / segment_lengths_sq[None, :]
-    projection_t = np.clip(projection_t, 0.0, 1.0)
-    closest = start[None, :, :] + projection_t[:, :, None] * segment_vectors[None, :, :]
-    deltas = points[:, None, :] - closest
-    return np.sqrt(np.sum(deltas * deltas, axis=2))
-
-
-def draw_projected_cube_grid_fit(
-    frame: np.ndarray,
-    fit: ProjectedCubeGridFit,
-    *,
-    offset_xy: tuple[int, int],
-) -> None:
-    offset = np.asarray(offset_xy, dtype=np.float32)
-    hull = np.round(fit.hull_points_xy + offset).astype(np.int32).reshape(-1, 1, 2)
-    hull = cv2.convexHull(hull)
-    cv2.polylines(frame, [hull], isClosed=True, color=(0, 240, 255), thickness=2)
-    for start, end in fit.line_segments_xy:
-        start_xy = np.asarray(start, dtype=np.float32) + offset
-        end_xy = np.asarray(end, dtype=np.float32) + offset
-        cv2.line(
-            frame,
-            (int(round(start_xy[0])), int(round(start_xy[1]))),
-            (int(round(end_xy[0])), int(round(end_xy[1]))),
-            (255, 255, 255),
-            2,
-            lineType=cv2.LINE_AA,
-        )
-        cv2.line(
-            frame,
-            (int(round(start_xy[0])), int(round(start_xy[1]))),
-            (int(round(end_xy[0])), int(round(end_xy[1]))),
-            (0, 90, 255),
-            1,
-            lineType=cv2.LINE_AA,
-        )
-
 
 def tensor_to_numpy(value) -> np.ndarray | None:
     if value is None:
@@ -6458,12 +1307,2497 @@ def class_name_for_id(result, sticker_model, class_id: int) -> str:
     return str(names.get(class_id, class_id)).lower()
 
 
-def sticker_piece_type(class_name: str) -> str:
-    return class_name.removesuffix("_sticker")
+def pose_keypoint_kind(class_name: str, index: int) -> str:
+    if class_name == "corner":
+        return "corner"
+    if class_name == "corner-edge":
+        return "edge"
+    if class_name == "corner-edge-center":
+        return "edge-center"
+    return "center"
+
+
+def result_keypoints(result, size: int) -> tuple[np.ndarray | None, np.ndarray | None]:
+    keypoints = getattr(result, "keypoints", None)
+    if keypoints is None:
+        return None, None
+
+    xy = tensor_to_numpy(getattr(keypoints, "xy", None))
+    conf = tensor_to_numpy(getattr(keypoints, "conf", None))
+    if xy is not None and xy.size:
+        return np.asarray(xy, dtype=np.float32), None if conf is None else np.asarray(conf, dtype=np.float32)
+
+    xyn = tensor_to_numpy(getattr(keypoints, "xyn", None))
+    if xyn is not None and xyn.size:
+        xy = np.asarray(xyn, dtype=np.float32).copy()
+        xy[..., 0] *= size
+        xy[..., 1] *= size
+        return xy, None if conf is None else np.asarray(conf, dtype=np.float32)
+
+    data = tensor_to_numpy(getattr(keypoints, "data", None))
+    if data is None or not data.size:
+        return None, None
+    data = np.asarray(data, dtype=np.float32)
+    if data.shape[-1] < 2:
+        return None, None
+    xy = data[..., :2]
+    conf = data[..., 2] if data.shape[-1] >= 3 else None
+    return xy, conf
+
+
+def result_box_classes(result) -> np.ndarray | None:
+    boxes = getattr(result, "boxes", None)
+    if boxes is None:
+        return None
+    classes = tensor_to_numpy(getattr(boxes, "cls", None))
+    if classes is None:
+        return None
+    return np.asarray(classes, dtype=np.int32).reshape(-1)
+
+
+def collect_pose_graph_points(
+    result,
+    pose_model,
+    xy: np.ndarray | None,
+    keypoint_conf: np.ndarray | None,
+    *,
+    confidence_threshold: float,
+    offset_xy: tuple[int, int],
+    scale_xy: tuple[float, float],
+) -> list[PoseGraphPoint]:
+    if xy is None or len(xy) == 0:
+        return []
+
+    classes = result_box_classes(result)
+    points_by_detection = np.asarray(xy, dtype=np.float32)
+    scores_by_detection = (
+        None
+        if keypoint_conf is None or len(keypoint_conf) == 0
+        else np.asarray(keypoint_conf, dtype=np.float32)
+    )
+    offset_x, offset_y = offset_xy
+    scale_x, scale_y = scale_xy
+    observed: list[PoseGraphPoint] = []
+    for detection_index, points in enumerate(points_by_detection):
+        class_id = (
+            int(classes[detection_index])
+            if classes is not None and detection_index < len(classes)
+            else -1
+        )
+        class_name = class_name_for_id(result, pose_model, class_id).removesuffix("_sticker")
+        if class_name not in {"corner", "corner-edge", "corner-edge-center"}:
+            continue
+
+        detection_scores = (
+            None
+            if scores_by_detection is None
+            or detection_index >= len(scores_by_detection)
+            else np.asarray(scores_by_detection[detection_index], dtype=np.float32).reshape(-1)
+        )
+        for keypoint_index, point in enumerate(points):
+            keypoint_score = (
+                1.0
+                if detection_scores is None or keypoint_index >= len(detection_scores)
+                else float(detection_scores[keypoint_index])
+            )
+            if keypoint_score < confidence_threshold:
+                continue
+            observed.append(
+                PoseGraphPoint(
+                    point_index=len(observed),
+                    class_name=class_name,
+                    xy=(
+                        offset_x + (float(point[0]) * scale_x),
+                        offset_y + (float(point[1]) * scale_y),
+                    ),
+                    score=keypoint_score,
+                )
+            )
+    return observed
+
+
+def point_bounds_xyxy(points: np.ndarray, roi_xyxy: tuple[int, int, int, int]) -> tuple[int, int, int, int] | None:
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    if len(points) == 0:
+        return None
+
+    x1, y1, x2, y2 = roi_xyxy
+    local_x = np.clip(points[:, 0] - x1, 0, max(0, x2 - x1))
+    local_y = np.clip(points[:, 1] - y1, 0, max(0, y2 - y1))
+    return (
+        int(np.floor(local_x.min())),
+        int(np.floor(local_y.min())),
+        int(np.ceil(local_x.max())),
+        int(np.ceil(local_y.max())),
+    )
+
+
+def default_camera_matrix(
+    image_size: tuple[int, int],
+    *,
+    focal_scale: float = 1.2,
+    principal_offset_xy: tuple[float, float] = (0.0, 0.0),
+) -> np.ndarray:
+    width, height = image_size
+    focal = max(width, height) * float(focal_scale)
+    cx = (width * 0.5) + (width * float(principal_offset_xy[0]))
+    cy = (height * 0.5) + (height * float(principal_offset_xy[1]))
+    return np.array([[focal, 0.0, cx], [0.0, focal, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def transform_lattice_coord(
+    coord: tuple[int, int, int],
+    lattice_transform: tuple[tuple[int, int, int], tuple[int, int, int]],
+) -> tuple[int, int, int]:
+    axis_order, signs = lattice_transform
+    return tuple(
+        coord[axis] if sign > 0 else CUBE_GRID_MAX_INDEX - coord[axis]
+        for axis, sign in zip(axis_order, signs)
+    )
+
+
+def cube_lattice_point_mm(coord: tuple[int, int, int]) -> tuple[float, float, float]:
+    return (
+        (coord[0] - (CUBE_GRID_MAX_INDEX * 0.5)) * CUBE_LAYER_SIZE_MM,
+        (coord[1] - (CUBE_GRID_MAX_INDEX * 0.5)) * CUBE_LAYER_SIZE_MM,
+        (coord[2] - (CUBE_GRID_MAX_INDEX * 0.5)) * CUBE_LAYER_SIZE_MM,
+    )
+
+
+def cube_lattice_points_for_coords(
+    coords: tuple[tuple[int, int, int], ...],
+    *,
+    lattice_transform: tuple[tuple[int, int, int], tuple[int, int, int]] = CUBE_LATTICE_IDENTITY_TRANSFORM,
+) -> np.ndarray:
+    return np.asarray(
+        [
+            cube_lattice_point_mm(transform_lattice_coord(coord, lattice_transform))
+            for coord in coords
+        ],
+        dtype=np.float32,
+    )
+
+
+def cube_lattice_display_points_for_transform(
+    lattice_transform: tuple[tuple[int, int, int], tuple[int, int, int]] = CUBE_LATTICE_IDENTITY_TRANSFORM,
+) -> np.ndarray:
+    return cube_lattice_points_for_coords(
+        CUBE_LATTICE_DISPLAY_CORNER_COORDS,
+        lattice_transform=lattice_transform,
+    )
+
+
+def invisible_surface_point_count(
+    object_points: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+) -> int:
+    object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
+    return sum(
+        not object_point_has_visible_surface(point, rvec, tvec)
+        for point in object_points
+    )
+
+
+def object_point_has_visible_surface(
+    object_point: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray | None = None,
+) -> bool:
+    if tvec is None:
+        return object_point_has_front_facing_boundary_surface(object_point, rvec)
+    return not object_point_is_occluded_by_cube(object_point, rvec, tvec)
+
+
+def result_object_point_has_visible_surface(
+    object_point: np.ndarray,
+    result: PosePnPResult,
+) -> bool:
+    tvec = getattr(result, "tvec", None)
+    if tvec is None:
+        return object_point_has_visible_surface(object_point, result.rvec)
+    try:
+        return object_point_has_visible_surface(object_point, result.rvec, tvec)
+    except TypeError:
+        return object_point_has_visible_surface(object_point, result.rvec)
+
+
+def object_point_is_occluded_by_cube(
+    object_point: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+) -> bool:
+    point = np.asarray(object_point, dtype=np.float64).reshape(3)
+    rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    camera_origin = (-rotation.T @ np.asarray(tvec, dtype=np.float64).reshape(3, 1)).reshape(3)
+    direction = point - camera_origin
+    if float(np.linalg.norm(direction)) <= 1e-9:
+        return False
+
+    bounds_min = np.full(3, -float(CUBE_HALF_SIZE_MM), dtype=np.float64)
+    bounds_max = np.full(3, float(CUBE_HALF_SIZE_MM), dtype=np.float64)
+    t_enter = 0.0
+    t_exit = 1.0
+    for axis in range(3):
+        origin_value = float(camera_origin[axis])
+        direction_value = float(direction[axis])
+        if abs(direction_value) <= 1e-12:
+            if origin_value < bounds_min[axis] or origin_value > bounds_max[axis]:
+                return False
+            continue
+        near = (bounds_min[axis] - origin_value) / direction_value
+        far = (bounds_max[axis] - origin_value) / direction_value
+        if near > far:
+            near, far = far, near
+        t_enter = max(t_enter, float(near))
+        t_exit = min(t_exit, float(far))
+        if t_enter > t_exit:
+            return False
+
+    return 1e-5 < t_enter < 1.0 - 1e-4
+
+
+def object_point_has_front_facing_boundary_surface(object_point: np.ndarray, rvec: np.ndarray) -> bool:
+    point = np.asarray(object_point, dtype=np.float32).reshape(3)
+    rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    for axis in range(3):
+        if abs(float(point[axis]) + CUBE_HALF_SIZE_MM) <= 1e-3:
+            normal = np.zeros(3, dtype=np.float64)
+            normal[axis] = -1.0
+        elif abs(float(point[axis]) - CUBE_HALF_SIZE_MM) <= 1e-3:
+            normal = np.zeros(3, dtype=np.float64)
+            normal[axis] = 1.0
+        else:
+            continue
+        camera_normal = rotation @ normal
+        if float(camera_normal[2]) < 0.0:
+            return True
+    return False
+
+
+def lattice_boundary_face_is_visible(
+    face: tuple[int, int],
+    rvec: np.ndarray,
+) -> bool:
+    return lattice_boundary_face_camera_normal_z(face, rvec) < 0.0
+
+
+def lattice_boundary_face_camera_normal_z(
+    face: tuple[int, int],
+    rvec: np.ndarray,
+) -> float:
+    axis, value = face
+    normal = np.zeros(3, dtype=np.float64)
+    normal[int(axis)] = -1.0 if int(value) == 0 else 1.0
+    rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    camera_normal = rotation @ normal
+    return float(camera_normal[2])
+
+
+def visible_lattice_boundary_faces_for_pose(
+    rvec: np.ndarray,
+) -> frozenset[tuple[int, int]]:
+    rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    visible_faces = set()
+    for axis in range(3):
+        for value, sign in ((0, -1.0), (CUBE_GRID_MAX_INDEX, 1.0)):
+            normal = np.zeros(3, dtype=np.float64)
+            normal[axis] = sign
+            camera_normal = rotation @ normal
+            if float(camera_normal[2]) < 0.0:
+                visible_faces.add((axis, value))
+    return frozenset(visible_faces)
+
+
+def pose_correspondence_backface_only_point_count(
+    correspondence: PoseGraphCorrespondence,
+    result: PosePnPResult,
+) -> int:
+    if getattr(result, "rvec", None) is None or getattr(result, "tvec", None) is None:
+        return 0
+    lattice_transform = getattr(result, "lattice_transform", CUBE_LATTICE_IDENTITY_TRANSFORM)
+    object_points = cube_lattice_points_for_coords(
+        tuple(correspondence.lattice_coords),
+        lattice_transform=lattice_transform,
+    )
+    backface_only_count = 0
+    for object_point in object_points:
+        if not object_point_has_visible_surface(object_point, result.rvec, result.tvec):
+            backface_only_count += 1
+    return backface_only_count
+
+
+def graph_camera_matrix_candidates(
+    image_size: tuple[int, int],
+    *,
+    focal_min: float,
+    focal_max: float,
+    focal_steps: int,
+) -> list[np.ndarray]:
+    focal_steps = max(1, int(focal_steps))
+    return [
+        default_camera_matrix(image_size, focal_scale=float(focal_scale))
+        for focal_scale in np.linspace(float(focal_min), float(focal_max), focal_steps)
+    ]
+
+
+def solve_best_lattice_graph_pnp_current(
+    image_points: np.ndarray,
+    lattice_coords: tuple[tuple[int, int, int], ...],
+    image_size: tuple[int, int],
+    *,
+    focal_min: float,
+    focal_max: float,
+    focal_steps: int,
+    camera_matrix: np.ndarray | None = None,
+    lattice_transforms: tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...] = CUBE_LATTICE_AXIS_TRANSFORMS,
+    previous_tvec: np.ndarray | None = None,
+    profile: dict[str, float | int] | None = None,
+) -> PosePnPResult | None:
+    image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
+    if len(image_points) != len(lattice_coords):
+        return None
+
+    best_result: PosePnPResult | None = None
+    best_score: tuple[float, ...] | None = None
+    previous_tvec_array = (
+        None
+        if previous_tvec is None
+        else np.asarray(previous_tvec, dtype=np.float64).reshape(3, 1)
+    )
+    camera_matrices = (
+        [np.asarray(camera_matrix, dtype=np.float64).reshape(3, 3)]
+        if camera_matrix is not None
+        else graph_camera_matrix_candidates(
+            image_size,
+            focal_min=focal_min,
+            focal_max=focal_max,
+            focal_steps=focal_steps,
+        )
+    )
+    lattice_transforms = tuple(lattice_transforms)
+    if not lattice_transforms:
+        return None
+    if profile is not None:
+        profile["pnp_camera_candidates"] = len(camera_matrices)
+        profile["pnp_axis_transforms"] = len(lattice_transforms)
+    for camera_matrix in camera_matrices:
+        for lattice_transform in lattice_transforms:
+            if profile is not None:
+                profile["pnp_solve_calls"] = int(profile.get("pnp_solve_calls", 0)) + 1
+            result = solve_lattice_graph_pnp(
+                image_points,
+                cube_lattice_points_for_coords(
+                    lattice_coords,
+                    lattice_transform=lattice_transform,
+                ),
+                camera_matrix,
+                display_points=cube_lattice_display_points_for_transform(lattice_transform),
+                display_edge_indexes=CUBE_LATTICE_DISPLAY_EDGE_INDEXES,
+            )
+            if result is None:
+                continue
+            result.lattice_transform = lattice_transform
+            invisible_count = float(getattr(result, "invisible_point_count", 0))
+            matched_error = float(result.matched_error)
+            if previous_tvec_array is None or getattr(result, "tvec", None) is None:
+                score = (invisible_count, matched_error)
+            else:
+                translation_jump = float(
+                    np.linalg.norm(
+                        np.asarray(result.tvec, dtype=np.float64).reshape(3, 1)
+                        - previous_tvec_array
+                    )
+                )
+                score = (invisible_count, translation_jump, matched_error)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_result = result
+    return best_result
+
+
+def solve_lattice_graph_pnp(
+    image_points: np.ndarray,
+    object_points: np.ndarray,
+    camera_matrix: np.ndarray,
+    *,
+    display_points: np.ndarray,
+    display_edge_indexes: tuple[tuple[int, int], ...],
+) -> PosePnPResult | None:
+    candidates = solve_lattice_graph_pnp_candidates(
+        image_points,
+        object_points,
+        camera_matrix,
+        display_points=display_points,
+        display_edge_indexes=display_edge_indexes,
+    )
+    if not candidates:
+        return None
+
+    best_result = None
+    for result in candidates:
+        candidate = (
+            int(getattr(result, "invisible_point_count", 0)),
+            float(result.matched_error),
+        )
+        if best_result is None:
+            best_result = (candidate, result)
+        elif candidate < best_result[0]:
+            best_result = (candidate, result)
+    return None if best_result is None else best_result[1]
+
+
+def solve_lattice_graph_pnp_candidates(
+    image_points: np.ndarray,
+    object_points: np.ndarray,
+    camera_matrix: np.ndarray,
+    *,
+    display_points: np.ndarray,
+    display_edge_indexes: tuple[tuple[int, int], ...],
+) -> list[PosePnPResult]:
+    image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
+    object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
+    display_points = np.asarray(display_points, dtype=np.float32).reshape(-1, 3)
+    if len(image_points) != len(object_points) or len(image_points) < 3:
+        return []
+
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    try:
+        ok, rvecs, tvecs, _reprojection_errors = cv2.solvePnPGeneric(
+            object_points,
+            image_points,
+            camera_matrix,
+            dist_coeffs,
+            flags=cv2.SOLVEPNP_SQPNP,
+        )
+    except cv2.error:
+        return []
+    if not ok or not rvecs or not tvecs:
+        return []
+
+    candidates: list[PosePnPResult] = []
+    for rvec, tvec in zip(rvecs, tvecs):
+        try:
+            rvec, tvec = cv2.solvePnPRefineLM(
+                object_points,
+                image_points,
+                camera_matrix,
+                dist_coeffs,
+                np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+                np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+            )
+        except cv2.error:
+            pass
+        projected_graph_points, _ = cv2.projectPoints(
+            object_points,
+            rvec,
+            tvec,
+            camera_matrix,
+            dist_coeffs,
+        )
+        projected_graph_points = projected_graph_points.reshape(-1, 2)
+        reprojection_distances = np.linalg.norm(projected_graph_points - image_points, axis=1)
+        matched_error = float(np.mean(reprojection_distances))
+        invisible_count = invisible_surface_point_count(object_points, rvec, tvec)
+
+        projected_display_points, _ = cv2.projectPoints(
+            display_points,
+            rvec,
+            tvec,
+            camera_matrix,
+            dist_coeffs,
+        )
+        projected_display_points = projected_display_points.reshape(-1, 2)
+        candidates.append(
+            PosePnPResult(
+                error=matched_error,
+                inlier_count=int(len(image_points)),
+                matched_error=matched_error,
+                camera_matrix=np.asarray(camera_matrix, dtype=np.float64),
+                dist_coeffs=dist_coeffs,
+                rvec=rvec,
+                tvec=tvec,
+                image_points=image_points,
+                object_points=object_points,
+                display_points=display_points,
+                projected_object_points=projected_graph_points,
+                projected_display_points=projected_display_points,
+                point_names=tuple(),
+                edge_indexes=tuple(),
+                display_edge_indexes=display_edge_indexes,
+                invisible_point_count=int(invisible_count),
+            )
+        )
+    return candidates
+
+
+def draw_pose_keypoints(
+    frame: np.ndarray,
+    result,
+    pose_model,
+    xy: np.ndarray | None,
+    keypoint_conf: np.ndarray | None,
+    *,
+    confidence_threshold: float,
+    offset_xy: tuple[int, int],
+    scale_xy: tuple[float, float],
+) -> int:
+    if xy is None or len(xy) == 0:
+        return 0
+
+    classes = result_box_classes(result)
+    points_by_detection = np.asarray(xy, dtype=np.float32)
+    scores_by_detection = (
+        None
+        if keypoint_conf is None or len(keypoint_conf) == 0
+        else np.asarray(keypoint_conf, dtype=np.float32)
+    )
+    offset_x, offset_y = offset_xy
+    scale_x, scale_y = scale_xy
+    drawn = 0
+    for detection_index, points in enumerate(points_by_detection):
+        class_id = (
+            int(classes[detection_index])
+            if classes is not None and detection_index < len(classes)
+            else -1
+        )
+        class_name = class_name_for_id(result, pose_model, class_id).removesuffix("_sticker")
+        if class_name not in POSE_CLASS_NAMES:
+            continue
+
+        detection_scores = (
+            None
+            if scores_by_detection is None
+            or detection_index >= len(scores_by_detection)
+            else np.asarray(scores_by_detection[detection_index], dtype=np.float32).reshape(-1)
+        )
+        for keypoint_index, point in enumerate(points):
+            keypoint_score = (
+                None
+                if detection_scores is None or keypoint_index >= len(detection_scores)
+                else float(detection_scores[keypoint_index])
+            )
+            if keypoint_score is not None and keypoint_score < confidence_threshold:
+                continue
+
+            x = int(round(offset_x + (float(point[0]) * scale_x)))
+            y = int(round(offset_y + (float(point[1]) * scale_y)))
+            if not (0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]):
+                continue
+
+            color = POSE_KEYPOINT_COLORS.get(class_name, (255, 255, 255))
+            cv2.circle(frame, (x, y), 4, color, -1, lineType=cv2.LINE_AA)
+            cv2.circle(frame, (x, y), 5, (0, 0, 0), 1, lineType=cv2.LINE_AA)
+            drawn += 1
+    return drawn
+
+
+def draw_pnp_cube(
+    frame: np.ndarray,
+    result: PosePnPResult | None,
+    *,
+    alpha: float = 1.0,
+    observed_graph: PoseGraph | None = None,
+    profile: dict[str, float | int] | None = None,
+) -> None:
+    if result is None:
+        return
+
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    target = frame if alpha >= 1.0 else frame.copy()
+
+    draw_pnp_debug_pose_candidates(target, result)
+    if observed_graph is not None:
+        draw_observed_model_distance_lines(target, result, observed_graph)
+        if DRAW_POSE_GRAPH_COORDS:
+            draw_refinement_point_marker(target, result, observed_graph)
+
+    image_points = np.asarray(result.image_points, dtype=np.float32).reshape(-1, 2)
+    projected_object_points = np.asarray(result.projected_object_points, dtype=np.float32).reshape(-1, 2)
+    residuals = (
+        np.linalg.norm(projected_object_points - image_points, axis=1)
+        if len(image_points) == len(projected_object_points)
+        else np.empty((0,), dtype=np.float32)
+    )
+    for observed_point, projected_point in zip(image_points, projected_object_points):
+        observed = tuple(np.round(observed_point).astype(int))
+        projected_match = tuple(np.round(projected_point).astype(int))
+        cv2.line(target, observed, projected_match, (0, 0, 0), 4, lineType=cv2.LINE_AA)
+        cv2.line(target, observed, projected_match, PNP_REPROJECTION_RESIDUAL_COLOR, 2, lineType=cv2.LINE_AA)
+
+    projected = np.asarray(result.projected_display_points, dtype=np.float32)
+    edge_indexes = result.display_edge_indexes or result.edge_indexes
+    for start, end in edge_indexes:
+        start_point = tuple(np.round(projected[start]).astype(int))
+        end_point = tuple(np.round(projected[end]).astype(int))
+        color = PNP_CUBE_LINE_COLOR
+        cv2.line(target, start_point, end_point, (0, 0, 0), 4, lineType=cv2.LINE_AA)
+        cv2.line(target, start_point, end_point, color, 2, lineType=cv2.LINE_AA)
+    for point in projected_object_points:
+        center = tuple(np.round(point).astype(int))
+        cv2.circle(target, center, 5, (0, 0, 0), -1, lineType=cv2.LINE_AA)
+        cv2.circle(target, center, 3, PNP_CUBE_POINT_COLOR, -1, lineType=cv2.LINE_AA)
+    if len(residuals):
+        focal = float(result.camera_matrix[0, 0])
+        axis_order, signs = result.lattice_transform
+        observed_error = getattr(result, "observed_reprojection_error", None)
+        if observed_graph is None:
+            object_error = float(getattr(result, "matched_error", float(np.mean(residuals))))
+        else:
+            object_error = observed_pose_model_nearest_same_class_score(
+                result,
+                observed_graph,
+                inlier_threshold_px=PNP_INLIER_THRESHOLD_PX,
+            )[0]
+        display_error = float(np.mean(residuals)) if observed_error is None else float(observed_error)
+        fit_label = "" if observed_error is None else f" fit {float(np.mean(residuals)):.1f}"
+        face = getattr(result, "correspondence_face", None)
+        face_normal_z = getattr(result, "correspondence_face_normal_z", None)
+        face_label = "" if face is None or face_normal_z is None else f" face {face} nz {face_normal_z:.2f}"
+        rejected_label = " rejected" if getattr(result, "pose_label", "") == "graph-rejected" else ""
+        attempt_label = pose_attempt_summary(profile)
+        label = (
+            f"pnp{rejected_label} {attempt_label} obj {object_error:.1f} err {display_error:.1f}{fit_label} max {float(np.max(residuals)):.1f} "
+            f"f {focal:.0f}{face_label} axes {axis_order} signs {signs}"
+        )
+        cv2.putText(
+            target,
+            label,
+            (12, max(24, frame.shape[0] - 16)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 0),
+            4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            target,
+            label,
+            (12, max(24, frame.shape[0] - 16)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            PNP_REPROJECTION_RESIDUAL_COLOR,
+            2,
+            cv2.LINE_AA,
+        )
+    if alpha < 1.0:
+        cv2.addWeighted(target, alpha, frame, 1.0 - alpha, 0.0, dst=frame)
+
+
+def draw_observed_model_distance_lines(
+    frame: np.ndarray,
+    result: PosePnPResult,
+    observed_graph: PoseGraph,
+) -> None:
+    matches = observed_pose_model_nearest_same_class_matches(result, observed_graph)
+    if not matches:
+        return
+
+    overlay = frame.copy()
+    for observed_xy, projected_xy, _distance, _using_invisible_fallback in matches:
+        observed = tuple(np.round(observed_xy).astype(int))
+        projected = tuple(np.round(projected_xy).astype(int))
+        cv2.line(overlay, observed, projected, PNP_OBSERVED_MODEL_DISTANCE_COLOR, 2, lineType=cv2.LINE_AA)
+    cv2.addWeighted(
+        overlay,
+        float(PNP_OBSERVED_MODEL_DISTANCE_ALPHA),
+        frame,
+        1.0 - float(PNP_OBSERVED_MODEL_DISTANCE_ALPHA),
+        0.0,
+        dst=frame,
+    )
+
+
+def draw_refinement_point_marker(
+    frame: np.ndarray,
+    result: PosePnPResult,
+    observed_graph: PoseGraph,
+) -> None:
+    graph_index = getattr(result, "refinement_graph_index", None)
+    if graph_index is None:
+        return
+    graph_index = int(graph_index)
+    if graph_index < 0 or graph_index >= len(observed_graph.points):
+        return
+
+    point = observed_graph.points[graph_index]
+    center = tuple(np.round(np.asarray(point.xy, dtype=np.float32)).astype(int))
+    cv2.circle(frame, center, 9, (0, 0, 0), 2, lineType=cv2.LINE_AA)
+    cv2.circle(frame, center, 7, PNP_REFINEMENT_POINT_COLOR, 2, lineType=cv2.LINE_AA)
+
+    lattice_coord = getattr(result, "refinement_lattice_coord", None)
+    label = "refine" if lattice_coord is None else f"refine {lattice_coord}"
+    label_xy = (center[0] + 10, center[1] - 8)
+    cv2.putText(
+        frame,
+        label,
+        label_xy,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (0, 0, 0),
+        3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        label,
+        label_xy,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        PNP_REFINEMENT_POINT_COLOR,
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def draw_pnp_debug_pose_candidates(frame: np.ndarray, result: PosePnPResult) -> None:
+    candidates = tuple(getattr(result, "debug_pose_candidates", tuple()))
+    if not candidates:
+        return
+
+    overlay = frame.copy()
+    for candidate_index, candidate in enumerate(candidates):
+        projected = np.asarray(candidate.projected_display_points, dtype=np.float32).reshape(-1, 2)
+        edge_indexes = candidate.display_edge_indexes or candidate.edge_indexes
+        if len(projected) == 0 or not edge_indexes:
+            continue
+        color = PNP_DEBUG_POSE_COLORS[candidate_index % len(PNP_DEBUG_POSE_COLORS)]
+        for start, end in edge_indexes:
+            start_point = tuple(np.round(projected[start]).astype(int))
+            end_point = tuple(np.round(projected[end]).astype(int))
+            cv2.line(overlay, start_point, end_point, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+            cv2.line(overlay, start_point, end_point, color, 1, lineType=cv2.LINE_AA)
+
+        label_point = tuple(np.round(projected[0]).astype(int))
+        label = f"{candidate_index + 1}:{float(getattr(candidate, 'observed_reprojection_error', 0.0)):.1f}"
+        cv2.putText(
+            overlay,
+            label,
+            (label_point[0] + 4, label_point[1] + 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            overlay,
+            label,
+            (label_point[0] + 4, label_point[1] + 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+    cv2.addWeighted(
+        overlay,
+        float(PNP_DEBUG_POSE_ALPHA),
+        frame,
+        1.0 - float(PNP_DEBUG_POSE_ALPHA),
+        0.0,
+        dst=frame,
+    )
+
+
+def odd_kernel(value: int) -> int:
+    value = max(1, int(value))
+    return value if value % 2 == 1 else value + 1
+
+
+def build_adjacency_edge_map(roi: np.ndarray, args, *, roi_side: float | None = None) -> np.ndarray:
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    roi_side = float(max(roi.shape[:2])) if roi_side is None else float(roi_side)
+    blur_kernel = odd_kernel(
+        scaled_adjacency_int_px(
+            getattr(args, "adjacency_canny_blur", ADJACENCY_CANNY_BLUR_KERNEL),
+            roi_side,
+            args,
+            min_value=1,
+        )
+    )
+    if blur_kernel > 1:
+        gray = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+    canny_low = max(0, int(getattr(args, "adjacency_canny_low", ADJACENCY_CANNY_LOW)))
+    canny_high = max(1, int(getattr(args, "adjacency_canny_high", ADJACENCY_CANNY_HIGH)))
+    if canny_low > canny_high:
+        canny_low, canny_high = canny_high, canny_low
+    return cv2.Canny(gray, canny_low, canny_high)
+
+
+def merged_interval_coverage(
+    intervals: list[tuple[float, float]],
+    segment_length: float,
+) -> tuple[float, float]:
+    if segment_length <= 0.0 or not intervals:
+        return 0.0, segment_length
+
+    clipped = [
+        (max(0.0, start), min(segment_length, end))
+        for start, end in intervals
+        if end >= 0.0 and start <= segment_length
+    ]
+    clipped = [(start, end) for start, end in clipped if end > start]
+    if not clipped:
+        return 0.0, segment_length
+
+    clipped.sort()
+    merged: list[tuple[float, float]] = []
+    for start, end in clipped:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+
+    covered = sum(end - start for start, end in merged)
+    max_gap = merged[0][0]
+    for previous, current in zip(merged, merged[1:]):
+        max_gap = max(max_gap, current[0] - previous[1])
+    max_gap = max(max_gap, segment_length - merged[-1][1])
+    return covered / segment_length, max_gap
+
+
+POSE_GRAPH_NEIGHBOR_LIMITS = {
+    "corner": {"corner-edge": 3},
+    "corner-edge": {"corner": 1, "corner-edge": 1, "corner-edge-center": 2},
+    "corner-edge-center": {"corner-edge-center": 2, "corner-edge": 2},
+}
+
+
+def pose_graph_candidate_edges(points: list[PoseGraphPoint]) -> list[tuple[int, int]]:
+    candidate_edges: set[tuple[int, int]] = set()
+    for source_index, source in enumerate(points):
+        neighbor_limits = POSE_GRAPH_NEIGHBOR_LIMITS.get(source.class_name, {})
+        source_xy = np.asarray(source.xy, dtype=np.float32)
+        for neighbor_class, limit in neighbor_limits.items():
+            neighbors = [
+                (
+                    float(np.linalg.norm(np.asarray(target.xy, dtype=np.float32) - source_xy)),
+                    target_index,
+                )
+                for target_index, target in enumerate(points)
+                if target_index != source_index and target.class_name == neighbor_class
+            ]
+            neighbors.sort(key=lambda item: item[0])
+            for _distance, target_index in neighbors[: max(0, limit)]:
+                candidate_edges.add(tuple(sorted((source_index, target_index))))
+    return sorted(candidate_edges)
+
+
+def edge_support_along_segment(
+    edge_map: np.ndarray,
+    start_xy: tuple[float, float],
+    end_xy: tuple[float, float],
+) -> tuple[float, float]:
+    start = np.asarray(start_xy, dtype=np.float32)
+    end = np.asarray(end_xy, dtype=np.float32)
+    delta = end - start
+    length = float(np.linalg.norm(delta))
+    if length <= 1.0:
+        return 0.0, length
+
+    sample_count = max(2, int(np.ceil(length)) + 1)
+    t = np.linspace(0.0, 1.0, sample_count, dtype=np.float32)
+    samples = start[None, :] + ((end - start)[None, :] * t[:, None])
+    xs = np.round(samples[:, 0]).astype(np.int32)
+    ys = np.round(samples[:, 1]).astype(np.int32)
+    inside = (
+        (xs >= 0)
+        & (xs < edge_map.shape[1])
+        & (ys >= 0)
+        & (ys < edge_map.shape[0])
+    )
+    support = np.zeros(sample_count, dtype=bool)
+    support[inside] = edge_map[ys[inside], xs[inside]] > 0
+
+    if not bool(support.any()):
+        return 0.0, length
+
+    sample_step = length / max(1, sample_count - 1)
+    intervals: list[tuple[float, float]] = []
+    run_start: int | None = None
+    for sample_index, has_edge in enumerate(support):
+        if has_edge and run_start is None:
+            run_start = sample_index
+        if (not has_edge or sample_index == len(support) - 1) and run_start is not None:
+            run_end = sample_index if has_edge else sample_index - 1
+            intervals.append(
+                (
+                    (run_start * sample_step) - sample_step,
+                    (run_end * sample_step) + sample_step,
+                )
+            )
+            run_start = None
+
+    return merged_interval_coverage(intervals, length)
+
+
+def dilated_adjacency_edge_map(
+    edge_map: np.ndarray,
+    args,
+    *,
+    roi_side: float | None = None,
+) -> np.ndarray:
+    roi_side = float(max(edge_map.shape[:2])) if roi_side is None else float(roi_side)
+    dilation_px = scaled_adjacency_int_px(
+        getattr(args, "adjacency_edge_dilation", ADJACENCY_EDGE_DILATION_PX),
+        roi_side,
+        args,
+    )
+    if dilation_px <= 0:
+        return edge_map
+    kernel_size = (dilation_px * 2) + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.dilate(edge_map, kernel)
+
+
+def adjacency_edge_strip_width_px(args, *, roi_side: float) -> int:
+    dilation_px = scaled_adjacency_int_px(
+        getattr(args, "adjacency_edge_dilation", ADJACENCY_EDGE_DILATION_PX),
+        roi_side,
+        args,
+    )
+    return (dilation_px * 2) + 1
+
+
+def segment_skips_observed_keypoint(
+    points: list[PoseGraphPoint],
+    start_index: int,
+    end_index: int,
+    args,
+    *,
+    roi_side: float,
+) -> bool:
+    start = np.asarray(points[start_index].xy, dtype=np.float32)
+    end = np.asarray(points[end_index].xy, dtype=np.float32)
+    delta = end - start
+    length = float(np.linalg.norm(delta))
+    if length <= 1.0:
+        return False
+
+    unit = delta / length
+    intersection_distance = max(
+        0.0,
+        scaled_adjacency_px(
+            getattr(
+                args,
+                "adjacency_keypoint_intersection_distance",
+                ADJACENCY_KEYPOINT_INTERSECTION_DISTANCE_PX,
+            ),
+            roi_side,
+            args,
+        ),
+    )
+    endpoint_margin = min(intersection_distance, length * 0.25)
+    for point_index, point in enumerate(points):
+        if point_index in (start_index, end_index):
+            continue
+        point_xy = np.asarray(point.xy, dtype=np.float32)
+        projection = float(np.dot(point_xy - start, unit))
+        if projection <= endpoint_margin or projection >= length - endpoint_margin:
+            continue
+        closest = start + (unit * projection)
+        if float(np.linalg.norm(point_xy - closest)) <= intersection_distance:
+            return True
+    return False
+
+
+def pose_graph_edge_evidence(
+    points: list[PoseGraphPoint],
+    roi_xyxy: tuple[int, int, int, int],
+    edge_map: np.ndarray,
+    args,
+) -> list[PoseGraphEdge]:
+    if len(points) < 2:
+        return []
+
+    roi_offset = np.asarray(roi_xyxy[:2], dtype=np.float32)
+    roi_side = roi_side_px(roi_xyxy)
+    sampled_edges = dilated_adjacency_edge_map(edge_map, args, roi_side=roi_side)
+    min_coverage = max(
+        0.0,
+        min(1.0, float(getattr(args, "adjacency_min_coverage", ADJACENCY_MIN_COVERAGE))),
+    )
+    max_gap_ratio = max(
+        0.0,
+        float(
+            getattr(
+                args,
+                "adjacency_max_uncovered_gap_ratio",
+                ADJACENCY_MAX_UNCOVERED_GAP_RATIO,
+            )
+        ),
+    )
+    min_edge_length = max(
+        0.0,
+        scaled_adjacency_px(
+            getattr(args, "adjacency_min_edge_length", ADJACENCY_MIN_EDGE_LENGTH_PX),
+            roi_side,
+            args,
+        ),
+    )
+
+    graph_edges: list[PoseGraphEdge] = []
+    for start_index, end_index in pose_graph_candidate_edges(points):
+        start = tuple(np.asarray(points[start_index].xy, dtype=np.float32) - roi_offset)
+        end = tuple(np.asarray(points[end_index].xy, dtype=np.float32) - roi_offset)
+        length = float(
+            np.linalg.norm(np.asarray(end, dtype=np.float32) - np.asarray(start, dtype=np.float32))
+        )
+        if length < min_edge_length:
+            continue
+        skips_keypoint = segment_skips_observed_keypoint(
+            points,
+            start_index,
+            end_index,
+            args,
+            roi_side=roi_side,
+        )
+        if skips_keypoint:
+            coverage, max_gap = 0.0, length
+        else:
+            coverage, max_gap = edge_support_along_segment(sampled_edges, start, end)
+        accepted = (
+            not skips_keypoint
+            and coverage >= min_coverage
+            and max_gap <= (max_gap_ratio * length)
+        )
+        graph_edges.append(
+            PoseGraphEdge(
+                start_index=start_index,
+                end_index=end_index,
+                coverage=coverage,
+                max_uncovered_gap=max_gap,
+                accepted=accepted,
+            )
+        )
+    return graph_edges
+
+
+def pose_graph_edge_length(
+    points: tuple[PoseGraphPoint, ...] | list[PoseGraphPoint],
+    edge: PoseGraphEdge,
+) -> float:
+    start = np.asarray(points[edge.start_index].xy, dtype=np.float32)
+    end = np.asarray(points[edge.end_index].xy, dtype=np.float32)
+    return float(np.linalg.norm(end - start))
+
+
+def prune_long_pose_graph_edges(graph: PoseGraph, args) -> PoseGraph:
+    accepted_lengths = [
+        pose_graph_edge_length(graph.points, edge)
+        for edge in graph.edges
+        if edge.accepted
+    ]
+    if not accepted_lengths:
+        return graph
+
+    max_length_ratio = max(
+        0.0,
+        float(
+            getattr(
+                args,
+                "adjacency_max_average_length_ratio",
+                ADJACENCY_MAX_AVERAGE_LENGTH_RATIO,
+            )
+        ),
+    )
+    if max_length_ratio <= 0.0:
+        return graph
+
+    max_length = float(np.mean(accepted_lengths)) * max_length_ratio
+    pruned_edges = tuple(
+        (
+            PoseGraphEdge(
+                start_index=edge.start_index,
+                end_index=edge.end_index,
+                coverage=edge.coverage,
+                max_uncovered_gap=edge.max_uncovered_gap,
+                accepted=False,
+            )
+            if edge.accepted and pose_graph_edge_length(graph.points, edge) > max_length
+            else edge
+        )
+        for edge in graph.edges
+    )
+    return PoseGraph(points=graph.points, edges=pruned_edges)
+
+
+def build_pose_graph(
+    points: list[PoseGraphPoint],
+    roi: np.ndarray,
+    roi_xyxy: tuple[int, int, int, int],
+    args,
+) -> PoseGraph:
+    if len(points) < 2:
+        return PoseGraph(points=tuple(points), edges=tuple())
+    profile = getattr(args, "_pose_profile", None)
+    started = perf_counter()
+    side = roi_side_px(roi_xyxy)
+    edges = build_adjacency_edge_map(roi, args, roi_side=side)
+    if profile is not None:
+        profile["edge_map_ms"] = (perf_counter() - started) * 1000.0
+        started = perf_counter()
+    graph = PoseGraph(
+        points=tuple(points),
+        edges=tuple(pose_graph_edge_evidence(points, roi_xyxy, edges, args)),
+    )
+    if profile is not None:
+        profile["edge_evidence_ms"] = (perf_counter() - started) * 1000.0
+        profile["candidate_edges"] = len(graph.edges)
+        profile["accepted_edges_before_prune"] = sum(edge.accepted for edge in graph.edges)
+        started = perf_counter()
+    graph = prune_long_pose_graph_edges(graph, args)
+    if profile is not None:
+        profile["edge_prune_ms"] = (perf_counter() - started) * 1000.0
+        profile["accepted_edges"] = sum(edge.accepted for edge in graph.edges)
+    return graph
+
+
+def pose_graph_adjacency(graph: PoseGraph) -> dict[int, list[int]]:
+    adjacency = {index: [] for index in range(len(graph.points))}
+    for edge in graph.edges:
+        if not edge.accepted:
+            continue
+        adjacency[edge.start_index].append(edge.end_index)
+        adjacency[edge.end_index].append(edge.start_index)
+    for neighbors in adjacency.values():
+        neighbors.sort(key=lambda index: (-graph.points[index].score, index))
+    return adjacency
+
+
+def pose_graph_components(
+    graph: PoseGraph,
+    adjacency: dict[int, list[int]] | None = None,
+) -> list[tuple[int, ...]]:
+    adjacency = pose_graph_adjacency(graph) if adjacency is None else adjacency
+    seen: set[int] = set()
+    components: list[tuple[int, ...]] = []
+    for start_index in range(len(graph.points)):
+        if start_index in seen:
+            continue
+        queue = deque([start_index])
+        seen.add(start_index)
+        component = []
+        while queue:
+            index = queue.popleft()
+            component.append(index)
+            for neighbor in adjacency[index]:
+                if neighbor in seen:
+                    continue
+                seen.add(neighbor)
+                queue.append(neighbor)
+        components.append(tuple(component))
+    return components
+
+
+def cube_lattice_class(coord: tuple[int, int, int]) -> str:
+    boundary_count = sum(value in (0, CUBE_GRID_MAX_INDEX) for value in coord)
+    if boundary_count == 3:
+        return "corner"
+    if boundary_count == 2:
+        return "corner-edge"
+    if boundary_count == 1:
+        return "corner-edge-center"
+    return "center"
+
+
+CUBE_LATTICE_COORDS_BY_CLASS = {
+    class_name: tuple(coord for coord in CUBE_LATTICE_COORDS if cube_lattice_class(coord) == class_name)
+    for class_name in ("corner", "corner-edge", "corner-edge-center")
+}
+
+
+CUBE_LATTICE_POINT_BY_COORD = {
+    coord: CUBE_LATTICE_POINTS_MM[index]
+    for index, coord in enumerate(CUBE_LATTICE_COORDS)
+}
+CUBE_LATTICE_DISPLAY_CORNER_COORDS = tuple(
+    coord for coord in CUBE_LATTICE_COORDS if cube_lattice_class(coord) == "corner"
+)
+CUBE_LATTICE_DISPLAY_POINTS_MM = np.asarray(
+    [CUBE_LATTICE_POINT_BY_COORD[coord] for coord in CUBE_LATTICE_DISPLAY_CORNER_COORDS],
+    dtype=np.float32,
+)
+CUBE_LATTICE_DISPLAY_EDGE_INDEXES = tuple(
+    (start_index, end_index)
+    for start_index, start_coord in enumerate(CUBE_LATTICE_DISPLAY_CORNER_COORDS)
+    for end_index, end_coord in enumerate(CUBE_LATTICE_DISPLAY_CORNER_COORDS)
+    if start_index < end_index
+    and sum(abs(start_value - end_value) for start_value, end_value in zip(start_coord, end_coord))
+    == CUBE_GRID_MAX_INDEX
+)
+
+
+def shared_lattice_boundary_faces(
+    lattice_coords: tuple[tuple[int, int, int], ...],
+) -> frozenset[tuple[int, int]]:
+    if not lattice_coords:
+        return frozenset()
+    shared_faces = set(cube_lattice_boundary_faces(lattice_coords[0]))
+    for coord in lattice_coords[1:]:
+        shared_faces &= set(cube_lattice_boundary_faces(coord))
+    return frozenset(shared_faces)
+
+
+def lattice_correspondence_face_is_visible(
+    lattice_coords: tuple[tuple[int, int, int], ...],
+    rvec: np.ndarray,
+) -> bool:
+    shared_faces = shared_lattice_boundary_faces(lattice_coords)
+    if not shared_faces:
+        return False
+    return any(lattice_boundary_face_is_visible(face, rvec) for face in shared_faces)
+
+
+def projected_lattice_points_by_class(
+    result: PosePnPResult,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    projected_by_class: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if any(
+        getattr(result, attribute, None) is None
+        for attribute in ("rvec", "tvec", "camera_matrix", "dist_coeffs")
+    ):
+        return projected_by_class
+
+    for class_name in ("corner", "corner-edge", "corner-edge-center"):
+        coords = CUBE_LATTICE_COORDS_BY_CLASS[class_name]
+        object_points = cube_lattice_points_for_coords(
+            coords,
+            lattice_transform=getattr(result, "lattice_transform", CUBE_LATTICE_IDENTITY_TRANSFORM),
+        )
+        try:
+            projected_points, _ = cv2.projectPoints(
+                object_points,
+                result.rvec,
+                result.tvec,
+                result.camera_matrix,
+                result.dist_coeffs,
+            )
+        except cv2.error:
+            continue
+        projected_by_class[class_name] = (
+            projected_points.reshape(-1, 2).astype(np.float32, copy=False),
+            object_points.astype(np.float32, copy=False),
+        )
+    return projected_by_class
+
+
+def observed_pose_model_nearest_same_class_score(
+    result: PosePnPResult,
+    observed_graph: PoseGraph,
+    *,
+    inlier_threshold_px: float,
+) -> tuple[float, int, int, int]:
+    matches = observed_pose_model_nearest_same_class_matches(result, observed_graph)
+    errors = [distance for _observed_xy, _projected_xy, distance, _fallback in matches]
+    observed_point_count = sum(
+        1
+        for point in observed_graph.points
+        if point.class_name in ("corner", "corner-edge", "corner-edge-center")
+    )
+    invisible_observed_count = sum(1 for *_points, using_invisible_fallback in matches if using_invisible_fallback)
+    if not errors:
+        return float("inf"), 0, observed_point_count, invisible_observed_count
+    inlier_count = sum(error <= float(inlier_threshold_px) for error in errors)
+    return float(np.mean(errors)), int(inlier_count), len(errors), invisible_observed_count
+
+
+def observed_pose_model_backface_fit_count(
+    result: PosePnPResult,
+    observed_graph: PoseGraph,
+    *,
+    inlier_threshold_px: float,
+) -> tuple[int, int]:
+    projected_by_class = projected_lattice_points_by_class(result)
+    backface_fit_count = 0
+    tested_count = 0
+    for class_name in ("corner", "corner-edge", "corner-edge-center"):
+        observed_points = [
+            point
+            for point in observed_graph.points
+            if point.class_name == class_name
+        ]
+        if not observed_points:
+            continue
+        projected_entry = projected_by_class.get(class_name)
+        if projected_entry is None:
+            continue
+        projected_points, object_points = projected_entry
+        if len(projected_points) == 0 or len(projected_points) != len(object_points):
+            continue
+        visible_mask = np.asarray(
+            [
+                result_object_point_has_visible_surface(object_point, result)
+                for object_point in object_points
+            ],
+            dtype=bool,
+        )
+        hidden_projected_points = projected_points[~visible_mask]
+        if len(hidden_projected_points) == 0:
+            continue
+        visible_projected_points = projected_points[visible_mask]
+        observed_xy = np.asarray([point.xy for point in observed_points], dtype=np.float32).reshape(-1, 2)
+        hidden_distances = np.linalg.norm(
+            observed_xy[:, None, :] - hidden_projected_points[None, :, :],
+            axis=2,
+        )
+        nearest_hidden = np.min(hidden_distances, axis=1)
+        if len(visible_projected_points) == 0:
+            nearest_visible = np.full_like(nearest_hidden, float("inf"), dtype=np.float32)
+        else:
+            visible_distances = np.linalg.norm(
+                observed_xy[:, None, :] - visible_projected_points[None, :, :],
+                axis=2,
+            )
+            nearest_visible = np.min(visible_distances, axis=1)
+        tested_count += len(observed_xy)
+        backface_fit_count += int(
+            np.count_nonzero(
+                (nearest_hidden <= float(inlier_threshold_px))
+                & (nearest_hidden <= nearest_visible)
+            )
+        )
+    return backface_fit_count, tested_count
+
+
+def observed_pose_model_nearest_same_class_matches(
+    result: PosePnPResult,
+    observed_graph: PoseGraph,
+) -> list[tuple[np.ndarray, np.ndarray, float, bool]]:
+    projected_by_class = projected_lattice_points_by_class(result)
+    matches: list[tuple[np.ndarray, np.ndarray, float, bool]] = []
+    observed_points_by_class: dict[str, list[PoseGraphPoint]] = {
+        class_name: [
+            point
+            for point in observed_graph.points
+            if point.class_name == class_name
+        ]
+        for class_name in ("corner", "corner-edge", "corner-edge-center")
+    }
+    for class_name, observed_points in observed_points_by_class.items():
+        if not observed_points:
+            continue
+        projected_entry = projected_by_class.get(class_name)
+        if projected_entry is None:
+            continue
+        projected_points, object_points = projected_entry
+        if len(projected_points) == 0 or len(projected_points) != len(object_points):
+            continue
+
+        visible_mask = np.asarray(
+            [
+                result_object_point_has_visible_surface(object_point, result)
+                for object_point in object_points
+            ],
+            dtype=bool,
+        )
+        candidate_projected_points = projected_points[visible_mask]
+        using_invisible_fallback = False
+        if len(candidate_projected_points) == 0:
+            candidate_projected_points = projected_points
+            using_invisible_fallback = True
+
+        observed_xy = np.asarray([point.xy for point in observed_points], dtype=np.float32).reshape(-1, 2)
+        distance_matrix = np.linalg.norm(
+            observed_xy[:, None, :] - candidate_projected_points[None, :, :],
+            axis=2,
+        )
+        nearest_model_indexes = np.argmin(distance_matrix, axis=1)
+        for observed_xy_point, model_index in zip(observed_xy, nearest_model_indexes):
+            projected_xy = candidate_projected_points[int(model_index)]
+            distance = float(np.linalg.norm(observed_xy_point - projected_xy))
+            matches.append((observed_xy_point, projected_xy, distance, using_invisible_fallback))
+
+    return matches
+
+
+CUBE_LATTICE_BOUNDARY_FACES_BY_COORD = {
+    coord: frozenset(
+        (axis, value)
+        for axis, value in enumerate(coord)
+        if value in (0, CUBE_GRID_MAX_INDEX)
+    )
+    for coord in CUBE_LATTICE_COORDS
+}
+def cube_lattice_coords_are_neighbors(
+    left: tuple[int, int, int],
+    right: tuple[int, int, int],
+) -> bool:
+    return sum(abs(left_value - right_value) for left_value, right_value in zip(left, right)) == 1
+
+
+VECTOR_GUIDED_START_COORDS = {
+    "corner": (0, 0, 0),
+    "corner-edge": (1, 0, 0),
+    "corner-edge-center": (1, 1, 0),
+}
+VECTOR_GUIDED_DIRECTION_PRIORITY = (
+    (1, 0, 0),
+    (0, 1, 0),
+    (0, 0, 1),
+    (-1, 0, 0),
+    (0, -1, 0),
+    (0, 0, -1),
+)
+VECTOR_GUIDED_DIRECTION_RANK = {
+    direction: index
+    for index, direction in enumerate(VECTOR_GUIDED_DIRECTION_PRIORITY)
+}
+VECTOR_GUIDED_LOCAL_TURN_ORDER = ("straight", "left", "right", "back")
+VECTOR_GUIDED_LOCAL_TURNS = {
+    (1, 0, 0): {
+        "straight": (1, 0, 0),
+        "left": (0, 1, 0),
+        "right": (0, 0, 1),
+        "back": (-1, 0, 0),
+    },
+    (0, 1, 0): {
+        "straight": (0, 1, 0),
+        "left": (0, 0, 1),
+        "right": (1, 0, 0),
+        "back": (0, -1, 0),
+    },
+    (0, 0, 1): {
+        "straight": (0, 0, 1),
+        "left": (1, 0, 0),
+        "right": (0, 1, 0),
+        "back": (0, 0, -1),
+    },
+    (-1, 0, 0): {
+        "straight": (-1, 0, 0),
+        "left": (0, 0, 1),
+        "right": (0, 1, 0),
+        "back": (1, 0, 0),
+    },
+    (0, -1, 0): {
+        "straight": (0, -1, 0),
+        "left": (1, 0, 0),
+        "right": (0, 0, 1),
+        "back": (0, 1, 0),
+    },
+    (0, 0, -1): {
+        "straight": (0, 0, -1),
+        "left": (0, 1, 0),
+        "right": (1, 0, 0),
+        "back": (0, 0, 1),
+    },
+}
+CUBE_LATTICE_NEIGHBOR_COORDS_BY_CLASS = {
+    (coord, class_name): tuple(
+        candidate
+        for direction in VECTOR_GUIDED_DIRECTION_PRIORITY
+        for candidate in (tuple(coord[index] + direction[index] for index in range(3)),)
+        if all(0 <= value <= CUBE_GRID_MAX_INDEX for value in candidate)
+        and candidate in CUBE_LATTICE_POINT_BY_COORD
+        and cube_lattice_class(candidate) == class_name
+    )
+    for coord in CUBE_LATTICE_COORDS
+    for class_name in ("corner", "corner-edge", "corner-edge-center")
+}
+
+
+def normalized_vector(vector: np.ndarray) -> np.ndarray | None:
+    length = float(np.linalg.norm(vector))
+    if length <= 1e-6:
+        return None
+    return (vector / length).astype(np.float32)
+
+
+def cube_lattice_neighbor_coords(
+    coord: tuple[int, int, int],
+    class_name: str,
+    *,
+    used_coords: set[tuple[int, int, int]] | None = None,
+) -> list[tuple[int, int, int]]:
+    used_coords = set() if used_coords is None else used_coords
+    return [
+        candidate
+        for candidate in CUBE_LATTICE_NEIGHBOR_COORDS_BY_CLASS.get((coord, class_name), ())
+        if candidate not in used_coords
+    ]
+
+
+def cube_lattice_boundary_faces(coord: tuple[int, int, int]) -> frozenset[tuple[int, int]]:
+    return CUBE_LATTICE_BOUNDARY_FACES_BY_COORD[coord]
+
+
+def cube_lattice_shared_boundary_faces(
+    left: tuple[int, int, int],
+    right: tuple[int, int, int],
+) -> frozenset[tuple[int, int]]:
+    return cube_lattice_boundary_faces(left) & cube_lattice_boundary_faces(right)
+
+
+def axis_delta(axis: int, sign: int) -> tuple[int, int, int]:
+    return tuple(sign if index == axis else 0 for index in range(3))
+
+
+def cross_delta(
+    left: tuple[int, int, int],
+    right: tuple[int, int, int],
+) -> tuple[int, int, int]:
+    return (
+        (left[1] * right[2]) - (left[2] * right[1]),
+        (left[2] * right[0]) - (left[0] * right[2]),
+        (left[0] * right[1]) - (left[1] * right[0]),
+    )
+
+
+def face_normal_delta(face: tuple[int, int]) -> tuple[int, int, int]:
+    axis, value = face
+    return axis_delta(axis, -1 if value == 0 else 1)
+
+
+def face_local_turn_basis(
+    previous_delta: tuple[int, int, int],
+    face: tuple[int, int],
+) -> dict[str, tuple[int, int, int]] | None:
+    normal = face_normal_delta(face)
+    if sum(abs(normal[index] * previous_delta[index]) for index in range(3)) != 0:
+        return None
+    right = cross_delta(normal, previous_delta)
+    if sum(abs(value) for value in right) != 1:
+        return None
+    return {
+        "straight": previous_delta,
+        "left": negated_delta(right),
+        "right": right,
+        "back": negated_delta(previous_delta),
+    }
+
+
+def coord_delta_axis_and_sign(
+    start: tuple[int, int, int],
+    end: tuple[int, int, int],
+) -> tuple[int, int] | None:
+    delta = tuple(end[index] - start[index] for index in range(3))
+    if sum(abs(value) for value in delta) != 1:
+        return None
+    axis = next(index for index, value in enumerate(delta) if value != 0)
+    return axis, delta[axis]
+
+
+def coord_delta(
+    start: tuple[int, int, int],
+    end: tuple[int, int, int],
+) -> tuple[int, int, int] | None:
+    delta = tuple(end[index] - start[index] for index in range(3))
+    if sum(abs(value) for value in delta) != 1:
+        return None
+    return delta
+
+
+def local_turn_scores(previous_unit: np.ndarray, next_unit: np.ndarray) -> dict[str, float]:
+    dot = float(np.dot(previous_unit, next_unit))
+    cross = float(
+        (previous_unit[0] * next_unit[1])
+        - (previous_unit[1] * next_unit[0])
+    )
+    return {
+        "straight": dot,
+        "left": -cross,
+        "right": cross,
+        "back": -dot,
+    }
+
+
+def local_turn_for_delta(
+    previous_delta: tuple[int, int, int],
+    next_delta: tuple[int, int, int],
+) -> str | None:
+    local_turns = VECTOR_GUIDED_LOCAL_TURNS.get(previous_delta, {})
+    for turn_name, turn_delta in local_turns.items():
+        if turn_delta == next_delta:
+            return turn_name
+    return None
+
+
+def local_turn_basis_for_delta(delta: tuple[int, int, int]) -> dict[str, tuple[int, int, int]] | None:
+    local_turns = VECTOR_GUIDED_LOCAL_TURNS.get(delta)
+    return None if local_turns is None else dict(local_turns)
+
+
+def local_turn_for_basis_delta(
+    basis: dict[str, tuple[int, int, int]],
+    delta: tuple[int, int, int],
+) -> str | None:
+    for turn_name, turn_delta in basis.items():
+        if turn_delta == delta:
+            return turn_name
+    return None
+
+
+def candidate_local_turn_name(
+    basis: dict[str, tuple[int, int, int]],
+    previous_delta: tuple[int, int, int],
+    next_delta: tuple[int, int, int],
+    previous_unit: np.ndarray,
+    observed_unit: np.ndarray,
+    turn_scores: dict[str, float] | None = None,
+) -> str | None:
+    turn_name = local_turn_for_basis_delta(basis, next_delta)
+    if turn_name is not None:
+        return turn_name
+    return None
+
+
+def negated_delta(delta: tuple[int, int, int]) -> tuple[int, int, int]:
+    return tuple(-value for value in delta)
+
+
+def propagated_local_to_global_frame(
+    local_to_global: dict[str, tuple[int, int, int]],
+    turn_name: str,
+) -> dict[str, tuple[int, int, int]]:
+    straight = local_to_global[turn_name]
+    if turn_name == "straight":
+        left = local_to_global["left"]
+        right = local_to_global["right"]
+    elif turn_name == "left":
+        left = local_to_global["right"]
+        right = local_to_global["straight"]
+    elif turn_name == "right":
+        left = local_to_global["straight"]
+        right = local_to_global["left"]
+    else:
+        left = local_to_global["right"]
+        right = local_to_global["left"]
+    return {
+        "straight": straight,
+        "left": left,
+        "right": right,
+        "back": negated_delta(straight),
+    }
+
+
+def unique_local_to_global_frames(
+    previous_delta: tuple[int, int, int],
+    path_faces: frozenset[tuple[int, int]],
+    fallback: dict[str, tuple[int, int, int]],
+) -> tuple[dict[str, tuple[int, int, int]], ...]:
+    frames = []
+    seen = set()
+    for face in sorted(path_faces):
+        frame = face_local_turn_basis(previous_delta, face)
+        if frame is None:
+            continue
+        key = tuple(sorted(frame.items()))
+        if key in seen:
+            continue
+        frames.append(frame)
+        seen.add(key)
+    key = tuple(sorted(fallback.items()))
+    if key not in seen:
+        frames.append(fallback)
+    return tuple(frames)
+
+
+def image_axis_preference(delta: tuple[int, int, int], observed_unit: np.ndarray) -> float:
+    axis_and_sign = coord_delta_axis_and_sign((0, 0, 0), delta)
+    if axis_and_sign is None:
+        return 0.0
+    axis, sign = axis_and_sign
+    if axis == 0:
+        return float(observed_unit[0]) * float(sign)
+    if axis == 1:
+        return -float(observed_unit[0]) * float(sign)
+    return float(observed_unit[1]) * float(sign)
+
+
+def pose_graph_correspondence_from_assignments(
+    graph: PoseGraph,
+    assignments: dict[int, PoseGraphNodeAssignment],
+) -> PoseGraphCorrespondence | None:
+    if len(assignments) < 3 or not any(assignment.has_turn for assignment in assignments.values()):
+        return None
+
+    graph_indexes = tuple(
+        sorted(
+            assignments,
+            key=lambda index: (-graph.points[index].score, index),
+        )
+    )
+    lattice_coords = tuple(assignments[index].coord for index in graph_indexes)
+    image_points = np.asarray([graph.points[index].xy for index in graph_indexes], dtype=np.float32)
+    return PoseGraphCorrespondence(
+        image_points=image_points,
+        object_points=cube_lattice_points_for_coords(lattice_coords),
+        graph_indexes=graph_indexes,
+        lattice_coords=lattice_coords,
+    )
+
+
+def mirrored_first_neighbor_lattice_coord(
+    start_class_name: str,
+    first_neighbor_class_name: str,
+    first_neighbor_coord: tuple[int, int, int],
+) -> tuple[int, int, int] | None:
+    mirror_pairs: tuple[
+        tuple[str, str, tuple[int, int, int], tuple[int, int, int]],
+        ...
+    ] = (
+        ("corner-edge", "corner-edge-center", (1, 1, 0), (1, 0, 1)),
+        ("corner-edge-center", "corner-edge-center", (2, 1, 0), (1, 2, 0)),
+        ("corner-edge-center", "corner-edge", (1, 0, 0), (0, 1, 0)),
+    )
+    for pair_start_class, pair_neighbor_class, first_coord, second_coord in mirror_pairs:
+        if (
+            start_class_name != pair_start_class
+            or first_neighbor_class_name != pair_neighbor_class
+        ):
+            continue
+        if first_neighbor_coord == first_coord:
+            return second_coord
+        if first_neighbor_coord == second_coord:
+            return first_coord
+    return None
+
+
+def pose_graph_component_has_observed_turn(
+    graph: PoseGraph,
+    adjacency: tuple[tuple[int, ...], ...],
+    component: tuple[int, ...],
+    *,
+    min_cross: float = 0.15,
+) -> bool:
+    component_set = set(component)
+    for current_index in component:
+        current_xy = np.asarray(graph.points[current_index].xy, dtype=np.float32)
+        neighbor_units = []
+        for neighbor_index in adjacency[current_index]:
+            if neighbor_index not in component_set:
+                continue
+            neighbor_unit = normalized_vector(
+                np.asarray(graph.points[neighbor_index].xy, dtype=np.float32) - current_xy
+            )
+            if neighbor_unit is not None:
+                neighbor_units.append(neighbor_unit)
+        for first_index, first_unit in enumerate(neighbor_units):
+            for second_unit in neighbor_units[first_index + 1:]:
+                cross = float(
+                    (first_unit[0] * second_unit[1])
+                    - (first_unit[1] * second_unit[0])
+                )
+                if abs(cross) >= float(min_cross):
+                    return True
+    return False
+
+
+def weighted_shuffle_start_options(
+    start_options: list[tuple[tuple[int, ...], int]],
+    point_weights: dict[int, float],
+) -> list[tuple[tuple[int, ...], int]]:
+    remaining = list(start_options)
+    shuffled = []
+    while remaining:
+        weights = [max(0.0, float(point_weights.get(index, 1.0))) for _component, index in remaining]
+        total = sum(weights)
+        if total <= 0.0:
+            random.shuffle(remaining)
+            shuffled.extend(remaining)
+            break
+        target = random.random() * total
+        cumulative = 0.0
+        selected_index = len(remaining) - 1
+        for option_index, weight in enumerate(weights):
+            cumulative += weight
+            if target <= cumulative:
+                selected_index = option_index
+                break
+        shuffled.append(remaining.pop(selected_index))
+    return shuffled
+
+
+def _vector_guided_pose_graph_correspondence_candidates_from_start(
+    graph: PoseGraph,
+    adjacency: tuple[tuple[int, ...], ...],
+    component: tuple[int, ...],
+    start_index: int,
+    *,
+    max_candidates: int | None = None,
+    point_weights: dict[int, float] | None = None,
+    exclude_keys: set[tuple[tuple[int, ...], tuple[tuple[int, int, int], ...]]] | None = None,
+) -> tuple[PoseGraphCorrespondence, ...]:
+    component_set = set(component)
+    start = graph.points[start_index]
+    start_coord = VECTOR_GUIDED_START_COORDS.get(start.class_name)
+    if start_coord is None:
+        return tuple()
+
+    def weighted_point_score(index: int) -> float:
+        weight = 1.0 if point_weights is None else float(point_weights.get(index, 1.0))
+        return float(graph.points[index].score) * max(0.0, weight)
+
+    start_assignment = PoseGraphNodeAssignment(
+        coord=start_coord,
+        parent_index=None,
+        local_to_global=None,
+        local_to_global_frames=tuple(),
+        path_faces=cube_lattice_boundary_faces(start_coord),
+        depth=0,
+        has_turn=False,
+    )
+    start_used_coords = {start_coord}
+
+    first_neighbor_options = []
+    for neighbor_index in adjacency[start_index]:
+        if neighbor_index not in component_set:
+            continue
+        neighbor = graph.points[neighbor_index]
+        observed_unit = normalized_vector(
+            np.asarray(neighbor.xy, dtype=np.float32)
+            - np.asarray(start.xy, dtype=np.float32)
+        )
+        if observed_unit is None:
+            continue
+        for neighbor_coord in cube_lattice_neighbor_coords(
+            start_coord,
+            neighbor.class_name,
+            used_coords=start_used_coords,
+        ):
+            delta = tuple(neighbor_coord[index] - start_coord[index] for index in range(3))
+            first_neighbor_options.append(
+                (
+                    -weighted_point_score(neighbor_index),
+                    VECTOR_GUIDED_DIRECTION_RANK.get(delta, len(VECTOR_GUIDED_DIRECTION_PRIORITY)),
+                    neighbor_index,
+                    neighbor_coord,
+                    observed_unit,
+                )
+            )
+    if not first_neighbor_options:
+        return tuple()
+
+    correspondences: list[PoseGraphCorrespondence] = []
+    correspondence_keys: set[tuple[tuple[int, ...], tuple[tuple[int, int, int], ...]]] = set()
+
+    def add_correspondence(
+        assignments: dict[int, PoseGraphNodeAssignment],
+    ) -> bool:
+        correspondence = pose_graph_correspondence_from_assignments(graph, assignments)
+        if correspondence is None:
+            return False
+        key = correspondence.key
+        if key in correspondence_keys or (exclude_keys is not None and key in exclude_keys):
+            return False
+        correspondence_keys.add(key)
+        correspondences.append(correspondence)
+        return max_candidates is not None and len(correspondences) >= max_candidates
+
+    def walk_from_first_neighbor(
+        first_neighbor_index: int,
+        first_neighbor_coord: tuple[int, int, int],
+        reference_vector: np.ndarray,
+    ) -> bool:
+        first_delta = coord_delta(start_coord, first_neighbor_coord)
+        if first_delta is None:
+            return False
+        first_basis = local_turn_basis_for_delta(first_delta)
+        if first_basis is None:
+            return False
+        assignments: dict[int, PoseGraphNodeAssignment] = {
+            start_index: start_assignment,
+        }
+        used_coords = {start_coord}
+        first_path_faces = start_assignment.path_faces & cube_lattice_boundary_faces(
+            first_neighbor_coord
+        )
+        assignments[first_neighbor_index] = PoseGraphNodeAssignment(
+            coord=first_neighbor_coord,
+            parent_index=start_index,
+            local_to_global=first_basis,
+            local_to_global_frames=unique_local_to_global_frames(
+                first_delta,
+                first_path_faces,
+                first_basis,
+            ),
+            path_faces=first_path_faces,
+            depth=1,
+            has_turn=False,
+        )
+        used_coords.add(first_neighbor_coord)
+
+        queue = deque([start_index, first_neighbor_index])
+        queued_indexes = {start_index, first_neighbor_index}
+
+        def enqueue_node(index: int) -> None:
+            if index in queued_indexes:
+                return
+            queue.append(index)
+            queued_indexes.add(index)
+
+        while queue:
+            current_index = queue.popleft()
+            current_assignment = assignments[current_index]
+            current_coord = current_assignment.coord
+            current_xy = np.asarray(graph.points[current_index].xy, dtype=np.float32)
+            if current_assignment.parent_index is None:
+                current_local_to_global_frames = (first_basis,)
+                previous_unit = reference_vector
+            else:
+                current_local_to_global_frames = current_assignment.local_to_global_frames
+                if not current_local_to_global_frames:
+                    continue
+                parent_coord = assignments[current_assignment.parent_index].coord
+                previous_delta = coord_delta(parent_coord, current_coord)
+                if previous_delta is None:
+                    continue
+                parent_xy = np.asarray(
+                    graph.points[current_assignment.parent_index].xy,
+                    dtype=np.float32,
+                )
+                previous_unit = normalized_vector(current_xy - parent_xy)
+                if previous_unit is None:
+                    continue
+            candidate_assignments = []
+            for neighbor_index in adjacency[current_index]:
+                if neighbor_index not in component_set:
+                    continue
+                if neighbor_index == current_assignment.parent_index:
+                    continue
+                if neighbor_index in assignments:
+                    continue
+
+                neighbor = graph.points[neighbor_index]
+                observed_unit = normalized_vector(np.asarray(neighbor.xy, dtype=np.float32) - current_xy)
+                if observed_unit is None:
+                    continue
+                turn_scores = local_turn_scores(previous_unit, observed_unit)
+                for neighbor_coord in cube_lattice_neighbor_coords(
+                    current_coord,
+                    neighbor.class_name,
+                    used_coords=used_coords,
+                ):
+                    assigned_neighbor_coords = [
+                        assignments[assigned_neighbor_index].coord
+                        for assigned_neighbor_index in adjacency[neighbor_index]
+                        if assigned_neighbor_index in assignments
+                    ]
+                    conflict_count = sum(
+                        not cube_lattice_coords_are_neighbors(neighbor_coord, assigned_neighbor_coord)
+                        for assigned_neighbor_coord in assigned_neighbor_coords
+                    )
+                    if conflict_count > 0:
+                        continue
+                    next_delta = coord_delta(current_coord, neighbor_coord)
+                    if next_delta is None:
+                        continue
+                    turn_options = []
+                    allowed_turns = ("straight", "left", "right")
+                    if current_assignment.parent_index is None:
+                        allowed_turns = (*allowed_turns, "back")
+                    seen_turn_options = set()
+                    for current_local_to_global in current_local_to_global_frames:
+                        for turn_name in allowed_turns:
+                            if current_local_to_global.get(turn_name) != next_delta:
+                                continue
+                            next_path_faces = (
+                                current_assignment.path_faces
+                                & cube_lattice_boundary_faces(neighbor_coord)
+                            )
+                            fallback_frame = propagated_local_to_global_frame(
+                                current_local_to_global,
+                                turn_name,
+                            )
+                            next_local_to_global_frames = unique_local_to_global_frames(
+                                next_delta,
+                                next_path_faces,
+                                fallback_frame,
+                            )
+                            option_key = (
+                                turn_name,
+                                tuple(tuple(sorted(frame.items())) for frame in next_local_to_global_frames),
+                                next_path_faces,
+                            )
+                            if option_key in seen_turn_options:
+                                continue
+                            seen_turn_options.add(option_key)
+                            turn_options.append(
+                                (
+                                    turn_name,
+                                    next_local_to_global_frames[0],
+                                    next_local_to_global_frames,
+                                    next_path_faces,
+                                    (3.0 if len(assigned_neighbor_coords) >= 2 else 0.0)
+                                    + (1.0 if next_path_faces else 0.0),
+                                )
+                            )
+
+                    if not turn_options and len(assigned_neighbor_coords) >= 2:
+                        topology_turn = max(("straight", "left", "right"), key=turn_scores.get)
+                        next_path_faces = (
+                            current_assignment.path_faces
+                            & cube_lattice_boundary_faces(neighbor_coord)
+                        )
+                        fallback_frame = (
+                            local_turn_basis_for_delta(next_delta)
+                            or propagated_local_to_global_frame(
+                                current_local_to_global_frames[0],
+                                topology_turn,
+                            )
+                        )
+                        next_local_to_global_frames = unique_local_to_global_frames(
+                            next_delta,
+                            next_path_faces,
+                            fallback_frame,
+                        )
+                        turn_options.append(
+                            (
+                                topology_turn,
+                                next_local_to_global_frames[0],
+                                next_local_to_global_frames,
+                                next_path_faces,
+                                3.0,
+                            )
+                        )
+
+                    if not turn_options:
+                        continue
+                    (
+                        turn_name,
+                        next_local_to_global,
+                        next_local_to_global_frames,
+                        next_path_faces,
+                        context_bonus,
+                    ) = min(
+                        turn_options,
+                        key=lambda option: (
+                            -turn_scores[option[0]] - option[4],
+                            VECTOR_GUIDED_LOCAL_TURN_ORDER.index(option[0]),
+                        ),
+                    )
+                    score = (
+                        turn_scores[turn_name]
+                        + context_bonus
+                    )
+                    candidate_assignments.append(
+                        (
+                            conflict_count,
+                            -score,
+                            -weighted_point_score(neighbor_index),
+                            neighbor_index,
+                            neighbor_coord,
+                            next_local_to_global,
+                            next_local_to_global_frames,
+                            next_path_faces,
+                            turn_name in ("left", "right"),
+                        )
+                    )
+
+            candidate_assignments.sort()
+            for (
+                _conflict_count,
+                _direction_score,
+                _point_score,
+                neighbor_index,
+                neighbor_coord,
+                next_local_to_global,
+                next_local_to_global_frames,
+                next_path_faces,
+                has_turn,
+            ) in candidate_assignments:
+                if neighbor_index in assignments or neighbor_coord in used_coords:
+                    continue
+                node_has_turn = current_assignment.has_turn or bool(has_turn)
+                assignments[neighbor_index] = PoseGraphNodeAssignment(
+                    coord=neighbor_coord,
+                    parent_index=current_index,
+                    local_to_global=next_local_to_global,
+                    local_to_global_frames=next_local_to_global_frames,
+                    path_faces=next_path_faces,
+                    depth=current_assignment.depth + 1,
+                    has_turn=node_has_turn,
+                )
+                used_coords.add(neighbor_coord)
+                if node_has_turn and len(assignments) >= 3:
+                    if add_correspondence(assignments):
+                        return True
+                enqueue_node(neighbor_index)
+
+        return add_correspondence(assignments)
+
+    _score, _rank, first_neighbor_index, first_neighbor_coord, reference_vector = min(first_neighbor_options)
+    first_neighbor = graph.points[first_neighbor_index]
+    first_neighbor_coord_options = [first_neighbor_coord]
+    mirrored_coord = mirrored_first_neighbor_lattice_coord(
+        start.class_name,
+        first_neighbor.class_name,
+        first_neighbor_coord,
+    )
+    if mirrored_coord is not None:
+        first_neighbor_coord_options.append(mirrored_coord)
+    for coord_option in first_neighbor_coord_options:
+        if walk_from_first_neighbor(first_neighbor_index, coord_option, reference_vector):
+            return tuple(correspondences)
+    return tuple(correspondences)
+
+
+def vector_guided_pose_graph_correspondence_candidates(
+    graph: PoseGraph,
+    *,
+    max_candidates: int | None = None,
+    point_weights: dict[int, float] | None = None,
+    exclude_keys: set[tuple[tuple[int, ...], tuple[tuple[int, int, int], ...]]] | None = None,
+) -> tuple[PoseGraphCorrespondence, ...]:
+    if max_candidates is not None:
+        max_candidates = max(0, int(max_candidates))
+        if max_candidates == 0:
+            return tuple()
+
+    adjacency = pose_graph_adjacency(graph)
+    components = pose_graph_components(graph, adjacency)
+    eligible_components = [
+        component
+        for component in components
+        if len(component) >= 3
+        and pose_graph_component_has_observed_turn(graph, adjacency, component)
+    ]
+    if not eligible_components:
+        return tuple()
+
+    start_options = [
+        (component, index)
+        for component in eligible_components
+        for index in component
+        if graph.points[index].class_name in VECTOR_GUIDED_START_COORDS
+    ]
+    if not start_options:
+        return tuple()
+    if point_weights is None:
+        random.shuffle(start_options)
+    else:
+        start_options = weighted_shuffle_start_options(start_options, point_weights)
+
+    correspondences: list[PoseGraphCorrespondence] = []
+    correspondence_keys: set[tuple[tuple[int, ...], tuple[tuple[int, int, int], ...]]] = (
+        set() if exclude_keys is None else set(exclude_keys)
+    )
+    for component, start_index in start_options:
+        remaining = (
+            None
+            if max_candidates is None
+            else max(0, max_candidates - len(correspondences))
+        )
+        if remaining == 0:
+            break
+        for correspondence in _vector_guided_pose_graph_correspondence_candidates_from_start(
+            graph,
+            adjacency,
+            component,
+            start_index,
+            max_candidates=remaining,
+            point_weights=point_weights,
+            exclude_keys=correspondence_keys,
+        ):
+            key = correspondence.key
+            if key in correspondence_keys:
+                continue
+            correspondence_keys.add(key)
+            correspondences.append(correspondence)
+            if max_candidates is not None and len(correspondences) >= max_candidates:
+                return tuple(correspondences)
+    return tuple(correspondences)
+
+
+def vector_guided_pose_graph_correspondence(graph: PoseGraph) -> PoseGraphCorrespondence | None:
+    correspondences = vector_guided_pose_graph_correspondence_candidates(graph, max_candidates=1)
+    return None if not correspondences else correspondences[0]
+
+
+def draw_pose_graph_adjacencies(
+    frame: np.ndarray,
+    graph: PoseGraph,
+    args,
+    *,
+    roi_side: float | None = None,
+) -> int:
+    if len(graph.points) < 2:
+        return 0
+
+    accepted_count = 0
+    roi_side = (
+        ADJACENCY_REFERENCE_ROI_SIZE_PX
+        if roi_side is None
+        else float(roi_side)
+    )
+    strip_width_px = adjacency_edge_strip_width_px(args, roi_side=roi_side)
+    if strip_width_px > 1:
+        strip_overlay = frame.copy()
+        for adjacency in graph.edges:
+            start = tuple(np.round(graph.points[adjacency.start_index].xy).astype(int))
+            end = tuple(np.round(graph.points[adjacency.end_index].xy).astype(int))
+            cv2.line(
+                strip_overlay,
+                start,
+                end,
+                POSE_GRAPH_EDGE_STRIP_COLOR,
+                strip_width_px,
+                lineType=cv2.LINE_AA,
+            )
+        cv2.addWeighted(
+            strip_overlay,
+            float(POSE_GRAPH_EDGE_STRIP_ALPHA),
+            frame,
+            1.0 - float(POSE_GRAPH_EDGE_STRIP_ALPHA),
+            0.0,
+            dst=frame,
+        )
+
+    for adjacency in graph.edges:
+        if not adjacency.accepted:
+            continue
+        start = tuple(np.round(graph.points[adjacency.start_index].xy).astype(int))
+        end = tuple(np.round(graph.points[adjacency.end_index].xy).astype(int))
+        cv2.line(frame, start, end, (0, 0, 0), 5, lineType=cv2.LINE_AA)
+        cv2.line(frame, start, end, (60, 255, 120), 2, lineType=cv2.LINE_AA)
+        if getattr(args, "debug_overlay", False):
+            midpoint = tuple(
+                np.round(
+                    (
+                        np.asarray(graph.points[adjacency.start_index].xy, dtype=np.float32)
+                        + np.asarray(graph.points[adjacency.end_index].xy, dtype=np.float32)
+                    )
+                    * 0.5
+                ).astype(int)
+            )
+            cv2.putText(
+                frame,
+                f"{adjacency.coverage:.0%}",
+                midpoint,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        accepted_count += 1
+    return accepted_count
+
+
+def draw_pose_graph_correspondence(
+    frame: np.ndarray,
+    graph: PoseGraph,
+    correspondence: PoseGraphCorrespondence | None,
+) -> None:
+    if correspondence is None:
+        return
+
+    used_indexes = set(correspondence.graph_indexes)
+    for edge in graph.edges:
+        if not edge.accepted:
+            continue
+        if edge.start_index not in used_indexes or edge.end_index not in used_indexes:
+            continue
+        start = tuple(np.round(graph.points[edge.start_index].xy).astype(int))
+        end = tuple(np.round(graph.points[edge.end_index].xy).astype(int))
+        cv2.line(frame, start, end, (0, 0, 0), 7, lineType=cv2.LINE_AA)
+        cv2.line(frame, start, end, POSE_GRAPH_CORRESPONDENCE_LINE_COLOR, 3, lineType=cv2.LINE_AA)
+
+    for graph_index, lattice_coord in zip(correspondence.graph_indexes, correspondence.lattice_coords):
+        point = np.asarray(graph.points[graph_index].xy, dtype=np.float32)
+        label_at = tuple(np.round(point + np.asarray((8.0, -8.0), dtype=np.float32)).astype(int))
+        label = f"{lattice_coord}"
+        cv2.putText(
+            frame,
+            label,
+            label_at,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (0, 0, 0),
+            5,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            label,
+            label_at,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            POSE_GRAPH_CORRESPONDENCE_TEXT_COLOR,
+            2,
+            cv2.LINE_AA,
+        )
+
+
+def draw_pose_estimate(
+    frame: np.ndarray,
+    roi: np.ndarray,
+    roi_xyxy: tuple[int, int, int, int],
+    pose_model,
+    pose_solver: PoseGraphPnPSolver | None,
+    args,
+) -> tuple[int, PosePnPResult | None, tuple[int, int, int, int] | None]:
+    if pose_model is None:
+        return 0, None, None
+
+    profile = getattr(args, "_pose_profile", None)
+    x1, y1, x2, y2 = roi_xyxy
+    model_roi = resize_to_square_size(roi, POSE_IMAGE_SIZE)
+    started = perf_counter()
+    results = pose_model.predict(
+        source=model_roi,
+        conf=POSE_OBJECT_CONFIDENCE,
+        imgsz=POSE_IMAGE_SIZE,
+        verbose=False,
+    )
+    if profile is not None:
+        profile["pose_model_ms"] = (perf_counter() - started) * 1000.0
+    if not results:
+        reset_pose_solver_temporal_tracking(pose_solver)
+        return 0, None, None
+
+    started = perf_counter()
+    result = results[0]
+    xy, conf = result_keypoints(result, POSE_IMAGE_SIZE)
+    scale_x = (x2 - x1) / float(model_roi.shape[1])
+    scale_y = (y2 - y1) / float(model_roi.shape[0])
+    pose_points = collect_pose_graph_points(
+        result,
+        pose_model,
+        xy,
+        conf,
+        confidence_threshold=POSE_KEYPOINT_CONFIDENCE,
+        offset_xy=(x1, y1),
+        scale_xy=(scale_x, scale_y),
+    )
+    if profile is not None:
+        profile["collect_points_ms"] = (perf_counter() - started) * 1000.0
+        profile["pose_points"] = len(pose_points)
+    should_build_pose_graph = (
+        getattr(args, "show_corner_adjacency", DRAW_CORNER_ADJACENCY)
+        or ENABLE_POSE_GRAPH_CORRESPONDENCE
+    )
+    started = perf_counter()
+    pose_graph = (
+        build_pose_graph(pose_points, roi, roi_xyxy, args)
+        if should_build_pose_graph
+        else PoseGraph(points=tuple(pose_points), edges=tuple())
+    )
+    if profile is not None:
+        profile["graph_total_ms"] = (perf_counter() - started) * 1000.0
+    started = perf_counter()
+    if getattr(args, "show_corner_adjacency", DRAW_CORNER_ADJACENCY):
+        draw_pose_graph_adjacencies(frame, pose_graph, args, roi_side=roi_side_px(roi_xyxy))
+    if profile is not None:
+        profile["draw_adjacency_ms"] = (perf_counter() - started) * 1000.0
+
+    point_count = 0
+    started = perf_counter()
+    if DRAW_POSE_KEYPOINTS:
+        point_count = draw_pose_keypoints(
+            frame,
+            result,
+            pose_model,
+            xy,
+            conf,
+            confidence_threshold=POSE_KEYPOINT_CONFIDENCE,
+            offset_xy=(x1, y1),
+            scale_xy=(scale_x, scale_y),
+        )
+    if profile is not None:
+        profile["draw_keypoints_ms"] = (perf_counter() - started) * 1000.0
+
+    graph_image_points = np.asarray([point.xy for point in pose_graph.points], dtype=np.float32)
+    pose_tracking_bounds_xyxy = point_bounds_xyxy(graph_image_points, roi_xyxy)
+    pnp_result = None
+    if ENABLE_POSE_ESTIMATION and ENABLE_POSE_GRAPH_CORRESPONDENCE and pose_solver is not None:
+        started = perf_counter()
+        max_correspondence_candidates = max(
+            0,
+            int(getattr(pose_solver, "max_refinement_attempts", PNP_MAX_REFINEMENT_ATTEMPTS)),
+        )
+        correspondences: list[PoseGraphCorrespondence] = []
+        correspondence = None
+        tried_correspondence_keys: set[tuple[tuple[int, ...], tuple[tuple[int, int, int], ...]]] = set()
+        point_weights = {index: 1.0 for index in range(len(pose_graph.points))}
+        if profile is not None:
+            profile["correspondence_generation_ms"] = 0.0
+        refinement_budget = {"remaining": max_correspondence_candidates}
+        solve_started = perf_counter()
+        for _attempt_index in range(max_correspondence_candidates):
+            generation_started = perf_counter()
+            next_correspondences = vector_guided_pose_graph_correspondence_candidates(
+                pose_graph,
+                max_candidates=1,
+                point_weights=point_weights,
+                exclude_keys=tried_correspondence_keys,
+            )
+            if profile is not None:
+                profile["correspondence_generation_ms"] = (
+                    float(profile.get("correspondence_generation_ms", 0.0))
+                    + (perf_counter() - generation_started) * 1000.0
+                )
+            if not next_correspondences:
+                break
+            correspondence = next_correspondences[0]
+            correspondences.append(correspondence)
+            tried_correspondence_keys.add(correspondence.key)
+            if profile is not None:
+                profile["seed_attempts"] = int(profile.get("seed_attempts", 0)) + 1
+            try:
+                pnp_result = pose_solver.solve_correspondences(
+                    correspondence,
+                    (frame.shape[1], frame.shape[0]),
+                    observed_graph=pose_graph,
+                    profile=profile,
+                    refinement_budget=refinement_budget,
+                    clear_rejected=False,
+                )
+            except TypeError:
+                pnp_result = pose_solver.solve_correspondences(
+                    correspondence,
+                    (frame.shape[1], frame.shape[0]),
+                    observed_graph=pose_graph,
+                )
+            if pnp_result is not None:
+                break
+            for graph_index in correspondence.graph_indexes:
+                point_weights[graph_index] = float(point_weights.get(graph_index, 1.0)) * 0.5
+        if pnp_result is None:
+            clear_last_tvec = getattr(pose_solver, "clear_last_tvec", None)
+            if callable(clear_last_tvec):
+                clear_last_tvec()
+        if profile is not None:
+            profile["correspondence_ms"] = (perf_counter() - started) * 1000.0
+            profile["solve_ms"] = (perf_counter() - solve_started) * 1000.0
+            profile["correspondence_points"] = (
+                0 if correspondence is None else len(correspondence.graph_indexes)
+            )
+            profile["correspondence_candidates"] = len(correspondences)
+        if profile is not None:
+            profile["pnp_ms"] = (perf_counter() - started) * 1000.0
+            profile["pnp_points"] = 0 if pnp_result is None else len(pnp_result.object_points)
+        started = perf_counter()
+        if DRAW_POSE_GRAPH_COORDS:
+            draw_pose_graph_correspondence(frame, pose_graph, correspondence)
+        if DRAW_PNP_CUBE:
+            rejected_pnp_result = (
+                getattr(pose_solver, "rejected_pose_result", None)
+                if pnp_result is None
+                else None
+            )
+            draw_pnp_cube(
+                frame,
+                pnp_result or rejected_pnp_result,
+                alpha=0.5 if pnp_result is None else 1.0,
+                observed_graph=pose_graph,
+                profile=profile,
+            )
+        if profile is not None:
+            profile["draw_pose_ms"] = (perf_counter() - started) * 1000.0
+    return point_count, pnp_result, pose_tracking_bounds_xyxy
+
+
+def reset_pose_solver_temporal_tracking(pose_solver: PoseGraphPnPSolver | None) -> None:
+    reset = getattr(pose_solver, "reset_temporal_tracking", None)
+    if callable(reset):
+        reset()
 
 
 def mask_color_for_segment(class_name: str, segment_index: int) -> tuple[int, int, int]:
-    del class_name, segment_index
+    if class_name == "face":
+        return FACE_INSTANCE_MASK_COLORS[segment_index % len(FACE_INSTANCE_MASK_COLORS)]
     return DEFAULT_STICKER_MASK_COLOR
 
 
@@ -6528,22 +3862,11 @@ def sticker_color_samples_at_points(
     return crop[ys, xs].astype(np.uint8)
 
 
-def direct_sticker_graph(
-    nodes: list[StickerNode],
-    *,
-    adjacency_radius_px: int,
-) -> PieceGraph:
-    return PieceGraph(
-        nodes=nodes,
-        edges=_legal_mask_adjacencies(nodes, adjacency_radius_px=adjacency_radius_px),
-    )
-
-
 def stickers_for_ready_color_classifier(
     frame: np.ndarray,
     roi_xyxy: tuple[int, int, int, int],
     stickers: list[tuple[np.ndarray, np.ndarray]],
-    color_classifier: ColorClassifier | None,
+    color_classifier: ColorDensityClassifier | None,
     color_samples: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> list[tuple[np.ndarray, np.ndarray, int | None]]:
     if color_classifier is None or not color_classifier.ready:
@@ -6566,82 +3889,6 @@ def stickers_for_ready_color_classifier(
     return classified_stickers
 
 
-def classified_net_colors_from_graph(
-    graph,
-    color_classifier: ColorClassifier,
-) -> tuple[dict[int, str], dict[str, tuple[int, int, int]]]:
-    colors_by_node_id = {}
-    bgr_by_color = {}
-    if not color_classifier.ready:
-        return colors_by_node_id, bgr_by_color
-
-    for node in graph.nodes:
-        cluster_index = color_classifier.classify_bgr(np.asarray(node.mean_bgr, dtype=np.uint8))
-        if cluster_index is None or cluster_index >= len(color_classifier.centroids):
-            continue
-        color_id = f"cluster-{int(cluster_index) + 1}"
-        colors_by_node_id[node.node_id] = color_id
-        bgr_by_color[color_id] = tuple(
-            int(value) for value in color_classifier.centroids[cluster_index][::-1]
-        )
-    return colors_by_node_id, bgr_by_color
-
-
-def parse_net_cluster_faces(value: str) -> dict[str, str]:
-    face_by_color = {}
-    value = value.strip()
-    if not value:
-        return face_by_color
-
-    for item in value.split(","):
-        cluster_text, separator, face = item.partition("=")
-        if not separator:
-            raise argparse.ArgumentTypeError(
-                "Expected comma-separated cluster=face entries, for example 1=R,2=U"
-            )
-        cluster_text = cluster_text.strip()
-        face = face.strip().upper()
-        if not cluster_text.isdigit() or face not in {"U", "D", "F", "B", "R", "L"}:
-            raise argparse.ArgumentTypeError(
-                "Expected cluster numbers and cube faces U,D,F,B,R,L"
-            )
-        face_by_color[f"cluster-{int(cluster_text)}"] = face
-    return face_by_color
-
-
-def parse_gmm_color_priors(value: str) -> np.ndarray:
-    text = value.strip()
-    if not text:
-        return np.empty((0, 3), dtype=np.float32)
-
-    priors = []
-    for item in text.replace("|", ";").split(";"):
-        item = item.strip()
-        if not item:
-            continue
-        _name, separator, rgb_text = item.partition("=")
-        if not separator:
-            rgb_text = item
-        parts = [part.strip() for part in rgb_text.split(",")]
-        if len(parts) != 3:
-            raise argparse.ArgumentTypeError(
-                "Expected RGB priors as r,g,b triples separated by semicolons"
-            )
-        try:
-            rgb = [float(part) for part in parts]
-        except ValueError as exc:
-            raise argparse.ArgumentTypeError(
-                "Expected RGB prior values to be numbers"
-            ) from exc
-        if any(value < 0.0 or value > 255.0 for value in rgb):
-            raise argparse.ArgumentTypeError("Expected RGB prior values in the 0..255 range")
-        priors.append(rgb)
-
-    if not priors:
-        return np.empty((0, 3), dtype=np.float32)
-    return np.asarray(priors, dtype=np.float32).reshape(-1, 3)
-
-
 def normalized_rgb_html_plot_path(rgb_html_path: Path) -> Path:
     suffix = rgb_html_path.suffix or ".html"
     return rgb_html_path.with_name(f"{rgb_html_path.stem}_normalized{suffix}")
@@ -6653,253 +3900,7 @@ def color_features_enabled(args) -> bool:
 
 def color_plot_outputs_requested(args) -> bool:
     return color_features_enabled(args) and bool(
-        args.rgb_color_plot
-        or args.rgb_html_plot
-        or args.hsv_html_plot
-        or args.oklab_html_plot
-        or getattr(args, "color_samples_file", None)
-    )
-
-
-def capture_fps_or_default(capture, default: float = 30.0) -> float:
-    fps = float(capture.get(cv2.CAP_PROP_FPS))
-    if not np.isfinite(fps) or fps <= 0:
-        return default
-    return fps
-
-
-def create_video_writer(output_path: Path, frame_shape: tuple[int, ...], fps: float):
-    height, width = frame_shape[:2]
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(
-        str(output_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        float(fps),
-        (int(width), int(height)),
-    )
-    if not writer.isOpened():
-        raise SystemExit(f"Could not open video writer: {output_path}")
-    return writer
-
-
-def run_two_pass_color_classification_video(
-    capture,
-    source,
-    args,
-    bbox_detector,
-    sticker_model,
-    color_classifier,
-    color_plot_requested,
-    cube_net_state,
-):
-    """Collect color samples, rewind a file source, then render classifications."""
-    if isinstance(source, int):
-        raise SystemExit("--color-classifier-mode two-pass requires a seekable video file")
-
-    frame_limit = 1 if args.once else max(1, int(args.color_plot_frames))
-    color_plot_bgr_batches = []
-    color_plot_group_batches = []
-    color_plot_detected_frames = 0
-    roi_tracker = RoiTracker()
-
-    # Pass one deliberately does not display or write frames.  The classifier
-    # observes samples inside process_frame and fits when the requested sample
-    # frame count has been reached.
-    sample_frame_count = 0
-    while sample_frame_count < frame_limit:
-        ok, frame = capture.read()
-        if not ok:
-            break
-        frame_result = process_frame(
-            frame,
-            bbox_detector,
-            sticker_model,
-            args,
-            color_classifier,
-            None,
-            roi_tracker,
-            return_sample_groups=color_plot_requested,
-        )
-        if color_plot_requested:
-            _output, bgr_samples, sample_groups = frame_result
-            if len(bgr_samples) > 0:
-                color_plot_bgr_batches.append(bgr_samples)
-                group_offset = (
-                    max(
-                        (int(groups.max()) for groups in color_plot_group_batches if len(groups)),
-                        default=-1,
-                    )
-                    + 1
-                )
-                color_plot_group_batches.append(sample_groups + group_offset)
-                color_plot_detected_frames += 1
-        if args.display:
-            collection_output = frame_result[0]
-            cv2.putText(
-                collection_output,
-                f"Collecting color samples {sample_frame_count + 1}/{frame_limit}",
-                (12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                3,
-            )
-            cv2.putText(
-                collection_output,
-                f"Collecting color samples {sample_frame_count + 1}/{frame_limit}",
-                (12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (20, 20, 20),
-                1,
-            )
-            cv2.imshow("cube sticker segmentations", collection_output)
-            if cv2.waitKey(0 if args.once else 1) & 0xFF == ord("q"):
-                cv2.destroyAllWindows()
-                capture.release()
-                raise SystemExit("Color sample collection cancelled")
-        sample_frame_count += 1
-
-    if not color_classifier.ready:
-        raise SystemExit(
-            "Could not fit color classifier during the first video pass; "
-            "collect more detected color samples or reduce --color-plot-frames"
-        )
-    if not capture.set(cv2.CAP_PROP_POS_FRAMES, 0):
-        raise SystemExit("Could not rewind video for the second color-classification pass")
-
-    roi_tracker.reset()
-    if cube_net_state is not None:
-        cube_net_state.replace_with(CubeNetState())
-    video_writer = None
-    video_fps = capture_fps_or_default(capture)
-    previous = perf_counter()
-    display_frame_count = 0
-    while display_frame_count < frame_limit:
-        ok, frame = capture.read()
-        if not ok:
-            break
-        frame_result = process_frame(
-            frame,
-            bbox_detector,
-            sticker_model,
-            args,
-            color_classifier,
-            cube_net_state,
-            roi_tracker,
-            return_sample_groups=False,
-        )
-        output, _ = frame_result
-        now = perf_counter()
-        fps = 1.0 / max(now - previous, 1e-6)
-        previous = now
-        if args.debug_overlay:
-            cv2.putText(output, f"FPS {fps:.1f}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 3)
-            cv2.putText(output, f"FPS {fps:.1f}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (20, 20, 20), 1)
-        if args.save and args.once:
-            cv2.imwrite(str(args.save), output)
-        if args.save_video:
-            if video_writer is None:
-                video_writer = create_video_writer(args.save_video, output.shape, video_fps)
-            video_writer.write(output)
-        if args.display:
-            cv2.imshow("cube sticker segmentations", output)
-            key = cv2.waitKey(0 if args.once else 1) & 0xFF
-            if key == ord("q"):
-                break
-        display_frame_count += 1
-
-    if args.display:
-        cv2.destroyAllWindows()
-    if video_writer is not None:
-        video_writer.release()
-    capture.release()
-    if args.save_net and cube_net_state is not None:
-        args.save_net.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(args.save_net), draw_cube_net(cube_net_state))
-
-    if color_plot_requested and color_plot_bgr_batches:
-        bgr_samples = np.concatenate(color_plot_bgr_batches, axis=0)
-        sample_groups = np.concatenate(color_plot_group_batches, axis=0)
-        if args.color_samples_file:
-            save_color_samples_file(args.color_samples_file, bgr_samples, sample_groups)
-            print(f"Saved color sample cache: {args.color_samples_file.resolve()}")
-        if args.rgb_color_plot:
-            save_rgb_samples_plot(
-                bgr_samples, str(args.rgb_color_plot),
-                title=f"Sticker segmentation RGB samples across {color_plot_detected_frames} frames",
-                point_size=args.average_plot_point_size,
-                normalize_rgb=args.normalize_rgb_plot,
-                regression_polylines=rgb_piecewise_polylines_for_classifier(color_classifier),
-            )
-        if args.rgb_html_plot:
-            save_rgb_html_plots(
-                bgr_samples, args.rgb_html_plot,
-                title=f"Sticker segmentation RGB samples across {color_plot_detected_frames} frames",
-                normalize_rgb=args.normalize_rgb_plot, args=args,
-                color_classifier=color_classifier,
-            )
-        if args.hsv_html_plot:
-            cluster_indexes, cluster_centroids = rgb_plot_clusters_for_samples(bgr_samples, color_classifier)
-            save_hsv_samples_interactive_plot(
-                bgr_samples, str(args.hsv_html_plot),
-                title=f"Sticker segmentation HSV samples across {color_plot_detected_frames} frames",
-                point_size=args.plotly_point_size,
-                cluster_indexes=cluster_indexes, cluster_centroids=cluster_centroids,
-            )
-        if args.oklab_html_plot:
-            cluster_indexes, cluster_centroids = rgb_plot_clusters_for_samples(bgr_samples, color_classifier)
-            save_oklab_samples_interactive_plot(
-                bgr_samples, str(args.oklab_html_plot),
-                title=f"Sticker segmentation Oklab samples across {color_plot_detected_frames} frames",
-                point_size=args.plotly_point_size,
-                oklab_samples=bgr_samples_to_oklab(bgr_samples),
-                cluster_indexes=cluster_indexes, cluster_centroids=cluster_centroids,
-                curve_points=oklab_piecewise_curves_for_classifier(color_classifier),
-                split_planes=(color_classifier.split_planes if isinstance(color_classifier, HDBSCANDensityPlaneColorClassifier) and color_classifier.ready else None),
-            )
-    return 0
-
-
-def build_color_classifier(args) -> ColorClassifier | None:
-    if not color_features_enabled(args):
-        return None
-    classifier_type = (
-        PiecewiseLinearColorClassifier
-        if args.color_classifier_mode == "piecewise-linear"
-        else ClusterMembershipColorClassifier
-        if args.color_classifier_mode == "cluster-membership"
-        else HDBSCANDensityPlaneColorClassifier
-    )
-    return classifier_type(
-        cluster_ambiguity_distance=args.color_cluster_ambiguity_distance,
-        required_frames=args.color_plot_frames,
-        cluster_count=args.color_cluster_count,
-        min_brightness=args.sticker_color_min_brightness,
-        max_brightness=args.sticker_color_max_brightness,
-        hdbscan_min_cluster_size=args.hdbscan_min_cluster_size,
-        hdbscan_min_samples=args.hdbscan_min_samples,
-        hdbscan_cluster_selection_method=args.hdbscan_cluster_selection_method,
-        hdbscan_cluster_selection_epsilon=args.hdbscan_cluster_selection_epsilon,
-        hdbscan_alpha=args.hdbscan_alpha,
-        hdbscan_metric=args.hdbscan_metric,
-        hdbscan_core_dist_n_jobs=args.hdbscan_core_dist_n_jobs,
-        hdbscan_leave_noise=args.hdbscan_leave_noise,
-        hdbscan_hierarchy_plot=args.hdbscan_hierarchy_plot,
-        plane_angle_count=args.plane_angle_count,
-        plane_tilt_count=args.plane_tilt_count,
-        plane_max_tilt_degrees=args.plane_max_tilt_degrees,
-        plane_offset_count=args.plane_offset_count,
-        plane_density_grid_size=args.plane_density_grid_size,
-        plane_density_smoothing=args.plane_density_smoothing,
-        plane_bandwidth=args.plane_bandwidth,
-        plane_min_child_size=args.plane_min_child_size,
-        plane_min_child_fraction=args.plane_min_child_fraction,
-        plane_balance_penalty=args.plane_balance_penalty,
-        plane_relative_valley_weight=args.plane_relative_valley_weight,
-        plane_min_side_mass=args.plane_min_side_mass,
-        plane_cut_mass_weight=args.plane_cut_mass_weight,
-        plane_cluster_size_weight=args.plane_cluster_size_weight,
+        args.rgb_color_plot or args.rgb_html_plot or args.hsv_html_plot
     )
 
 
@@ -6910,19 +3911,17 @@ def save_rgb_html_plots(
     title: str,
     normalize_rgb: bool,
     args,
-    color_classifier: ColorClassifier | None = None,
+    color_classifier: ColorDensityClassifier | None = None,
 ) -> None:
-    cluster_indexes, cluster_centroids = rgb_plot_clusters_for_samples(
-        bgr_samples,
-        color_classifier,
-    )
-    regression_rays = (
-        color_classifier.ray_directions
-        if isinstance(color_classifier, (BalancedConeColorClassifier, DenseRayColorClassifier))
-        and color_classifier.ready
-        else None
-    )
-    regression_polylines = rgb_piecewise_polylines_for_classifier(color_classifier)
+    cluster_indexes = None
+    cluster_centroids = None
+    if color_classifier is not None and color_classifier.ready:
+        cluster_indexes = classifier_cluster_indexes_for_bgr_samples(
+            color_classifier,
+            bgr_samples,
+        )
+        cluster_centroids = color_classifier.centroids
+
     save_rgb_samples_interactive_plot(
         bgr_samples,
         str(rgb_html_path),
@@ -6931,199 +3930,20 @@ def save_rgb_html_plots(
         point_size=args.plotly_point_size,
         cluster_indexes=cluster_indexes,
         cluster_centroids=cluster_centroids,
-        regression_rays=regression_rays,
-        regression_polylines=regression_polylines,
     )
-    print(f"Saved RGB HTML plot: {rgb_html_path.resolve()}")
-    normalized_html_path = normalized_rgb_html_plot_path(rgb_html_path)
     save_rgb_samples_interactive_plot(
         bgr_samples,
-        str(normalized_html_path),
+        str(normalized_rgb_html_plot_path(rgb_html_path)),
         title=f"{title} normalized to brightness",
         normalize_rgb=True,
         point_size=args.plotly_point_size,
         cluster_indexes=cluster_indexes,
         cluster_centroids=cluster_centroids,
-        regression_rays=regression_rays,
-        regression_polylines=regression_polylines,
     )
-    print(f"Saved normalized RGB HTML plot: {normalized_html_path.resolve()}")
-
-
-def rgb_piecewise_polylines_for_classifier(
-    color_classifier: ColorClassifier | None,
-) -> list[np.ndarray] | None:
-    oklab_polylines = oklab_piecewise_curves_for_classifier(color_classifier)
-    if oklab_polylines is None:
-        return None
-    return [oklab_to_rgb(polyline) for polyline in oklab_polylines]
-
-
-def oklab_piecewise_curves_for_classifier(
-    color_classifier: ColorClassifier | None,
-) -> list[np.ndarray] | None:
-    if not isinstance(color_classifier, PiecewiseLinearColorClassifier) or not color_classifier.ready:
-        return None
-    return [
-        np.vstack(
-            [
-                np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
-                breakpoint,
-                np.zeros(3, dtype=np.float32),
-            ]
-        )
-        for breakpoint in color_classifier.polyline_models
-    ]
-
-
-def rgb_plot_clusters_for_samples(
-    bgr_samples: np.ndarray,
-    color_classifier: ColorClassifier | None,
-) -> tuple[np.ndarray | None, np.ndarray | None]:
-    if color_classifier is None:
-        return None, None
-    if color_classifier.ready:
-        if (
-            isinstance(color_classifier, HDBSCANDensityPlaneColorClassifier)
-            and len(color_classifier._fit_bgr_samples) == len(bgr_samples)
-            and np.array_equal(
-                color_classifier._fit_bgr_samples,
-                np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3),
-            )
-        ):
-            # Preserve HDBSCAN noise as the explicit unknown cluster (-1).
-            return color_classifier.sample_labels.copy(), color_classifier.centroids
-        return (
-            classifier_cluster_indexes_for_bgr_samples(color_classifier, bgr_samples),
-            color_classifier.centroids,
-        )
-    if isinstance(color_classifier, HDBSCANDensityPlaneColorClassifier):
-        # Do not run a second provisional classifier just for a preview. The
-        # production fit is deliberately performed once after sample capture.
-        return None, None
-
-    rgb_samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)[:, ::-1]
-    if isinstance(color_classifier, BalancedConeColorClassifier):
-        cluster_indexes, centroids, _cluster_samples, _ray_directions = (
-            balanced_ray_rgb_cluster_memberships(
-                rgb_samples,
-                target_clusters=color_classifier.cluster_count,
-                min_brightness=color_classifier.min_brightness,
-                max_brightness=color_classifier.max_brightness,
-                max_angle_radians=color_classifier.max_angle_radians,
-                assignment_balance=color_classifier.assignment_balance,
-                assignment_sharpness=color_classifier.assignment_sharpness,
-                balance_iterations=color_classifier.balance_iterations,
-                max_iterations=color_classifier.max_iterations,
-            )
-        )
-    elif isinstance(color_classifier, DenseRayColorClassifier):
-        cluster_indexes, centroids, _cluster_samples, _ray_directions = (
-            dense_ray_rgb_cluster_memberships(
-                rgb_samples,
-                target_clusters=color_classifier.cluster_count,
-                min_brightness=color_classifier.min_brightness,
-                max_brightness=color_classifier.max_brightness,
-                k_neighbors=color_classifier.k_neighbors,
-                max_fit_samples=color_classifier.max_fit_samples,
-                min_anchor_distance=color_classifier.min_anchor_distance,
-            )
-        )
-    elif isinstance(color_classifier, DensityPeakColorClassifier):
-        cluster_indexes, centroids, _cluster_samples = density_peak_rgb_cluster_memberships(
-            rgb_samples,
-            target_clusters=color_classifier.cluster_count,
-            min_brightness=color_classifier.min_brightness,
-            max_brightness=color_classifier.max_brightness,
-            k_neighbors=color_classifier.k_neighbors,
-            max_fit_samples=color_classifier.max_fit_samples,
-            min_peak_distance=color_classifier.min_peak_distance,
-        )
-    elif isinstance(color_classifier, BalancedGMMColorClassifier):
-        (
-            cluster_indexes,
-            centroids,
-            _cluster_samples,
-            _covariances,
-            _precisions,
-            dense_core_mask,
-        ) = (
-            balanced_gmm_rgb_cluster_memberships_with_core_mask(
-                rgb_samples,
-                target_clusters=color_classifier.cluster_count,
-                min_brightness=color_classifier.min_brightness,
-                max_brightness=color_classifier.max_brightness,
-                max_mahalanobis_distance=color_classifier.max_mahalanobis_distance,
-                regularization=color_classifier.regularization,
-                ray_variance_floor=color_classifier.ray_variance_floor,
-                constrain_covariance_to_ray=color_classifier.constrain_covariance_to_ray,
-                perpendicular_variance_floor=color_classifier.perpendicular_variance_floor,
-                perpendicular_variance_ceiling=color_classifier.perpendicular_variance_ceiling,
-                dense_core_k_neighbors=color_classifier.dense_core_k_neighbors,
-                dense_core_quantile=color_classifier.dense_core_quantile,
-                prior_rgb_values=color_classifier.prior_rgb_values,
-                prior_strength=color_classifier.prior_strength,
-                min_assignment_confidence=color_classifier.min_assignment_confidence,
-                assignment_balance=color_classifier.assignment_balance,
-                balance_iterations=color_classifier.balance_iterations,
-                max_iterations=color_classifier.max_iterations,
-                tolerance=color_classifier.tolerance,
-            )
-        )
-        cluster_indexes = np.asarray(cluster_indexes, dtype=np.int32).copy()
-        cluster_indexes[~dense_core_mask] = -1
-    elif isinstance(color_classifier, HSVColorDensityClassifier):
-        cluster_indexes, centroids, _rgb_cluster_samples, _hsv_cluster_samples = (
-            density_hsv_cluster_memberships(
-                bgr_samples,
-                target_clusters=color_classifier.cluster_count,
-                min_brightness=color_classifier.min_brightness,
-                max_brightness=color_classifier.max_brightness,
-                eps=color_classifier.density_cluster_eps,
-                min_points=color_classifier.density_cluster_min_neighbors,
-            )
-        )
-    elif isinstance(color_classifier, OklabGMMColorClassifier):
-        (
-            cluster_indexes,
-            centroids,
-            _cluster_samples,
-            _angular_models,
-            _weights,
-        ) = oklab_angular_cluster_memberships(
-                compress_oklab_l(
-                    bgr_samples_to_oklab(bgr_samples),
-                    color_classifier.l_compression_factor,
-                ),
-                original_oklab_samples=bgr_samples_to_oklab(bgr_samples),
-                target_clusters=color_classifier.cluster_count,
-                min_brightness=(
-                    color_classifier.min_brightness
-                    / color_classifier.l_compression_factor
-                ),
-                max_brightness=(
-                    color_classifier.max_brightness
-                    / color_classifier.l_compression_factor
-                    if color_classifier.max_brightness is not None
-                    else None
-                ),
-        )
-    else:
-        cluster_indexes, centroids, _cluster_samples = density_rgb_cluster_memberships(
-            rgb_samples,
-            target_clusters=color_classifier.cluster_count,
-            min_brightness=color_classifier.min_brightness,
-            max_brightness=color_classifier.max_brightness,
-            eps=color_classifier.density_cluster_eps,
-            eps_reference_rgb=color_classifier.density_cluster_eps_reference_rgb,
-            min_points=color_classifier.density_cluster_min_neighbors,
-            merge_ray_distance_divisor=color_classifier.cluster_merge_ray_distance_divisor,
-        )
-    return cluster_indexes, centroids
 
 
 def classifier_cluster_indexes_for_bgr_samples(
-    color_classifier: ColorClassifier,
+    color_classifier: ColorDensityClassifier,
     bgr_samples: np.ndarray,
 ) -> np.ndarray:
     samples = np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3)
@@ -7152,60 +3972,14 @@ def concatenate_samples(
     return bgr_samples
 
 
-def concatenate_samples_with_groups(
-    bgr_batches: list[np.ndarray],
-    group_batches: list[np.ndarray],
-    max_samples: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    if not bgr_batches:
-        return np.empty((0, 3), dtype=np.uint8), np.empty((0,), dtype=np.int64)
-    bgr_samples = np.concatenate(bgr_batches, axis=0)
-    groups = np.concatenate(group_batches, axis=0).astype(np.int64, copy=False)
-    if len(bgr_samples) > max_samples:
-        indexes = np.linspace(0, len(bgr_samples) - 1, max_samples, dtype=np.int32)
-        bgr_samples = bgr_samples[indexes]
-        groups = groups[indexes]
-    return bgr_samples, groups
-
-
-def save_color_samples_file(
-    output_path: Path,
-    bgr_samples: np.ndarray,
-    sticker_ids: np.ndarray,
-) -> str:
-    """Save cached samples and their aligned sticker identities."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output_path,
-        bgr_samples=np.asarray(bgr_samples, dtype=np.uint8).reshape(-1, 3),
-        sticker_ids=np.asarray(sticker_ids, dtype=np.int64).reshape(-1),
-        edge_pairs=_consecutive_same_group_edges(sticker_ids),
-        format_version=np.asarray([2], dtype=np.int32),
-    )
-    return str(output_path)
-
-
-def _consecutive_same_group_edges(group_ids: np.ndarray) -> np.ndarray:
-    """Create the legacy sample-order graph when no spatial graph is available."""
-    groups = np.asarray(group_ids).reshape(-1)
-    edges = []
-    for group_id in np.unique(groups):
-        indexes = np.flatnonzero(groups == group_id)
-        if len(indexes) > 1:
-            edges.extend(zip(indexes[:-1], indexes[1:]))
-    return np.asarray(edges, dtype=np.int64).reshape(-1, 2)
-
-
 def draw_sticker_segments(
     frame: np.ndarray,
     roi: np.ndarray,
     sticker_model,
     roi_xyxy,
     args,
-    color_classifier: ColorClassifier | None = None,
-    cube_net_state: CubeNetState | None = None,
-    return_sample_groups: bool = False,
-) -> tuple[int, np.ndarray, tuple[int, int, int, int] | None, np.ndarray | None]:
+    color_classifier: ColorDensityClassifier | None = None,
+) -> tuple[int, np.ndarray, tuple[int, int, int, int] | None]:
     x1, y1, x2, y2 = roi_xyxy
     original_frame = frame.copy()
     model_roi = resize_to_square_size(roi, args.sticker_imgsz)
@@ -7216,61 +3990,40 @@ def draw_sticker_segments(
         verbose=False,
     )
     bgr_batches = []
-    bgr_group_batches = []
     if not results:
-        return 0, np.empty((0, 3), dtype=np.uint8), None, None
+        return 0, np.empty((0, 3), dtype=np.uint8), None
 
     result = results[0]
     boxes = result.boxes
     if boxes is None:
-        return 0, np.empty((0, 3), dtype=np.uint8), None, None
+        return 0, np.empty((0, 3), dtype=np.uint8), None
 
     overlay = np.zeros_like(frame)
     roi_height = y2 - y1
     roi_width = x2 - x1
     result_masks = getattr(result, "masks", None)
     if result_masks is None:
-        return 0, np.empty((0, 3), dtype=np.uint8), None, None
+        return 0, np.empty((0, 3), dtype=np.uint8), None
     mask_data = result_masks.data.detach().cpu().numpy()
 
     count = 0
     confidence_labels = []
     sticker_color_numbers = []
     classifier_bgr_batches = []
-    sticker_nodes = []
-    build_sticker_nodes = args.draw_sticker_graph or cube_net_state is not None
     color_samples = roi_color_samples(roi)
     tracking_min_x: int | None = None
     tracking_min_y: int | None = None
     tracking_max_x: int | None = None
     tracking_max_y: int | None = None
-    indexed_face_masks = []
-    for index in range(len(boxes)):
-        class_id = int(boxes.cls[index].item())
-        class_name = class_name_for_id(result, sticker_model, class_id)
-        if class_name != "face":
-            continue
-        mask_bool = sticker_mask_bool(mask_data, index, roi_width, roi_height)
-        if mask_bool.any():
-            indexed_face_masks.append((index, mask_bool))
-    constrained_face_masks = constrained_face_masks_by_index(
-        indexed_face_masks,
-        roi_shape=(roi_height, roi_width),
-    )
 
     for index in range(len(boxes)):
         class_id = int(boxes.cls[index].item())
         class_name = class_name_for_id(result, sticker_model, class_id)
         if class_name not in STICKER_CLASS_NAMES:
             continue
-        piece_type = sticker_piece_type(class_name)
         color = mask_color_for_segment(class_name, count)
 
         mask_bool = sticker_mask_bool(mask_data, index, roi_width, roi_height)
-        if class_name == "face":
-            mask_bool = constrained_face_masks.get(index)
-            if mask_bool is None:
-                continue
         if not mask_bool.any():
             continue
 
@@ -7278,9 +4031,8 @@ def draw_sticker_segments(
         if not sample_mask.any():
             sample_mask = mask_bool
         draw_mask = sample_mask
-        graph_mask = mask_bool
 
-        ys, xs = np.nonzero(graph_mask)
+        ys, xs = np.nonzero(mask_bool)
         mask_min_x = int(xs.min())
         mask_max_x = int(xs.max()) + 1
         mask_min_y = int(ys.min())
@@ -7316,42 +4068,9 @@ def draw_sticker_segments(
             sample_ys,
             sample_xs,
         )
-        raw_stickers = (
-            [(draw_mask, sample_bgr)]
-            if len(sample_bgr)
-            else []
-        )
-        if (
-            build_sticker_nodes
-            and len(sample_bgr)
-            and int(graph_mask.sum()) >= args.graph_min_sticker_area
-        ):
-            full_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-            full_mask[y1:y2, x1:x2] = graph_mask.astype(np.uint8) * 255
-            mean_sample_bgr = (
-                sample_bgr.astype(np.float32)
-                .mean(axis=0)
-                .clip(0, 255)
-                .astype(np.uint8)
-            )
-            sticker_nodes.append(
-                StickerNode(
-                    node_id=len(sticker_nodes),
-                    piece_id=len(sticker_nodes),
-                    piece_type=piece_type,
-                    confidence=confidence,
-                    centroid_xy=(float(xs.mean() + x1), float(ys.mean() + y1)),
-                    mask=full_mask,
-                    mean_bgr=tuple(int(channel) for channel in mean_sample_bgr),
-                )
-            )
-        if not raw_stickers:
-            raw_stickers = [
-                (
-                    draw_mask,
-                    np.empty((0, 3), dtype=np.uint8),
-                )
-            ]
+        raw_stickers = [(draw_mask, sample_bgr)] if len(sample_bgr) else [
+            (draw_mask, np.empty((0, 3), dtype=np.uint8))
+        ]
         display_stickers = stickers_for_ready_color_classifier(
             frame,
             roi_xyxy,
@@ -7383,39 +4102,33 @@ def draw_sticker_segments(
                 sticker_color_numbers.append((sticker_label_at, cluster_index + 1))
             roi_overlay[sticker_mask] = sticker_color
 
-        sticker_bgr_batches = []
-        for _, sticker_bgr_samples, _ in display_stickers:
-            if len(sticker_bgr_samples) > 0:
-                sticker_bgr_batches.append(sticker_bgr_samples)
+        sticker_bgr_batches = [
+            sticker_bgr_samples
+            for _, sticker_bgr_samples, _ in display_stickers
+            if len(sticker_bgr_samples) > 0
+        ]
         bgr_samples = concatenate_samples(
             sticker_bgr_batches,
             args.color_plot_samples_per_frame,
         )
         if len(bgr_samples) > 0:
             bgr_batches.append(bgr_samples)
-            bgr_group_batches.append(
-                np.full(len(bgr_samples), len(bgr_group_batches), dtype=np.int64)
-            )
         if color_classifier is not None:
             classifier_sample_batches = [
                 sticker_bgr
                 for _, sticker_bgr in raw_stickers
                 if len(sticker_bgr) > 0
             ]
-            classifier_bgr_samples = concatenate_samples(
-                classifier_sample_batches,
-                args.color_plot_samples_per_frame,
+            classifier_bgr_samples = (
+                np.concatenate(classifier_sample_batches, axis=0)
+                if classifier_sample_batches
+                else np.empty((0, 3), dtype=np.uint8)
             )
             if len(classifier_bgr_samples) > 0:
                 classifier_bgr_batches.append(classifier_bgr_samples)
         count += 1
 
-    side_panel_masks = bool(getattr(args, "show_masks_side_panel", False))
-    projection_panel = None
-    if side_panel_masks:
-        frame[:] = original_frame
-        projection_panel = overlay.copy()
-    elif getattr(args, "show_original_underlay", False):
+    if getattr(args, "show_original_underlay", False):
         alpha = float(np.clip(getattr(args, "mask_opacity", 1.0), 0.0, 1.0))
         overlay_mask = np.any(overlay != 0, axis=2)
         frame[:] = original_frame
@@ -7427,40 +4140,10 @@ def draw_sticker_segments(
             frame[overlay_mask] = blended.clip(0, 255).astype(np.uint8)
     else:
         frame[:] = overlay
-    if (args.draw_sticker_graph or cube_net_state is not None) and sticker_nodes:
-        graph = direct_sticker_graph(
-            sticker_nodes,
-            adjacency_radius_px=args.graph_adjacency_radius,
-        )
-        if cube_net_state is not None and color_classifier is not None and color_classifier.ready:
-            classified_colors, classified_bgr = classified_net_colors_from_graph(
-                graph,
-                color_classifier,
-            )
-            cube_net_state.replace_with(
-                build_cube_net_from_graph(
-                    graph,
-                    classified_colors_by_node_id=classified_colors,
-                    classified_bgr_by_color=classified_bgr,
-                    face_by_color=getattr(args, "net_cluster_faces", None),
-                )
-            )
-        if args.draw_sticker_graph:
-            graph_frame = frame
-            graph_roi_xyxy = roi_xyxy
-            if side_panel_masks and projection_panel is not None:
-                graph_frame = projection_panel
-            graph_frame[:] = draw_sticker_graph(
-                graph_frame,
-                graph,
-                roi_xyxy=graph_roi_xyxy,
-                draw_masks=False,
-            )
     if args.show_confidence or args.debug_overlay:
-        label_frame = projection_panel if side_panel_masks and projection_panel is not None else frame
         for label_at, confidence in confidence_labels:
             cv2.putText(
-                label_frame,
+                frame,
                 f"{confidence:.2f}",
                 label_at,
                 cv2.FONT_HERSHEY_SIMPLEX,
@@ -7470,7 +4153,7 @@ def draw_sticker_segments(
                 cv2.LINE_AA,
             )
             cv2.putText(
-                label_frame,
+                frame,
                 f"{confidence:.2f}",
                 label_at,
                 cv2.FONT_HERSHEY_SIMPLEX,
@@ -7480,22 +4163,16 @@ def draw_sticker_segments(
                 cv2.LINE_AA,
             )
     if args.show_confidence or args.debug_overlay:
-        label_frame = projection_panel if side_panel_masks and projection_panel is not None else frame
-        draw_sticker_color_numbers(label_frame, sticker_color_numbers)
+        draw_sticker_color_numbers(frame, sticker_color_numbers)
     bgr_samples = concatenate_samples(
         bgr_batches,
         args.color_plot_samples_per_frame,
     )
-    if return_sample_groups:
-        bgr_samples, sample_groups = concatenate_samples_with_groups(
-            bgr_batches,
-            bgr_group_batches,
-            args.color_plot_samples_per_frame,
-        )
     if color_classifier is not None:
-        classifier_bgr_samples = concatenate_samples(
-            classifier_bgr_batches,
-            args.color_plot_samples_per_frame,
+        classifier_bgr_samples = (
+            np.concatenate(classifier_bgr_batches, axis=0)
+            if classifier_bgr_batches
+            else np.empty((0, 3), dtype=np.uint8)
         )
         color_classifier.observe_frame(classifier_bgr_samples)
     tracking_bounds_xyxy = (
@@ -7508,9 +4185,7 @@ def draw_sticker_segments(
         )
         else None
     )
-    if return_sample_groups:
-        return count, bgr_samples, tracking_bounds_xyxy, projection_panel, sample_groups
-    return count, bgr_samples, tracking_bounds_xyxy, projection_panel
+    return count, bgr_samples, tracking_bounds_xyxy
 
 
 def draw_sticker_color_numbers(
@@ -7542,43 +4217,120 @@ def draw_sticker_color_numbers(
         )
 
 
+def pose_profile_summary(profile: dict[str, float | int]) -> str:
+    timing_parts = [
+        f"model {float(profile.get('pose_model_ms', 0.0)):.1f}",
+        f"graph {float(profile.get('graph_total_ms', 0.0)):.1f}",
+        f"walk {float(profile.get('correspondence_ms', 0.0)):.1f}",
+        f"pnp {float(profile.get('pnp_ms', 0.0)):.1f}",
+        f"draw {float(profile.get('draw_pose_ms', 0.0)):.1f}",
+    ]
+    count_parts = [
+        f"pts {int(profile.get('pose_points', 0))}",
+        f"corr {int(profile.get('correspondence_points', 0))}",
+        f"edges {int(profile.get('accepted_edges', 0))}/{int(profile.get('candidate_edges', 0))}",
+        f"p1 {int(profile.get('seed_attempts', 0))}",
+        f"p2 {int(profile.get('refinement_attempts', 0))}",
+        f"pnp_calls {int(profile.get('pnp_solve_calls', 0))}",
+    ]
+    return "pose ms " + " ".join(timing_parts) + " | " + " ".join(count_parts)
+
+
+def pose_attempt_summary(profile: dict[str, float | int] | None) -> str:
+    profile = {} if profile is None else profile
+    return (
+        f"p1 {int(profile.get('seed_attempts', 0))} "
+        f"p2 {int(profile.get('refinement_attempts', 0))}"
+    )
+
+
+def print_pose_validity_summary(valid_pose_frames: int, invalid_pose_frames: int) -> None:
+    keypoint_frames = int(valid_pose_frames) + int(invalid_pose_frames)
+    print(
+        "pose summary: "
+        f"{valid_pose_frames} valid, {invalid_pose_frames} invalid "
+        f"out of {keypoint_frames} frames with keypoint detections",
+        flush=True,
+    )
+
+
+def source_fps(capture: cv2.VideoCapture, fallback: float = 30.0) -> float:
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    if not np.isfinite(fps) or fps <= 1e-3:
+        return float(fallback)
+    return fps
+
+
+def create_video_writer(path: Path, frame_shape: tuple[int, ...], fps: float) -> cv2.VideoWriter:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = frame_shape[:2]
+    suffix = path.suffix.lower()
+    fourcc_name = "mp4v" if suffix in {".mp4", ".m4v", ".mov"} else "MJPG"
+    writer = cv2.VideoWriter(
+        str(path),
+        cv2.VideoWriter_fourcc(*fourcc_name),
+        float(fps),
+        (int(width), int(height)),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open video writer for {path}")
+    return writer
+
+
 def process_frame(
     frame: np.ndarray,
     bbox_detector,
     sticker_model,
     args,
-    color_classifier: ColorClassifier | None = None,
-    cube_net_state: CubeNetState | None = None,
+    color_classifier: ColorDensityClassifier | None = None,
     roi_tracker: RoiTracker | None = None,
-    return_sample_groups: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
+    pose_model=None,
+    pose_solver: PoseGraphPnPSolver | None = None,
+    return_pose_stats: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, FramePoseStats]:
     output = frame.copy()
     roi_xyxy, candidate, roi_source = roi_for_frame(frame, bbox_detector, args, roi_tracker)
     if roi_xyxy is None:
-        if return_sample_groups:
-            return output, np.empty((0, 3), dtype=np.uint8), np.empty((0,), dtype=np.int64)
-        return output, np.empty((0, 3), dtype=np.uint8)
+        bgr_samples = np.empty((0, 3), dtype=np.uint8)
+        if return_pose_stats:
+            return output, bgr_samples, FramePoseStats(keypoint_count=0, valid_pose=False)
+        return output, bgr_samples
 
     x1, y1, x2, y2 = roi_xyxy
     roi = frame[y1:y2, x1:x2]
-    segment_result = draw_sticker_segments(
-        output,
-        roi,
-        sticker_model,
-        roi_xyxy,
-        args,
-        color_classifier,
-        cube_net_state,
-        return_sample_groups=return_sample_groups,
-    )
-    if return_sample_groups:
-        if len(segment_result) == 5:
-            segment_count, bgr_samples, tracking_bounds_xyxy, projection_panel, sample_groups = segment_result
-        else:
-            segment_count, bgr_samples, tracking_bounds_xyxy, projection_panel = segment_result
-            sample_groups = np.empty((0,), dtype=np.int64)
-    else:
-        segment_count, bgr_samples, tracking_bounds_xyxy, projection_panel = segment_result
+    segment_count = 0
+    bgr_samples = np.empty((0, 3), dtype=np.uint8)
+    tracking_bounds_xyxy = None
+    if getattr(args, "enable_sticker_segmentation", ENABLE_STICKER_SEGMENTATION) and sticker_model is not None:
+        segment_count, bgr_samples, tracking_bounds_xyxy = draw_sticker_segments(
+            output,
+            roi,
+            sticker_model,
+            roi_xyxy,
+            args,
+            color_classifier,
+        )
+    pose_keypoint_count = 0
+    pnp_result = None
+    pose_profile = {}
+    setattr(args, "_pose_profile", pose_profile)
+    if pose_model is not None:
+        if ENABLE_POSE_ESTIMATION and pose_solver is None:
+            pose_solver = PoseGraphPnPSolver(
+                focal_min=PNP_FOCAL_SCALE_MIN,
+                focal_max=PNP_FOCAL_SCALE_MAX,
+                focal_steps=PNP_FOCAL_SCALE_STEPS,
+            )
+        pose_keypoint_count, pnp_result, pose_tracking_bounds_xyxy = draw_pose_estimate(
+            output,
+            roi,
+            roi_xyxy,
+            pose_model,
+            pose_solver,
+            args,
+        )
+        if not getattr(args, "enable_sticker_segmentation", ENABLE_STICKER_SEGMENTATION):
+            tracking_bounds_xyxy = pose_tracking_bounds_xyxy
     if roi_tracker is not None:
         height, width = frame.shape[:2]
         roi_tracker.observe_tracking_bounds(
@@ -7596,10 +4348,15 @@ def process_frame(
         roi_color = (0, 0, 255) if roi_source == "detector" else (40, 220, 40)
         cv2.rectangle(output, (x1, y1), (x2, y2), roi_color, 2)
     if args.debug_overlay:
+        pnp_label = (
+            ""
+            if pnp_result is None
+            else f" pnp {len(pnp_result.object_points)}pts {pnp_result.error:.1f}px"
+        )
         debug_label = (
-            f"cube {candidate.confidence:.2f} stickers {segment_count}"
+            f"cube {candidate.confidence:.2f} stickers {segment_count} keypoints {pose_keypoint_count}{pnp_label}"
             if candidate is not None
-            else f"sticker viewport stickers {segment_count}"
+            else f"sticker viewport stickers {segment_count} keypoints {pose_keypoint_count}{pnp_label}"
         )
         cv2.putText(
             output,
@@ -7611,10 +4368,38 @@ def process_frame(
             2,
             cv2.LINE_AA,
         )
-    if projection_panel is not None:
-        output = np.concatenate([output, projection_panel], axis=1)
-    if return_sample_groups:
-        return output, bgr_samples, sample_groups
+        if pose_profile is not None:
+            cv2.putText(
+                output,
+                pose_profile_summary(pose_profile),
+                (12, 56),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 0),
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                output,
+                pose_profile_summary(pose_profile),
+                (12, 56),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+    if getattr(args, "profile_pose", False) and pose_profile is not None:
+        print(pose_profile_summary(pose_profile), flush=True)
+    if return_pose_stats:
+        return (
+            output,
+            bgr_samples,
+            FramePoseStats(
+                keypoint_count=pose_keypoint_count,
+                valid_pose=pnp_result is not None,
+            ),
+        )
     return output, bgr_samples
 
 
@@ -7676,57 +4461,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=-2,
         help="Pixel padding applied to each sticker segmentation mask before sampling; negative values erode",
     )
-    parser.add_argument(
-        "--draw-sticker-graph",
-        dest="draw_sticker_graph",
-        action="store_true",
-        help="Draw sticker graph nodes and edges on top of the sticker overlay",
-    )
-    parser.add_argument(
-        "--adjacency-radius",
-        "--graph-adjacency-radius",
-        dest="graph_adjacency_radius",
-        type=int,
-        default=1,
-        help="Pixel distance threshold used when connecting nearby graph nodes",
-    )
-    parser.add_argument(
-        "--graph-min-sticker-area",
-        type=int,
-        default=12,
-        help="Minimum sticker area kept as a graph node",
-    )
-    parser.add_argument(
-        "--draw-cube-grid-fit",
-        action="store_true",
-        help="Draw lines that fit per-sticker quadrilateral hull edges",
-    )
-    parser.add_argument(
-        "--edge-line-width",
-        "--empty-space-line-width",
-        dest="empty_space_line_width",
-        type=int,
-        default=EMPTY_SPACE_LINE_WIDTH_PX,
-        help="Pixel width used when drawing each fitted sticker-side line",
-    )
-    parser.add_argument(
-        "--basis-angle-bucket-degrees",
-        type=float,
-        default=BASIS_VECTOR_ANGLE_BUCKET_DEGREES,
-        help="Angle histogram bucket size used to derive the two displayed basis vectors",
-    )
-    parser.add_argument(
-        "--cube-grid-fit-line-thickness",
-        type=int,
-        default=2,
-        help="Line thickness used when scoring fitted cube-grid intersections with stickers",
-    )
-    parser.add_argument(
-        "--cube-grid-fit-min-coverage",
-        type=float,
-        default=0.88,
-        help="Minimum sticker-mask coverage expected inside the fitted cube hull",
-    )
     parser.add_argument("--mask-opacity", type=float, default=1.0)
     parser.add_argument("--rgb-color-plot", type=Path, help="Output PNG path for 3D RGB samples")
     parser.add_argument(
@@ -7737,44 +4471,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--hsv-html-plot",
         type=Path,
-        help="Output HTML path for interactive cylindrical HSV samples",
-    )
-    parser.add_argument(
-        "--oklab-html-plot",
-        type=Path,
-        help="Output HTML path for interactive 3D Oklab samples",
-    )
-    parser.add_argument(
-        "--color-samples-file",
-        type=Path,
-        help="Save sampled BGR colors and aligned sticker IDs to a compressed NPZ file",
-    )
-    parser.add_argument(
-        "--oklab-l-compression-factor",
-        type=float,
-        default=OKLAB_L_COMPRESSION_FACTOR,
-        help=(
-            "Compress Oklab L by this factor in the GMM feature space; "
-            "3 reduces brightness influence while plots remain in original Oklab"
-        ),
-    )
-    parser.add_argument(
-        "--oklab-slice-sticker-link-lambda",
-        type=float,
-        default=OKLAB_SLICE_STICKER_LINK_LAMBDA,
-        help=(
-            "Penalty for splitting samples from the same sticker when grouping "
-            "Oklab L-slice visualization points; 0 disables sticker-link regularization"
-        ),
-    )
-    parser.add_argument(
-        "--oklab-slice-overlap-lambda",
-        type=float,
-        default=OKLAB_SLICE_OVERLAP_LAMBDA,
-        help=(
-            "Penalty for overlapping 90%% support regions between Oklab L-slice "
-            "clusters; 0 disables overlap regularization"
-        ),
+        help="Output HTML path for interactive 3D HSV samples",
     )
     parser.add_argument(
         "--normalize-rgb-plot",
@@ -7785,345 +4482,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--hide-sticker-color-classification",
         dest="show_sticker_color_classification",
         action="store_false",
-        help="Do not recolor sticker masks using learned color classification",
+        help="Do not recolor sticker masks using density-cluster color classification",
+    )
+    parser.add_argument(
+        "--sticker-color-frames",
+        type=int,
+        default=90,
+        help="Detected frames of sticker color samples to collect before classifying stickers",
     )
     parser.add_argument(
         "--sticker-color-min-brightness",
         type=float,
         default=40.0,
-        help="Minimum raw RGB vector length used while fitting color clusters",
-    )
-    parser.add_argument(
-        "--sticker-color-max-brightness",
-        type=float,
-        default=None,
-        help=(
-            "Maximum sample brightness before color samples are treated as unknown; "
-            "uses raw RGB vector length for RGB classifiers and HSV value for HSV density"
-        ),
-    )
-    parser.add_argument(
-        "--sticker-color-max-cluster-distance",
-        type=float,
-        default=None,
-        help=(
-            "Maximum raw RGB distance from a sticker sample to the nearest final "
-            "cluster surface before the sample is treated as unknown"
-        ),
+        help="Minimum raw RGB vector length used while fitting density color clusters",
     )
     parser.add_argument(
         "--color-cluster-count",
+        "--rgb-regression-clusters",
         dest="color_cluster_count",
         type=int,
         default=6,
-        help="Target number of color clusters to keep",
-    )
-    parser.add_argument(
-        "--color-cluster-ambiguity-distance",
-        type=float,
-        default=0.01,
-        help=(
-            "For cluster-membership mode, leave a point unanswered when another "
-            "cluster has a sample within this Oklab distance; 0 disables the margin"
-        ),
+        help="Target number of density color clusters to keep",
     )
     parser.add_argument(
         "--color-classifier-mode",
-        choices=(
-            "density-cluster",
-            "hsv-density-cluster",
-            "balanced-gmm",
-            "density-peak",
-            "dense-ray",
-            "balanced-cone",
-            "oklab-gmm",
-            "hdbscan-plane",
-            "piecewise-linear",
-            "cluster-membership",
-        ),
-        default="hdbscan-plane",
-        help="Color recognition algorithm to use",
+        choices=("density-cluster",),
+        default="density-cluster",
+        help="Color classification mode. Only density-cluster is supported.",
     )
     parser.add_argument(
-        "--color-classifier-pass-mode",
-        "--color-pass-mode",
-        choices=("single-pass", "two-pass"),
-        default="single-pass",
-        help=(
-            "Video processing strategy; two-pass collects color samples, rewinds "
-            "the video, then displays classifications"
-        ),
-    )
-    parser.add_argument("--hdbscan-min-cluster-size", type=int, default=500)
-    parser.add_argument("--hdbscan-min-samples", type=int, default=5)
-    parser.add_argument("--hdbscan-cluster-selection-method", choices=("eom", "leaf"), default="eom")
-    parser.add_argument("--hdbscan-cluster-selection-epsilon", type=float, default=0.01)
-    parser.add_argument("--hdbscan-alpha", type=float, default=1.0)
-    parser.add_argument("--hdbscan-metric", default="euclidean")
-    parser.add_argument("--hdbscan-core-dist-n-jobs", type=int, default=1)
-    parser.add_argument(
-        "--hdbscan-leave-noise", action=argparse.BooleanOptionalAction, default=True,
-        help="Keep HDBSCAN noise out of the fit (default); --no-hdbscan-leave-noise attaches it to the nearest cluster",
-    )
-    parser.add_argument("--hdbscan-hierarchy-plot", type=Path, default=None)
-    parser.add_argument("--plane-angle-count", type=int, default=36)
-    parser.add_argument("--plane-tilt-count", type=int, default=3)
-    parser.add_argument("--plane-max-tilt-degrees", type=float, default=15.0)
-    parser.add_argument("--plane-offset-count", type=int, default=25)
-    parser.add_argument("--plane-density-grid-size", type=int, default=48)
-    parser.add_argument("--plane-density-smoothing", type=float, default=1.5)
-    parser.add_argument("--plane-bandwidth", type=float, default=0.0)
-    parser.add_argument("--plane-min-child-size", type=int, default=10)
-    parser.add_argument("--plane-min-child-fraction", type=float, default=0.15)
-    parser.add_argument("--plane-balance-penalty", type=float, default=0.25)
-    parser.add_argument("--plane-relative-valley-weight", type=float, default=1.0)
-    parser.add_argument("--plane-min-side-mass", type=float, default=0.12)
-    parser.add_argument(
-        "--plane-cut-mass-weight", type=float, default=0.5,
-        help="Blend weight for geometric cut mass; 0 uses density cost, 1 uses point-band mass",
-    )
-    parser.add_argument(
-        "--plane-cluster-size-weight", type=float, default=0.25,
-        help="Soft preference for splitting larger unresolved clusters first",
-    )
-    parser.add_argument(
-        "--density-cluster-eps",
-        "--cluster-eps",
-        dest="density_cluster_eps",
+        "--density-cluster-eps-radians",
+        "--cluster-eps-radians",
+        dest="density_cluster_eps_radians",
         type=float,
-        default=DENSITY_CLUSTER_EPS,
-        help=(
-            "RGB distance epsilon for density clustering at the reference brightness; "
-            "effective epsilon scales by sample distance from the origin"
-        ),
-    )
-    parser.add_argument(
-        "--density-cluster-eps-reference-rgb",
-        type=float,
-        default=DENSITY_CLUSTER_EPS_REFERENCE_RGB,
-        help=(
-            "RGB channel value used as the epsilon scaling reference; default 150 "
-            "means --cluster-eps is measured at RGB=(150,150,150)"
-        ),
+        default=DENSITY_CLUSTER_EPS_RADIANS,
+        help="Angular radius for normalized RGB density clustering",
     )
     parser.add_argument(
         "--density-cluster-min-neighbors",
         type=int,
         default=DENSITY_CLUSTER_MIN_POINTS,
-        help="Minimum RGB points in the epsilon neighborhood for a density core point",
-    )
-    parser.add_argument(
-        "--hsv-density-cluster-eps",
-        type=float,
-        default=HSV_DENSITY_CLUSTER_EPS,
-        help="Fixed OpenCV-HSV distance epsilon for HSV density clustering",
-    )
-    parser.add_argument(
-        "--hsv-density-cluster-min-neighbors",
-        type=int,
-        default=HSV_DENSITY_CLUSTER_MIN_POINTS,
-        help="Minimum HSV points in the fixed-epsilon neighborhood for a density core point",
-    )
-    parser.add_argument(
-        "--cluster-merge-ray-distance-divisor",
-        type=float,
-        default=CLUSTER_MERGE_RAY_DISTANCE_DIVISOR,
-        help=(
-            "Divisor applied to RGB distance along the origin-to-cluster ray when "
-            "merging extra density clusters"
-        ),
-    )
-    parser.add_argument(
-        "--density-peak-k-neighbors",
-        type=int,
-        default=DENSITY_PEAK_K_NEIGHBORS,
-        help="Neighbor count used to estimate local RGB density for density-peak clustering",
-    )
-    parser.add_argument(
-        "--density-peak-max-fit-samples",
-        type=int,
-        default=DENSITY_PEAK_MAX_FIT_SAMPLES,
-        help="Maximum RGB samples used for density-peak fitting",
-    )
-    parser.add_argument(
-        "--density-peak-min-peak-distance",
-        type=float,
-        default=DENSITY_PEAK_MIN_PEAK_DISTANCE,
-        help="Minimum RGB distance between selected density peaks",
-    )
-    parser.add_argument(
-        "--dense-ray-k-neighbors",
-        type=int,
-        default=DENSE_RAY_K_NEIGHBORS,
-        help="Neighbor count used to estimate local RGB density for dense-ray anchors",
-    )
-    parser.add_argument(
-        "--dense-ray-max-fit-samples",
-        type=int,
-        default=DENSE_RAY_MAX_FIT_SAMPLES,
-        help="Maximum RGB samples used for dense-ray anchor fitting",
-    )
-    parser.add_argument(
-        "--dense-ray-min-anchor-distance",
-        type=float,
-        default=DENSE_RAY_MIN_ANCHOR_DISTANCE,
-        help="Minimum RGB distance between selected dense-ray anchors",
-    )
-    parser.add_argument(
-        "--dense-ray-max-distance",
-        type=float,
-        default=DENSE_RAY_MAX_DISTANCE,
-        help="Maximum perpendicular RGB distance to a dense ray before a sample is unknown",
-    )
-    parser.add_argument(
-        "--cone-max-angle-radians",
-        type=float,
-        default=CONE_MAX_ANGLE_RADIANS,
-        help="Maximum angular distance from a fitted RGB cone axis before a sample is unknown",
-    )
-    parser.add_argument(
-        "--cone-assignment-balance",
-        type=float,
-        default=GMM_ASSIGNMENT_BALANCE,
-        help=(
-            "How strongly balanced-cone responsibilities are pushed toward equal "
-            "cluster mass; 0 is vanilla angular assignment, 1 is fully balanced"
-        ),
-    )
-    parser.add_argument(
-        "--cone-assignment-sharpness",
-        type=float,
-        default=CONE_ASSIGNMENT_SHARPNESS,
-        help="Cosine-score multiplier used when fitting balanced-cone RGB axes",
-    )
-    parser.add_argument(
-        "--cone-balance-iterations",
-        type=int,
-        default=CONE_BALANCE_ITERATIONS,
-        help="Sinkhorn normalization iterations used for balanced-cone assignment balancing",
-    )
-    parser.add_argument(
-        "--cone-max-iterations",
-        type=int,
-        default=CONE_MAX_ITERATIONS,
-        help="Maximum angular-refinement iterations for balanced-cone fitting",
-    )
-    parser.add_argument(
-        "--gmm-max-mahalanobis-distance",
-        type=float,
-        default=GMM_MAX_MAHALANOBIS_DISTANCE,
-        help="Maximum squared Mahalanobis distance before a balanced-GMM sample is unknown",
-    )
-    parser.add_argument(
-        "--gmm-regularization",
-        type=float,
-        default=GMM_REGULARIZATION,
-        help="Diagonal covariance regularization for balanced full-covariance GMM",
-    )
-    parser.add_argument(
-        "--gmm-ray-variance-floor",
-        type=float,
-        default=GMM_RAY_VARIANCE_FLOOR,
-        help=(
-            "Minimum covariance variance along each balanced-GMM component's "
-            "origin-to-centroid RGB ray; 0 disables the ray-shape constraint"
-        ),
-    )
-    parser.add_argument(
-        "--gmm-constrain-covariance-to-ray",
-        action="store_true",
-        default=GMM_CONSTRAIN_COVARIANCE_TO_RAY,
-        help=(
-            "Force each balanced-GMM covariance to align with its origin-to-centroid "
-            "ray with no tilted cross-covariance"
-        ),
-    )
-    parser.add_argument(
-        "--gmm-perpendicular-variance-floor",
-        type=float,
-        default=GMM_PERPENDICULAR_VARIANCE_FLOOR,
-        help="Minimum variance perpendicular to each constrained GMM ray",
-    )
-    parser.add_argument(
-        "--gmm-perpendicular-variance-ceiling",
-        type=float,
-        default=GMM_PERPENDICULAR_VARIANCE_CEILING,
-        help=(
-            "Maximum variance perpendicular to each constrained GMM ray; "
-            "0 leaves the measured perpendicular variance uncapped"
-        ),
-    )
-    parser.add_argument(
-        "--gmm-dense-core-k-neighbors",
-        type=int,
-        default=GMM_DENSE_CORE_K_NEIGHBORS,
-        help=(
-            "When >0, estimate local RGB density with this RGB bin size and fit "
-            "balanced-GMM only on dense core samples; larger values smooth more"
-        ),
-    )
-    parser.add_argument(
-        "--gmm-dense-core-quantile",
-        type=float,
-        default=GMM_DENSE_CORE_QUANTILE,
-        help=(
-            "Lowest density quantile to drop before fitting balanced-GMM; "
-            "0 disables dense-core prefiltering"
-        ),
-    )
-    parser.add_argument(
-        "--gmm-color-priors",
-        type=parse_gmm_color_priors,
-        default=parse_gmm_color_priors(GMM_COLOR_PRIORS),
-        help=(
-            "Semicolon-separated RGB priors for balanced-GMM components, for example "
-            "'white=255,255,255;yellow=255,255,0;red=255,0,0;orange=255,120,0;blue=0,0,255;green=0,255,0'"
-        ),
-    )
-    parser.add_argument(
-        "--gmm-prior-strength",
-        type=float,
-        default=GMM_PRIOR_STRENGTH,
-        help=(
-            "How strongly provided --gmm-color-priors lock component directions; "
-            "0 only initializes from priors, 1 keeps means on prior rays"
-        ),
-    )
-    parser.add_argument(
-        "--gmm-min-assignment-confidence",
-        type=float,
-        default=GMM_MIN_ASSIGNMENT_CONFIDENCE,
-        help=(
-            "Minimum unbalanced GMM posterior confidence for the winning color; "
-            "samples below this are treated as unknown"
-        ),
-    )
-    parser.add_argument(
-        "--gmm-assignment-balance",
-        type=float,
-        default=GMM_ASSIGNMENT_BALANCE,
-        help=(
-            "How strongly balanced-GMM responsibilities are pushed toward equal "
-            "cluster mass; 0 is vanilla soft assignment, 1 is fully balanced"
-        ),
-    )
-    parser.add_argument(
-        "--gmm-balance-iterations",
-        type=int,
-        default=GMM_BALANCE_ITERATIONS,
-        help="Sinkhorn normalization iterations used for balanced-GMM responsibility balancing",
-    )
-    parser.add_argument(
-        "--gmm-max-iterations",
-        type=int,
-        default=GMM_MAX_ITERATIONS,
-        help="Maximum EM iterations for balanced full-covariance GMM",
-    )
-    parser.add_argument(
-        "--gmm-tolerance",
-        type=float,
-        default=GMM_TOLERANCE,
-        help="Per-sample log-likelihood tolerance used to stop balanced-GMM EM",
+        help="Minimum normalized RGB points in the epsilon neighborhood for a density core point",
     )
     parser.add_argument(
         "--color-plot-frames",
@@ -8144,20 +4543,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--save-video",
         type=Path,
-        help="Output video path for processed frames",
+        help="Output path for processed video frames.",
     )
-    parser.add_argument(
-        "--save-net",
-        type=Path,
-        help="Output PNG path for the latest cube net built from sticker ROI graphs",
-    )
-    parser.add_argument(
-        "--net-cluster-faces",
-        type=parse_net_cluster_faces,
-        default={},
-        help="Map learned color clusters to cube faces, for example 1=R,2=U",
-    )
-    parser.add_argument("--display", action="store_true")
+    parser.add_argument("--display", dest="display", action="store_true")
+    parser.add_argument("--no-display", dest="display", action="store_false")
     parser.add_argument("--hide-bbox", dest="show_bbox", action="store_false")
     parser.add_argument("--hide-confidence", dest="show_confidence", action="store_false")
     parser.add_argument(
@@ -8166,19 +4555,89 @@ def build_parser() -> argparse.ArgumentParser:
         help="Draw ROI box, polygon outlines, labels, and FPS",
     )
     parser.add_argument(
+        "--profile-pose",
+        action="store_true",
+        help="Print per-frame pose timing buckets for model, graph, correspondence, PnP, and drawing.",
+    )
+    parser.add_argument(
         "--show-original-underlay",
+        dest="show_original_underlay",
         action="store_true",
         help="Draw sticker overlays on top of the original image instead of a black background",
     )
     parser.add_argument(
-        "--show-masks-side-panel",
-        action="store_true",
-        help="Append a black side panel showing sticker masks instead of drawing them over the cube",
+        "--hide-original-underlay",
+        dest="show_original_underlay",
+        action="store_false",
+        help="Draw only the sticker overlay on a black background",
+    )
+    parser.add_argument(
+        "--hide-corner-adjacency",
+        dest="show_corner_adjacency",
+        action="store_false",
+        help="Do not draw Canny/Hough-derived adjacency lines between detected corner keypoints",
+    )
+    parser.add_argument(
+        "--adjacency-canny-blur",
+        type=int,
+        default=ADJACENCY_CANNY_BLUR_KERNEL,
+        help="Gaussian blur kernel before Canny, in pixels at the reference ROI size",
+    )
+    parser.add_argument(
+        "--adjacency-canny-low",
+        type=int,
+        default=ADJACENCY_CANNY_LOW,
+        help="Lower Canny threshold for corner adjacency evidence",
+    )
+    parser.add_argument(
+        "--adjacency-canny-high",
+        type=int,
+        default=ADJACENCY_CANNY_HIGH,
+        help="Upper Canny threshold for corner adjacency evidence",
+    )
+    parser.add_argument(
+        "--adjacency-min-edge-length",
+        type=float,
+        default=ADJACENCY_MIN_EDGE_LENGTH_PX,
+        help="Ignore candidate pose graph connections shorter than this many pixels at the reference ROI size",
+    )
+    parser.add_argument(
+        "--adjacency-min-coverage",
+        type=float,
+        default=ADJACENCY_MIN_COVERAGE,
+        help="Minimum covered fraction of the corner-pair distance required for adjacency",
+    )
+    parser.add_argument(
+        "--adjacency-max-uncovered-gap-ratio",
+        type=float,
+        default=ADJACENCY_MAX_UNCOVERED_GAP_RATIO,
+        help="Maximum uncovered gap as a fraction of the corner-pair distance",
+    )
+    parser.add_argument(
+        "--adjacency-edge-dilation",
+        type=int,
+        default=ADJACENCY_EDGE_DILATION_PX,
+        help="Half-width in pixels at the reference ROI size around candidate pose graph connections checked for Canny edge support",
+    )
+    parser.add_argument(
+        "--adjacency-keypoint-intersection-distance",
+        type=float,
+        default=ADJACENCY_KEYPOINT_INTERSECTION_DISTANCE_PX,
+        help="Reject candidate pose graph connections that pass within this many reference-ROI pixels of another keypoint",
+    )
+    parser.add_argument(
+        "--adjacency-reference-roi-size",
+        type=float,
+        default=ADJACENCY_REFERENCE_ROI_SIZE_PX,
+        help="ROI side length represented by the adjacency pixel defaults",
     )
     parser.set_defaults(
         show_bbox=True,
         show_confidence=True,
         show_sticker_color_classification=True,
+        display=DISPLAY_PREVIEW_BY_DEFAULT,
+        show_original_underlay=SHOW_ORIGINAL_UNDERLAY_BY_DEFAULT,
+        show_corner_adjacency=DRAW_CORNER_ADJACENCY,
     )
     return parser
 
@@ -8193,16 +4652,39 @@ def main() -> int:
         confidence_threshold=args.bbox_conf,
         image_size=args.bbox_imgsz,
     )
-    sticker_model = YOLO(str(args.sticker_model))
+    sticker_model = YOLO(str(args.sticker_model)) if ENABLE_STICKER_SEGMENTATION else None
+    pose_model = None
+    if DRAW_POSE_KEYPOINTS or ENABLE_POSE_ESTIMATION:
+        register_training_checkpoint_classes()
+        pose_model = YOLO(str(DEFAULT_POSE_MODEL))
     source = parse_source(args.source)
     plot_point_size = args.average_plot_point_size
-    color_classifier = build_color_classifier(args)
-    color_plot_requested = color_plot_outputs_requested(args)
+    color_classifier = (
+        ColorDensityClassifier(
+            required_frames=args.sticker_color_frames,
+            cluster_count=args.color_cluster_count,
+            min_brightness=args.sticker_color_min_brightness,
+            density_cluster_eps_radians=args.density_cluster_eps_radians,
+            density_cluster_min_neighbors=args.density_cluster_min_neighbors,
+        )
+        if ENABLE_STICKER_SEGMENTATION and color_features_enabled(args)
+        else None
+    )
+    color_plot_requested = ENABLE_STICKER_SEGMENTATION and color_plot_outputs_requested(args)
     color_plot_bgr_batches = []
-    color_plot_group_batches = []
     color_plot_detected_frames = 0
-    cube_net_state = CubeNetState() if args.save_net else None
+    valid_pose_frames = 0
+    invalid_pose_frames = 0
     roi_tracker = RoiTracker()
+    pose_solver = (
+        PoseGraphPnPSolver(
+            focal_min=PNP_FOCAL_SCALE_MIN,
+            focal_max=PNP_FOCAL_SCALE_MAX,
+            focal_steps=PNP_FOCAL_SCALE_STEPS,
+        )
+        if ENABLE_POSE_ESTIMATION
+        else None
+    )
 
     if isinstance(source, str) and Path(source).suffix.lower() in {
         ".png",
@@ -8213,32 +4695,56 @@ def main() -> int:
         frame = cv2.imread(source)
         if frame is None:
             raise SystemExit(f"Could not read image: {source}")
-        image_result = process_frame(
+        output, bgr_samples, pose_stats = process_frame(
             frame,
             bbox_detector,
             sticker_model,
             args,
             color_classifier,
-            cube_net_state,
             roi_tracker,
-            return_sample_groups=color_plot_requested,
+            pose_model,
+            pose_solver,
+            return_pose_stats=True,
         )
         if color_plot_requested:
-            output, image_samples, image_groups = image_result
-            if args.color_samples_file:
-                save_color_samples_file(args.color_samples_file, image_samples, image_groups)
-                print(f"Saved color sample cache: {args.color_samples_file.resolve()}")
-        else:
-            output, _ = image_result
+            if len(bgr_samples) == 0:
+                raise SystemExit(
+                    "Could not collect color plot samples because no stickers were segmented"
+                )
+            if args.rgb_color_plot:
+                save_rgb_samples_plot(
+                    bgr_samples,
+                    str(args.rgb_color_plot),
+                    title="Sticker segmentation reliable pixels in RGB",
+                    point_size=plot_point_size,
+                    normalize_rgb=args.normalize_rgb_plot,
+                )
+            if args.rgb_html_plot:
+                save_rgb_html_plots(
+                    bgr_samples,
+                    args.rgb_html_plot,
+                    title="Sticker segmentation reliable pixels in RGB",
+                    normalize_rgb=args.normalize_rgb_plot,
+                    args=args,
+                    color_classifier=color_classifier,
+                )
+            if args.hsv_html_plot:
+                save_hsv_samples_interactive_plot(
+                    bgr_samples,
+                    str(args.hsv_html_plot),
+                    title="Sticker segmentation reliable pixels in HSV",
+                    point_size=args.plotly_point_size,
+                )
         if args.save:
             cv2.imwrite(str(args.save), output)
-        if args.save_net and cube_net_state is not None:
-            args.save_net.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(args.save_net), draw_cube_net(cube_net_state))
         if args.display:
-            cv2.imshow("cube sticker segmentations", output)
+            cv2.imshow(DISPLAY_WINDOW_NAME, output)
             cv2.waitKey(0)
             cv2.destroyAllWindows()
+        print_pose_validity_summary(
+            1 if pose_stats.keypoint_count > 0 and pose_stats.valid_pose else 0,
+            1 if pose_stats.keypoint_count > 0 and not pose_stats.valid_pose else 0,
+        )
         return 0
 
     capture = cv2.VideoCapture(source)
@@ -8247,108 +4753,87 @@ def main() -> int:
     if not capture.isOpened():
         raise SystemExit(f"Could not open source: {args.source}")
 
-    if args.color_classifier_pass_mode == "two-pass":
-        if args.color_plot_frames <= 0:
-            raise SystemExit("--color-plot-frames must be positive for two-pass classification")
-        return run_two_pass_color_classification_video(
-            capture,
-            source,
-            args,
-            bbox_detector,
-            sticker_model,
-            color_classifier,
-            color_plot_requested,
-            cube_net_state,
-        )
-
-    video_writer = None
-    video_fps = capture_fps_or_default(capture)
     previous = perf_counter()
-    while True:
-        ok, frame = capture.read()
-        if not ok:
-            break
-        frame_result = process_frame(
-            frame,
-            bbox_detector,
-            sticker_model,
-            args,
-            color_classifier,
-            cube_net_state,
-            roi_tracker,
-            return_sample_groups=color_plot_requested,
-        )
-        if color_plot_requested:
-            output, bgr_samples, sample_groups = frame_result
-        else:
-            output, bgr_samples = frame_result
-        now = perf_counter()
-        fps = 1.0 / max(now - previous, 1e-6)
-        previous = now
-        if args.debug_overlay:
-            cv2.putText(
-                output,
-                f"FPS {fps:.1f}",
-                (12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                3,
-            )
-            cv2.putText(
-                output,
-                f"FPS {fps:.1f}",
-                (12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (20, 20, 20),
-                1,
-            )
-
-        if args.save and args.once:
-            cv2.imwrite(str(args.save), output)
-        if args.save_video:
-            if video_writer is None:
-                video_writer = create_video_writer(args.save_video, output.shape, video_fps)
-            video_writer.write(output)
-        if color_plot_requested:
-            if color_plot_detected_frames < args.color_plot_frames and len(bgr_samples) > 0:
-                color_plot_bgr_batches.append(bgr_samples)
-                group_offset = (
-                    max(
-                        (int(groups.max()) for groups in color_plot_group_batches if len(groups)),
-                        default=-1,
-                    )
-                    + 1
-                )
-                color_plot_group_batches.append(sample_groups + group_offset)
-                color_plot_detected_frames += 1
-                if color_plot_detected_frames >= args.color_plot_frames and not args.display:
-                    break
-        if args.display:
-            cv2.imshow("cube sticker segmentations", output)
-            key = cv2.waitKey(0 if args.once else 1) & 0xFF
-            if key == ord("q"):
+    video_writer = None
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
                 break
-        if args.once:
-            break
+            output, bgr_samples, pose_stats = process_frame(
+                frame,
+                bbox_detector,
+                sticker_model,
+                args,
+                color_classifier,
+                roi_tracker,
+                pose_model,
+                pose_solver,
+                return_pose_stats=True,
+            )
+            if pose_stats.keypoint_count > 0:
+                if pose_stats.valid_pose:
+                    valid_pose_frames += 1
+                else:
+                    invalid_pose_frames += 1
+            now = perf_counter()
+            fps = 1.0 / max(now - previous, 1e-6)
+            previous = now
+            if args.debug_overlay:
+                cv2.putText(
+                    output,
+                    f"FPS {fps:.1f}",
+                    (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
+                    3,
+                )
+                cv2.putText(
+                    output,
+                    f"FPS {fps:.1f}",
+                    (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (20, 20, 20),
+                    1,
+                )
+
+            if args.save_video:
+                if video_writer is None:
+                    video_writer = create_video_writer(
+                        args.save_video,
+                        output.shape,
+                        source_fps(capture),
+                    )
+                video_writer.write(output)
+            if args.save and args.once:
+                cv2.imwrite(str(args.save), output)
+            if color_plot_requested:
+                if color_plot_detected_frames < args.color_plot_frames and len(bgr_samples) > 0:
+                    color_plot_bgr_batches.append(bgr_samples)
+                    color_plot_detected_frames += 1
+                    if color_plot_detected_frames >= args.color_plot_frames and not args.display:
+                        break
+            if args.display:
+                cv2.imshow(DISPLAY_WINDOW_NAME, output)
+                key = cv2.waitKey(0 if args.once else 1) & 0xFF
+                if key == ord("q"):
+                    break
+            if args.once:
+                break
+    finally:
+        if video_writer is not None:
+            video_writer.release()
 
     if args.display:
         cv2.destroyAllWindows()
-    if video_writer is not None:
-        video_writer.release()
     capture.release()
-    if args.save_net and cube_net_state is not None:
-        args.save_net.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(args.save_net), draw_cube_net(cube_net_state))
+    print_pose_validity_summary(valid_pose_frames, invalid_pose_frames)
     if color_plot_requested:
         if not color_plot_bgr_batches:
             raise SystemExit("Could not collect color plot samples from any segmented frames")
         bgr_samples = np.concatenate(color_plot_bgr_batches, axis=0)
-        sample_groups = np.concatenate(color_plot_group_batches, axis=0)
-        if args.color_samples_file:
-            save_color_samples_file(args.color_samples_file, bgr_samples, sample_groups)
-            print(f"Saved color sample cache: {args.color_samples_file.resolve()}")
         if args.rgb_color_plot:
             save_rgb_samples_plot(
                 bgr_samples,
@@ -8367,43 +4852,11 @@ def main() -> int:
                 color_classifier=color_classifier,
             )
         if args.hsv_html_plot:
-            cluster_indexes, cluster_centroids = rgb_plot_clusters_for_samples(
-                bgr_samples,
-                color_classifier,
-            )
             save_hsv_samples_interactive_plot(
                 bgr_samples,
                 str(args.hsv_html_plot),
                 title=f"Sticker segmentation HSV samples across {color_plot_detected_frames} frames",
                 point_size=args.plotly_point_size,
-                cluster_indexes=cluster_indexes,
-                cluster_centroids=cluster_centroids,
-            )
-        if args.oklab_html_plot:
-            cluster_indexes, cluster_centroids = rgb_plot_clusters_for_samples(
-                bgr_samples,
-                color_classifier,
-            )
-            save_oklab_samples_interactive_plot(
-                bgr_samples,
-                str(args.oklab_html_plot),
-                title=f"Sticker segmentation Oklab samples across {color_plot_detected_frames} frames",
-                point_size=args.plotly_point_size,
-                oklab_samples=bgr_samples_to_oklab(bgr_samples),
-                cluster_indexes=cluster_indexes,
-                cluster_centroids=cluster_centroids,
-                curve_points=(
-                    oklab_curve_points_for_models(color_classifier.polyline_models)
-                    if isinstance(color_classifier, OklabGMMColorClassifier)
-                    and color_classifier.ready
-                    else oklab_piecewise_curves_for_classifier(color_classifier)
-                ),
-                split_planes=(
-                    color_classifier.split_planes
-                    if isinstance(color_classifier, HDBSCANDensityPlaneColorClassifier)
-                    and color_classifier.ready
-                    else None
-                ),
             )
     return 0
 
