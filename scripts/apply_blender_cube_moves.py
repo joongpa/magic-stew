@@ -57,6 +57,7 @@ CAMERA_VIEWPOINT_WEIGHTS = (
 CAMERA_ROI_LENS_RANGE = (42.0, 49.0)
 CAMERA_ROI_SHIFT_X_RANGE = (-0.09, 0.09)
 CAMERA_ROI_SHIFT_Y_RANGE = (-0.07, 0.07)
+CAMERA_ROLL_DEGREES_RANGE = (-20.0, 20.0)
 # The existing framing is calibrated around four feet from the cube. Varying
 # distance and focal length together produces different perspective compression
 # without making the cube substantially larger or smaller in the image.
@@ -97,6 +98,7 @@ BACKGROUND_DISTANCE = 4.0
 BACKGROUND_SIZE = 12.0
 BACKGROUND_SCENE_COLLECTION_NAME = "SyntheticBackgroundScene"
 BACKGROUND_SCENE_PREFIX = "SyntheticBackgroundObject"
+SECONDARY_CUBE_OBJECT_PREFIX = f"{BACKGROUND_SCENE_PREFIX}.secondary_cube."
 BACKGROUND_SCENE_MATERIAL_PREFIX = "SyntheticBackgroundMaterial"
 BACKGROUND_ASSET_COLLECTION_PREFIX = "SyntheticBackgroundAsset"
 BACKGROUND_ASSET_ROOT_SUFFIX = "_ROOT"
@@ -164,6 +166,8 @@ BACKGROUND_BLEND_ASSET_FAMILY_WEIGHTS = {
     "Asset_NotebookPhone": 1.0,
 }
 STICKER_COLOR_MATERIAL_NAMES = ("White", "Yellow", "Red", "Orange", "Blue", "Green")
+WHOLE_CUBE_YOLO_CLASS_NAMES = ("cube",)
+STICKER_YOLO_CLASS_NAMES = STICKER_COLOR_MATERIAL_NAMES
 # Display-space RGB samples taken from the flat sticker centers in the six
 # predefined GAN sticker-set images on TheCubicle's product page. These are
 # visual references rather than manufacturer color specifications; the page
@@ -715,33 +719,28 @@ def randomize_camera(
         azimuth_degrees = -90.0 + random.uniform(-12.0, 12.0)
         elevation_degrees = random.uniform(18.0, 36.0)
         reference_distance = 11.75
-        roll_degrees = random.uniform(-6.0, 6.0)
     elif viewpoint == "front_diagonal":
         azimuth_degrees = random.choice((-45.0, -135.0)) + random.uniform(-9.0, 9.0)
         elevation_degrees = random.uniform(20.0, 43.0)
         reference_distance = 12.25
-        roll_degrees = random.uniform(-8.0, 8.0)
     elif viewpoint == "over_shoulder":
         azimuth_degrees = random.choice((58.0, 122.0)) + random.uniform(-6.0, 6.0)
         elevation_degrees = random.uniform(57.0, 68.0)
         reference_distance = 13.75
-        roll_degrees = random.uniform(-7.0, 7.0)
     elif viewpoint == "behind_diagonal":
         azimuth_degrees = random.choice((42.0, 138.0)) + random.uniform(-8.0, 8.0)
         elevation_degrees = random.uniform(27.0, 48.0)
         reference_distance = 12.5
-        roll_degrees = random.uniform(-8.0, 8.0)
     elif viewpoint == "low_behind_diagonal":
         azimuth_degrees = random.choice((32.0, 148.0)) + random.uniform(-7.0, 7.0)
         elevation_degrees = random.uniform(34.0, 50.0)
         reference_distance = 16.0
-        roll_degrees = random.uniform(-6.0, 6.0)
     else:
         azimuth_degrees = random.choice((-135.0, -90.0, -45.0, 45.0, 90.0, 135.0))
         azimuth_degrees += random.uniform(-10.0, 10.0)
         elevation_degrees = random.uniform(64.0, 80.0)
         reference_distance = 13.5
-        roll_degrees = random.uniform(-18.0, 18.0)
+    roll_degrees = random.uniform(*CAMERA_ROLL_DEGREES_RANGE)
 
     if viewpoint == "low_behind_diagonal" and distance_buckets is None:
         distance_buckets = CAMERA_LOW_BEHIND_DISTANCE_BUCKETS_FEET
@@ -3730,6 +3729,212 @@ def configure_render(width: int, height: int) -> None:
     scene.render.film_transparent = False
 
 
+def mesh_objects_in_roots(roots: list[bpy.types.Object]) -> list[bpy.types.Object]:
+    """Return mesh objects in the supplied object hierarchies without duplicates."""
+    objects = []
+    seen: set[int] = set()
+    for root in roots:
+        for obj in object_tree(root):
+            if obj.type != "MESH" or obj.as_pointer() in seen:
+                continue
+            seen.add(obj.as_pointer())
+            objects.append(obj)
+    return objects
+
+
+def sticker_segmentation_class_id(material: bpy.types.Material | None) -> int:
+    """Map a cube sticker material to the stable sticker segmentation class id."""
+    if material is None:
+        return 0
+
+    material_name = material.name
+    name_prefix, separator, name_suffix = material_name.rpartition(".")
+    if separator and name_suffix.isdigit():
+        material_name = name_prefix
+    for class_id, color_name in enumerate(STICKER_COLOR_MATERIAL_NAMES, start=1):
+        if material_name == color_name:
+            return class_id
+
+    # The cube asset also documents sticker colors with material pass_index.
+    # Keep this fallback for renamed or suffixed materials while treating pass 0
+    # as cubie plastic/non-sticker.
+    pass_index = int(getattr(material, "pass_index", 0))
+    return pass_index if 1 <= pass_index <= len(STICKER_COLOR_MATERIAL_NAMES) else 0
+
+
+def camera_frame_bounds(
+    camera: bpy.types.Object,
+    scene: bpy.types.Scene,
+) -> tuple[float, float, float, float, float]:
+    frame = camera.data.view_frame(scene=scene)
+    xs = [corner.x for corner in frame]
+    ys = [corner.y for corner in frame]
+    zs = [corner.z for corner in frame]
+    return min(xs), max(xs), min(ys), max(ys), sum(zs) / len(zs)
+
+
+def camera_ray(
+    camera: bpy.types.Object,
+    scene: bpy.types.Scene,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+) -> tuple[Vector, Vector]:
+    left, right, bottom, top, frame_z = camera_frame_bounds(camera, scene)
+    u = (x + 0.5) / width
+    v = 1.0 - ((y + 0.5) / height)
+    frame_x = left + u * (right - left)
+    frame_y = bottom + v * (top - bottom)
+    camera_matrix = camera.matrix_world
+
+    if camera.data.type == "ORTHO":
+        origin = camera_matrix @ Vector((frame_x, frame_y, 0.0))
+        direction = (camera_matrix.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
+        return origin, direction
+
+    origin = camera_matrix.translation
+    direction = (camera_matrix.to_3x3() @ Vector((frame_x, frame_y, frame_z))).normalized()
+    return origin, direction
+
+
+def render_segmentation_masks(
+    main_cube_roots: list[bpy.types.Object],
+    width: int,
+    height: int,
+) -> tuple[object, object]:
+    """Ray-cast whole-cube and sticker masks directly without image files."""
+    try:
+        import numpy as np
+    except ImportError:
+        raise RuntimeError("NumPy is required to write segmentation labels.") from None
+
+    main_cube_names = {
+        obj.name for obj in mesh_objects_in_roots(main_cube_roots)
+    }
+    secondary_cube_names = {
+        obj.name
+        for obj in bpy.data.objects
+        if obj.type == "MESH" and obj.name.startswith(SECONDARY_CUBE_OBJECT_PREFIX)
+    }
+    whole_mask = np.zeros((height, width), dtype=np.uint8)
+    sticker_mask = np.zeros((height, width), dtype=np.uint8)
+    camera = get_camera()
+    scene = bpy.context.scene
+
+    segmentation_objects = {
+        obj.as_pointer(): obj
+        for obj in bpy.data.objects
+        if obj.type == "MESH"
+        and (obj.name in main_cube_names or obj.name in secondary_cube_names)
+    }
+    original_visibility = [
+        (obj, obj.hide_render, obj.hide_viewport, obj.hide_get())
+        for obj in segmentation_objects.values()
+    ]
+    try:
+        for obj in segmentation_objects.values():
+            obj.hide_render = False
+            obj.hide_viewport = False
+            obj.hide_set(False)
+        bpy.context.view_layer.update()
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        for y in range(height):
+            for x in range(width):
+                origin, direction = camera_ray(camera, scene, x, y, width, height)
+                ray_origin = origin
+                hit = False
+                hit_object = None
+                polygon_index = -1
+                for _ in range(32):
+                    hit, location, _normal, polygon_index, hit_object, _matrix = scene.ray_cast(
+                        depsgraph,
+                        ray_origin,
+                        direction,
+                    )
+                    if not hit or hit_object is None:
+                        break
+                    if (
+                        getattr(hit_object, "visible_camera", True)
+                        and not getattr(hit_object, "hide_render", False)
+                    ):
+                        break
+                    ray_origin = location + direction * 1e-4
+                if not hit or hit_object is None:
+                    continue
+
+                object_name = hit_object.name
+                if object_name in main_cube_names:
+                    whole_mask[y, x] = 1
+                if object_name not in main_cube_names and object_name not in secondary_cube_names:
+                    continue
+                if polygon_index < 0 or polygon_index >= len(hit_object.data.polygons):
+                    continue
+                polygon = hit_object.data.polygons[polygon_index]
+                materials = hit_object.data.materials
+                material = materials[polygon.material_index] if materials else None
+                sticker_mask[y, x] = sticker_segmentation_class_id(material)
+    finally:
+        for obj, hide_render, hide_viewport, hide in original_visibility:
+            obj.hide_render = hide_render
+            obj.hide_viewport = hide_viewport
+            obj.hide_set(hide)
+        bpy.context.view_layer.update()
+
+    return whole_mask, sticker_mask
+
+
+def write_yolo_segmentation_label(
+    mask: object,
+    label_path: Path,
+    class_id_map: dict[int, int],
+) -> int:
+    """Convert an in-memory class map into one YOLO polygon label file."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        raise RuntimeError(
+            "OpenCV and NumPy are required to write YOLO segmentation annotations."
+        ) from None
+
+    if not isinstance(mask, np.ndarray) or mask.ndim != 2:
+        raise TypeError("Segmentation mask must be a 2-D NumPy array.")
+    mask_height, mask_width = mask.shape[:2]
+    if mask_width <= 0 or mask_height <= 0:
+        raise RuntimeError("Segmentation mask has invalid dimensions.")
+
+    lines = []
+    for source_class_id, yolo_class_id in sorted(class_id_map.items()):
+        binary_mask = np.where(mask == source_class_id, 255, 0).astype(np.uint8)
+        contours, _hierarchy = cv2.findContours(
+            binary_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        for contour in contours:
+            if len(contour) < 3 or cv2.contourArea(contour) <= 0.0:
+                continue
+            points = contour.reshape(-1, 2).astype(float)
+            if len(points) < 3:
+                continue
+            normalized_points = []
+            for x, y in points:
+                normalized_points.extend((
+                    max(0.0, min(float(x) / mask_width, 1.0)),
+                    max(0.0, min(float(y) / mask_height, 1.0)),
+                ))
+            lines.append(
+                str(yolo_class_id)
+                + " "
+                + " ".join(f"{value:.6f}" for value in normalized_points)
+            )
+
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+    label_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return len(lines)
+
+
 def render_png(path: Path) -> None:
     bpy.context.scene.render.filepath = str(path)
     bpy.ops.render.render(write_still=True)
@@ -4683,15 +4888,42 @@ def generate_dataset(
     cube_rotational_blur_samples: int,
     degrade_probability: float,
     render_masks: bool,
+    render_segmentations: bool,
     min_visible_keypoints_with_hands: int,
     max_hand_placement_attempts: int,
 ) -> None:
     images_dir = output_dir / "images"
     masks_dir = output_dir / "masks" if render_masks else None
     labels_dir = output_dir / "labels"
+    whole_cube_labels_dir = labels_dir / "whole_cube" if render_segmentations else None
+    sticker_labels_dir = labels_dir / "stickers" if render_segmentations else None
     images_dir.mkdir(parents=True, exist_ok=True)
     if masks_dir is not None:
         masks_dir.mkdir(parents=True, exist_ok=True)
+    if whole_cube_labels_dir is not None:
+        whole_cube_labels_dir.mkdir(parents=True, exist_ok=True)
+        (whole_cube_labels_dir / "classes.json").write_text(
+            json.dumps(
+                {
+                    str(class_id): name
+                    for class_id, name in enumerate(WHOLE_CUBE_YOLO_CLASS_NAMES)
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    if sticker_labels_dir is not None:
+        sticker_labels_dir.mkdir(parents=True, exist_ok=True)
+        (sticker_labels_dir / "classes.json").write_text(
+            json.dumps(
+                {
+                    str(class_id): name
+                    for class_id, name in enumerate(STICKER_YOLO_CLASS_NAMES)
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     labels_dir.mkdir(parents=True, exist_ok=True)
 
     ensure_hand_assets_loaded()
@@ -4724,6 +4956,16 @@ def generate_dataset(
         stem = f"{(index):06d}"
         image_path = images_dir / f"{stem}.png"
         mask_path = masks_dir / f"{stem}.png" if masks_dir is not None else None
+        whole_cube_label_path = (
+            whole_cube_labels_dir / f"{stem}.txt"
+            if whole_cube_labels_dir is not None
+            else None
+        )
+        sticker_label_path = (
+            sticker_labels_dir / f"{stem}.txt"
+            if sticker_labels_dir is not None
+            else None
+        )
         label_path = labels_dir / f"{stem}.txt"
 
         hands = hand_objects()
@@ -4813,6 +5055,45 @@ def generate_dataset(
                 image_path,
                 probability=degrade_probability,
             )
+            segmentations = {}
+            segmentation_roots = list(objects) + core_objects
+            whole_cube_mask = sticker_mask = None
+            if whole_cube_label_path is not None or sticker_label_path is not None:
+                whole_cube_mask, sticker_mask = render_segmentation_masks(
+                    segmentation_roots,
+                    width,
+                    height,
+                )
+            if whole_cube_label_path is not None:
+                whole_cube_segments = write_yolo_segmentation_label(
+                    whole_cube_mask,
+                    whole_cube_label_path,
+                    {1: 0},
+                )
+                segmentations["whole_cube"] = {
+                    "path": str(whole_cube_label_path),
+                    "classes": {
+                        str(class_id): name
+                        for class_id, name in enumerate(WHOLE_CUBE_YOLO_CLASS_NAMES)
+                    },
+                    "format": "YOLO polygon segmentation",
+                    "segments": whole_cube_segments,
+                }
+            if sticker_label_path is not None:
+                sticker_segments = write_yolo_segmentation_label(
+                    sticker_mask,
+                    sticker_label_path,
+                    {source_class_id: source_class_id - 1 for source_class_id in range(1, 7)},
+                )
+                segmentations["stickers"] = {
+                    "path": str(sticker_label_path),
+                    "classes": {
+                        str(class_id): name
+                        for class_id, name in enumerate(STICKER_YOLO_CLASS_NAMES)
+                    },
+                    "format": "YOLO polygon segmentation",
+                    "segments": sticker_segments,
+                }
             yolo_lines, pose_objects, pose_geometry = render_pose_keypoints(mask_path)
             write_yolo_pose(label_path, yolo_lines)
             pose_geometry["preflight_visibility"] = pose_visibility_summary(preflight_pose_objects)
@@ -4825,6 +5106,7 @@ def generate_dataset(
             "image": str(image_path),
             "mask": str(mask_path) if mask_path is not None else None,
             "label": str(label_path),
+            "segmentations": segmentations,
             "moves": moves,
             "layer_state": layer_state,
             "cubie_labels": {obj.name: obj.pass_index for obj in objects},
@@ -4843,10 +5125,13 @@ def generate_dataset(
             "objects": len(yolo_lines),
         })
         mask_message = f", {mask_path}" if mask_path is not None else ""
+        whole_cube_label_message = f", {whole_cube_label_path}" if whole_cube_label_path else ""
+        sticker_label_message = f", {sticker_label_path}" if sticker_label_path else ""
         blend_asset_count = background_randomization.get("blend_asset_count", 0)
         blend_asset_sources = background_randomization.get("blend_asset_sources", [])
         print(
-            f"Wrote {image_path}{mask_message}, and {label_path} "
+            f"Wrote {image_path}{mask_message}{whole_cube_label_message}{sticker_label_message}, "
+            f"and {label_path} "
             f"with {len(yolo_lines)} pose keypoint objects, "
             f"{blend_asset_count} blend background assets {blend_asset_sources}, "
             f"{'with' if rotational_blur else 'without'} rotational blur "
@@ -4908,7 +5193,12 @@ def cli_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-masks",
         action="store_true",
-        help="Skip writing visualization masks; segmentation labels are still written.",
+        help="Skip writing keypoint visualization masks; segmentation label maps are still written.",
+    )
+    parser.add_argument(
+        "--no-segmentations",
+        action="store_true",
+        help="Skip writing whole-cube and sticker class-index segmentation maps.",
     )
     parser.add_argument(
         "--min-visible-keypoints-with-hands",
@@ -4954,6 +5244,7 @@ def main() -> None:
         cube_rotational_blur_samples=args.cube_rotational_blur_samples,
         degrade_probability=args.degrade_probability,
         render_masks=not args.no_masks,
+        render_segmentations=not args.no_segmentations,
         min_visible_keypoints_with_hands=args.min_visible_keypoints_with_hands,
         max_hand_placement_attempts=args.max_hand_placement_attempts,
     )
