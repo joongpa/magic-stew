@@ -164,6 +164,61 @@ BACKGROUND_BLEND_ASSET_FAMILY_WEIGHTS = {
     "Asset_NotebookPhone": 1.0,
 }
 STICKER_COLOR_MATERIAL_NAMES = ("White", "Yellow", "Red", "Orange", "Blue", "Green")
+# Display-space RGB samples taken from the flat sticker centers in the six
+# predefined GAN sticker-set images on TheCubicle's product page. These are
+# visual references rather than manufacturer color specifications; the page
+# itself says the product images are intended to represent the shades.
+STICKER_COLOR_PALETTES = {
+    "full_bright": {
+        "White": (255, 255, 255),
+        "Yellow": (245, 238, 0),
+        "Red": (231, 32, 1),
+        "Orange": (242, 146, 0),
+        "Blue": (101, 177, 227),
+        "Green": (80, 227, 1),
+    },
+    "full_bright_sky_blue": {
+        "White": (255, 255, 255),
+        "Yellow": (245, 238, 0),
+        "Red": (231, 32, 1),
+        "Orange": (242, 146, 0),
+        "Blue": (0, 118, 205),
+        "Green": (80, 227, 1),
+    },
+    "half_bright": {
+        "White": (255, 255, 255),
+        "Yellow": (249, 240, 1),
+        "Red": (154, 0, 0),
+        "Orange": (242, 148, 0),
+        "Blue": (0, 62, 195),
+        "Green": (79, 226, 0),
+    },
+    "half_bright_sky_blue": {
+        "White": (255, 255, 255),
+        "Yellow": (249, 240, 1),
+        "Red": (154, 0, 0),
+        "Orange": (242, 148, 0),
+        "Blue": (1, 123, 208),
+        "Green": (79, 226, 0),
+    },
+    "factory_half_bright": {
+        "White": (255, 255, 255),
+        "Yellow": (245, 238, 0),
+        "Red": (154, 0, 0),
+        "Orange": (238, 83, 1),
+        "Blue": (0, 54, 128),
+        "Green": (80, 227, 1),
+    },
+    "classic": {
+        "White": (255, 255, 255),
+        "Yellow": (236, 203, 0),
+        "Red": (154, 0, 0),
+        "Orange": (203, 53, 0),
+        "Blue": (0, 61, 188),
+        "Green": (30, 133, 24),
+    },
+}
+STICKER_COLOR_PALETTE_SOURCE = "https://www.thecubicle.com/products/gan-3x3-ff-sticker-set"
 STICKER_ROUGHNESS_RANGE = (0.18, 0.38)
 STICKER_SPECULAR_RANGE = (0.45, 0.75)
 STICKER_COAT_WEIGHT_RANGE = (0.08, 0.24)
@@ -1276,15 +1331,32 @@ def set_principled_input(material: bpy.types.Material, input_name: str, value: o
         bsdf.inputs[input_name].default_value = value
 
 
-def randomize_sticker_material_gloss() -> dict[str, dict[str, float]]:
-    """Give Rubik's cube stickers mild glossy highlights while preserving labels."""
-    material_settings = {}
+def srgb_channel_to_linear(channel: int) -> float:
+    """Convert an 8-bit sRGB channel to Blender's linear color value."""
+    normalized = channel / 255.0
+    if normalized <= 0.04045:
+        return normalized / 12.92
+    return ((normalized + 0.055) / 1.055) ** 2.4
+
+
+def randomize_sticker_material_gloss() -> dict[str, object]:
+    """Randomize sticker shades from one coherent product-page palette and gloss."""
+    palette_name, palette = random.choice(tuple(STICKER_COLOR_PALETTES.items()))
+    material_settings: dict[str, object] = {
+        "palette": palette_name,
+        "palette_source": STICKER_COLOR_PALETTE_SOURCE,
+    }
     for name in STICKER_COLOR_MATERIAL_NAMES:
         material = bpy.data.materials.get(name)
         if material is None:
             continue
 
         material.use_nodes = True
+        rgb = palette[name]
+        linear_rgb = tuple(srgb_channel_to_linear(channel) for channel in rgb)
+        rgba = (*linear_rgb, 1.0)
+        material.diffuse_color = rgba
+        set_principled_input(material, "Base Color", rgba)
         roughness = random.uniform(*STICKER_ROUGHNESS_RANGE)
         specular = random.uniform(*STICKER_SPECULAR_RANGE)
         coat_weight = random.uniform(*STICKER_COAT_WEIGHT_RANGE)
@@ -1299,6 +1371,8 @@ def randomize_sticker_material_gloss() -> dict[str, dict[str, float]]:
         set_principled_input(material, "Clearcoat Roughness", coat_roughness)
 
         material_settings[name] = {
+            "rgb": list(rgb),
+            "linear_rgba": list(rgba),
             "roughness": roughness,
             "specular": specular,
             "coat_weight": coat_weight,
@@ -3571,7 +3645,7 @@ def randomize_scene(
     dict[str, object],
     dict[str, object],
     dict[str, object],
-    dict[str, dict[str, float]],
+    dict[str, object],
 ]:
     sticker_materials = randomize_sticker_material_gloss()
     objects = cube_objects()
