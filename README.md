@@ -111,3 +111,49 @@ The intended next steps are:
 3. Label visible corners and facelet centers after box quality is acceptable.
 4. Train a PyTorch detector/keypoint model.
 5. Add orientation only after detection quality is acceptable.
+
+## Dense color-map head
+
+`live_recognition.color_segmentation.YOLOColorMapModel` attaches a PyTorch
+decoder to a trained Ultralytics whole-cube segmentation model. It captures the
+multiscale features immediately before the existing YOLO segmentation head,
+adds explicit RGB/chromaticity/luminance/saturation features, and returns a
+seven-channel per-pixel map:
+
+```text
+white, yellow, red, orange, blue, green, none
+```
+
+The base YOLO model is frozen by default. To train the head using the generated
+sticker polygons:
+
+```bash
+.venv/bin/python scripts/train_yolo_color_map_head.py \
+  --source-dir data/synthetic_cube_dataset \
+  --model runs/cube_whole_seg_local/runs/cube_whole_yolo11n_seg/weights/best.pt
+```
+
+The script derives a square ROI from the whole-cube labels, rasterizes the six
+sticker-color polygons into dense targets, assigns uncovered pixels to `none`,
+and ignores a small boundary band. Add `--unfreeze-backbone` only after the
+frozen-head experiment is working.
+
+To restore the trained head and obtain probabilities for an RGB ROI tensor:
+
+```python
+import torch
+
+from live_recognition.color_segmentation import YOLOColorMapModel
+
+model = YOLOColorMapModel.from_color_checkpoint(
+    "runs/cube_color_map_head/best_color_map_head.pt"
+).eval()
+with torch.no_grad():
+    probabilities = model(roi_rgb_float_0_to_1)["color_probabilities"]
+```
+
+To inspect the predictions visually, add `--color-map-model` to
+`scripts/render_yolo_sticker_segmentation.py`. The output is a compact 2x2 grid
+with the segmentation view, top-1 color mask, top-2 color mask, and a
+distribution panel. Click any pixel inside either color mask to display the
+seven probabilities, predicted class, and normalized entropy for that pixel.
