@@ -174,7 +174,16 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
         plots=True,
     )
 
-    best_model_path = runs_dir / args.name / "weights" / "best.pt"
+    # Ultralytics increments the run directory when args.name already exists
+    # (for example, cube_piece_keypoint_yolo11n_pose-2). Use the trainer's
+    # resolved path instead of reconstructing the unsuffixed path.
+    trainer = getattr(model, "trainer", None)
+    best_model_path = getattr(trainer, "best", None)
+    if best_model_path is None:
+        raise RuntimeError("Training completed without exposing a best-model path.")
+    best_model_path = Path(best_model_path).resolve()
+    if not best_model_path.is_file():
+        raise FileNotFoundError(f"Training completed but best model was not found: {best_model_path}")
     print(f"Best model: {best_model_path}")
 
     best_model = YOLO(str(best_model_path))
