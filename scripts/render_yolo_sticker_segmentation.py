@@ -207,21 +207,24 @@ def render_segmentation_overlay(
     class_ids = tensor_to_numpy(boxes.cls).reshape(-1)
     names = getattr(result, "names", {})
     height, width = image.shape[:2]
+    rendered_masks = [
+        cv2.resize(mask.astype(np.float32), (width, height), interpolation=cv2.INTER_NEAREST) >= 0.5
+        for mask in mask_data[: len(class_ids)]
+    ]
+    rendered_indexes = range(len(rendered_masks))
+    if segmentation_type == "whole-cube" and rendered_masks:
+        rendered_indexes = (max(rendered_indexes, key=lambda index: int(rendered_masks[index].sum())),)
 
-    for index, mask in enumerate(mask_data):
-        if index >= len(class_ids):
-            break
-        mask = cv2.resize(mask.astype(np.float32), (width, height), interpolation=cv2.INTER_NEAREST) >= 0.5
+    for index in rendered_indexes:
+        mask = rendered_masks[index]
         color = class_color(names, int(class_ids[index]), segmentation_type)
         overlay[mask] = color
 
     output = cv2.addWeighted(overlay, opacity, image, 1.0 - opacity, 0.0)
-    for index, mask in enumerate(mask_data):
-        if index >= len(class_ids):
-            break
-        mask = cv2.resize(mask.astype(np.float32), (width, height), interpolation=cv2.INTER_NEAREST)
+    for index in rendered_indexes:
+        mask = rendered_masks[index]
         contours, _ = cv2.findContours(
-            (mask >= 0.5).astype(np.uint8),
+            mask.astype(np.uint8),
             cv2.RETR_EXTERNAL,
             cv2.CHAIN_APPROX_SIMPLE,
         )

@@ -3,7 +3,7 @@
 The base YOLO model is kept intact.  A pre-hook captures the multiscale feature
 pyramid immediately before the existing segmentation head, and a small PyTorch
 decoder combines those features with explicit color features computed from the
-ROI image.
+ROI image, including RGB, chromaticity, luminance, saturation, and OkLab.
 
 The model expects RGB tensors in ``[0, 1]`` with shape ``[B, 3, H, W]``.  It
 returns seven-channel logits/probabilities in the same spatial resolution:
@@ -52,10 +52,46 @@ class ConvNormAct(nn.Sequential):
         )
 
 
+def _srgb_to_linear(images_rgb: Tensor) -> Tensor:
+    """Convert normalized sRGB values to linear RGB for OkLab conversion."""
+
+    return torch.where(
+        images_rgb <= 0.04045,
+        images_rgb / 12.92,
+        ((images_rgb + 0.055) / 1.055).clamp_min(0.0).pow(2.4),
+    )
+
+
+def _oklab_features(images_rgb: Tensor) -> Tensor:
+    """Return normalized sRGB converted to the three OkLab channels."""
+
+    linear_rgb = _srgb_to_linear(images_rgb)
+    rgb_to_lms = images_rgb.new_tensor(
+        (
+            (0.4122214708, 0.5363325363, 0.0514459929),
+            (0.2119034982, 0.6806995451, 0.1073969566),
+            (0.0883024619, 0.2817188376, 0.6299787005),
+        )
+    )
+    lms_to_oklab = images_rgb.new_tensor(
+        (
+            (0.2104542553, 0.7936177850, -0.0040720468),
+            (1.9779984951, -2.4285922050, 0.4505937099),
+            (0.0259040371, 0.7827717662, -0.8086757660),
+        )
+    )
+    lms = torch.einsum("ij,bjhw->bihw", rgb_to_lms, linear_rgb)
+    lms_cbrt = torch.sign(lms) * lms.abs().clamp_min(1e-8).pow(1.0 / 3.0)
+    return torch.einsum("ij,bjhw->bihw", lms_to_oklab, lms_cbrt)
+
+
 def explicit_color_features(images_rgb: Tensor) -> Tensor:
     """Build differentiable color features from an RGB image tensor.
 
-    In addition to RGB, the branch sees chromaticity, luminance, and saturation.
+    In addition to RGB, the branch sees chromaticity, luminance, saturation, and
+    OkLab. OkLab provides a more perceptually organized color representation,
+    while the raw RGB and simpler features preserve information that may still
+    be useful for the learned head.
     These are deliberately simple features: the learned head can decide which
     representation is useful, while the raw RGB skip preserves exact local color.
     """
@@ -71,13 +107,14 @@ def explicit_color_features(images_rgb: Tensor) -> Tensor:
     maximum = rgb.amax(dim=1, keepdim=True)
     minimum = rgb.amin(dim=1, keepdim=True)
     saturation = maximum - minimum
-    return torch.cat((rgb, chromaticity, luminance, saturation), dim=1)
+    oklab = _oklab_features(rgb)
+    return torch.cat((rgb, chromaticity, luminance, saturation, oklab), dim=1)
 
 
 class DenseColorDecoder(nn.Module):
     """Fuse YOLO's multiscale features with an image color branch."""
 
-    color_feature_channels = 8
+    color_feature_channels = 11
 
     def __init__(
         self,

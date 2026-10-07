@@ -5,6 +5,7 @@ from torch import nn
 from live_recognition.color_segmentation import (
     COLOR_CLASS_NAMES,
     IGNORE_INDEX,
+    explicit_color_features,
     YOLOColorMapModel,
 )
 from live_recognition.color_targets import dense_color_target
@@ -30,6 +31,15 @@ class FakeSegmentationModel(nn.Module):
         high_resolution = self.model[0](images)
         low_resolution = self.model[1](high_resolution)
         return self.model[-1]([low_resolution, high_resolution])
+
+
+def test_explicit_color_features_include_oklab_channels():
+    images = torch.rand(2, 3, 16, 16)
+
+    features = explicit_color_features(images)
+
+    assert features.shape == (2, 11, 16, 16)
+    assert torch.isfinite(features).all()
 
 
 def test_color_head_returns_full_resolution_probability_map():
@@ -66,4 +76,3 @@ def test_dense_color_target_maps_polygons_and_ignores_boundaries():
     assert target[5, 5] == red_index
     assert target[0, 0] == COLOR_CLASS_NAMES.index("none")
     assert np.count_nonzero(target == IGNORE_INDEX) > 0
-

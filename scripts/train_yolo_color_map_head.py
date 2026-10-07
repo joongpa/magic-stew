@@ -11,9 +11,11 @@ Expected generated-data layout::
         whole_cube/
           *.txt
 
-The YOLO cube model is frozen by default.  Its feature pyramid is captured
+The YOLO cube model is frozen by default. Its feature pyramid is captured
 before the existing segmentation head and fused with explicit RGB/color
-features by :class:`YOLOColorMapModel`.
+features by :class:`YOLOColorMapModel`. The loss uses training-set class
+balancing and focal weighting, and validation reports per-class metrics and a
+target-by-prediction confusion matrix so common color confusions are visible.
 """
 
 from __future__ import annotations
@@ -167,9 +169,13 @@ class ColorMapDataset(Dataset[tuple[Tensor, Tensor]]):
 class EpochMetrics:
     loss: float
     color_mean_iou: float
+    color_macro_f1: float
     pixel_accuracy: float
     sticker_pixel_accuracy: float
     color_ious: tuple[float, ...]
+    color_precisions: tuple[float, ...]
+    color_recalls: tuple[float, ...]
+    confusion_matrix: tuple[tuple[int, ...], ...]
     none_iou: float
 
 
@@ -197,8 +203,11 @@ def dense_dice_loss(logits: Tensor, target: Tensor) -> Tensor:
     probabilities = torch.softmax(logits, dim=1)
     one_hot = F.one_hot(safe_target, num_classes=COLOR_CLASS_COUNT).permute(0, 3, 1, 2).float()
     valid_float = valid.unsqueeze(1).float()
-    probabilities = probabilities * valid_float
-    one_hot = one_hot * valid_float
+    # The downstream segmentation mask already removes most non-sticker
+    # pixels. Optimize Dice for the six useful sticker colors; ``none`` is
+    # retained as an output channel but is not a primary training objective.
+    probabilities = probabilities[:, :NONE_CLASS_INDEX] * valid_float
+    one_hot = one_hot[:, :NONE_CLASS_INDEX] * valid_float
     intersection = (probabilities * one_hot).sum(dim=(0, 2, 3))
     denominator = probabilities.sum(dim=(0, 2, 3)) + one_hot.sum(dim=(0, 2, 3))
     present = one_hot.sum(dim=(0, 2, 3)) > 0
@@ -206,15 +215,53 @@ def dense_dice_loss(logits: Tensor, target: Tensor) -> Tensor:
     return (1.0 - dice[present]).mean() if bool(present.any()) else logits.sum() * 0.0
 
 
-def compute_loss(logits: Tensor, target: Tensor, none_weight: float) -> Tensor:
-    weights = torch.ones(COLOR_CLASS_COUNT, device=logits.device, dtype=logits.dtype)
-    weights[-1] = none_weight
-    cross_entropy = F.cross_entropy(
-        logits,
-        target,
-        weight=weights,
-        ignore_index=IGNORE_INDEX,
-    )
+def compute_class_weights(
+    dataset: Dataset[tuple[Tensor, Tensor]],
+    *,
+    none_weight: float,
+    balance_strength: float,
+) -> Tensor:
+    """Estimate stable per-class weights from valid training pixels."""
+
+    counts = torch.zeros(COLOR_CLASS_COUNT, dtype=torch.float64)
+    for _image, target in dataset:
+        valid_target = target[target != IGNORE_INDEX].long()
+        counts += torch.bincount(valid_target, minlength=COLOR_CLASS_COUNT).double()
+
+    color_counts = counts[:NONE_CLASS_INDEX]
+    present = color_counts > 0
+    color_weights = torch.ones(NONE_CLASS_INDEX, dtype=torch.float64)
+    if bool(present.any()):
+        reference_count = color_counts[present].mean()
+        color_weights[present] = (reference_count / color_counts[present]).pow(balance_strength)
+        color_weights[present] /= color_weights[present].mean()
+
+    weights = torch.ones(COLOR_CLASS_COUNT, dtype=torch.float64)
+    weights[:NONE_CLASS_INDEX] = color_weights
+    weights[NONE_CLASS_INDEX] = none_weight
+    return weights.float()
+
+
+def compute_loss(
+    logits: Tensor,
+    target: Tensor,
+    class_weights: Tensor,
+    focal_gamma: float,
+) -> Tensor:
+    """Use class-balanced focal CE plus class-balanced dense Dice loss."""
+
+    safe_target = target.masked_fill(target == IGNORE_INDEX, 0)
+    log_probabilities = F.log_softmax(logits, dim=1)
+    target_log_probability = log_probabilities.gather(
+        1, safe_target.unsqueeze(1)
+    ).squeeze(1)
+    probabilities = target_log_probability.exp()
+    focal_factor = (1.0 - probabilities).clamp_min(0.0).pow(focal_gamma)
+    pixel_weights = class_weights.to(device=logits.device, dtype=logits.dtype)[safe_target]
+    valid = (target != IGNORE_INDEX).to(logits.dtype)
+    cross_entropy = (
+        -target_log_probability * focal_factor * pixel_weights * valid
+    ).sum() / valid.sum().clamp_min(1.0)
     return cross_entropy + 0.5 * dense_dice_loss(logits, target)
 
 
@@ -227,6 +274,7 @@ def update_metrics(
     total: list[int],
     sticker_correct: list[int],
     sticker_total: list[int],
+    confusion_matrix: Tensor,
 ) -> None:
     predictions = logits.argmax(dim=1)
     valid = target != IGNORE_INDEX
@@ -240,6 +288,13 @@ def update_metrics(
     sticker_pixels = valid & (target != NONE_CLASS_INDEX)
     sticker_correct[0] += ((predictions == target) & sticker_pixels).sum().item()
     sticker_total[0] += sticker_pixels.sum().item()
+    valid_target = target[valid].long().cpu()
+    valid_predictions = predictions[valid].long().cpu()
+    batch_indices = valid_target * COLOR_CLASS_COUNT + valid_predictions
+    confusion_matrix += torch.bincount(
+        batch_indices,
+        minlength=COLOR_CLASS_COUNT * COLOR_CLASS_COUNT,
+    ).reshape(COLOR_CLASS_COUNT, COLOR_CLASS_COUNT)
 
 
 def run_epoch(
@@ -247,7 +302,8 @@ def run_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
-    none_weight: float,
+    class_weights: Tensor,
+    focal_gamma: float,
     *,
     phase: str,
 ) -> EpochMetrics:
@@ -264,6 +320,9 @@ def run_epoch(
     total = [0] * COLOR_CLASS_COUNT
     sticker_correct = [0]
     sticker_total = [0]
+    confusion_matrix = torch.zeros(
+        (COLOR_CLASS_COUNT, COLOR_CLASS_COUNT), dtype=torch.int64
+    )
     for batch_number, (images, targets) in enumerate(loader, start=1):
         images = images.to(device)
         targets = targets.to(device)
@@ -271,7 +330,7 @@ def run_epoch(
             optimizer.zero_grad(set_to_none=True)
         outputs = model(images)
         logits = outputs["color_logits"]
-        loss = compute_loss(logits, targets, none_weight)
+        loss = compute_loss(logits, targets, class_weights, focal_gamma)
         if training:
             loss.backward()
             optimizer.step()
@@ -287,6 +346,7 @@ def run_epoch(
             total,
             sticker_correct,
             sticker_total,
+            confusion_matrix,
         )
         if (
             batch_number == 1
@@ -299,21 +359,47 @@ def run_epoch(
                 flush=True,
             )
 
-    color_intersections = intersections[:NONE_CLASS_INDEX]
-    color_unions = unions[:NONE_CLASS_INDEX]
-    valid_color_classes = color_unions > 0
+    true_positive = confusion_matrix.diag().double()
+    predicted_counts = confusion_matrix.sum(dim=0).double()
+    target_counts = confusion_matrix.sum(dim=1).double()
+    color_unions = predicted_counts + target_counts - true_positive
+    valid_color_classes = color_unions[:NONE_CLASS_INDEX] > 0
     color_ious_tensor = torch.zeros(NONE_CLASS_INDEX, dtype=torch.float64)
     color_ious_tensor[valid_color_classes] = (
-        color_intersections[valid_color_classes] / color_unions[valid_color_classes]
+        true_positive[:NONE_CLASS_INDEX][valid_color_classes]
+        / color_unions[:NONE_CLASS_INDEX][valid_color_classes]
+    )
+    color_precisions_tensor = torch.zeros(NONE_CLASS_INDEX, dtype=torch.float64)
+    color_recalls_tensor = torch.zeros(NONE_CLASS_INDEX, dtype=torch.float64)
+    valid_precision = predicted_counts[:NONE_CLASS_INDEX] > 0
+    valid_recall = target_counts[:NONE_CLASS_INDEX] > 0
+    color_precisions_tensor[valid_precision] = (
+        true_positive[:NONE_CLASS_INDEX][valid_precision]
+        / predicted_counts[:NONE_CLASS_INDEX][valid_precision]
+    )
+    color_recalls_tensor[valid_recall] = (
+        true_positive[:NONE_CLASS_INDEX][valid_recall]
+        / target_counts[:NONE_CLASS_INDEX][valid_recall]
     )
     color_mean_iou = (
         float(color_ious_tensor[valid_color_classes].mean())
         if bool(valid_color_classes.any())
         else 0.0
     )
+    color_f1 = (
+        2.0
+        * color_precisions_tensor
+        * color_recalls_tensor
+        / (color_precisions_tensor + color_recalls_tensor).clamp_min(1e-8)
+    )
+    color_macro_f1 = (
+        float(color_f1[valid_color_classes].mean())
+        if bool(valid_color_classes.any())
+        else 0.0
+    )
     none_iou = (
-        float(intersections[NONE_CLASS_INDEX] / unions[NONE_CLASS_INDEX])
-        if unions[NONE_CLASS_INDEX] > 0
+        float(true_positive[NONE_CLASS_INDEX] / color_unions[NONE_CLASS_INDEX])
+        if color_unions[NONE_CLASS_INDEX] > 0
         else 0.0
     )
     pixel_accuracy = sum(correct) / max(1, sum(total))
@@ -322,9 +408,15 @@ def run_epoch(
     return EpochMetrics(
         loss=total_loss / max(1, sample_count),
         color_mean_iou=color_mean_iou,
+        color_macro_f1=color_macro_f1,
         pixel_accuracy=pixel_accuracy,
         sticker_pixel_accuracy=sticker_pixel_accuracy,
         color_ious=tuple(float(value) for value in color_ious_tensor),
+        color_precisions=tuple(float(value) for value in color_precisions_tensor),
+        color_recalls=tuple(float(value) for value in color_recalls_tensor),
+        confusion_matrix=tuple(
+            tuple(int(value) for value in row) for row in confusion_matrix.tolist()
+        ),
         none_iou=none_iou,
     )
 
@@ -352,7 +444,24 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--roi-padding", type=float, default=0.08)
     parser.add_argument("--boundary-ignore-px", type=int, default=1)
-    parser.add_argument("--none-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--none-weight",
+        type=float,
+        default=0.0,
+        help="Optional loss weight for background/none targets; 0 focuses training on sticker colors",
+    )
+    parser.add_argument(
+        "--class-balance-strength",
+        type=float,
+        default=0.5,
+        help="Strength of inverse-frequency weighting for the six color classes",
+    )
+    parser.add_argument(
+        "--focal-gamma",
+        type=float,
+        default=1.0,
+        help="Focal-loss gamma; use 0 to disable hard-pixel emphasis",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--device", default="mps")
@@ -365,6 +474,12 @@ def main() -> None:
     args = parser.parse_args()
     if not args.model.is_file():
         raise SystemExit(f"YOLO model does not exist: {args.model}")
+    if args.class_balance_strength < 0.0:
+        raise SystemExit("--class-balance-strength must be non-negative")
+    if args.focal_gamma < 0.0:
+        raise SystemExit("--focal-gamma must be non-negative")
+    if args.none_weight < 0.0:
+        raise SystemExit("--none-weight must be non-negative")
 
     print(f"Loading dataset metadata from {args.source_dir}...", flush=True)
     samples, sticker_class_names = collect_samples(args.source_dir)
@@ -401,6 +516,12 @@ def main() -> None:
         pin_memory=False,
     )
 
+    class_weights = compute_class_weights(
+        train_dataset,
+        none_weight=args.none_weight,
+        balance_strength=args.class_balance_strength,
+    )
+
     device = resolve_device(args.device)
     print(f"Using device: {device}", flush=True)
     print(f"Loading YOLO segmentation model: {args.model}", flush=True)
@@ -421,6 +542,15 @@ def main() -> None:
     print(f"Training samples: {len(train_dataset)}, validation samples: {len(val_dataset)}", flush=True)
     print(f"Color classes: {', '.join(COLOR_CLASS_NAMES)}", flush=True)
     print(
+        "Class weights: "
+        + " ".join(
+            f"{name}={float(weight):.3f}"
+            for name, weight in zip(COLOR_CLASS_NAMES, class_weights)
+        ),
+        flush=True,
+    )
+    print(f"Focal gamma: {args.focal_gamma:.3f}", flush=True)
+    print(
         f"Trainable parameters: {sum(parameter.numel() for parameter in trainable_parameters):,} "
         f"({'YOLO unfrozen' if args.unfreeze_backbone else 'color head only'})",
         flush=True,
@@ -432,7 +562,8 @@ def main() -> None:
             train_loader,
             optimizer,
             device,
-            args.none_weight,
+            class_weights,
+            args.focal_gamma,
             phase=f"epoch {epoch} train",
         )
         with torch.no_grad():
@@ -441,25 +572,36 @@ def main() -> None:
                 val_loader,
                 None,
                 device,
-                args.none_weight,
+                class_weights,
+                args.focal_gamma,
                 phase=f"epoch {epoch} val",
             )
         print(
             f"epoch {epoch:03d} "
             f"train loss={train_metrics.loss:.4f} "
             f"color_mIoU={train_metrics.color_mean_iou:.4f} "
+            f"color_macroF1={train_metrics.color_macro_f1:.4f} "
             f"sticker_acc={train_metrics.sticker_pixel_accuracy:.4f} "
             f"val loss={val_metrics.loss:.4f} "
             f"color_mIoU={val_metrics.color_mean_iou:.4f} "
+            f"color_macroF1={val_metrics.color_macro_f1:.4f} "
             f"sticker_acc={val_metrics.sticker_pixel_accuracy:.4f} "
             f"none_IoU={val_metrics.none_iou:.4f}",
             flush=True,
         )
         per_color = " ".join(
-            f"{name}={iou:.3f}"
-            for name, iou in zip(COLOR_CLASS_NAMES[:-1], val_metrics.color_ious)
+            f"{name}=IoU:{iou:.3f}/P:{precision:.3f}/R:{recall:.3f}"
+            for name, iou, precision, recall in zip(
+                COLOR_CLASS_NAMES[:-1],
+                val_metrics.color_ious,
+                val_metrics.color_precisions,
+                val_metrics.color_recalls,
+            )
         )
-        print(f"validation per-color IoU: {per_color}", flush=True)
+        print(f"validation per-color metrics: {per_color}", flush=True)
+        print("validation confusion matrix (rows=target, cols=prediction):", flush=True)
+        for name, row in zip(COLOR_CLASS_NAMES, val_metrics.confusion_matrix):
+            print(f"  {name:>6}: {row}", flush=True)
         if val_metrics.color_mean_iou > best_color_miou:
             best_color_miou = val_metrics.color_mean_iou
             checkpoint = {
@@ -469,6 +611,8 @@ def main() -> None:
                 "class_names": COLOR_CLASS_NAMES,
                 "epoch": epoch,
                 "val_miou": val_metrics.color_mean_iou,
+                "class_weights": class_weights.tolist(),
+                "focal_gamma": args.focal_gamma,
             }
             torch.save(checkpoint, args.workdir / "best_color_map_head.pt")
 
@@ -479,6 +623,8 @@ def main() -> None:
             "imgsz": args.imgsz,
             "class_names": COLOR_CLASS_NAMES,
             "val_miou": best_color_miou,
+            "class_weights": class_weights.tolist(),
+            "focal_gamma": args.focal_gamma,
         },
         args.workdir / "last_color_map_head.pt",
     )

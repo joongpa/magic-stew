@@ -53,6 +53,55 @@ Single image:
 cube-orient --source /path/to/frame.jpg --once --save runs/frame_bbox.jpg
 ```
 
+## Curate blurry move pairs from videos
+
+Use `scripts/curate_move_cases.py` to build a labeled image-pair dataset from local
+videos or YouTube URLs. YouTube videos are downloaded with `yt-dlp` and cached under
+`data/move_case_video_cache` (720p maximum by default). Put one URL or local video path
+per line in a text file to work through a batch:
+
+```text
+# videos_to_review.txt
+https://www.youtube.com/watch?v=VIDEO_ID
+/path/to/another_solve.mp4
+```
+
+Run the curator:
+
+```bash
+.venv/bin/python scripts/curate_move_cases.py --source-list videos_to_review.txt
+```
+
+For each video, first use the ROI selector to watch and navigate the full video while
+choosing a rectangle around the cube. Drag the rectangle, then press Enter when it fits;
+Space plays/pauses, `,`/`.` step frames, `j`/`l` jump a second, and `c` clears the rectangle.
+Instructions and ROI coordinates appear in a separate status window, never over the video.
+Saved frames are cropped to this fixed rectangle, whose coordinates are kept in metadata.
+The video then opens as a clean cropped feed beside separate status and **Camera position
+relative to solver** windows. Drag/click the camera marker in both diagrams: top view sets
+horizontal position, side view sets vertical position. The diagrams show the camera relative to a solver facing
+the cube: horizontal `0°` is straight ahead, positive is to the solver's right; vertical
+`0°` is level, positive is above. Tilt is assumed to be zero. Both angles must be set before
+a move can be labeled.
+
+Use Space to play/pause, `,` and `.` to step one frame, and `j` and `l` to jump about one
+second. When viewing frame `n`, press `m` to label the transition from frame `n-1` to `n`,
+then enter the move in standard notation in the terminal (for example, `R`, `U2`, `F'`,
+`M`, or `x`). The GUI stays live while the terminal prompt is open, and the pending label
+remains tied to the frame index where you pressed `m`. Leave the prompt blank to save that
+pair as a no-move transition. Frames you step past without pressing `m` are treated as no
+move and are not saved. Frame 0 has no preceding transition. Press `n` to move to the next
+video or `q` to quit. Case IDs continue across runs.
+
+Each accepted pair is saved under `data/move_cases/case_NNNNNN/` with `frame_a.png`,
+`frame_b.png`, and `metadata.json`. PNG preserves the decoded video frames without adding
+another lossy compression step. Each case contains adjacent frames (`n-1`, `n`), so its
+time delta is one video frame. Metadata records source frame numbers, timestamps, the source
+URL when available, the move applied on that transition, crop rectangle, and manually
+annotated horizontal/vertical camera angles. Start/end cube states are reserved as nullable
+fields so they can be added later. The case folders are ignored by Git through the existing
+`data/` ignore rule.
+
 Piece graph overlay:
 
 ```bash
@@ -117,15 +166,18 @@ The intended next steps are:
 `live_recognition.color_segmentation.YOLOColorMapModel` attaches a PyTorch
 decoder to a trained Ultralytics whole-cube segmentation model. It captures the
 multiscale features immediately before the existing YOLO segmentation head,
-adds explicit RGB/chromaticity/luminance/saturation features, and returns a
-seven-channel per-pixel map:
+adds explicit RGB/chromaticity/luminance/saturation/OkLab features, and returns
+a seven-channel per-pixel map:
 
 ```text
 white, yellow, red, orange, blue, green, none
 ```
 
 The base YOLO model is frozen by default. To train the head using the generated
-sticker polygons:
+sticker polygons, with class-balanced focal loss and per-color validation
+metrics. By default, `none` pixels have zero loss weight because the runtime
+segmentation mask is expected to remove most background pixels; pass a small
+`--none-weight` if weak background supervision is useful:
 
 ```bash
 .venv/bin/python scripts/train_yolo_color_map_head.py \
