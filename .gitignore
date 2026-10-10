@@ -1,4 +1,6 @@
 .venv/
+.linea/
+.models/
 __pycache__/
 *.py[cod]
 .pytest_cache/

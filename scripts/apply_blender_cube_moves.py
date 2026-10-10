@@ -11,8 +11,8 @@ Assumptions:
 - Cubies are 1 meter wide, so cubie origins sit on the -1/0/1 grid.
 - Cubie objects use quaternion rotation mode.
 - Cubie object pass_index values identify physical cubies.
-- Sticker material pass_index values identify sticker colors; material pass_index 0 is
-  treated as non-sticker cubie plastic and is not labeled.
+- Wireframe labels contain one class of visible cube-line segments, represented
+  as normalized endpoint pairs. Occluded portions are omitted.
 - Blender axes are X=right, Z=up, and Y=front/back. Change FRONT_AXIS if needed.
 """
 
@@ -167,7 +167,10 @@ BACKGROUND_BLEND_ASSET_FAMILY_WEIGHTS = {
 }
 STICKER_COLOR_MATERIAL_NAMES = ("White", "Yellow", "Red", "Orange", "Blue", "Green")
 WHOLE_CUBE_YOLO_CLASS_NAMES = ("cube",)
-STICKER_YOLO_CLASS_NAMES = STICKER_COLOR_MATERIAL_NAMES
+WIREFRAME_CLASS_NAMES = ("cube_line",)
+WIREFRAME_SURFACE_COORDINATES = (-1.5, -0.5, 0.5, 1.5)
+WIREFRAME_LINE_COLOR = (0, 255, 255)
+WIREFRAME_LINE_SHADOW_COLOR = (0, 0, 0)
 # Display-space RGB samples taken from the flat sticker centers in the six
 # predefined GAN sticker-set images on TheCubicle's product page. These are
 # visual references rather than manufacturer color specifications; the page
@@ -3669,7 +3672,13 @@ def randomize_scene(
     background_randomization["world_lighting"] = light_randomization["world"]
     moves = random_scramble_moves(scramble_length)
     scramble_objects = objects + core_objects
+    wireframe_scramble_transform = Matrix.Identity(4)
     for move in moves:
+        if move in "xyz":
+            whole_cube_turn = Quaternion(whole_cube_move_axis(move), -math.pi / 2.0)
+            wireframe_scramble_transform = (
+                whole_cube_turn.to_matrix().to_4x4() @ wireframe_scramble_transform
+            )
         apply_scramble_move(scramble_objects, move)
 
     duplicate_secondary_cube(objects, core_objects, background_randomization)
@@ -3695,6 +3704,7 @@ def randomize_scene(
         apply=False,
         force_on_table=desk_no_hands,
     )
+    cube_pose["wireframe_scramble_transform"] = matrix_rows(wireframe_scramble_transform)
     return (
         moves,
         layer_state,
@@ -3742,26 +3752,6 @@ def mesh_objects_in_roots(roots: list[bpy.types.Object]) -> list[bpy.types.Objec
     return objects
 
 
-def sticker_segmentation_class_id(material: bpy.types.Material | None) -> int:
-    """Map a cube sticker material to the stable sticker segmentation class id."""
-    if material is None:
-        return 0
-
-    material_name = material.name
-    name_prefix, separator, name_suffix = material_name.rpartition(".")
-    if separator and name_suffix.isdigit():
-        material_name = name_prefix
-    for class_id, color_name in enumerate(STICKER_COLOR_MATERIAL_NAMES, start=1):
-        if material_name == color_name:
-            return class_id
-
-    # The cube asset also documents sticker colors with material pass_index.
-    # Keep this fallback for renamed or suffixed materials while treating pass 0
-    # as cubie plastic/non-sticker.
-    pass_index = int(getattr(material, "pass_index", 0))
-    return pass_index if 1 <= pass_index <= len(STICKER_COLOR_MATERIAL_NAMES) else 0
-
-
 def camera_frame_bounds(
     camera: bpy.types.Object,
     scene: bpy.types.Scene,
@@ -3802,8 +3792,8 @@ def render_segmentation_masks(
     main_cube_roots: list[bpy.types.Object],
     width: int,
     height: int,
-) -> tuple[object, object]:
-    """Ray-cast whole-cube and sticker masks directly without image files."""
+) -> object:
+    """Ray-cast the whole-cube mask directly without creating an image file."""
     try:
         import numpy as np
     except ImportError:
@@ -3818,7 +3808,6 @@ def render_segmentation_masks(
         if obj.type == "MESH" and obj.name.startswith(SECONDARY_CUBE_OBJECT_PREFIX)
     }
     whole_mask = np.zeros((height, width), dtype=np.uint8)
-    sticker_mask = np.zeros((height, width), dtype=np.uint8)
     camera = get_camera()
     scene = bpy.context.scene
 
@@ -3845,9 +3834,8 @@ def render_segmentation_masks(
                 ray_origin = origin
                 hit = False
                 hit_object = None
-                polygon_index = -1
                 for _ in range(32):
-                    hit, location, _normal, polygon_index, hit_object, _matrix = scene.ray_cast(
+                    hit, location, _normal, _polygon_index, hit_object, _matrix = scene.ray_cast(
                         depsgraph,
                         ray_origin,
                         direction,
@@ -3866,14 +3854,6 @@ def render_segmentation_masks(
                 object_name = hit_object.name
                 if object_name in main_cube_names:
                     whole_mask[y, x] = 1
-                if object_name not in main_cube_names and object_name not in secondary_cube_names:
-                    continue
-                if polygon_index < 0 or polygon_index >= len(hit_object.data.polygons):
-                    continue
-                polygon = hit_object.data.polygons[polygon_index]
-                materials = hit_object.data.materials
-                material = materials[polygon.material_index] if materials else None
-                sticker_mask[y, x] = sticker_segmentation_class_id(material)
     finally:
         for obj, hide_render, hide_viewport, hide in original_visibility:
             obj.hide_render = hide_render
@@ -3881,7 +3861,7 @@ def render_segmentation_masks(
             obj.hide_set(hide)
         bpy.context.view_layer.update()
 
-    return whole_mask, sticker_mask
+    return whole_mask
 
 
 def write_yolo_segmentation_label(
@@ -4151,6 +4131,18 @@ def project_world_point(point: Vector, camera: bpy.types.Object, scene: bpy.type
     if x < 0.0 or x >= width or y < 0.0 or y >= height:
         return None
     return x, y
+
+
+def project_world_point_unclipped(
+    point: Vector,
+    camera: bpy.types.Object,
+    scene: bpy.types.Scene,
+) -> tuple[float, float] | None:
+    """Project a point without dropping it just because it is outside the frame."""
+    co = world_to_camera_view(scene, camera, point)
+    if co.z < 0.0:
+        return None
+    return co.x * scene.render.resolution_x, (1.0 - co.y) * scene.render.resolution_y
 
 
 def cube_keypoint_coordinate(letter: str) -> tuple[int, float, Vector | None]:
@@ -4467,6 +4459,299 @@ def object_occluding_point(
         origin = location + (direction * epsilon)
         traveled += epsilon
     return None
+
+
+def wireframe_local_line_specs() -> list[dict[str, object]]:
+    """Return the 4-by-4 line grid on each of the cube's six local faces."""
+    specs = []
+    for normal_axis in range(3):
+        tangent_axes = [axis for axis in range(3) if axis != normal_axis]
+        for normal_sign in (-1.0, 1.0):
+            for varying_axis, fixed_axis in (
+                (tangent_axes[0], tangent_axes[1]),
+                (tangent_axes[1], tangent_axes[0]),
+            ):
+                for fixed_value in WIREFRAME_SURFACE_COORDINATES:
+                    start = [0.0, 0.0, 0.0]
+                    end = [0.0, 0.0, 0.0]
+                    start[normal_axis] = normal_sign * 1.5
+                    end[normal_axis] = normal_sign * 1.5
+                    start[fixed_axis] = fixed_value
+                    end[fixed_axis] = fixed_value
+                    start[varying_axis] = -1.5
+                    end[varying_axis] = 1.5
+                    specs.append({
+                        "start": Vector(start),
+                        "end": Vector(end),
+                        "normal": axis_vector(normal_axis, normal_sign),
+                        "support_direction": axis_vector(fixed_axis),
+                    })
+    return specs
+
+
+def wireframe_ray_hit_is_visible(
+    point: Vector,
+    face_normal: Vector,
+    support_direction: Vector,
+    main_cube_names: set[str],
+    depsgraph: bpy.types.Depsgraph,
+) -> bool:
+    """Return whether a visible face point is unobstructed by the scene."""
+    camera = get_camera()
+    toward_camera = camera.matrix_world.translation - point
+    if toward_camera.length <= 1e-6 or face_normal.dot(toward_camera.normalized()) <= 1e-4:
+        return False
+
+    scene = bpy.context.scene
+    target_distance_tolerance = 0.08
+    support_direction = support_direction.normalized()
+    # The exact seam can be a small gap between beveled cubies. Probe both
+    # adjacent surface strips as well as the seam itself. A hand or prop that
+    # truly occludes the line also covers these immediate support probes.
+    probe_points = [
+        point,
+        point + support_direction * 0.018,
+        point - support_direction * 0.018,
+    ]
+    for probe_point in probe_points:
+        origin = camera.matrix_world.translation
+        direction = (probe_point - origin).normalized()
+        point_distance = (probe_point - origin).length
+        ray_origin = origin
+        traveled = 0.0
+        while traveled < point_distance + target_distance_tolerance:
+            hit, location, _normal, _polygon_index, hit_object, _matrix = scene.ray_cast(
+                depsgraph,
+                ray_origin,
+                direction,
+                distance=(point_distance - traveled) + target_distance_tolerance,
+            )
+            if not hit or hit_object is None:
+                # Surface seams and the outer silhouette can be tiny gaps in
+                # the beveled mesh. If no scene object blocks the ray before
+                # this front-facing line, the line is still visible in the
+                # rendered image.
+                return True
+
+            hit_distance = (location - origin).length
+            if (
+                not getattr(hit_object, "visible_camera", True)
+                or getattr(hit_object, "hide_render", False)
+                or hit_object.name.startswith(SYNTHETIC_WINDOW_BLOCKER_PREFIX)
+            ):
+                ray_origin = location + direction * 1e-4
+                traveled = hit_distance + 1e-4
+                continue
+
+            if hit_object.name in main_cube_names and hit_distance >= point_distance - target_distance_tolerance:
+                return True
+            break
+    return False
+
+
+def interpolate_wireframe_boundary(
+    start_t: float,
+    end_t: float,
+    start_visible: bool,
+    visibility_at,
+) -> float:
+    """Refine a sampled visible/occluded transition along one line."""
+    low = start_t
+    high = end_t
+    for _ in range(9):
+        middle = (low + high) * 0.5
+        if visibility_at(middle) == start_visible:
+            low = middle
+        else:
+            high = middle
+    return (low + high) * 0.5
+
+
+def clip_wireframe_segment(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    width: int,
+    height: int,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Clip a projected segment to the image rectangle using Liang-Barsky."""
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    lower = 0.0
+    upper = 1.0
+    for coefficient, numerator in (
+        (-dx, start[0]),
+        (dx, (width - 1e-3) - start[0]),
+        (-dy, start[1]),
+        (dy, (height - 1e-3) - start[1]),
+    ):
+        if abs(coefficient) <= 1e-12:
+            if numerator > 0.0:
+                return None
+            continue
+        value = numerator / coefficient
+        if coefficient < 0.0:
+            lower = max(lower, value)
+        else:
+            upper = min(upper, value)
+        if lower > upper:
+            return None
+    return (
+        (start[0] + lower * dx, start[1] + lower * dy),
+        (start[0] + upper * dx, start[1] + upper * dy),
+    )
+
+
+def visible_wireframe_segments(
+    cube_transform: Matrix,
+    main_cube_roots: list[bpy.types.Object],
+    width: int,
+    height: int,
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Project visible portions of the cube's surface grid into image space."""
+    camera = get_camera()
+    scene = bpy.context.scene
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    main_cube_names = {
+        obj.name for obj in mesh_objects_in_roots(main_cube_roots)
+    }
+    segments = []
+
+    for spec in wireframe_local_line_specs():
+        local_start = spec["start"]
+        local_end = spec["end"]
+        local_normal = spec["normal"]
+        local_support_direction = spec["support_direction"]
+        if not all(
+            isinstance(value, Vector)
+            for value in (local_start, local_end, local_normal, local_support_direction)
+        ):
+            continue
+        start = cube_transform @ local_start
+        end = cube_transform @ local_end
+        normal = (cube_transform.to_3x3() @ local_normal).normalized()
+        support_direction = (cube_transform.to_3x3() @ local_support_direction).normalized()
+        projected_start = project_world_point_unclipped(start, camera, scene)
+        projected_end = project_world_point_unclipped(end, camera, scene)
+        if projected_start is None or projected_end is None:
+            continue
+
+        pixel_length = math.dist(projected_start, projected_end)
+        sample_count = max(32, min(192, int(math.ceil(pixel_length / 2.0)) + 1))
+        visibility_cache: dict[float, bool] = {}
+
+        def visibility_at(t: float) -> bool:
+            cached = visibility_cache.get(t)
+            if cached is not None:
+                return cached
+            world_point = start.lerp(end, t)
+            visible = wireframe_ray_hit_is_visible(
+                world_point,
+                normal,
+                support_direction,
+                main_cube_names,
+                depsgraph,
+            )
+            visibility_cache[t] = visible
+            return visible
+
+        samples = [index / (sample_count - 1) for index in range(sample_count)]
+        visible = [visibility_at(t) for t in samples]
+        index = 0
+        while index < sample_count:
+            if not visible[index]:
+                index += 1
+                continue
+            run_start = index
+            while index + 1 < sample_count and visible[index + 1]:
+                index += 1
+            run_end = index
+            start_t = (
+                0.0
+                if run_start == 0
+                else interpolate_wireframe_boundary(
+                    samples[run_start - 1],
+                    samples[run_start],
+                    False,
+                    visibility_at,
+                )
+            )
+            end_t = (
+                1.0
+                if run_end == sample_count - 1
+                else interpolate_wireframe_boundary(
+                    samples[run_end],
+                    samples[run_end + 1],
+                    True,
+                    visibility_at,
+                )
+            )
+            if end_t - start_t > 1e-4:
+                world_start = start.lerp(end, start_t)
+                world_end = start.lerp(end, end_t)
+                image_start = project_world_point_unclipped(world_start, camera, scene)
+                image_end = project_world_point_unclipped(world_end, camera, scene)
+                if image_start is not None and image_end is not None:
+                    clipped = clip_wireframe_segment(image_start, image_end, width, height)
+                    if clipped is not None and math.dist(*clipped) >= 1.0:
+                        segments.append(clipped)
+            index += 1
+
+    unique_segments = []
+    seen = set()
+    for start, end in segments:
+        first = (round(start[0], 3), round(start[1], 3))
+        second = (round(end[0], 3), round(end[1], 3))
+        key = tuple(sorted((first, second)))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_segments.append((start, end))
+    return unique_segments
+
+
+def write_wireframe_label(
+    path: Path,
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+    width: int,
+    height: int,
+) -> int:
+    """Write one class plus two normalized endpoints for every visible segment."""
+    lines = []
+    for start, end in segments:
+        normalized_start = normalize_point(start[0], start[1], width, height)
+        normalized_end = normalize_point(end[0], end[1], width, height)
+        lines.append(
+            f"0 {normalized_start[0]:.6f} {normalized_start[1]:.6f} "
+            f"{normalized_end[0]:.6f} {normalized_end[1]:.6f}"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return len(lines)
+
+
+def write_wireframe_overlay(
+    path: Path,
+    image_path: Path,
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+) -> None:
+    """Draw the exported visible wireframe over the final rendered image."""
+    try:
+        import cv2
+    except ImportError:
+        raise RuntimeError("OpenCV is required to write wireframe verification renders.") from None
+
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError(f"Could not read rendered image for wireframe overlay: {image_path}")
+    output = image.copy()
+    for start, end in segments:
+        start_point = tuple(round(value) for value in start)
+        end_point = tuple(round(value) for value in end)
+        cv2.line(output, start_point, end_point, WIREFRAME_LINE_SHADOW_COLOR, 5, cv2.LINE_AA)
+        cv2.line(output, start_point, end_point, WIREFRAME_LINE_COLOR, 2, cv2.LINE_AA)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), output):
+        raise RuntimeError(f"Could not write wireframe verification render: {path}")
 
 
 def yolo_pose_line(
@@ -4894,12 +5179,15 @@ def generate_dataset(
 ) -> None:
     images_dir = output_dir / "images"
     masks_dir = output_dir / "masks" if render_masks else None
+    wireframe_renders_dir = output_dir / "wireframes" if render_segmentations else None
     labels_dir = output_dir / "labels"
     whole_cube_labels_dir = labels_dir / "whole_cube" if render_segmentations else None
-    sticker_labels_dir = labels_dir / "stickers" if render_segmentations else None
+    wireframe_labels_dir = labels_dir / "wireframe" if render_segmentations else None
     images_dir.mkdir(parents=True, exist_ok=True)
     if masks_dir is not None:
         masks_dir.mkdir(parents=True, exist_ok=True)
+    if wireframe_renders_dir is not None:
+        wireframe_renders_dir.mkdir(parents=True, exist_ok=True)
     if whole_cube_labels_dir is not None:
         whole_cube_labels_dir.mkdir(parents=True, exist_ok=True)
         (whole_cube_labels_dir / "classes.json").write_text(
@@ -4912,13 +5200,13 @@ def generate_dataset(
             ),
             encoding="utf-8",
         )
-    if sticker_labels_dir is not None:
-        sticker_labels_dir.mkdir(parents=True, exist_ok=True)
-        (sticker_labels_dir / "classes.json").write_text(
+    if wireframe_labels_dir is not None:
+        wireframe_labels_dir.mkdir(parents=True, exist_ok=True)
+        (wireframe_labels_dir / "classes.json").write_text(
             json.dumps(
                 {
                     str(class_id): name
-                    for class_id, name in enumerate(STICKER_YOLO_CLASS_NAMES)
+                    for class_id, name in enumerate(WIREFRAME_CLASS_NAMES)
                 },
                 indent=2,
             ),
@@ -4961,9 +5249,14 @@ def generate_dataset(
             if whole_cube_labels_dir is not None
             else None
         )
-        sticker_label_path = (
-            sticker_labels_dir / f"{stem}.txt"
-            if sticker_labels_dir is not None
+        wireframe_label_path = (
+            wireframe_labels_dir / f"{stem}.txt"
+            if wireframe_labels_dir is not None
+            else None
+        )
+        wireframe_render_path = (
+            wireframe_renders_dir / f"{stem}.png"
+            if wireframe_renders_dir is not None
             else None
         )
         label_path = labels_dir / f"{stem}.txt"
@@ -5057,9 +5350,9 @@ def generate_dataset(
             )
             segmentations = {}
             segmentation_roots = list(objects) + core_objects
-            whole_cube_mask = sticker_mask = None
-            if whole_cube_label_path is not None or sticker_label_path is not None:
-                whole_cube_mask, sticker_mask = render_segmentation_masks(
+            whole_cube_mask = None
+            if whole_cube_label_path is not None:
+                whole_cube_mask = render_segmentation_masks(
                     segmentation_roots,
                     width,
                     height,
@@ -5079,20 +5372,39 @@ def generate_dataset(
                     "format": "YOLO polygon segmentation",
                     "segments": whole_cube_segments,
                 }
-            if sticker_label_path is not None:
-                sticker_segments = write_yolo_segmentation_label(
-                    sticker_mask,
-                    sticker_label_path,
-                    {source_class_id: source_class_id - 1 for source_class_id in range(1, 7)},
+            wireframe_segments = []
+            if wireframe_label_path is not None:
+                cube_transform = (
+                    matrix_from_rows(cube_pose["transform"])
+                    @ matrix_from_rows(cube_pose["wireframe_scramble_transform"])
                 )
-                segmentations["stickers"] = {
-                    "path": str(sticker_label_path),
+                wireframe_segments = visible_wireframe_segments(
+                    cube_transform,
+                    segmentation_roots,
+                    width,
+                    height,
+                )
+                wireframe_line_count = write_wireframe_label(
+                    wireframe_label_path,
+                    wireframe_segments,
+                    width,
+                    height,
+                )
+                if wireframe_render_path is not None:
+                    write_wireframe_overlay(
+                        wireframe_render_path,
+                        image_path,
+                        wireframe_segments,
+                    )
+                segmentations["wireframe"] = {
+                    "path": str(wireframe_label_path),
+                    "render_path": str(wireframe_render_path) if wireframe_render_path else None,
                     "classes": {
                         str(class_id): name
-                        for class_id, name in enumerate(STICKER_YOLO_CLASS_NAMES)
+                        for class_id, name in enumerate(WIREFRAME_CLASS_NAMES)
                     },
-                    "format": "YOLO polygon segmentation",
-                    "segments": sticker_segments,
+                    "format": "class_id plus normalized endpoint pairs",
+                    "segments": wireframe_line_count,
                 }
             yolo_lines, pose_objects, pose_geometry = render_pose_keypoints(mask_path)
             write_yolo_pose(label_path, yolo_lines)
@@ -5126,11 +5438,13 @@ def generate_dataset(
         })
         mask_message = f", {mask_path}" if mask_path is not None else ""
         whole_cube_label_message = f", {whole_cube_label_path}" if whole_cube_label_path else ""
-        sticker_label_message = f", {sticker_label_path}" if sticker_label_path else ""
+        wireframe_label_message = f", {wireframe_label_path}" if wireframe_label_path else ""
+        wireframe_render_message = f", {wireframe_render_path}" if wireframe_render_path else ""
         blend_asset_count = background_randomization.get("blend_asset_count", 0)
         blend_asset_sources = background_randomization.get("blend_asset_sources", [])
         print(
-            f"Wrote {image_path}{mask_message}{whole_cube_label_message}{sticker_label_message}, "
+            f"Wrote {image_path}{mask_message}{whole_cube_label_message}"
+            f"{wireframe_label_message}{wireframe_render_message}, "
             f"and {label_path} "
             f"with {len(yolo_lines)} pose keypoint objects, "
             f"{blend_asset_count} blend background assets {blend_asset_sources}, "
@@ -5198,7 +5512,7 @@ def cli_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-segmentations",
         action="store_true",
-        help="Skip writing whole-cube and sticker class-index segmentation maps.",
+        help="Skip writing whole-cube segmentation and cube-wireframe labels.",
     )
     parser.add_argument(
         "--min-visible-keypoints-with-hands",

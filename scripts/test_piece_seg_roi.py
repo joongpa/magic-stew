@@ -29,10 +29,17 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
-from live_recognition.visualization import _reliable_color_mask  # noqa: E402
-from live_recognition.visualization import (save_hsv_samples_interactive_plot,
+from live_recognition.roi_tracking import (  # noqa: E402
+    RoiTracker,
+    roi_for_frame as shared_roi_for_frame,
+    square_roi_from_bbox,
+)
+from live_recognition.visualization import (  # noqa: E402
+    save_hsv_samples_interactive_plot,
                                             save_rgb_samples_interactive_plot,
-                                            save_rgb_samples_plot)
+                                            save_rgb_samples_plot,
+)
+from live_recognition.visualization import _reliable_color_mask  # noqa: E402
 
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 DEFAULT_STICKER_MODEL = (
@@ -202,77 +209,6 @@ def register_training_checkpoint_classes() -> None:
     ):
         if hasattr(training, name):
             setattr(__main__, name, getattr(training, name))
-
-
-@dataclass
-class RoiTracker:
-    roi_xyxy: tuple[int, int, int, int] | None = None
-    cube_candidate: object | None = None
-    base_side: int | None = None
-
-    def reset(self) -> None:
-        self.roi_xyxy = None
-        self.cube_candidate = None
-        self.base_side = None
-
-    def initialize(
-        self,
-        candidate,
-        frame_width: int,
-        frame_height: int,
-        padding: float,
-    ) -> tuple[int, int, int, int]:
-        self.cube_candidate = candidate
-        self.roi_xyxy = square_roi_from_bbox(
-            candidate.bbox_xyxy,
-            frame_width,
-            frame_height,
-            padding,
-        )
-        x1, y1, x2, y2 = self.roi_xyxy
-        self.base_side = min(x2 - x1, y2 - y1)
-        return self.roi_xyxy
-
-    def observe_tracking_bounds(
-        self,
-        tracking_bounds_xyxy: tuple[int, int, int, int] | None,
-        frame_width: int,
-        frame_height: int,
-        tracking_gain: float = 1.0,
-        tracking_padding: float = 0.0,
-        reset_on_missing: bool = True,
-    ) -> None:
-        if self.roi_xyxy is None:
-            return
-        if tracking_bounds_xyxy is None:
-            if reset_on_missing:
-                self.reset()
-            return
-
-        x1, y1, x2, y2 = self.roi_xyxy
-        side = min(x2 - x1, y2 - y1)
-        base_side = self.base_side if self.base_side is not None else side
-        bx1, by1, bx2, by2 = tracking_bounds_xyxy
-        tracking_point_x = (bx1 + bx2) / 2.0
-        tracking_point_y = (by1 + by2) / 2.0
-        observed_side = max(bx2 - bx1, by2 - by1)
-        target_side = max(base_side, observed_side) * (
-            1.0 + max(0.0, float(tracking_padding)) * 2.0
-        )
-        roi_center_x = side / 2.0
-        roi_center_y = side / 2.0
-        gain = max(0.0, float(tracking_gain))
-        dx = (tracking_point_x - roi_center_x) * gain
-        dy = (tracking_point_y - roi_center_y) * gain
-        center_x = (x1 + x2) / 2.0 + dx
-        center_y = (y1 + y2) / 2.0 + dy
-        self.roi_xyxy = square_roi_from_center(
-            center_x,
-            center_y,
-            target_side,
-            frame_width,
-            frame_height,
-        )
 
 
 @dataclass
@@ -1182,50 +1118,7 @@ def clipped_square_roi(
     frame_height: int,
     padding: float,
 ) -> tuple[int, int, int, int]:
-    x1, y1, x2, y2 = bbox_xyxy
-    cx = (x1 + x2) / 2.0
-    cy = (y1 + y2) / 2.0
-    side = max(x2 - x1, y2 - y1) * (1.0 + padding * 2.0)
-
-    rx1 = int(round(cx - side / 2.0))
-    ry1 = int(round(cy - side / 2.0))
-    rx2 = int(round(cx + side / 2.0))
-    ry2 = int(round(cy + side / 2.0))
-
-    rx1 = max(0, min(frame_width - 1, rx1))
-    ry1 = max(0, min(frame_height - 1, ry1))
-    rx2 = max(rx1 + 1, min(frame_width, rx2))
-    ry2 = max(ry1 + 1, min(frame_height, ry2))
-    return rx1, ry1, rx2, ry2
-
-
-def square_roi_from_bbox(
-    bbox_xyxy: tuple[int, int, int, int],
-    frame_width: int,
-    frame_height: int,
-    padding: float,
-) -> tuple[int, int, int, int]:
-    x1, y1, x2, y2 = bbox_xyxy
-    cx = (x1 + x2) / 2.0
-    cy = (y1 + y2) / 2.0
-    side = max(x2 - x1, y2 - y1) * (1.0 + padding * 2.0)
-    return square_roi_from_center(cx, cy, side, frame_width, frame_height)
-
-
-def square_roi_from_center(
-    center_x: float,
-    center_y: float,
-    side: float,
-    frame_width: int,
-    frame_height: int,
-) -> tuple[int, int, int, int]:
-    side_px = int(round(side))
-    side_px = max(1, min(side_px, frame_width, frame_height))
-    x1 = int(round(center_x - side_px / 2.0))
-    y1 = int(round(center_y - side_px / 2.0))
-    x1 = max(0, min(frame_width - side_px, x1))
-    y1 = max(0, min(frame_height - side_px, y1))
-    return x1, y1, x1 + side_px, y1 + side_px
+    return square_roi_from_bbox(bbox_xyxy, frame_width, frame_height, padding)
 
 
 def roi_side_px(roi_xyxy: tuple[int, int, int, int]) -> float:
@@ -4409,22 +4302,8 @@ def roi_for_frame(
     args,
     roi_tracker: RoiTracker | None = None,
 ) -> tuple[tuple[int, int, int, int] | None, object | None, str]:
-    height, width = frame.shape[:2]
-    if roi_tracker is not None and roi_tracker.roi_xyxy is not None:
-        return roi_tracker.roi_xyxy, roi_tracker.cube_candidate, "tracker"
-
-    candidate = bbox_detector.detect(frame)
-    if candidate is None:
-        if roi_tracker is not None:
-            roi_tracker.reset()
-        return None, None, "none"
-    if roi_tracker is not None:
-        return (
-            roi_tracker.initialize(candidate, width, height, args.roi_padding),
-            candidate,
-            "detector",
-        )
-    return clipped_square_roi(candidate.bbox_xyxy, width, height, args.roi_padding), candidate, "detector"
+    tracker = roi_tracker or RoiTracker()
+    return shared_roi_for_frame(frame, bbox_detector, tracker, args.roi_padding)
 
 
 def resize_to_square_size(image: np.ndarray, size: int) -> np.ndarray:

@@ -29,6 +29,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
+from live_recognition.roi_tracking import (  # noqa: E402
+    RoiTracker,
+    roi_for_frame as shared_roi_for_frame,
+)
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".avi", ".mkv", ".webm"}
@@ -71,95 +75,6 @@ def parse_source(source: str) -> int | str:
 
 def is_image_source(source: int | str) -> bool:
     return isinstance(source, str) and Path(source).suffix.lower() in IMAGE_EXTENSIONS
-
-
-def square_roi_from_center(
-    center_x: float,
-    center_y: float,
-    side: float,
-    frame_width: int,
-    frame_height: int,
-) -> tuple[int, int, int, int]:
-    side_px = max(1, min(int(round(side)), frame_width, frame_height))
-    x1 = max(0, min(frame_width - side_px, int(round(center_x - side_px / 2.0))))
-    y1 = max(0, min(frame_height - side_px, int(round(center_y - side_px / 2.0))))
-    return x1, y1, x1 + side_px, y1 + side_px
-
-
-def square_roi_from_bbox(
-    bbox_xyxy: tuple[int, int, int, int],
-    frame_width: int,
-    frame_height: int,
-    padding: float,
-) -> tuple[int, int, int, int]:
-    x1, y1, x2, y2 = bbox_xyxy
-    side = max(x2 - x1, y2 - y1) * (1.0 + padding * 2.0)
-    return square_roi_from_center(
-        (x1 + x2) / 2.0,
-        (y1 + y2) / 2.0,
-        side,
-        frame_width,
-        frame_height,
-    )
-
-
-class RoiTracker:
-    """Track the sticker-derived ROI between cube-detector fallbacks."""
-
-    def __init__(self) -> None:
-        self.roi_xyxy: tuple[int, int, int, int] | None = None
-        self.base_side: int | None = None
-
-    def reset(self) -> None:
-        self.roi_xyxy = None
-        self.base_side = None
-
-    def initialize(
-        self,
-        bbox_xyxy: tuple[int, int, int, int],
-        frame_width: int,
-        frame_height: int,
-        padding: float,
-    ) -> tuple[int, int, int, int]:
-        self.roi_xyxy = square_roi_from_bbox(
-            bbox_xyxy,
-            frame_width,
-            frame_height,
-            padding,
-        )
-        x1, y1, x2, y2 = self.roi_xyxy
-        self.base_side = min(x2 - x1, y2 - y1)
-        return self.roi_xyxy
-
-    def observe_tracking_bounds(
-        self,
-        bounds_xyxy: tuple[int, int, int, int] | None,
-        frame_width: int,
-        frame_height: int,
-        tracking_gain: float = 1.4,
-        tracking_padding: float = 0.18,
-    ) -> None:
-        if self.roi_xyxy is None:
-            return
-        if bounds_xyxy is None:
-            self.reset()
-            return
-
-        x1, y1, x2, y2 = self.roi_xyxy
-        side = min(x2 - x1, y2 - y1)
-        base_side = self.base_side if self.base_side is not None else side
-        bx1, by1, bx2, by2 = bounds_xyxy
-        observed_side = max(bx2 - bx1, by2 - by1)
-        target_side = max(base_side, observed_side) * (1.0 + tracking_padding * 2.0)
-        dx = ((bx1 + bx2) / 2.0 - side / 2.0) * max(0.0, tracking_gain)
-        dy = ((by1 + by2) / 2.0 - side / 2.0) * max(0.0, tracking_gain)
-        self.roi_xyxy = square_roi_from_center(
-            (x1 + x2) / 2.0 + dx,
-            (y1 + y2) / 2.0 + dy,
-            target_side,
-            frame_width,
-            frame_height,
-        )
 
 
 def class_name(names: object, class_id: int) -> str:
@@ -672,31 +587,31 @@ def predict_and_render(
     args: argparse.Namespace,
 ) -> tuple[np.ndarray, YOLOCubeDetector | None]:
     height, width = image.shape[:2]
-    roi_source = "tracker"
-    if roi_tracker.roi_xyxy is None:
-        if bbox_detector is None:
-            bbox_detector = YOLOCubeDetector(
-                model_name=str(args.bbox_model),
-                confidence_threshold=args.bbox_conf,
-                image_size=args.bbox_imgsz,
-            )
-        candidate = bbox_detector.detect(image)
-        if candidate is None:
-            if color_model is not None:
-                if distribution_picker is not None:
-                    distribution_picker.clear(image.shape[:2])
-                right_panel = [
-                    empty_color_panel(image),
-                    empty_color_panel(image),
-                    distribution_picker.render(image.shape) if distribution_picker else empty_color_panel(image),
-                ]
-            else:
-                right_panel = None
-            return split_screen(image.copy(), right_panel), bbox_detector
-        roi_tracker.initialize(candidate.bbox_xyxy, width, height, args.roi_padding)
-        roi_source = "detector"
+    if bbox_detector is None:
+        bbox_detector = YOLOCubeDetector(
+            model_name=str(args.bbox_model),
+            confidence_threshold=args.bbox_conf,
+            image_size=args.bbox_imgsz,
+        )
+    roi_xyxy, _candidate, roi_source = shared_roi_for_frame(
+        image,
+        bbox_detector,
+        roi_tracker,
+        args.roi_padding,
+    )
+    if roi_xyxy is None:
+        if color_model is not None:
+            if distribution_picker is not None:
+                distribution_picker.clear(image.shape[:2])
+            right_panel = [
+                empty_color_panel(image),
+                empty_color_panel(image),
+                distribution_picker.render(image.shape) if distribution_picker else empty_color_panel(image),
+            ]
+        else:
+            right_panel = None
+        return split_screen(image.copy(), right_panel), bbox_detector
 
-    roi_xyxy = roi_tracker.roi_xyxy
     assert roi_xyxy is not None
     x1, y1, x2, y2 = roi_xyxy
     roi = image[y1:y2, x1:x2]

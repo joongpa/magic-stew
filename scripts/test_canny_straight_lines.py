@@ -9,11 +9,20 @@ segment and no large unsupported gap.
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
+from live_recognition.roi_tracking import RoiTracker, roi_for_frame  # noqa: E402
 
 
 WINDOW_NAME = "canny straight-line evidence"
@@ -226,6 +235,16 @@ def draw_overlay(frame: np.ndarray, edges: np.ndarray, lines: list[ScoredLine], 
     return combined
 
 
+def accepted_line_bounds(lines: list[ScoredLine]) -> tuple[int, int, int, int] | None:
+    accepted = [line.endpoints for line in lines if line.accepted]
+    if not accepted:
+        return None
+    points = np.asarray(accepted, dtype=np.int32).reshape(-1, 2)
+    x_min, y_min = points.min(axis=0)
+    x_max, y_max = points.max(axis=0)
+    return int(x_min), int(y_min), int(x_max), int(y_max)
+
+
 def resize_for_display(frame: np.ndarray, max_width: int) -> np.ndarray:
     if max_width <= 0 or frame.shape[1] <= max_width:
         return frame
@@ -250,6 +269,12 @@ def parse_args() -> argparse.Namespace:
         default="0",
         help="Camera index, image path, or video path. Defaults to webcam 0.",
     )
+    parser.add_argument("--bbox-model", type=Path, default=ROOT / "runs/500ExamplesWeights.pt")
+    parser.add_argument("--bbox-conf", type=float, default=0.25)
+    parser.add_argument("--bbox-imgsz", type=int, default=640)
+    parser.add_argument("--roi-padding", type=float, default=0.08)
+    parser.add_argument("--roi-tracking-gain", type=float, default=1.4)
+    parser.add_argument("--roi-tracking-padding", type=float, default=0.18)
     parser.add_argument("--blur", type=int, default=5, help="Gaussian blur kernel size.")
     parser.add_argument("--canny-low", type=int, default=60, help="Lower Canny threshold.")
     parser.add_argument("--canny-high", type=int, default=160, help="Upper Canny threshold.")
@@ -286,6 +311,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if not args.bbox_model.is_file():
+        raise RuntimeError(f"Could not find bbox model: {args.bbox_model}")
+    bbox_detector = YOLOCubeDetector(
+        model_name=str(args.bbox_model),
+        confidence_threshold=args.bbox_conf,
+        image_size=args.bbox_imgsz,
+    )
+    roi_tracker = RoiTracker()
     defaults = LineFilterSettings(
         blur_kernel=odd_kernel(args.blur),
         canny_low=max(0, args.canny_low),
@@ -329,8 +362,47 @@ def main() -> int:
             last_frame = frame.copy()
 
         settings = read_trackbar_settings(defaults)
-        edges, lines = detect_scored_lines(frame, settings)
-        overlay = draw_overlay(frame, edges, lines, args.show_rejected)
+        roi_xyxy, _candidate, roi_source = roi_for_frame(
+            frame,
+            bbox_detector,
+            roi_tracker,
+            args.roi_padding,
+        )
+        if roi_xyxy is None:
+            overlay = frame.copy()
+            cv2.putText(
+                overlay,
+                "no cube bbox",
+                (12, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        else:
+            x1, y1, x2, y2 = roi_xyxy
+            roi = frame[y1:y2, x1:x2]
+            edges, lines = detect_scored_lines(roi, settings)
+            roi_overlay = draw_overlay(roi, edges, lines, args.show_rejected)
+            overlay = frame.copy()
+            overlay[y1:y2, x1:x2] = roi_overlay
+            roi_tracker.observe_tracking_bounds(
+                accepted_line_bounds(lines),
+                frame.shape[1],
+                frame.shape[0],
+                tracking_gain=args.roi_tracking_gain,
+                tracking_padding=args.roi_tracking_padding,
+            )
+            active_roi = roi_tracker.roi_xyxy or roi_xyxy
+            ax1, ay1, ax2, ay2 = active_roi
+            cv2.rectangle(
+                overlay,
+                (ax1, ay1),
+                (ax2 - 1, ay2 - 1),
+                (0, 0, 255) if roi_source == "detector" else (40, 220, 40),
+                2,
+            )
         last_overlay = overlay
         display = resize_for_display(overlay, args.max_display_width)
         cv2.imshow(WINDOW_NAME, display)
