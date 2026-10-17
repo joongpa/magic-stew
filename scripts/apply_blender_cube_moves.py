@@ -11,22 +11,26 @@ Assumptions:
 - Cubies are 1 meter wide, so cubie origins sit on the -1/0/1 grid.
 - Cubie objects use quaternion rotation mode.
 - Cubie object pass_index values identify physical cubies.
-- Wireframe labels contain one class of visible cube-line segments, represented
-  as normalized endpoint pairs. Occluded portions are omitted.
+- Segmentation labels contain two YOLO polygon classes: one whole-cube instance
+  and one instance for every visible sticker.
 - Blender axes are X=right, Z=up, and Y=front/back. Change FRONT_AXIS if needed.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
 import random
+import shutil
 import site
+import subprocess
 import sys
 import tempfile
 import time
+from itertools import permutations, product
 from pathlib import Path
 
 import bpy
@@ -166,11 +170,22 @@ BACKGROUND_BLEND_ASSET_FAMILY_WEIGHTS = {
     "Asset_NotebookPhone": 1.0,
 }
 STICKER_COLOR_MATERIAL_NAMES = ("White", "Yellow", "Red", "Orange", "Blue", "Green")
-WHOLE_CUBE_YOLO_CLASS_NAMES = ("cube",)
-WIREFRAME_CLASS_NAMES = ("cube_line",)
-WIREFRAME_SURFACE_COORDINATES = (-1.5, -0.5, 0.5, 1.5)
+STICKER_OBJECT_NAME_PREFIX = "StickerlessMaterialRadialPart."
+SEGMENTATION_CLASS_NAMES = ("cube", "sticker")
+MIN_VISIBLE_STICKER_AREA_PX_AT_128 = 8.0
+POSE_LABEL_FORMAT = "cube_pose_v7"
+POSE_LABEL_DIRECTORY = "pose"
+# Annotation widths are specified at the former 256x256 reference resolution
+# and scaled with the output image so overlays remain visually proportional.
+ANNOTATION_REFERENCE_SIZE = 256.0
+WIREFRAME_LINE_BASE_WIDTH = 2
+WIREFRAME_LINE_SHADOW_BASE_WIDTH = 5
 WIREFRAME_LINE_COLOR = (0, 255, 255)
 WIREFRAME_LINE_SHADOW_COLOR = (0, 0, 0)
+POSE_SEGMENT_FILL_BASE_WIDTH = 9
+POSE_SEGMENT_OUTLINE_BASE_WIDTH = 2
+POSE_POINT_BASE_RADIUS = 5
+POSE_POINT_OUTLINE_BASE_RADIUS = 7
 # Display-space RGB samples taken from the flat sticker centers in the six
 # predefined GAN sticker-set images on TheCubicle's product page. These are
 # visual references rather than manufacturer color specifications; the page
@@ -230,14 +245,19 @@ STICKER_ROUGHNESS_RANGE = (0.18, 0.38)
 STICKER_SPECULAR_RANGE = (0.45, 0.75)
 STICKER_COAT_WEIGHT_RANGE = (0.08, 0.24)
 STICKER_COAT_ROUGHNESS_RANGE = (0.12, 0.32)
+STICKER_IMPERFECTIONS_ENABLED = True
+STICKER_IMPERFECTION_FINE_SCALE_RANGE = (120.0, 240.0)
+STICKER_IMPERFECTION_SCRATCH_SCALE_RANGE = (28.0, 70.0)
+STICKER_IMPERFECTION_BUMP_STRENGTH_RANGE = (0.012, 0.035)
+STICKER_IMPERFECTION_BUMP_DISTANCE_RANGE = (0.008, 0.022)
 CORE_FILL_OBJECT_NAMES = ("StickerlessBlackCoreFill", "StickerlessBlackCoreSphereFill")
 LAYER_RENDER_STATE_WEIGHTS = (
-    ("none", 0.40),
-    ("mid_turn", 0.40),
+    ("none", 0.30),
+    ("mid_turn", 0.50),
     ("corner_cut", 0.20),
 )
-CUBE_MISALIGNMENT_ENABLED = False
-MID_TURN_DEGREES_RANGE = (5.0, 45.0)
+CUBE_MISALIGNMENT_ENABLED = True
+MID_TURN_DEGREES_RANGE = (-45.0, 45.0)
 CORNER_CUT_SMALL_DEGREES_RANGE = (0.0, 10.0)
 CORNER_CUT_ADJACENT_DEGREES_RANGE = (5.0, 45.0)
 CUBE_FLOAT_PROBABILITY = 0.55
@@ -248,15 +268,27 @@ CUBE_FLOAT_CLEARANCE_RANGE = (0.12, 0.55)
 CUBE_FLOAT_TILT_DEGREES = (-15.0, 15.0)
 CUBE_POSE_XY_JITTER_RANGE = (-0.28, 0.28)
 CUBE_POSE_ROTATION_DEGREES = (-15.0, 15.0)
-DEFAULT_CUBE_ROTATIONAL_BLUR_PROBABILITY = 0.0
+DEFAULT_CUBE_ROTATIONAL_BLUR_PROBABILITY = 1.0
 DEFAULT_MAX_CUBE_ROTATIONAL_BLUR_DEGREES = 8.0
 DEFAULT_CUBE_ROTATIONAL_BLUR_SAMPLES = 7
+# The larger range is reserved for hands and cubies participating in a
+# partial layer turn. The global range is intentionally specified in degrees
+# so the whole-image blur stays in the desired 1-4 degree band.
+GLOBAL_ROTATIONAL_BLUR_DEGREES_RANGE = (3.0, 4.0)
+LOCAL_ROTATIONAL_BLUR_FRACTION_RANGE = (1.00, 1.50)
+MAX_LOCAL_ROTATIONAL_BLUR_DEGREES = 40.0
 DEFAULT_DEGRADE_PROBABILITY = 0.85
-DEGRADE_GAUSSIAN_BLUR_PROBABILITY = 0.45
-DEGRADE_MOTION_BLUR_PROBABILITY = 0.35
-DEGRADE_NOISE_PROBABILITY = 0.7
-DEGRADE_COMPRESSION_PROBABILITY = 0.8
-DEGRADE_RESCALE_PROBABILITY = 0.35
+DEGRADE_GAUSSIAN_BLUR_PROBABILITY = 0.35
+DEGRADE_MOTION_BLUR_PROBABILITY = 0.70
+DEGRADE_NOISE_PROBABILITY = 0.45
+DEGRADE_VIDEO_COMPRESSION_PROBABILITY = 0.60
+DEGRADE_RESCALE_PROBABILITY = 0.25
+# CRF 40 was producing occasional overly harsh block/compression artifacts;
+# keep the lower bound unchanged while softening the worst case slightly.
+VIDEO_COMPRESSION_CRF_RANGE = (28, 36)
+VIDEO_COMPRESSION_CONTEXT_FRAMES = 5
+VIDEO_COMPRESSION_FRAME_RATE = 30
+VIDEO_COMPRESSION_MOTION_JITTER_PX_RANGE = (0.35, 1.25)
 HAND_NAMES = ("left-hand", "right-hand")
 # Normal samples always show hands.  The separate desk_no_hands probability
 # controls the approximately 10% no-hand population.
@@ -310,7 +342,58 @@ HAND_ASSET_IMPORTED = False
 SOLVED_LOCATION_PROP = "synthetic_solved_location"
 SOLVED_ROTATION_PROP = "synthetic_solved_rotation"
 DEFAULT_OUTPUT_DIR = "data/synthetic_cube_dataset"
-DEFAULT_IMAGE_SIZE = 512
+DEFAULT_IMAGE_SIZE = 128
+DEFAULT_HARD_CASE = "none"
+SOLID_BACKGROUND_PATCH_HARD_CASE = "solid_background_patch"
+DIAGONAL_CAMERA_ROLL_HARD_CASE = "diagonal_camera_roll"
+SHARP_CUBE_SHADOWS_HARD_CASE = "sharp_cube_shadows"
+SOLVED_CUBE_HARD_CASE = "solved_cube"
+NEAR_SIDE_FACE_HARD_CASE = "near_side_face"
+PALM_GAP_HARD_CASE = "palm_gap"
+# Automatic dataset-generation mixture.  The solved state is sampled
+# independently from the deliberate hard-case factor, so a solved cube can
+# appear in either an ordinary scene or a non-solved hard-case layout.
+HARD_CASE_GLOBAL_PROBABILITY = 0.40
+GLOBAL_SOLVED_CUBE_PROBABILITY = 0.15
+NON_SOLVED_HARD_CASES = (
+    SOLID_BACKGROUND_PATCH_HARD_CASE,
+    DIAGONAL_CAMERA_ROLL_HARD_CASE,
+    SHARP_CUBE_SHADOWS_HARD_CASE,
+    NEAR_SIDE_FACE_HARD_CASE,
+    PALM_GAP_HARD_CASE,
+)
+HARD_CASE_AUTO_SAMPLING_ENABLED = True
+# Procedural hard-case ranges. Each sample is still drawn from these ranges;
+# they are broad enough to avoid memorizing one composition.
+PALM_HULL_DISTANCE_RANGE = (2.50, 3.80)
+PALM_HULL_WIDTH_RANGE = (3.00, 4.20)
+PALM_HULL_HEIGHT_RANGE = (2.40, 3.40)
+PALM_HULL_DEPTH_RANGE = (0.08, 0.18)
+PALM_HAND_LIFT_RANGE = (0.85, 1.20)
+SOLID_PATCH_BACKING_WIDTH_RANGE = (2.80, 4.10)
+SOLID_PATCH_BACKING_DEPTH_RANGE = (0.16, 0.32)
+SOLID_PATCH_BACKING_HEIGHT_RANGE = (0.75, 1.35)
+SOLID_PATCH_GAP_RANGE = (0.012, 0.045)
+# Secondary cubes are tabletop objects behind the target, rather than
+# side-by-side distractors. The layout modes below include a controlled subset
+# whose projected silhouettes overlap the target from the camera.
+SECONDARY_CUBE_BEHIND_DEPTH_RANGE = (1.60, 4.40)
+SECONDARY_CUBE_LATERAL_OVERLAP_RANGE = (-0.78, 0.78)
+SECONDARY_CUBE_LATERAL_NEAR_RANGE = (-1.15, 1.15)
+SECONDARY_CUBE_LATERAL_OFFSET_RANGE = (1.35, 2.10)
+SECONDARY_CUBE_LAYOUT_WEIGHTS = (0.52, 0.33, 0.15)
+SECONDARY_CUBE_MIN_SILHOUETTE_OVERLAP = 0.12
+# Deliberate cases have dedicated builders, and the automatic mixture below
+# selects among them per image during ordinary generation. Add a case-specific
+# builder to HARD_CASE_BUILDERS when a new failure is found; the builder should
+# set only the requested scene variables and return the same scene metadata
+# tuple as randomize_scene().
+HARD_CASE_BUILDERS: dict[str, object] = {}
+HIGH_RESOLUTION_IMAGE_SIZE = (256, 256)
+HIGH_RESOLUTION_PROBABILITY = 0.25
+# Purging Blender's orphan-ID graph is more expensive than ordinary object
+# cleanup, so do it periodically during long-running generation.
+MEMORY_CLEANUP_INTERVAL = 32
 DEFAULT_CYCLES_SAMPLES = 128
 CYCLES_ADAPTIVE_THRESHOLD = 0.03
 CYCLES_ADAPTIVE_MIN_SAMPLES = 16
@@ -456,6 +539,359 @@ def matrix_rows(matrix: Matrix) -> list[list[float]]:
 
 def matrix_from_rows(rows: list[list[float]]) -> Matrix:
     return Matrix(rows)
+
+
+def cube_symmetry_matrices() -> tuple[Matrix, ...]:
+    """Return the 24 proper rotational symmetries of a cube."""
+    matrices: list[Matrix] = []
+    for permutation in permutations(range(3)):
+        for signs in product((-1.0, 1.0), repeat=3):
+            rows = [[0.0, 0.0, 0.0] for _ in range(3)]
+            for row, column in enumerate(permutation):
+                rows[row][column] = signs[row]
+            rotation = Matrix(rows)
+            if rotation.determinant() > 0.5:
+                matrices.append(rotation)
+    return tuple(matrices)
+
+
+CUBE_SYMMETRY_MATRICES = cube_symmetry_matrices()
+
+
+def canonical_cube_symmetry(rotation: Matrix) -> Matrix:
+    """Choose the no-turn symmetry whose stack axis is closest to image zenith."""
+    image_zenith = Vector((0.0, -1.0, 0.0))
+    candidates: list[tuple[float, tuple[float, ...], Matrix]] = []
+    for symmetry in CUBE_SYMMETRY_MATRICES:
+        candidate = rotation @ symmetry
+        stack_axis = candidate @ Vector((0.0, 0.0, 1.0))
+        colatitude = math.acos(
+            max(-1.0, min(1.0, float(image_zenith.dot(stack_axis.normalized()))))
+        )
+        tie_break = tuple(
+            round(float(candidate[row][column]), 9)
+            for row in range(3)
+            for column in range(3)
+        )
+        candidates.append((colatitude, tie_break, symmetry))
+    return min(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def canonical_cube_symmetry_for_turn(rotation: Matrix, layer_state: dict[str, object]) -> Matrix:
+    """Canonicalize a turning cube while keeping its axis on the 1x1x3 stack.
+
+    The pose head has two angle channels, one for each outer layer of a fixed
+    three-slab model.  Therefore the cube symmetry must be selected jointly
+    with the turn: after applying the symmetry, the active layer axis is the
+    canonical Z axis.  Both signs are allowed so the turn can land in either
+    outer-layer channel.  The visible representative is selected by stack
+    colatitude; applying that symmetry then transforms the turn face, which
+    remaps the active layer channel in the written v7 articulation payload.
+    """
+    candidate_turns = []
+    for face_key, angle_key, direction_key, objects_key, role in (
+        ("face", "angle_degrees", "direction", "objects", "primary"),
+        ("adjacent_face", "adjacent_angle_degrees", "adjacent_direction", "adjacent_objects", "adjacent"),
+    ):
+        turn = pose_turn_payload(
+            layer_state,
+            face_key=face_key,
+            angle_key=angle_key,
+            direction_key=direction_key,
+            objects_key=objects_key,
+            role=role,
+        )
+        if turn is not None:
+            candidate_turns.append(turn)
+    if not candidate_turns:
+        return canonical_cube_symmetry(rotation)
+    if str(layer_state.get("mode", "none")) == "corner_cut":
+        selected_turn = max(
+            candidate_turns,
+            key=lambda turn: abs(float(turn["signed_angle_degrees"])),
+        )
+    else:
+        selected_turn = candidate_turns[0]
+    source_axis = face_specs()[str(selected_turn["face"])]
+    candidates: list[tuple[float, tuple[float, ...], Matrix]] = []
+    for symmetry in CUBE_SYMMETRY_MATRICES:
+        transformed_axis = (symmetry.transposed() @ source_axis).normalized()
+        if abs(abs(float(transformed_axis.z)) - 1.0) > 1e-6:
+            continue
+        candidate = rotation @ symmetry
+        stack_axis = (candidate @ Vector((0.0, 0.0, 1.0))).normalized()
+        colatitude = math.acos(
+            max(-1.0, min(1.0, float(image_zenith.dot(stack_axis))))
+        )
+        tie_break = tuple(
+            round(float(candidate[row][column]), 9)
+            for row in range(3)
+            for column in range(3)
+        )
+        candidates.append((colatitude, tie_break, symmetry))
+    if not candidates:
+        raise ValueError("Could not align a turning layer with the canonical Z axis")
+    return min(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def canonical_signed_turn_angle(angle_degrees: float) -> float:
+    """Wrap a fourfold-symmetric layer angle into [-45, 45) degrees."""
+    wrapped = ((float(angle_degrees) + 45.0) % 90.0) - 45.0
+    return 0.0 if abs(wrapped) < 1e-8 else wrapped
+
+
+def canonicalize_turn_payload(turn: dict[str, object]) -> dict[str, object]:
+    signed_angle = canonical_signed_turn_angle(float(turn["signed_angle_degrees"]))
+    direction = int(turn["direction"])
+    if abs(signed_angle) > 1e-8:
+        direction = 1 if signed_angle > 0.0 else -1
+    return {
+        **turn,
+        "angle_degrees": abs(signed_angle),
+        "direction": direction,
+        "signed_angle_degrees": signed_angle,
+    }
+
+
+def vector_values(vector: Vector) -> list[float]:
+    return [float(vector[index]) for index in range(len(vector))]
+
+
+def quaternion_values(quaternion: Quaternion) -> list[float]:
+    return [
+        float(quaternion.x),
+        float(quaternion.y),
+        float(quaternion.z),
+        float(quaternion.w),
+    ]
+
+
+def compact_quaternion_values(rotation_matrix: Matrix) -> list[float]:
+    """Return one deterministic quaternion representation for the pose head."""
+    values = quaternion_values(rotation_matrix.to_quaternion())
+    if values[3] < 0.0:
+        values = [-value for value in values]
+    return values
+
+
+def pose_turn_payload(
+    layer_state: dict[str, object],
+    *,
+    face_key: str,
+    angle_key: str,
+    direction_key: str,
+    objects_key: str,
+    role: str,
+) -> dict[str, object] | None:
+    face = layer_state.get(face_key)
+    angle = layer_state.get(angle_key)
+    direction = layer_state.get(direction_key)
+    objects = layer_state.get(objects_key, [])
+    if not isinstance(face, str) or not isinstance(angle, (int, float)):
+        return None
+    if not isinstance(direction, (int, float)):
+        direction = 1
+    axis = face_specs().get(face)
+    if axis is None:
+        return None
+    axis_index = max(range(3), key=lambda index: abs(axis[index]))
+    side = int(round(axis[axis_index]))
+    object_names = [name for name in objects if isinstance(name, str)] if isinstance(objects, list) else []
+    return {
+        "role": role,
+        "face": face,
+        "axis": vector_values(axis),
+        "axis_index": axis_index,
+        "side": side,
+        "layer_index": side + 1,
+        "angle_degrees": float(angle),
+        "direction": int(direction),
+        "signed_angle_degrees": float(angle) * int(direction),
+        "object_names": object_names,
+    }
+
+
+def pose_articulation_payload(layer_state: dict[str, object]) -> dict[str, object]:
+    candidate_turns: list[dict[str, object]] = []
+    primary = pose_turn_payload(
+        layer_state,
+        face_key="face",
+        angle_key="angle_degrees",
+        direction_key="direction",
+        objects_key="objects",
+        role="primary",
+    )
+    if primary is not None:
+        candidate_turns.append(primary)
+    adjacent = pose_turn_payload(
+        layer_state,
+        face_key="adjacent_face",
+        angle_key="adjacent_angle_degrees",
+        direction_key="adjacent_direction",
+        objects_key="adjacent_objects",
+        role="adjacent",
+    )
+    if adjacent is not None:
+        candidate_turns.append(adjacent)
+    source_mode = str(layer_state.get("mode", "none"))
+    if source_mode == "corner_cut" and candidate_turns:
+        selected = max(
+            candidate_turns,
+            key=lambda turn: abs(float(turn["signed_angle_degrees"])),
+        )
+        selected_turn = canonicalize_turn_payload(selected)
+    else:
+        selected_turn = (
+            canonicalize_turn_payload(candidate_turns[0])
+            if candidate_turns
+            else None
+        )
+    layer_angles = [0.0, 0.0]
+    if selected_turn is not None:
+        layer_index = int(selected_turn["layer_index"])
+        if layer_index not in (0, 2):
+            raise ValueError(f"Expected an outer layer index, got {layer_index}")
+        layer_angles[0 if layer_index == 0 else 1] = float(
+            selected_turn["signed_angle_degrees"]
+        )
+    return {
+        "layer_angles_degrees": layer_angles,
+    }
+
+
+def image_projection_payload(
+    camera: bpy.types.Object,
+    cube_to_opencv_camera: Matrix,
+    width: int,
+    height: int,
+) -> dict[str, object]:
+    """Return image-space pose terms useful for a compact projection head."""
+    data = camera.data
+    sensor_size = data.sensor_height if data.sensor_fit == "VERTICAL" else data.sensor_width
+    focal_x = float(data.lens) * width / float(sensor_size)
+    focal_y = float(data.lens) * height / float(sensor_size)
+    principal_x = width * (0.5 - float(data.shift_x))
+    principal_y = height * (0.5 + float(data.shift_y))
+
+    cube_center_camera = cube_to_opencv_camera.translation
+    depth = float(cube_center_camera.z)
+    if abs(depth) < 1e-8:
+        raise ValueError("Cannot label image projection with cube center at camera depth zero.")
+    center_x = focal_x * float(cube_center_camera.x) / depth + principal_x
+    center_y = focal_y * float(cube_center_camera.y) / depth + principal_y
+
+    return {
+        "model": "scaled_perspective",
+        "cube_center_normalized": [center_x / width, center_y / height],
+        "image_scale_normalized": focal_x / (abs(depth) * width),
+        "perspective_strength": 3.0 / depth,
+    }
+
+
+def wrap_pose_angle(angle_degrees: float, period_degrees: float) -> float:
+    wrapped = (float(angle_degrees) + period_degrees / 2.0) % period_degrees
+    wrapped -= period_degrees / 2.0
+    return 0.0 if abs(wrapped) < 1e-8 else wrapped
+
+
+def direct_pose_head_payload(rotation: Matrix) -> dict[str, float]:
+    """Return v7's colatitude/azimuth/twist head coordinates."""
+    image_zenith = Vector((0.0, -1.0, 0.0))
+    image_right = Vector((1.0, 0.0, 0.0))
+    fallback_right = Vector((0.0, 0.0, 1.0))
+    stack_axis = (rotation @ Vector((0.0, 0.0, 1.0))).normalized()
+    colatitude = math.degrees(
+        math.acos(max(-1.0, min(1.0, float(image_zenith.dot(stack_axis)))))
+    )
+    if not 0.0 <= colatitude < 90.0:
+        raise ValueError(
+            "Canonical Blender pose produced colatitude outside [0, 90): "
+            f"{colatitude:.6f}"
+        )
+    azimuth = math.degrees(math.atan2(float(stack_axis.x), float(stack_axis.z)))
+    reference = (
+        fallback_right
+        if abs(float(image_right.dot(stack_axis))) > 0.95
+        else image_right
+    )
+    local_x = (reference - stack_axis * reference.dot(stack_axis)).normalized()
+    local_y = stack_axis.cross(local_x).normalized()
+    rotation_x = (rotation @ Vector((1.0, 0.0, 0.0))).normalized()
+    twist = math.degrees(math.atan2(float(rotation_x.dot(local_y)), float(rotation_x.dot(local_x))))
+    return {
+        "u_colatitude_degrees": float(colatitude),
+        "v_azimuth_degrees": float(wrap_pose_angle(azimuth, 360.0)),
+        "twist_degrees": float(wrap_pose_angle(twist, 90.0)),
+    }
+
+
+def write_pose_label(
+    path: Path,
+    cube_pose: dict[str, object],
+    layer_state: dict[str, object],
+    width: int,
+    height: int,
+) -> None:
+    camera = get_camera()
+    transform_rows = cube_pose.get("transform")
+    if not isinstance(transform_rows, list):
+        raise ValueError("Cube pose is missing its transform matrix.")
+    base_cube_to_world = matrix_from_rows(transform_rows)
+    scramble_rows = cube_pose.get("wireframe_scramble_transform")
+    whole_cube_scramble = (
+        matrix_from_rows(scramble_rows)
+        if isinstance(scramble_rows, list)
+        else Matrix.Identity(4)
+    )
+    # Express the effective cube frame after any whole-cube scramble, then
+    # quotient out the 24 rotational symmetries of the cube. The resulting
+    # frame is an equivalent training target, not necessarily the frame used
+    # by Blender to render the image.
+    pre_symmetry_cube_to_world = base_cube_to_world @ whole_cube_scramble
+    pre_symmetry_world_to_blender_camera = camera.matrix_world.inverted_safe()
+    pre_symmetry_cube_to_blender_camera = (
+        pre_symmetry_world_to_blender_camera @ pre_symmetry_cube_to_world
+    )
+    blender_to_opencv = Matrix((
+        (1.0, 0.0, 0.0, 0.0),
+        (0.0, -1.0, 0.0, 0.0),
+        (0.0, 0.0, -1.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+    ))
+    pre_symmetry_cube_to_opencv_camera = (
+        blender_to_opencv @ pre_symmetry_cube_to_blender_camera
+    )
+    canonical_layer_state = canonical_wireframe_layer_state(
+        layer_state,
+        whole_cube_scramble,
+    )
+    canonical_symmetry = canonical_cube_symmetry_for_turn(
+        pre_symmetry_cube_to_opencv_camera.to_3x3(),
+        canonical_layer_state,
+    )
+    canonical_symmetry_4x4 = canonical_symmetry.to_4x4()
+    cube_to_world = pre_symmetry_cube_to_world @ canonical_symmetry_4x4
+    canonical_layer_state = transform_layer_state_by_symmetry(
+        canonical_layer_state,
+        canonical_symmetry,
+    )
+    world_to_blender_camera = camera.matrix_world.inverted_safe()
+    cube_to_blender_camera = world_to_blender_camera @ cube_to_world
+    cube_to_opencv_camera = blender_to_opencv @ cube_to_blender_camera
+
+    payload = {
+        "format": POSE_LABEL_FORMAT,
+        "cube_pose": direct_pose_head_payload(cube_to_opencv_camera.to_3x3()),
+        "image_projection": image_projection_payload(
+            camera,
+            cube_to_opencv_camera,
+            width,
+            height,
+        ),
+        "articulation": pose_articulation_payload(canonical_layer_state),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def apply_global_pose(objects: list[bpy.types.Object], rotation: Quaternion, translation: Vector) -> Matrix:
@@ -1341,6 +1777,88 @@ def srgb_channel_to_linear(channel: int) -> float:
     return ((normalized + 0.055) / 1.055) ** 2.4
 
 
+def randomize_sticker_imperfections(material: bpy.types.Material) -> dict[str, object] | None:
+    """Add subtle procedural scratches and dents to a sticker shader."""
+    if not STICKER_IMPERFECTIONS_ENABLED or not material.use_nodes:
+        return None
+
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    bsdf = nodes.get("Principled BSDF")
+    if bsdf is None:
+        return None
+
+    node_prefix = "SyntheticSticker.Imperfection."
+    for node in list(nodes):
+        if node.name.startswith(node_prefix):
+            nodes.remove(node)
+    for link in list(bsdf.inputs["Normal"].links):
+        links.remove(link)
+
+    texcoord = nodes.new("ShaderNodeTexCoord")
+    texcoord.name = f"{node_prefix}Coordinates"
+
+    fine_noise = nodes.new("ShaderNodeTexNoise")
+    fine_noise.name = f"{node_prefix}FineNoise"
+    fine_noise.inputs["Scale"].default_value = random.uniform(
+        *STICKER_IMPERFECTION_FINE_SCALE_RANGE
+    )
+    fine_noise.inputs["Detail"].default_value = random.uniform(2.0, 5.0)
+    fine_noise.inputs["Roughness"].default_value = random.uniform(0.55, 0.8)
+
+    scratch_wave = nodes.new("ShaderNodeTexWave")
+    scratch_wave.name = f"{node_prefix}Scratches"
+    scratch_wave.wave_type = "BANDS"
+    scratch_wave.bands_direction = random.choice(("X", "Y", "Z"))
+    scratch_wave.inputs["Scale"].default_value = random.uniform(
+        *STICKER_IMPERFECTION_SCRATCH_SCALE_RANGE
+    )
+    scratch_wave.inputs["Distortion"].default_value = random.uniform(3.0, 8.0)
+    scratch_wave.inputs["Detail"].default_value = random.uniform(2.0, 5.0)
+    scratch_wave.inputs["Detail Scale"].default_value = random.uniform(1.5, 3.5)
+
+    scratch_ramp = nodes.new("ShaderNodeValToRGB")
+    scratch_ramp.name = f"{node_prefix}ScratchMask"
+    scratch_ramp.color_ramp.interpolation = "CONSTANT"
+    scratch_ramp.color_ramp.elements[0].position = random.uniform(0.40, 0.52)
+    scratch_ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
+    scratch_ramp.color_ramp.elements[1].position = random.uniform(0.58, 0.72)
+    scratch_ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
+
+    combine = nodes.new("ShaderNodeMixRGB")
+    combine.name = f"{node_prefix}Combine"
+    combine.blend_type = "MULTIPLY"
+    combine.inputs["Fac"].default_value = random.uniform(0.28, 0.52)
+
+    bump = nodes.new("ShaderNodeBump")
+    bump.name = f"{node_prefix}Bump"
+    bump.inputs["Strength"].default_value = random.uniform(
+        *STICKER_IMPERFECTION_BUMP_STRENGTH_RANGE
+    )
+    bump.inputs["Distance"].default_value = random.uniform(
+        *STICKER_IMPERFECTION_BUMP_DISTANCE_RANGE
+    )
+    if "Invert" in bump.inputs:
+        bump.inputs["Invert"].default_value = random.random() < 0.25
+
+    links.new(texcoord.outputs["Object"], fine_noise.inputs["Vector"])
+    links.new(texcoord.outputs["Object"], scratch_wave.inputs["Vector"])
+    links.new(scratch_wave.outputs["Fac"], scratch_ramp.inputs["Fac"])
+    links.new(fine_noise.outputs["Fac"], combine.inputs[1])
+    links.new(scratch_ramp.outputs["Color"], combine.inputs[2])
+    links.new(combine.outputs["Color"], bump.inputs["Height"])
+    links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
+
+    return {
+        "enabled": True,
+        "fine_scale": fine_noise.inputs["Scale"].default_value,
+        "scratch_scale": scratch_wave.inputs["Scale"].default_value,
+        "scratch_direction": scratch_wave.bands_direction,
+        "bump_strength": bump.inputs["Strength"].default_value,
+        "bump_distance": bump.inputs["Distance"].default_value,
+    }
+
+
 def randomize_sticker_material_gloss() -> dict[str, object]:
     """Randomize sticker shades from one coherent product-page palette and gloss."""
     palette_name, palette = random.choice(tuple(STICKER_COLOR_PALETTES.items()))
@@ -1371,6 +1889,7 @@ def randomize_sticker_material_gloss() -> dict[str, object]:
         set_principled_input(material, "Clearcoat", coat_weight)
         set_principled_input(material, "Coat Roughness", coat_roughness)
         set_principled_input(material, "Clearcoat Roughness", coat_roughness)
+        imperfections = randomize_sticker_imperfections(material)
 
         material_settings[name] = {
             "rgb": list(rgb),
@@ -1379,6 +1898,7 @@ def randomize_sticker_material_gloss() -> dict[str, object]:
             "specular": specular,
             "coat_weight": coat_weight,
             "coat_roughness": coat_roughness,
+            "imperfections": imperfections,
         }
     return material_settings
 
@@ -1559,16 +2079,76 @@ def background_object_material(name: str) -> bpy.types.Material:
     return noisy_material(name)
 
 
+def _background_collection_objects(collection: bpy.types.Collection) -> list[bpy.types.Object]:
+    all_objects = getattr(collection, "all_objects", None)
+    if all_objects is not None:
+        return list(all_objects)
+
+    objects: list[bpy.types.Object] = []
+    seen: set[int] = set()
+
+    def visit(current: bpy.types.Collection) -> None:
+        for obj in current.objects:
+            pointer = obj.as_pointer()
+            if pointer in seen:
+                continue
+            seen.add(pointer)
+            objects.append(obj)
+        for child in current.children:
+            visit(child)
+
+    visit(collection)
+    return objects
+
+
 def clear_background_scene() -> None:
-    for obj in list(bpy.data.objects):
-        if obj.name.startswith(BACKGROUND_SCENE_PREFIX) or obj.name.startswith(BACKGROUND_ASSET_COLLECTION_PREFIX):
-            bpy.data.objects.remove(obj, do_unlink=True)
+    """Remove the generated background and its owned datablocks.
+
+    The imported solve-station collection also contains objects whose names do
+    not use the generated prefix, so name-based cleanup leaves a complete
+    asset behind on every iteration. Walk the generator-owned collection
+    instead. Orphan mesh/material/image datablocks are reclaimed in batches by
+    cleanup_blender_memory() to keep this hot path inexpensive.
+    """
+    generated_objects: list[bpy.types.Object] = []
+    generated_collections: list[bpy.types.Collection] = []
+    background_collection = bpy.data.collections.get(BACKGROUND_SCENE_COLLECTION_NAME)
+    if background_collection is not None:
+        generated_objects.extend(_background_collection_objects(background_collection))
+        generated_collections.extend(list(background_collection.children))
+
+    # Include stale generated collections left by older versions of the script.
     for collection in list(bpy.data.collections):
         if collection.name.startswith(BACKGROUND_ASSET_COLLECTION_PREFIX):
-            bpy.data.collections.remove(collection)
-    for material in list(bpy.data.materials):
-        if material.name.startswith(BACKGROUND_SCENE_MATERIAL_PREFIX) or material.name.startswith("SolveStation.Material."):
-            bpy.data.materials.remove(material, do_unlink=True)
+            if all(collection is not existing for existing in generated_collections):
+                generated_collections.append(collection)
+            for obj in _background_collection_objects(collection):
+                if all(obj is not existing for existing in generated_objects):
+                    generated_objects.append(obj)
+
+    for obj in generated_objects:
+        if obj.name in bpy.data.objects:
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+    def remove_collection_tree(collection: bpy.types.Collection) -> None:
+        for child in list(collection.children):
+            remove_collection_tree(child)
+        if collection.name in bpy.data.collections:
+            bpy.data.collections.remove(collection, do_unlink=True)
+
+    for collection in generated_collections:
+        remove_collection_tree(collection)
+
+
+def cleanup_blender_memory() -> None:
+    """Periodically reclaim orphan IDs and Python-side temporary arrays."""
+    purge = getattr(bpy.data, "orphans_purge", None)
+    if callable(purge):
+        try:
+            purge(do_recursive=True)
+        except TypeError:
+            purge()
+    gc.collect()
 
 
 def background_scene_collection() -> bpy.types.Collection:
@@ -1692,6 +2272,68 @@ def add_background_box(
     obj.scale = scale
     obj.data.materials.append(material)
     link_to_collection(obj, collection)
+    return obj
+
+
+def add_procedural_camera_hull(
+    collection: bpy.types.Collection,
+    name: str,
+    center: Vector,
+    camera_direction: Vector,
+    camera_right: Vector,
+    camera_up: Vector,
+    width: float,
+    height: float,
+    depth: float,
+    material: bpy.types.Material,
+) -> bpy.types.Object:
+    """Create a shallow irregular silhouette in camera space.
+
+    This is intentionally procedural: the asymmetric outline approximates the
+    broad convex envelope of a visible palm/hand without copying hand mesh
+    pixels into the label. It is placed behind the cube and the rigged hands,
+    so only the palm-gap region remains visible.
+    """
+    outline = (
+        (-0.96, -0.46),
+        (-0.82, 0.18),
+        (-0.48, 0.63),
+        (0.02, 0.78),
+        (0.58, 0.64),
+        (0.96, 0.30),
+        (0.86, -0.48),
+        (0.32, -0.82),
+        (-0.30, -0.78),
+    )
+    front = center + camera_direction * (depth * 0.5)
+    back = center - camera_direction * (depth * 0.5)
+    vertices = []
+    for plane_center in (front, back):
+        vertices.extend(
+            plane_center
+            + camera_right * (x * width * 0.5)
+            + camera_up * (y * height * 0.5)
+            for x, y in outline
+        )
+    count = len(outline)
+    faces = [
+        tuple(range(count)),
+        tuple(range(count, 2 * count))[::-1],
+    ]
+    faces.extend(
+        (index, (index + 1) % count, count + (index + 1) % count, count + index)
+        for index in range(count)
+    )
+    mesh = bpy.data.meshes.new(f"{name}.Mesh")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    collection.objects.link(obj)
+    obj.pass_index = 0
+    obj.data.materials.append(material)
+    bevel = obj.modifiers.new("Soft procedural palm-hull edge", "BEVEL")
+    bevel.width = min(width, height) * 0.018
+    bevel.segments = 2
     return obj
 
 
@@ -2730,6 +3372,39 @@ def set_solve_station_family_visible(
         obj.hide_set(False)
 
 
+def move_rear_station_cluster_for_camera(
+    asset_collection: bpy.types.Collection,
+    camera_direction: Vector,
+) -> dict[str, object]:
+    """Move existing rear desk props out of the central rear-camera ray.
+
+    Rear hand views can otherwise look directly through the solve timer and
+    solver cluster.  The props remain present and randomized, but are placed
+    on a plausible desk side so they do not create an accidental full-frame
+    occlusion unrelated to the palm-gap factor.
+    """
+    side = -1.0 if camera_direction.x >= 0.0 else 1.0
+    placements: dict[str, object] = {}
+    groups = (
+        ("timer", ("Timer",), side * random.uniform(3.4, 4.3), random.uniform(2.25, 2.95)),
+        ("solver", ("Shirt", "Arm"), side * random.uniform(3.1, 4.0), random.uniform(1.85, 2.60)),
+    )
+    for name, families, target_x, target_y in groups:
+        objects = solve_station_family_objects(asset_collection, families)
+        if not objects:
+            continue
+        base = {obj.name: obj.matrix_world.copy() for obj in objects}
+        yaw = random.uniform(-8.0, 8.0)
+        bounds = set_object_group_local_pose(objects, base, target_x, target_y, yaw)
+        placements[name] = {
+            "center": [target_x, target_y],
+            "yaw_degrees": yaw,
+            "bounds": list(bounds),
+            "rear_camera_side_layout": True,
+        }
+    return placements
+
+
 def remove_solve_station_forearm_stubs(
     asset_collection: bpy.types.Collection,
 ) -> list[str]:
@@ -2934,6 +3609,97 @@ def projected_object_group_bounds(
     )
 
 
+def projected_bounds_overlap_ratio(
+    first: tuple[float, float, float, float] | None,
+    second: tuple[float, float, float, float] | None,
+) -> float:
+    """Return intersection over the smaller projected bounding-box area."""
+    if first is None or second is None:
+        return 0.0
+    left = max(first[0], second[0])
+    right = min(first[1], second[1])
+    bottom = max(first[2], second[2])
+    top = min(first[3], second[3])
+    intersection = max(0.0, right - left) * max(0.0, top - bottom)
+    first_area = max(0.0, first[1] - first[0]) * max(0.0, first[3] - first[2])
+    second_area = max(0.0, second[1] - second[0]) * max(0.0, second[3] - second[2])
+    smaller_area = min(first_area, second_area)
+    return intersection / smaller_area if smaller_area > 1e-8 else 0.0
+
+
+def bounds_intersect_with_margin(
+    first: tuple[float, float, float, float, float, float],
+    second: tuple[float, float, float, float, float, float],
+    margin: float = 0.0,
+) -> bool:
+    """Return whether two world-space AABBs intersect after adding a margin."""
+    return all(
+        first[index * 2] - margin < second[index * 2 + 1]
+        and first[index * 2 + 1] + margin > second[index * 2]
+        for index in range(3)
+    )
+
+
+def ensure_secondary_cube_clearance(
+    main_objects: list[bpy.types.Object],
+    clearance_margin: float = 0.04,
+    max_attempts: int = 16,
+) -> dict[str, object] | None:
+    """Move a secondary cube backward until its 3D bounds cannot clip the target."""
+    secondary_objects = [
+        obj
+        for obj in bpy.data.objects
+        if obj.type == "MESH" and obj.name.startswith(SECONDARY_CUBE_OBJECT_PREFIX)
+    ]
+    if not secondary_objects:
+        return None
+
+    main_bounds = transformed_object_group_bounds(main_objects, Matrix.Identity(4))
+    secondary_bounds = transformed_object_group_bounds(
+        secondary_objects,
+        Matrix.Identity(4),
+    )
+    if not bounds_intersect_with_margin(main_bounds, secondary_bounds, clearance_margin):
+        return {
+            "applied": False,
+            "margin": clearance_margin,
+            "attempts": 0,
+            "shift": [0.0, 0.0, 0.0],
+        }
+
+    table_forward, _table_right = camera_table_basis()
+    roots = [obj for obj in secondary_objects if obj.parent is None]
+    if not roots:
+        roots = secondary_objects
+    total_shift = Vector((0.0, 0.0, 0.0))
+    attempts = 0
+    while attempts < max_attempts:
+        step = table_forward * (0.45 if attempts < 8 else 0.8)
+        for root in roots:
+            root.matrix_world = Matrix.Translation(step) @ root.matrix_world
+        total_shift += step
+        attempts += 1
+        bpy.context.view_layer.update()
+        secondary_bounds = transformed_object_group_bounds(
+            secondary_objects,
+            Matrix.Identity(4),
+        )
+        if not bounds_intersect_with_margin(main_bounds, secondary_bounds, clearance_margin):
+            break
+
+    return {
+        "applied": True,
+        "margin": clearance_margin,
+        "attempts": attempts,
+        "shift": list(total_shift),
+        "clear": not bounds_intersect_with_margin(
+            main_bounds,
+            secondary_bounds,
+            clearance_margin,
+        ),
+    }
+
+
 def duplicate_secondary_cube(
     objects: list[bpy.types.Object],
     core_objects: list[bpy.types.Object],
@@ -2978,23 +3744,31 @@ def duplicate_secondary_cube(
     pose_roots = duplicate_objects + duplicate_core_objects
     render_parts = duplicate_cube_parts + duplicate_core_parts
     min_z = transformed_min_z(render_parts, rotation)
-    preferred_side = random.choice((-1.0, 1.0))
-    layout = station_metadata.get("layout")
-    if isinstance(layout, dict):
-        phone_layout = layout.get("phone")
-        if isinstance(phone_layout, dict):
-            phone_center = phone_layout.get("center")
-            if isinstance(phone_center, list) and phone_center:
-                preferred_side = -1.0 if phone_center[0] > 0.0 else 1.0
-    side = preferred_side
-    initial_right_distance = random.uniform(5.6, 6.4)
-    depth_offset = random.uniform(0.0, 0.65)
-    placement_zone = "mat_left" if side < 0.0 else "mat_right"
+    main_projected_bounds = projected_object_group_bounds(
+        objects + core_objects,
+        Matrix.Identity(4),
+    )
+    layout_mode = random.choices(
+        ("silhouette_intersect", "behind_near", "behind_offset"),
+        weights=SECONDARY_CUBE_LAYOUT_WEIGHTS,
+        k=1,
+    )[0]
+    if layout_mode == "silhouette_intersect":
+        lateral_range = SECONDARY_CUBE_LATERAL_OVERLAP_RANGE
+        placement_zone = "behind_overlap"
+    elif layout_mode == "behind_near":
+        lateral_range = SECONDARY_CUBE_LATERAL_NEAR_RANGE
+        placement_zone = "behind_near"
+    else:
+        lateral_range = SECONDARY_CUBE_LATERAL_OFFSET_RANGE
+        placement_zone = "behind_offset"
     clearance = random.uniform(0.02, 0.08)
     cropped_candidate = None
-    for crop_attempt in range(48):
-        right_distance = initial_right_distance + crop_attempt * 0.08
-        right_offset = side * right_distance
+    for placement_attempt in range(64):
+        right_offset = random.uniform(*lateral_range)
+        if layout_mode == "behind_offset":
+            right_offset *= random.choice((-1.0, 1.0))
+        depth_offset = random.uniform(*SECONDARY_CUBE_BEHIND_DEPTH_RANGE)
         horizontal_location = (
             table_right * right_offset + table_forward * depth_offset
         )
@@ -3012,27 +3786,32 @@ def duplicate_secondary_cube(
         )
         if projected_bounds is None:
             continue
-        fully_in_frame = (
-            projected_bounds[0] >= 0.0
-            and projected_bounds[1] <= 1.0
-            and projected_bounds[2] >= 0.0
-            and projected_bounds[3] <= 1.0
-        )
         intersects_frame = (
             projected_bounds[1] > 0.0
             and projected_bounds[0] < 1.0
             and projected_bounds[3] > 0.0
             and projected_bounds[2] < 1.0
         )
-        if intersects_frame and not fully_in_frame:
-            cropped_candidate = (
-                crop_attempt + 1,
-                right_offset,
-                translation,
-                candidate_transform,
-                projected_bounds,
-            )
-            break
+        if not intersects_frame:
+            continue
+        silhouette_overlap = projected_bounds_overlap_ratio(
+            main_projected_bounds,
+            projected_bounds,
+        )
+        if (
+            layout_mode == "silhouette_intersect"
+            and silhouette_overlap < SECONDARY_CUBE_MIN_SILHOUETTE_OVERLAP
+        ):
+            continue
+        cropped_candidate = (
+            placement_attempt + 1,
+            right_offset,
+            translation,
+            candidate_transform,
+            projected_bounds,
+            silhouette_overlap,
+        )
+        break
     if cropped_candidate is None:
         for duplicate in render_parts:
             bpy.data.objects.remove(duplicate, do_unlink=True)
@@ -3049,6 +3828,7 @@ def duplicate_secondary_cube(
         translation,
         candidate_transform,
         projected_bounds,
+        silhouette_overlap,
     ) = cropped_candidate
     world_bounds = transformed_object_group_bounds(render_parts, candidate_transform)
 
@@ -3084,9 +3864,13 @@ def duplicate_secondary_cube(
         "solved": secondary_solved,
         "moves": secondary_moves,
         "placement_zone": placement_zone,
+        "layout_mode": layout_mode,
         "crop_attempts": crop_attempts,
+        "placement_attempts": crop_attempts,
         "right_offset": right_offset,
         "depth_offset": depth_offset,
+        "behind_main_cube": True,
+        "silhouette_overlap_ratio": silhouette_overlap,
         "projected_bounds": (
             list(projected_bounds)
             if projected_bounds is not None
@@ -3640,6 +4424,7 @@ def randomize_scene(
     scramble_length: int = DEFAULT_SCRAMBLE_LENGTH,
     background_object_count: int = DEFAULT_BACKGROUND_OBJECT_COUNT,
     desk_no_hands: bool = False,
+    solved: bool = False,
 ) -> tuple[
     list[str],
     dict[str, object],
@@ -3670,7 +4455,7 @@ def randomize_scene(
     light_randomization = randomize_light(background_randomization)
     background_randomization["world_color"] = light_randomization["world"]["display_color"]
     background_randomization["world_lighting"] = light_randomization["world"]
-    moves = random_scramble_moves(scramble_length)
+    moves = [] if solved else random_scramble_moves(scramble_length)
     scramble_objects = objects + core_objects
     wireframe_scramble_transform = Matrix.Identity(4)
     for move in moves:
@@ -3704,6 +4489,7 @@ def randomize_scene(
         apply=False,
         force_on_table=desk_no_hands,
     )
+    cube_pose["solved"] = solved
     cube_pose["wireframe_scramble_transform"] = matrix_rows(wireframe_scramble_transform)
     return (
         moves,
@@ -3714,6 +4500,781 @@ def randomize_scene(
         cube_pose,
         sticker_materials,
     )
+
+
+def build_hard_case_scene(
+    case_name: str,
+    *,
+    scramble_length: int,
+    background_object_count: int,
+    solved: bool = False,
+) -> tuple[
+    list[str],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
+    """Build one deliberate failure case with shared ordinary-scene variation.
+
+    This is a registry-backed extension point rather than a second set of
+    loosely related flags.  A future case can be added by defining a builder
+    near this function and registering it in ``HARD_CASE_BUILDERS``.  Builders
+    should reset the cube and explicitly choose the scramble, camera,
+    background, lighting, materials, and cube pose they need.  Background and
+    lighting builders should normally start from the ordinary distributions
+    and then add only the bounded hard-case override.  They must return the
+    same seven metadata values as ``randomize_scene``.
+
+    Keeping this branch separate is important: the failure factor remains
+    intentional, while shared ordinary-scene variation is inherited through
+    explicit helper calls rather than duplicated ad hoc ranges.
+    """
+
+    builder = HARD_CASE_BUILDERS.get(case_name)
+    if builder is None:
+        available = ", ".join(sorted(HARD_CASE_BUILDERS)) or "(none registered yet)"
+        raise ValueError(
+            f"Unknown hard case {case_name!r}. Registered hard cases: {available}. "
+            "Add its builder to HARD_CASE_BUILDERS before generating it."
+        )
+    if not callable(builder):
+        raise TypeError(f"Hard-case builder {case_name!r} is not callable.")
+    return builder(
+        scramble_length=scramble_length,
+        background_object_count=background_object_count,
+        solved=solved,
+    )
+
+
+def build_solid_background_patch_case(
+    *,
+    scramble_length: int,
+    background_object_count: int,
+    solved: bool = False,
+) -> tuple[
+    list[str],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
+    """Build the realistic solid-color background-patch failure case.
+
+    The target cube is held just above or in front of a nearby,
+    ordinary-looking desk accessory: a thin dark base with a solid-color top
+    visible across the small gap behind the cube.  The accessory is
+    deliberately background geometry, not a second cube, so the visibility
+    map keeps those pixels as class 0. This reproduces the observed failure
+    where a contiguous solid-color patch is absorbed into the cube mask.
+    """
+
+    clear_background_scene()
+    hide_flat_background()
+    background_collection = background_scene_collection()
+
+    variant_index = random.randrange(1000000)
+    patch_side = random.choice((-1.0, 1.0))
+    patch_profiles = (
+        ("red", (0.46, 0.018, 0.012, 1.0)),
+        ("burgundy", (0.22, 0.012, 0.018, 1.0)),
+        ("amber", (0.52, 0.19, 0.018, 1.0)),
+        ("blue", (0.018, 0.11, 0.28, 1.0)),
+        ("violet", (0.20, 0.025, 0.30, 1.0)),
+        ("green", (0.035, 0.25, 0.07, 1.0)),
+        ("yellow", (0.58, 0.48, 0.025, 1.0)),
+    )
+    patch_profile_name, patch_color = random.choices(
+        patch_profiles,
+        weights=(3.0, 0.7, 2.5, 0.8, 0.7, 0.6, 3.0),
+        k=1,
+    )[0]
+    backing_color = random.choice(
+        (
+            (0.10, 0.12, 0.14, 1.0),
+            (0.16, 0.17, 0.18, 1.0),
+            (0.20, 0.18, 0.16, 1.0),
+        )
+    )
+    backing_width = random.uniform(*SOLID_PATCH_BACKING_WIDTH_RANGE)
+    backing_depth = random.uniform(*SOLID_PATCH_BACKING_DEPTH_RANGE)
+    backing_height = random.uniform(*SOLID_PATCH_BACKING_HEIGHT_RANGE)
+    patch_width = backing_width * random.uniform(0.80, 0.96)
+    patch_depth = backing_depth * random.uniform(0.78, 0.94)
+    patch_height = backing_height * random.uniform(0.68, 0.90)
+    accessory_yaw_degrees = random.uniform(-18.0, 18.0)
+    accessory_tilt_degrees = random.uniform(-12.0, 12.0)
+
+    camera = get_camera()
+    azimuth_degrees = random.uniform(-58.0, -32.0)
+    elevation_degrees = random.uniform(24.0, 38.0)
+    distance = random.uniform(13.0, 17.0)
+    azimuth = math.radians(azimuth_degrees)
+    elevation = math.radians(elevation_degrees)
+    camera_target = Vector((
+        random.uniform(-0.15, 0.15),
+        random.uniform(-0.15, 0.15),
+        random.uniform(-0.40, -0.15),
+    ))
+    camera.location = camera_target + Vector((
+        distance * math.cos(elevation) * math.cos(azimuth),
+        distance * math.cos(elevation) * math.sin(azimuth),
+        distance * math.sin(elevation),
+    ))
+    look_at(camera, camera_target)
+    camera.data.type = "PERSP"
+    camera.data.lens = random.uniform(34.0, 42.0)
+    camera.data.shift_x = 0.0
+    camera.data.shift_y = 0.0
+    camera_roll_degrees = random.uniform(-20.0, 20.0)
+    camera.rotation_quaternion = camera.rotation_quaternion @ Quaternion(
+        Vector((0.0, 0.0, -1.0)),
+        math.radians(camera_roll_degrees),
+    )
+    table_forward, table_right = camera_table_basis()
+    table_up = Vector((0.0, 0.0, 1.0))
+    table_frame = Matrix((table_right, table_forward, table_up)).transposed().to_quaternion()
+    accessory_rotation = Quaternion(
+        table_up,
+        math.radians(accessory_yaw_degrees),
+    ) @ table_frame
+    accessory_rotation = Quaternion(
+        table_right,
+        math.radians(accessory_tilt_degrees),
+    ) @ accessory_rotation
+
+    # Use the ordinary solve-station background and lighting distribution;
+    # the solid patch is the only deliberate background-specific factor.
+    background_randomization = randomize_background(background_object_count)
+    station_metadata = solve_station_metadata(background_randomization)
+    if station_metadata is not None:
+        # Keep this false-positive case free of a second cube by design.
+        station_metadata["other_cube_visible"] = False
+    background_collection = background_scene_collection()
+    backing_material = noisy_material(
+        f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.hard_case.backing",
+        backing_color,
+        textured=False,
+    )
+    patch_material = glossy_material(
+        f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.hard_case.{patch_profile_name}_patch",
+        patch_color,
+        roughness=0.42,
+        specular=0.28,
+    )
+
+    cube_half_depth = random.uniform(0.72, 1.00)
+    gap_width = random.uniform(*SOLID_PATCH_GAP_RANGE)
+    side_gap = random.uniform(*SOLID_PATCH_GAP_RANGE)
+    table_depth = random.uniform(0.65, 1.10)
+    accessory_side_offset = random.uniform(-0.28, 0.28)
+    # Keep a raised accessory panel just behind the held cube, like a laptop
+    # screen, tablet, or upright book. The small physical gap is along the
+    # desk depth; the dark backing/bezel remains visible around the solid face.
+    accessory_center = (
+        camera_target
+        + table_right * accessory_side_offset
+        + table_forward * table_depth
+    )
+    backing_location = Vector((
+        accessory_center.x,
+        accessory_center.y,
+        BACKGROUND_TABLE_Z + backing_height * 0.5,
+    ))
+    patch_location = Vector((
+        accessory_center.x,
+        accessory_center.y,
+        BACKGROUND_TABLE_Z + backing_height * 0.5,
+    )) - table_forward * ((backing_depth - patch_depth) * 0.5)
+
+    backing = add_background_box(
+        background_collection,
+        f"{BACKGROUND_SCENE_PREFIX}.hard_case.backing",
+        backing_location,
+        (backing_width, backing_depth, backing_height),
+        backing_material,
+        rotation=accessory_rotation,
+    )
+    backing.pass_index = 0
+
+    patch = add_background_box(
+        background_collection,
+        f"{BACKGROUND_SCENE_PREFIX}.hard_case.solid_{patch_profile_name}_patch",
+        patch_location,
+        (patch_width, patch_depth, patch_height),
+        patch_material,
+        rotation=accessory_rotation,
+    )
+    patch.pass_index = 0
+    bevel = patch.modifiers.new("Soft accessory edges", "BEVEL")
+    bevel.width = 0.035
+    bevel.segments = 2
+
+    forced_hand_visibility = "left" if patch_side > 0.0 else "right"
+    if random.random() < 0.12:
+        forced_hand_visibility = "both"
+    camera_randomization = {
+        "viewpoint": "front_diagonal",
+        "location": list(camera.location),
+        "target": list(camera_target),
+        "azimuth_degrees": azimuth_degrees,
+        "elevation_degrees": elevation_degrees,
+        "distance": distance,
+        "distance_feet": distance / CAMERA_SCENE_UNITS_PER_FOOT,
+        "distance_bucket": "near",
+        "reference_distance": 12.25,
+        "roll_degrees": camera_roll_degrees,
+        "lens_mm": camera.data.lens,
+        "framing_lens_mm": camera.data.lens,
+        "roi_crop": {
+            "method": "hard_case_controlled_camera",
+            "shift_x": camera.data.shift_x,
+            "shift_y": camera.data.shift_y,
+        },
+    }
+
+    light_randomization = randomize_light(background_randomization)
+    background_randomization["world_color"] = light_randomization["world"]["display_color"]
+    background_randomization["world_lighting"] = light_randomization["world"]
+
+    objects = cube_objects()
+    core_objects = core_fill_objects()
+    reset_cube(objects)
+    reset_core_fill_objects(core_objects)
+    moves = [] if solved else random_scramble_moves(scramble_length)
+    wireframe_scramble_transform = Matrix.Identity(4)
+    for move in moves:
+        if move in "xyz":
+            whole_cube_turn = Quaternion(whole_cube_move_axis(move), -math.pi / 2.0)
+            wireframe_scramble_transform = (
+                whole_cube_turn.to_matrix().to_4x4() @ wireframe_scramble_transform
+            )
+        apply_scramble_move(objects + core_objects, move)
+    # Deliberate cases keep the ordinary transient-turn distribution.  The
+    # hard-case factor controls the scene condition; it must not silently
+    # remove mid-turn/corner-cut examples from the training mixture.
+    layer_state = randomize_layer_render_state(objects)
+    pose_objects = objects + core_objects
+    yaw_degrees = random.uniform(-28.0, 28.0)
+    pitch_degrees = random.uniform(-8.0, 8.0)
+    roll_degrees = random.uniform(-8.0, 8.0)
+    rotation = (
+        Quaternion(Vector((0.0, 0.0, 1.0)), math.radians(yaw_degrees))
+        @ Quaternion(Vector((1.0, 0.0, 0.0)), math.radians(pitch_degrees))
+        @ Quaternion(Vector((0.0, 1.0, 0.0)), math.radians(roll_degrees))
+    )
+    clearance = random.uniform(0.04, 0.22)
+    min_z = transformed_min_z(pose_objects, rotation)
+    translation = Vector((0.0, 0.0, BACKGROUND_TABLE_Z + clearance - min_z))
+    transform = Matrix.Translation(translation) @ rotation.to_matrix().to_4x4()
+    cube_pose = {
+        "mode": "near_table",
+        "desk_no_hands": False,
+        "clearance": clearance,
+        "table_z": BACKGROUND_TABLE_Z,
+        "translation": list(translation),
+        "transform": matrix_rows(transform),
+        "yaw_degrees": yaw_degrees,
+        "pitch_degrees": pitch_degrees,
+        "roll_degrees": roll_degrees,
+        "solved": solved,
+        "wireframe_scramble_transform": matrix_rows(wireframe_scramble_transform),
+    }
+
+    background_randomization["mode"] = "solid_background_patch"
+    background_randomization["forced_hand_visibility"] = forced_hand_visibility
+    background_randomization["families"] = [
+        family
+        for family in background_randomization.get("families", [])
+        if family != "other_cube"
+    ] + ["solid_background_patch"]
+    background_randomization["object_count"] = int(
+        background_randomization.get("object_count", 0)
+    ) + 2
+    background_randomization["variant"] = {
+        "index": variant_index,
+        "patch_profile": patch_profile_name,
+        "patch_color": list(patch_color),
+        "backing_color": list(backing_color),
+        "world_strength": light_randomization["world"]["strength"],
+        "patch_side": patch_side,
+        "accessory_yaw_degrees": accessory_yaw_degrees,
+        "accessory_tilt_degrees": accessory_tilt_degrees,
+        "table_depth": table_depth,
+        "gap_width": gap_width,
+        "side_gap": side_gap,
+        "accessory_side_offset": accessory_side_offset,
+        "cube_half_depth": cube_half_depth,
+        "patch_width": patch_width,
+        "patch_depth": patch_depth,
+        "patch_height": patch_height,
+        "backing_width": backing_width,
+        "backing_depth": backing_depth,
+        "backing_height": backing_height,
+        "accessory_rotation": "table_aligned_with_bounded_yaw_and_tilt",
+        "variation_policy": "controlled_ranges_preserve_background_patch_cause",
+    }
+    background_objects = background_randomization.setdefault("objects", [])
+    if isinstance(background_objects, list):
+        background_objects.append({
+            "family": "solid_background_patch",
+            "type": "desk_accessory_panel",
+            "target_role": "background_only",
+            "object_names": [backing.name, patch.name],
+            "patch_material": patch_profile_name,
+            "patch_side": patch_side,
+            "secondary_cube_visible": False,
+        })
+    sticker_materials = randomize_sticker_material_gloss()
+    return (
+        moves,
+        layer_state,
+        background_randomization,
+        camera_randomization,
+        light_randomization,
+        cube_pose,
+        sticker_materials,
+    )
+
+
+def apply_hard_case_lighting_override(
+    light_randomization: dict[str, object],
+    lighting_mode: str,
+) -> dict[str, object]:
+    """Retain normal lighting diversity while making a lighting case deliberate."""
+    sources = light_randomization.get("sources", [])
+    if not isinstance(sources, list):
+        return light_randomization
+    area_sources = [
+        source
+        for source in sources
+        if isinstance(source, dict) and source.get("type") == "AREA"
+    ]
+    if not area_sources:
+        return light_randomization
+
+    key = random.choice(area_sources)
+    key_object = bpy.data.objects.get(key.get("name"))
+    if key_object is None or key_object.type != "LIGHT":
+        return light_randomization
+
+    if lighting_mode == "sharp":
+        key_object.data.energy = random.uniform(950.0, 1900.0)
+        key_object.data.size = random.uniform(0.16, 0.55)
+        key_object.data.size_y = random.uniform(0.18, 0.75)
+        for source in area_sources:
+            if source is key:
+                continue
+            light_object = bpy.data.objects.get(source.get("name"))
+            if light_object is not None and light_object.type == "LIGHT":
+                light_object.data.energy *= random.uniform(0.08, 0.24)
+    elif lighting_mode == "split":
+        key_object.data.energy = random.uniform(850.0, 1700.0)
+        key_object.data.size = random.uniform(0.30, 0.95)
+        key_object.data.size_y = random.uniform(0.35, 1.25)
+        for source in area_sources:
+            if source is key:
+                continue
+            light_object = bpy.data.objects.get(source.get("name"))
+            if light_object is not None and light_object.type == "LIGHT":
+                light_object.data.energy *= random.uniform(0.12, 0.34)
+
+    light_randomization["hard_case_override"] = {
+        "mode": lighting_mode,
+        "key_source": key.get("name"),
+        "key_energy": key_object.data.energy,
+        "key_size": key_object.data.size,
+        "source_count": len(area_sources),
+    }
+    return light_randomization
+
+
+def build_controlled_cube_case(
+    *,
+    case_name: str,
+    scramble_length: int,
+    background_object_count: int,
+    camera_mode: str,
+    lighting_mode: str,
+    forced_hand_visibility: str,
+    solved: bool = False,
+    backdrop: bool = False,
+) -> tuple[
+    list[str],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
+    """Build a controlled failure factor on top of the ordinary scene distribution."""
+
+    side_face_angle_degrees = None
+    if camera_mode == "diagonal_roll":
+        azimuth_degrees = random.choice((-45.0, -135.0)) + random.uniform(-10.0, 10.0)
+        elevation_degrees = random.uniform(20.0, 40.0)
+        roll_range = (34.0, 45.0) if random.random() < 0.70 else (24.0, 34.0)
+        camera_roll_degrees = random.choice((-1.0, 1.0)) * random.uniform(*roll_range)
+    elif camera_mode == "near_side":
+        side_face_angle_degrees = random.uniform(9.0, 13.0)
+        side_face_sign = random.choice((-1.0, 1.0))
+        azimuth_degrees = -90.0 + side_face_sign * side_face_angle_degrees
+        elevation_degrees = random.uniform(18.0, 32.0)
+        camera_roll_degrees = random.uniform(-30.0, 30.0)
+    elif camera_mode == "behind_palm":
+        azimuth_degrees = random.choice((42.0, 138.0)) + random.uniform(-8.0, 8.0)
+        elevation_degrees = random.uniform(28.0, 48.0)
+        camera_roll_degrees = random.uniform(-45.0, 45.0)
+    elif camera_mode == "solved":
+        azimuth_degrees = random.choice((-56.0, -44.0)) + random.uniform(-8.0, 8.0)
+        elevation_degrees = random.uniform(18.0, 34.0)
+        camera_roll_degrees = random.choice((-1.0, 1.0)) * random.uniform(10.0, 24.0)
+    else:
+        azimuth_degrees = random.choice((-52.0, -38.0)) + random.uniform(-8.0, 8.0)
+        elevation_degrees = random.uniform(20.0, 40.0)
+        camera_roll_degrees = random.uniform(-20.0, 20.0)
+
+    distance = (
+        random.uniform(14.0, 18.0)
+        if camera_mode == "behind_palm"
+        else random.uniform(8.5, 11.5)
+    )
+    azimuth = math.radians(azimuth_degrees)
+    elevation = math.radians(elevation_degrees)
+    camera_target = Vector((
+        random.uniform(-0.14, 0.14),
+        random.uniform(-0.14, 0.14),
+        random.uniform(-0.38, -0.12),
+    ))
+    camera = get_camera()
+    camera.location = camera_target + Vector((
+        distance * math.cos(elevation) * math.cos(azimuth),
+        distance * math.cos(elevation) * math.sin(azimuth),
+        distance * math.sin(elevation),
+    ))
+    look_at(camera, camera_target)
+    camera.data.type = "PERSP"
+    camera.data.lens = (
+        random.uniform(34.0, 42.0)
+        if camera_mode == "behind_palm"
+        else random.uniform(41.0, 49.0)
+    )
+    camera.data.shift_x = random.uniform(-0.035, 0.035)
+    camera.data.shift_y = random.uniform(-0.03, 0.03)
+    camera.rotation_quaternion = camera.rotation_quaternion @ Quaternion(
+        Vector((0.0, 0.0, -1.0)),
+        math.radians(camera_roll_degrees),
+    )
+    camera_direction, camera_right, camera_up = camera_basis()
+
+    # Keep the hard-case builder separate so it can control the failure factor,
+    # but inherit the ordinary solve-station background distribution. This
+    # preserves variation in the desk, room, mat, laptop/phone visibility,
+    # clothing, wall elements, and their materials/layouts.
+    background_randomization = randomize_background(background_object_count)
+    background_collection = background_scene_collection()
+    if camera_mode == "behind_palm":
+        # The solve-station timer and solver/arm cluster are camera-facing
+        # props in the ordinary layout. A rear palm view can legitimately
+        # place them outside the crop; hide only those occluders so the
+        # deliberate case does not become a malformed all-background frame.
+        rear_view_hidden = []
+        for obj in solve_station_family_objects(
+            background_collection,
+            ("Timer", "Shirt", "Arm"),
+        ):
+            obj.hide_render = True
+            rear_view_hidden.append(obj.name)
+        station_metadata = solve_station_metadata(background_randomization)
+        if station_metadata is not None:
+            station_metadata["rear_view_hidden_families"] = [
+                "Timer",
+                "Shirt",
+                "Arm",
+            ]
+            station_metadata["rear_view_hidden_object_count"] = len(rear_view_hidden)
+    backdrop_object_names: list[str] = []
+    backdrop_obj: bpy.types.Object | None = None
+    backdrop_initial_center: Vector | None = None
+    backdrop_geometry: dict[str, object] = {}
+    if backdrop:
+        # Use a dimmed procedural skin tone so the hull blends with the palm
+        # while still being a distinct background-only surface in the label.
+        # Keep the backdrop in the visible mid-to-light skin range.  Very dark
+        # tones can turn a large procedural silhouette into an opaque black
+        # slab under the station's randomized lighting, which is not the
+        # intended palm-gap appearance.
+        hull_color = scaled_color(
+            random_color_from_ranges(HAND_SKIN_TONE_RANGES[:4]),
+            random.uniform(0.45, 0.75),
+        )
+        hull_material = noisy_material(
+            f"{BACKGROUND_SCENE_MATERIAL_PREFIX}.hard_case.{case_name}.palm_hull",
+            hull_color,
+            textured=False,
+        )
+        # Place the hull several scene units down the camera ray, so it is
+        # unambiguously behind the cube and hands.  Clamp its world height to
+        # the tabletop band after applying a small camera-space offset; this
+        # avoids the downward ray putting the backdrop under the desk.
+        hull_center = (
+            camera_target
+            + camera_direction * random.uniform(*PALM_HULL_DISTANCE_RANGE)
+            + camera_right * random.uniform(-0.16, 0.16)
+            + camera_up * random.uniform(-0.08, 0.18)
+        )
+        hull_center.z = min(
+            BACKGROUND_TABLE_Z + 2.0,
+            max(BACKGROUND_TABLE_Z + 0.05, hull_center.z),
+        )
+        backdrop_initial_center = hull_center.copy()
+        backdrop_obj = add_procedural_camera_hull(
+            background_collection,
+            f"{BACKGROUND_SCENE_PREFIX}.hard_case.{case_name}.palm_hull",
+            hull_center,
+            camera_direction,
+            camera_right,
+            camera_up,
+            width=random.uniform(*PALM_HULL_WIDTH_RANGE),
+            height=random.uniform(*PALM_HULL_HEIGHT_RANGE),
+            depth=random.uniform(*PALM_HULL_DEPTH_RANGE),
+            material=hull_material,
+        )
+        backdrop_object_names.append(backdrop_obj.name)
+        backdrop_geometry = {
+            "initial_center": list(backdrop_initial_center),
+            "width": float(backdrop_obj.dimensions.x),
+            "height": float(backdrop_obj.dimensions.z),
+            "depth": float(backdrop_obj.dimensions.y),
+        }
+
+    # Start from the same lighting distribution as ordinary samples. Sharp
+    # and split-shadow cases then apply a bounded override to that sampled rig,
+    # so they retain variation in setup, color temperature, window light,
+    # laptop glow, and world exposure.
+    light_randomization = randomize_light(background_randomization)
+    if lighting_mode in {"sharp", "split"}:
+        light_randomization = apply_hard_case_lighting_override(
+            light_randomization,
+            lighting_mode,
+        )
+    background_randomization["world_color"] = light_randomization["world"]["display_color"]
+    background_randomization["world_lighting"] = light_randomization["world"]
+
+    objects = cube_objects()
+    core_objects = core_fill_objects()
+    reset_cube(objects)
+    reset_core_fill_objects(core_objects)
+    moves = [] if solved else random_scramble_moves(scramble_length)
+    wireframe_scramble_transform = Matrix.Identity(4)
+    for move in moves:
+        if move in "xyz":
+            whole_cube_turn = Quaternion(whole_cube_move_axis(move), -math.pi / 2.0)
+            wireframe_scramble_transform = (
+                whole_cube_turn.to_matrix().to_4x4() @ wireframe_scramble_transform
+            )
+        apply_scramble_move(objects + core_objects, move)
+    layer_state = randomize_layer_render_state(objects)
+
+    # Retain the ordinary secondary-cube probability for the general hard
+    # cases; the solid-patch builder intentionally isolates its cause.
+    if case_name != SOLID_BACKGROUND_PATCH_HARD_CASE:
+        duplicate_secondary_cube(objects, core_objects, background_randomization)
+
+    if camera_mode == "near_side":
+        yaw_degrees = random.uniform(-3.0, 3.0)
+        pitch_degrees = random.uniform(-5.0, 5.0)
+        cube_roll_degrees = random.uniform(-4.0, 4.0)
+    elif solved:
+        yaw_degrees = random.uniform(-24.0, 24.0)
+        pitch_degrees = random.uniform(-8.0, 8.0)
+        cube_roll_degrees = random.uniform(-7.0, 7.0)
+    else:
+        yaw_degrees = random.uniform(-26.0, 26.0)
+        pitch_degrees = random.uniform(-10.0, 10.0)
+        cube_roll_degrees = random.uniform(-9.0, 9.0)
+    rotation = (
+        Quaternion(Vector((0.0, 0.0, 1.0)), math.radians(yaw_degrees))
+        @ Quaternion(Vector((1.0, 0.0, 0.0)), math.radians(pitch_degrees))
+        @ Quaternion(Vector((0.0, 1.0, 0.0)), math.radians(cube_roll_degrees))
+    )
+    clearance = random.uniform(0.05, 0.24)
+    min_z = transformed_min_z(objects + core_objects, rotation)
+    translation = Vector((0.0, 0.0, BACKGROUND_TABLE_Z + clearance - min_z))
+    transform = Matrix.Translation(translation) @ rotation.to_matrix().to_4x4()
+    if backdrop_obj is not None and backdrop_initial_center is not None:
+        # Re-anchor the procedural palm envelope to the cube's actual pose,
+        # including the later hand lift. The camera target is intentionally
+        # not used as the final anchor because it can sit below the held cube
+        # for elevated viewpoints.
+        cube_center = Vector(translation)
+        horizontal_view_direction = Vector((camera_direction.x, camera_direction.y, 0.0))
+        if horizontal_view_direction.length <= 1e-6:
+            horizontal_view_direction = Vector((0.0, 1.0, 0.0))
+        horizontal_view_direction.normalize()
+        hull_center = (
+            cube_center
+            + horizontal_view_direction * random.uniform(*PALM_HULL_DISTANCE_RANGE)
+            + camera_right * random.uniform(-0.16, 0.16)
+            + Vector((0.0, 0.0, random.uniform(-0.15, 0.20)))
+        )
+        backdrop_delta = hull_center - backdrop_initial_center
+        for vertex in backdrop_obj.data.vertices:
+            vertex.co += backdrop_delta
+        backdrop_geometry["final_center"] = list(backdrop_initial_center + backdrop_delta)
+    cube_pose = {
+        "mode": "near_table",
+        "desk_no_hands": False,
+        "clearance": clearance,
+        "table_z": BACKGROUND_TABLE_Z,
+        "translation": list(translation),
+        "transform": matrix_rows(transform),
+        "yaw_degrees": yaw_degrees,
+        "pitch_degrees": pitch_degrees,
+        "roll_degrees": cube_roll_degrees,
+        "solved": solved,
+        "wireframe_scramble_transform": matrix_rows(wireframe_scramble_transform),
+    }
+    variant = {
+        "index": random.randrange(1000000),
+        "camera_mode": camera_mode,
+        "lighting_mode": lighting_mode,
+        "solved": solved,
+        "azimuth_degrees": azimuth_degrees,
+        "elevation_degrees": elevation_degrees,
+        "camera_roll_degrees": camera_roll_degrees,
+        "camera_distance": distance,
+        "cube_yaw_degrees": yaw_degrees,
+        "cube_pitch_degrees": pitch_degrees,
+        "cube_roll_degrees": cube_roll_degrees,
+        "world_strength": light_randomization["world"]["strength"],
+    }
+    if side_face_angle_degrees is not None:
+        variant["side_face_angle_degrees"] = side_face_angle_degrees
+    if backdrop_geometry:
+        variant["palm_hull_geometry"] = backdrop_geometry
+    background_randomization["mode"] = case_name
+    background_randomization["forced_hand_visibility"] = forced_hand_visibility
+    background_randomization["variant"] = variant
+    background_randomization["hard_case_factor"] = {
+        "camera_mode": camera_mode,
+        "lighting_mode": lighting_mode,
+        "solved": solved,
+    }
+    background_randomization["families"] = list(
+        background_randomization.get("families", [])
+    ) + (["dark_gap_backdrop"] if backdrop else [])
+    background_randomization["object_count"] = int(
+        background_randomization.get("object_count", 0)
+    ) + len(backdrop_object_names)
+    background_objects = background_randomization.setdefault("objects", [])
+    if isinstance(background_objects, list) and backdrop_object_names:
+        background_objects.append({
+            "family": "dark_gap_backdrop",
+            "type": "background_only",
+            "target_role": "background_only",
+            "object_names": backdrop_object_names,
+            "secondary_cube_visible": False,
+        })
+    camera_randomization = {
+        "viewpoint": camera_mode,
+        "location": list(camera.location),
+        "target": list(camera_target),
+        "azimuth_degrees": azimuth_degrees,
+        "elevation_degrees": elevation_degrees,
+        "distance": distance,
+        "distance_feet": distance / CAMERA_SCENE_UNITS_PER_FOOT,
+        "distance_bucket": "near",
+        "reference_distance": distance,
+        "roll_degrees": camera_roll_degrees,
+        "lens_mm": camera.data.lens,
+        "framing_lens_mm": camera.data.lens,
+        "roi_crop": {
+            "method": "hard_case_controlled_camera",
+            "shift_x": camera.data.shift_x,
+            "shift_y": camera.data.shift_y,
+        },
+    }
+    sticker_materials = randomize_sticker_material_gloss()
+    return (
+        moves,
+        layer_state,
+        background_randomization,
+        camera_randomization,
+        light_randomization,
+        cube_pose,
+        sticker_materials,
+    )
+
+
+def build_diagonal_camera_roll_case(**kwargs: object) -> tuple[object, ...]:
+    return build_controlled_cube_case(
+        case_name=DIAGONAL_CAMERA_ROLL_HARD_CASE,
+        camera_mode="diagonal_roll",
+        lighting_mode="standard",
+        forced_hand_visibility=random.choice(("left", "right", "both")),
+        **kwargs,
+    )
+
+
+def build_sharp_cube_shadows_case(**kwargs: object) -> tuple[object, ...]:
+    return build_controlled_cube_case(
+        case_name=SHARP_CUBE_SHADOWS_HARD_CASE,
+        camera_mode="standard",
+        lighting_mode="sharp",
+        forced_hand_visibility=random.choice(("left", "right", "both")),
+        **kwargs,
+    )
+
+
+def build_solved_cube_case(**kwargs: object) -> tuple[object, ...]:
+    # The automatic sampler can independently mark any hard case as solved;
+    # this named builder remains an explicit solved-cube benchmark case.
+    kwargs.pop("solved", None)
+    return build_controlled_cube_case(
+        case_name=SOLVED_CUBE_HARD_CASE,
+        camera_mode="solved",
+        lighting_mode=random.choice(("standard", "standard", "split")),
+        forced_hand_visibility=random.choice(("left", "right", "left", "right", "both")),
+        solved=True,
+        **kwargs,
+    )
+
+
+def build_near_side_face_case(**kwargs: object) -> tuple[object, ...]:
+    return build_controlled_cube_case(
+        case_name=NEAR_SIDE_FACE_HARD_CASE,
+        camera_mode="near_side",
+        lighting_mode="split",
+        forced_hand_visibility=random.choice(("left", "right", "both")),
+        **kwargs,
+    )
+
+
+def build_palm_gap_case(**kwargs: object) -> tuple[object, ...]:
+    return build_controlled_cube_case(
+        case_name=PALM_GAP_HARD_CASE,
+        camera_mode="behind_palm",
+        lighting_mode=random.choice(("sharp", "split")),
+        forced_hand_visibility=random.choice(("both", "both", "both", "left", "right")),
+        backdrop=True,
+        **kwargs,
+    )
+
+
+HARD_CASE_BUILDERS.update({
+    SOLID_BACKGROUND_PATCH_HARD_CASE: build_solid_background_patch_case,
+    DIAGONAL_CAMERA_ROLL_HARD_CASE: build_diagonal_camera_roll_case,
+    SHARP_CUBE_SHADOWS_HARD_CASE: build_sharp_cube_shadows_case,
+    SOLVED_CUBE_HARD_CASE: build_solved_cube_case,
+    NEAR_SIDE_FACE_HARD_CASE: build_near_side_face_case,
+    PALM_GAP_HARD_CASE: build_palm_gap_case,
+})
 
 
 def configure_render(width: int, height: int) -> None:
@@ -3752,6 +5313,36 @@ def mesh_objects_in_roots(roots: list[bpy.types.Object]) -> list[bpy.types.Objec
     return objects
 
 
+def cube_render_mesh_names(roots: list[bpy.types.Object]) -> set[str]:
+    """Return cube body and detached sticker mesh names used by ray casts."""
+    names = {obj.name for obj in mesh_objects_in_roots(roots)}
+    root_names = {obj.name for obj in roots}
+    for obj in bpy.data.objects:
+        if obj.type != "MESH":
+            continue
+        dotted_name = f".{obj.name}."
+        if any(f".{root_name}." in dotted_name for root_name in root_names):
+            names.add(obj.name)
+    return names
+
+
+def sticker_render_mesh_names(roots: list[bpy.types.Object]) -> set[str]:
+    """Return the names of detached sticker objects, one name per sticker."""
+    names = set()
+    for obj in mesh_objects_in_roots(roots):
+        if obj.name.startswith(STICKER_OBJECT_NAME_PREFIX):
+            names.add(obj.name)
+            continue
+        materials = [material.name for material in obj.data.materials if material is not None]
+        if (
+            obj.parent is not None
+            and len(materials) == 1
+            and materials[0] in STICKER_COLOR_MATERIAL_NAMES
+        ):
+            names.add(obj.name)
+    return names
+
+
 def camera_frame_bounds(
     camera: bpy.types.Object,
     scene: bpy.types.Scene,
@@ -3788,46 +5379,76 @@ def camera_ray(
     return origin, direction
 
 
-def render_segmentation_masks(
+def render_visibility_class_map(
     main_cube_roots: list[bpy.types.Object],
+    hand_roots: list[bpy.types.Object],
     width: int,
     height: int,
-) -> object:
-    """Ray-cast the whole-cube mask directly without creating an image file."""
+) -> tuple[object, dict[str, object]]:
+    """Ray-cast visible ownership and a separate visible-sticker map.
+
+    The ownership map is 0=background, 1=target cube, 2=hand, 3=secondary
+    cube.  The sticker maps contain one binary raster per detached sticker
+    object; they are separate because sticker pixels are also part of the
+    whole-cube mask.
+    """
     try:
         import numpy as np
     except ImportError:
-        raise RuntimeError("NumPy is required to write segmentation labels.") from None
+        raise RuntimeError("NumPy is required to write visibility labels.") from None
 
-    main_cube_names = {
-        obj.name for obj in mesh_objects_in_roots(main_cube_roots)
+    main_cube_names = cube_render_mesh_names(main_cube_roots)
+    sticker_names = sticker_render_mesh_names(main_cube_roots)
+    sticker_instance_by_parent_material = {}
+    for sticker_name in sticker_names:
+        sticker_object = bpy.data.objects.get(sticker_name)
+        if sticker_object is None or sticker_object.parent is None:
+            continue
+        for material in sticker_object.data.materials:
+            if material is not None and material.name in STICKER_COLOR_MATERIAL_NAMES:
+                sticker_instance_by_parent_material[
+                    (sticker_object.parent.name, material.name)
+                ] = sticker_name
+    hand_names = {
+        obj.name
+        for root in hand_roots
+        for obj in object_tree(root)
+        if obj.type == "MESH"
     }
     secondary_cube_names = {
         obj.name
         for obj in bpy.data.objects
         if obj.type == "MESH" and obj.name.startswith(SECONDARY_CUBE_OBJECT_PREFIX)
     }
-    whole_mask = np.zeros((height, width), dtype=np.uint8)
-    camera = get_camera()
-    scene = bpy.context.scene
-
-    segmentation_objects = {
+    visibility = np.zeros((height, width), dtype=np.uint8)
+    sticker_masks = {
+        name: np.zeros((height, width), dtype=np.uint8)
+        for name in sorted(sticker_names)
+    }
+    tracked_names = main_cube_names | hand_names | secondary_cube_names
+    tracked_objects = {
         obj.as_pointer(): obj
         for obj in bpy.data.objects
-        if obj.type == "MESH"
-        and (obj.name in main_cube_names or obj.name in secondary_cube_names)
+        if obj.type == "MESH" and obj.name in tracked_names
     }
     original_visibility = [
         (obj, obj.hide_render, obj.hide_viewport, obj.hide_get())
-        for obj in segmentation_objects.values()
+        for obj in tracked_objects.values()
     ]
     try:
-        for obj in segmentation_objects.values():
-            obj.hide_render = False
-            obj.hide_viewport = False
-            obj.hide_set(False)
+        for obj in tracked_objects.values():
+            # Cube/secondary geometry must be queryable even when its render
+            # visibility was temporarily changed by the generator. Hands are
+            # different: preserve their current state so hidden hands do not
+            # occlude a hand-free ground-truth render.
+            if obj.name in main_cube_names or obj.name in secondary_cube_names:
+                obj.hide_render = False
+                obj.hide_viewport = False
+                obj.hide_set(False)
         bpy.context.view_layer.update()
         depsgraph = bpy.context.evaluated_depsgraph_get()
+        camera = get_camera()
+        scene = bpy.context.scene
         for y in range(height):
             for x in range(width):
                 origin, direction = camera_ray(camera, scene, x, y, width, height)
@@ -3850,10 +5471,39 @@ def render_segmentation_masks(
                     ray_origin = location + direction * 1e-4
                 if not hit or hit_object is None:
                     continue
-
                 object_name = hit_object.name
                 if object_name in main_cube_names:
-                    whole_mask[y, x] = 1
+                    visibility[y, x] = 1
+                    sticker_key = object_name if object_name in sticker_masks else None
+                    if sticker_key is None:
+                        # Older cube files keep sticker faces as material slots
+                        # on cubies. When detached sticker objects also exist,
+                        # map the parent face back to that same sticker object
+                        # so disjoint visible regions remain one instance.
+                        polygon_index = int(_polygon_index)
+                        materials = getattr(getattr(hit_object, "data", None), "materials", None)
+                        if (
+                            materials is not None
+                            and 0 <= polygon_index < len(getattr(hit_object.data, "polygons", ()))
+                        ):
+                            material_index = hit_object.data.polygons[polygon_index].material_index
+                            if 0 <= material_index < len(materials):
+                                material_name = materials[material_index].name
+                                if material_name in STICKER_COLOR_MATERIAL_NAMES:
+                                    sticker_key = sticker_instance_by_parent_material.get(
+                                        (object_name, material_name),
+                                        f"{object_name}:{material_name}",
+                                    )
+                                    sticker_masks.setdefault(
+                                        sticker_key,
+                                        np.zeros((height, width), dtype=np.uint8),
+                                    )
+                    if sticker_key is not None:
+                        sticker_masks[sticker_key][y, x] = 1
+                elif object_name in hand_names:
+                    visibility[y, x] = 2
+                elif object_name in secondary_cube_names:
+                    visibility[y, x] = 3
     finally:
         for obj, hide_render, hide_viewport, hide in original_visibility:
             obj.hide_render = hide_render
@@ -3861,7 +5511,178 @@ def render_segmentation_masks(
             obj.hide_set(hide)
         bpy.context.view_layer.update()
 
-    return whole_mask
+    return visibility, sticker_masks
+
+
+def render_segmentation_masks(
+    main_cube_roots: list[bpy.types.Object],
+    width: int,
+    height: int,
+) -> object:
+    """Ray-cast the whole-cube mask directly without creating an image file."""
+    visibility, _sticker_masks = render_visibility_class_map(main_cube_roots, [], width, height)
+    return (visibility == 1).astype("uint8")
+
+
+def filter_visible_sticker_masks(
+    sticker_masks: dict[str, object],
+    width: int,
+    height: int,
+) -> dict[str, object]:
+    """Keep sticker instances with at least 8 reference-resolution area pixels."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        raise RuntimeError("OpenCV and NumPy are required to filter sticker masks.") from None
+
+    minimum_area = MIN_VISIBLE_STICKER_AREA_PX_AT_128 * (width * height) / (128.0 * 128.0)
+    filtered = {}
+    for name, mask in sticker_masks.items():
+        if not isinstance(mask, np.ndarray):
+            continue
+        ys, xs = np.where(mask != 0)
+        if len(xs) < 3:
+            continue
+        points = np.column_stack((xs, ys)).astype(np.int32).reshape(-1, 1, 2)
+        hull = cv2.convexHull(points)
+        if cv2.contourArea(hull) >= minimum_area:
+            filtered[name] = mask
+    return filtered
+
+
+def segmentation_lines_from_mask(
+    mask: object,
+    class_id: int,
+    one_instance: bool = False,
+) -> list[str]:
+    """Return YOLO polygon lines for a mask's components or one instance."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        raise RuntimeError(
+            "OpenCV and NumPy are required to write YOLO segmentation annotations."
+        ) from None
+
+    if not isinstance(mask, np.ndarray) or mask.ndim != 2:
+        raise TypeError("Segmentation mask must be a 2-D NumPy array.")
+    mask_height, mask_width = mask.shape[:2]
+    if one_instance:
+        ys, xs = np.where(mask != 0)
+        if len(xs) == 0:
+            return []
+        if len(xs) >= 3:
+            points = np.column_stack((xs, ys)).astype(np.int32)
+            contour = cv2.convexHull(points.reshape(-1, 1, 2))
+            points = contour.reshape(-1, 2).astype(float)
+        else:
+            x_min, x_max = float(xs.min()), float(xs.max() + 1)
+            y_min, y_max = float(ys.min()), float(ys.max() + 1)
+            points = np.asarray(
+                ((x_min, y_min), (x_max, y_min), (x_max, y_max), (x_min, y_max)),
+                dtype=float,
+            )
+        normalized_points = []
+        for x, y in points:
+            normalized_points.extend((
+                max(0.0, min(float(x) / mask_width, 1.0)),
+                max(0.0, min(float(y) / mask_height, 1.0)),
+            ))
+        return [
+            str(class_id)
+            + " "
+            + " ".join(f"{value:.6f}" for value in normalized_points)
+        ]
+
+    binary_mask = np.where(mask != 0, 255, 0).astype(np.uint8)
+    contours, _hierarchy = cv2.findContours(
+        binary_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    lines = []
+    for contour in contours:
+        if len(contour) < 3 or cv2.contourArea(contour) <= 0.0:
+            continue
+        points = contour.reshape(-1, 2).astype(float)
+        if len(points) < 3:
+            continue
+        normalized_points = []
+        for x, y in points:
+            normalized_points.extend((
+                max(0.0, min(float(x) / mask_width, 1.0)),
+                max(0.0, min(float(y) / mask_height, 1.0)),
+            ))
+        lines.append(
+            str(class_id)
+            + " "
+            + " ".join(f"{value:.6f}" for value in normalized_points)
+        )
+    return lines
+
+
+def write_yolo_cube_sticker_segmentation_label(
+    cube_mask: object,
+    sticker_masks: object,
+    label_path: Path,
+) -> int:
+    """Write the cube and one polygon per connected visible sticker component.
+
+    YOLO polygon rows cannot represent disconnected regions as one instance.
+    The exact physical-sticker grouping remains available in the in-memory
+    masks and metadata, while the label file preserves each visible region.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        raise RuntimeError("NumPy is required to write YOLO segmentation annotations.") from None
+
+    if not isinstance(cube_mask, np.ndarray):
+        raise TypeError("Cube mask must be a NumPy array.")
+    lines = segmentation_lines_from_mask(cube_mask, 0)
+    if isinstance(sticker_masks, np.ndarray):
+        sticker_masks = {"sticker": sticker_masks}
+    if not isinstance(sticker_masks, dict):
+        raise TypeError("Sticker masks must be a dict of object name to NumPy mask.")
+    for _sticker_name, sticker_mask in sorted(sticker_masks.items()):
+        if not isinstance(sticker_mask, np.ndarray) or sticker_mask.shape != cube_mask.shape:
+            raise ValueError("Every sticker mask must match the cube mask dimensions.")
+        lines.extend(segmentation_lines_from_mask(sticker_mask, 1))
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+    label_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return len(lines)
+
+
+def write_segmentation_mask(
+    path: Path,
+    cube_mask: object,
+    sticker_masks: object,
+) -> None:
+    """Write an RGB verification mask: blue cube, green stickers, black background."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        raise RuntimeError("OpenCV and NumPy are required to write segmentation masks.") from None
+
+    if not isinstance(cube_mask, np.ndarray):
+        raise TypeError("Cube mask must be a NumPy array.")
+    if isinstance(sticker_masks, np.ndarray):
+        sticker_masks = {"sticker": sticker_masks}
+    if not isinstance(sticker_masks, dict):
+        raise TypeError("Sticker masks must be a dict of object name to NumPy mask.")
+    sticker_mask = np.zeros_like(cube_mask, dtype=np.uint8)
+    for mask in sticker_masks.values():
+        if not isinstance(mask, np.ndarray) or mask.shape != cube_mask.shape:
+            raise ValueError("Every sticker mask must match the cube mask dimensions.")
+        sticker_mask |= (mask != 0).astype(np.uint8)
+    output = np.zeros((*cube_mask.shape, 3), dtype=np.uint8)
+    output[cube_mask != 0] = (180, 80, 0)
+    output[sticker_mask != 0] = (0, 210, 0)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), output):
+        raise RuntimeError(f"Could not write segmentation mask: {path}")
 
 
 def write_yolo_segmentation_label(
@@ -3954,6 +5775,26 @@ def rotate_objects_around_origin(
     bpy.context.view_layer.update()
 
 
+def set_rotational_blur_sample_transforms(
+    objects: list[bpy.types.Object],
+    base_transforms: dict[str, tuple[Vector, Quaternion]],
+    axis: Vector,
+    global_angle_radians: float,
+    local_angle_radians: float,
+    local_object_names: set[str],
+) -> None:
+    """Apply separate whole-scene and localized motion to one blur sample."""
+    global_rotation = Quaternion(axis, global_angle_radians)
+    local_rotation = Quaternion(axis, local_angle_radians)
+    for obj in objects:
+        base_location, base_rotation = base_transforms[obj.name]
+        motion_rotation = local_rotation if obj.name in local_object_names else global_rotation
+        obj.location = motion_rotation @ base_location
+        obj.rotation_mode = "QUATERNION"
+        obj.rotation_quaternion = motion_rotation @ base_rotation
+    bpy.context.view_layer.update()
+
+
 def rotational_blur_sample_angles(magnitude_degrees: float, samples: int) -> list[float]:
     magnitude_radians = math.radians(magnitude_degrees)
     return [
@@ -3990,21 +5831,51 @@ def render_cube_rotational_blur_png(
     probability: float,
     max_degrees: float,
     samples: int,
+    local_object_names: set[str] | None = None,
 ) -> dict[str, object] | None:
     if probability <= 0.0 or max_degrees <= 0.0 or samples < 2 or random.random() >= probability:
         render_png(path)
         return None
 
     axis = random_point_on_unit_sphere()
-    magnitude_degrees = random.uniform(0.0, max_degrees)
+    # Keep the whole-image blur in the requested 3-4 degree range. Objects in
+    # local_object_names receive the larger range.
+    global_min_degrees = min(GLOBAL_ROTATIONAL_BLUR_DEGREES_RANGE[0], max_degrees)
+    global_max_degrees = min(GLOBAL_ROTATIONAL_BLUR_DEGREES_RANGE[1], max_degrees)
+    global_magnitude_degrees = random.uniform(
+        global_min_degrees,
+        max(global_min_degrees, global_max_degrees),
+    )
+    local_object_names = set(local_object_names or ())
+    local_object_names.intersection_update(obj.name for obj in objects)
+    local_magnitude_degrees = (
+        min(
+            MAX_LOCAL_ROTATIONAL_BLUR_DEGREES,
+            random.uniform(
+                max_degrees * LOCAL_ROTATIONAL_BLUR_FRACTION_RANGE[0],
+                max_degrees * LOCAL_ROTATIONAL_BLUR_FRACTION_RANGE[1],
+            ),
+        )
+        if local_object_names
+        else global_magnitude_degrees
+    )
     base_transforms = object_transforms(objects)
     sample_paths = []
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            for sample_index, angle in enumerate(rotational_blur_sample_angles(magnitude_degrees, samples)):
-                rotate_objects_around_origin(objects, base_transforms, axis, angle)
+            global_angles = rotational_blur_sample_angles(global_magnitude_degrees, samples)
+            local_angles = rotational_blur_sample_angles(local_magnitude_degrees, samples)
+            for sample_index, (global_angle, local_angle) in enumerate(zip(global_angles, local_angles)):
+                set_rotational_blur_sample_transforms(
+                    objects,
+                    base_transforms,
+                    axis,
+                    global_angle,
+                    local_angle,
+                    local_object_names,
+                )
                 sample_path = temp_path / f"rotational_blur_{sample_index:03d}.png"
                 render_png(sample_path)
                 sample_paths.append(sample_path)
@@ -4015,7 +5886,10 @@ def render_cube_rotational_blur_png(
 
     return {
         "axis": [axis.x, axis.y, axis.z],
-        "magnitude_degrees": magnitude_degrees,
+        "magnitude_degrees": global_magnitude_degrees,
+        "global_magnitude_degrees": global_magnitude_degrees,
+        "local_magnitude_degrees": local_magnitude_degrees if local_object_names else None,
+        "local_object_count": len(local_object_names),
         "samples": samples,
     }
 
@@ -4045,6 +5919,139 @@ def motion_blur_kernel(size: int, angle_degrees: float):
     return kernel / kernel_sum
 
 
+def apply_video_compression(
+    frame: object,
+    cv2: object,
+    np: object,
+) -> tuple[object, dict[str, object]]:
+    """Round-trip a frame through a short H.264/yuv420p video sequence."""
+    ffmpeg = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+    if not Path(ffmpeg).exists():
+        raise RuntimeError(
+            "Video degradation requires ffmpeg with libx264. "
+            "Install ffmpeg or set it on PATH."
+        )
+
+    height, width = frame.shape[:2]
+    context_frames = VIDEO_COMPRESSION_CONTEXT_FRAMES
+    center_index = context_frames // 2
+    jitter_x = random.uniform(*VIDEO_COMPRESSION_MOTION_JITTER_PX_RANGE)
+    jitter_y = random.uniform(*VIDEO_COMPRESSION_MOTION_JITTER_PX_RANGE)
+    if random.random() < 0.5:
+        jitter_x = -jitter_x
+    if random.random() < 0.5:
+        jitter_y = -jitter_y
+    crf = random.randint(*VIDEO_COMPRESSION_CRF_RANGE)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        source_pattern = temp_path / "source_%03d.png"
+        decoded_pattern = temp_path / "decoded_%03d.png"
+        video_path = temp_path / "compressed.mp4"
+        for frame_index in range(context_frames):
+            relative_index = frame_index - center_index
+            transform = np.asarray(
+                (
+                    (1.0, 0.0, relative_index * jitter_x / center_index),
+                    (0.0, 1.0, relative_index * jitter_y / center_index),
+                ),
+                dtype=np.float32,
+            )
+            context_frame = cv2.warpAffine(
+                frame,
+                transform,
+                (width, height),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REFLECT_101,
+            )
+            source_path = temp_path / f"source_{frame_index:03d}.png"
+            if not cv2.imwrite(str(source_path), context_frame):
+                raise RuntimeError(f"Could not write temporary video frame: {source_path}")
+
+        encode_command = [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
+            "-framerate",
+            str(VIDEO_COMPRESSION_FRAME_RATE),
+            "-i",
+            str(source_pattern),
+            "-frames:v",
+            str(context_frames),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            str(crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            str(context_frames + 1),
+            "-bf",
+            "2",
+            "-an",
+            str(video_path),
+        ]
+        decode_command = [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(video_path),
+            "-vsync",
+            "0",
+            "-frames:v",
+            str(context_frames),
+            str(decoded_pattern),
+        ]
+        try:
+            subprocess.run(
+                encode_command,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            subprocess.run(
+                decode_command,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                "Video degradation requires ffmpeg with libx264. "
+                "Install ffmpeg or set it on PATH."
+            ) from error
+        except subprocess.CalledProcessError as error:
+            details = error.stderr.strip() if error.stderr else "unknown ffmpeg error"
+            raise RuntimeError(f"Video degradation failed: {details}") from error
+
+        decoded_path = temp_path / f"decoded_{center_index + 1:03d}.png"
+        decoded = cv2.imread(str(decoded_path), cv2.IMREAD_COLOR)
+        if decoded is None:
+            raise RuntimeError(f"Could not read decoded video frame: {decoded_path}")
+        if decoded.shape[:2] != (height, width):
+            decoded = cv2.resize(decoded, (width, height), interpolation=cv2.INTER_LINEAR)
+
+    metadata = {
+        "codec": "h264",
+        "pixel_format": "yuv420p",
+        "crf": crf,
+        "preset": "veryfast",
+        "frame_rate": VIDEO_COMPRESSION_FRAME_RATE,
+        "context_frames": context_frames,
+        "center_frame": center_index,
+        "motion_jitter_px": [jitter_x, jitter_y],
+        "encoder": ffmpeg,
+    }
+    return decoded, metadata
+
+
 def apply_camera_degradation(path: Path, probability: float) -> dict[str, object] | None:
     if probability <= 0.0 or random.random() >= probability:
         return None
@@ -4067,7 +6074,7 @@ def apply_camera_degradation(path: Path, probability: float) -> dict[str, object
     frame = image[:, :, :3] if alpha is not None else image
 
     if random.random() < DEGRADE_RESCALE_PROBABILITY:
-        scale = random.uniform(0.55, 0.9)
+        scale = random.uniform(0.70, 0.95)
         height, width = frame.shape[:2]
         small = cv2.resize(
             frame,
@@ -4078,33 +6085,25 @@ def apply_camera_degradation(path: Path, probability: float) -> dict[str, object
         metadata["rescale"] = {"scale": scale}
 
     if random.random() < DEGRADE_GAUSSIAN_BLUR_PROBABILITY:
-        kernel = odd_kernel(random.choice((3, 3, 5, 7)))
-        sigma = random.uniform(0.35, 1.6)
+        kernel = odd_kernel(random.choice((3, 3, 5)))
+        sigma = random.uniform(0.25, 0.9)
         frame = cv2.GaussianBlur(frame, (kernel, kernel), sigmaX=sigma, sigmaY=sigma)
         metadata["gaussian_blur"] = {"kernel": kernel, "sigma": sigma}
 
     if random.random() < DEGRADE_MOTION_BLUR_PROBABILITY:
-        kernel_size = odd_kernel(random.choice((3, 5, 7, 9, 11)))
+        kernel_size = odd_kernel(random.choice((3, 5, 7)))
         angle = random.uniform(0.0, 180.0)
         frame = cv2.filter2D(frame, -1, motion_blur_kernel(kernel_size, angle))
         metadata["motion_blur"] = {"kernel": kernel_size, "angle_degrees": angle}
 
     if random.random() < DEGRADE_NOISE_PROBABILITY:
-        sigma = random.uniform(2.0, 13.0)
+        sigma = random.uniform(1.0, 7.0)
         noise = np.random.normal(0.0, sigma, frame.shape).astype(np.float32)
         frame = np.clip(frame.astype(np.float32) + noise, 0.0, 255.0).astype(np.uint8)
         metadata["sensor_noise"] = {"sigma": sigma}
 
-    if random.random() < DEGRADE_COMPRESSION_PROBABILITY:
-        quality = random.randint(35, 92)
-        success, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        if not success:
-            raise RuntimeError(f"Could not encode degraded JPEG buffer for: {path}")
-        decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
-        if decoded is None:
-            raise RuntimeError(f"Could not decode degraded JPEG buffer for: {path}")
-        frame = decoded
-        metadata["jpeg_compression"] = {"quality": quality}
+    if random.random() < DEGRADE_VIDEO_COMPRESSION_PROBABILITY:
+        frame, metadata["video_compression"] = apply_video_compression(frame, cv2, np)
 
     if alpha is not None:
         frame = np.dstack([frame, alpha])
@@ -4118,6 +6117,12 @@ def normalize_point(x: float, y: float, width: int, height: int) -> tuple[float,
         max(0.0, min(x / width, 1.0)),
         max(0.0, min(y / height, 1.0)),
     )
+
+
+def scaled_annotation_size(value: int, width: int, height: int) -> int:
+    """Scale an annotation width/radius from the 256px reference size."""
+    scale = min(width, height) / ANNOTATION_REFERENCE_SIZE
+    return max(1, int(round(value * scale)))
 
 
 def project_world_point(point: Vector, camera: bpy.types.Object, scene: bpy.types.Scene) -> tuple[float, float] | None:
@@ -4461,32 +6466,173 @@ def object_occluding_point(
     return None
 
 
-def wireframe_local_line_specs() -> list[dict[str, object]]:
-    """Return the 4-by-4 line grid on each of the cube's six local faces."""
-    specs = []
-    for normal_axis in range(3):
-        tangent_axes = [axis for axis in range(3) if axis != normal_axis]
-        for normal_sign in (-1.0, 1.0):
-            for varying_axis, fixed_axis in (
-                (tangent_axes[0], tangent_axes[1]),
-                (tangent_axes[1], tangent_axes[0]),
-            ):
-                for fixed_value in WIREFRAME_SURFACE_COORDINATES:
-                    start = [0.0, 0.0, 0.0]
-                    end = [0.0, 0.0, 0.0]
-                    start[normal_axis] = normal_sign * 1.5
-                    end[normal_axis] = normal_sign * 1.5
-                    start[fixed_axis] = fixed_value
-                    end[fixed_axis] = fixed_value
-                    start[varying_axis] = -1.5
-                    end[varying_axis] = 1.5
-                    specs.append({
-                        "start": Vector(start),
-                        "end": Vector(end),
-                        "normal": axis_vector(normal_axis, normal_sign),
-                        "support_direction": axis_vector(fixed_axis),
-                    })
-    return specs
+def dimension_cube_box_specs(
+    layer_state: dict[str, object] | None = None,
+) -> list[tuple[Vector, Matrix, Vector]]:
+    """Return oriented boxes for the idealized cube or a partial turn."""
+    if layer_state is None:
+        return [
+            (Vector((0.0, 0.0, 0.0)), Matrix.Identity(3), Vector((1.5, 1.5, 1.5)))
+        ]
+
+    if layer_state.get("mode") == "corner_cut":
+        return [
+            (center, rotation, Vector((0.5, 0.5, 0.5)))
+            for _initial_center, center, rotation in dimension_cubie_transforms(layer_state)
+        ]
+
+    face = layer_state.get("face")
+    angle_degrees = layer_state.get("angle_degrees")
+    direction = layer_state.get("direction")
+    if not isinstance(face, str) or not isinstance(angle_degrees, (int, float)):
+        raise ValueError("A partial-turn cube needs a face and angle.")
+    if not isinstance(direction, (int, float)):
+        raise ValueError("A partial-turn cube needs a direction.")
+
+    face_axis = face_specs()[face]
+    axis_index = max(range(3), key=lambda index: abs(face_axis[index]))
+    face_axis_sign = int(round(face_axis[axis_index]))
+    turn = Quaternion(
+        face_axis,
+        math.radians(float(direction) * float(angle_degrees)),
+    ).to_matrix()
+    boxes = []
+    half_extents = Vector((1.5, 1.5, 1.5))
+    half_extents[axis_index] = 0.5
+    for layer_coordinate in (-1.0, 0.0, 1.0):
+        center = Vector((0.0, 0.0, 0.0))
+        center[axis_index] = layer_coordinate
+        rotation = turn if layer_coordinate == float(face_axis_sign) else Matrix.Identity(3)
+        if layer_coordinate == float(face_axis_sign):
+            center = face_axis.copy()
+        boxes.append((center, rotation, half_extents.copy()))
+    return boxes
+
+
+def canonical_wireframe_layer_state(
+    layer_state: dict[str, object],
+    wireframe_scramble_transform: Matrix,
+) -> dict[str, object]:
+    """Express a post-scramble layer turn in canonical cube coordinates."""
+    scramble_rotation = wireframe_scramble_transform.to_3x3()
+    inverse_scramble_rotation = scramble_rotation.transposed()
+    axes = face_specs()
+
+    def canonical_face(face: object) -> object:
+        if not isinstance(face, str) or face not in axes:
+            return face
+        current_axis = axes[face]
+        canonical_axis = (inverse_scramble_rotation @ current_axis).normalized()
+        return max(axes, key=lambda candidate: axes[candidate].dot(canonical_axis))
+
+    canonical_state = dict(layer_state)
+    canonical_state["face"] = canonical_face(layer_state.get("face"))
+    if "adjacent_face" in layer_state:
+        canonical_state["adjacent_face"] = canonical_face(layer_state.get("adjacent_face"))
+    return canonical_state
+
+
+def transform_layer_state_by_symmetry(
+    layer_state: dict[str, object],
+    symmetry: Matrix,
+) -> dict[str, object]:
+    """Express layer axes in the canonical cube frame after a symmetry change."""
+    inverse_symmetry = symmetry.transposed()
+    axes = face_specs()
+
+    def transformed_face(face: object) -> object:
+        if not isinstance(face, str) or face not in axes:
+            return face
+        transformed_axis = (inverse_symmetry @ axes[face]).normalized()
+        return max(
+            axes,
+            key=lambda candidate: axes[candidate].dot(transformed_axis),
+        )
+
+    transformed_state = dict(layer_state)
+    transformed_state["face"] = transformed_face(layer_state.get("face"))
+    if "adjacent_face" in layer_state:
+        transformed_state["adjacent_face"] = transformed_face(
+            layer_state.get("adjacent_face")
+        )
+    return transformed_state
+
+
+def dimension_cubie_transforms(
+    layer_state: dict[str, object],
+) -> list[tuple[Vector, Vector, Matrix]]:
+    """Transform dimension-defined cubies through one or two layer turns."""
+    face = layer_state.get("face")
+    angle_degrees = layer_state.get("angle_degrees")
+    direction = layer_state.get("direction")
+    if not isinstance(face, str) or not isinstance(angle_degrees, (int, float)):
+        raise ValueError("A layer turn needs a face and angle.")
+    if not isinstance(direction, (int, float)):
+        raise ValueError("A layer turn needs a direction.")
+
+    primary_axis = face_specs()[face]
+    primary_turn = Quaternion(
+        primary_axis,
+        math.radians(float(direction) * float(angle_degrees)),
+    ).to_matrix()
+    second_face = layer_state.get("adjacent_face")
+    second_angle = layer_state.get("adjacent_angle_degrees")
+    second_direction = layer_state.get("adjacent_direction")
+    second_axis = None
+    second_turn = Matrix.Identity(3)
+    if layer_state.get("mode") == "corner_cut":
+        if not isinstance(second_face, str) or not isinstance(second_angle, (int, float)):
+            raise ValueError("A corner cut needs an adjacent face and angle.")
+        if not isinstance(second_direction, (int, float)):
+            raise ValueError("A corner cut needs an adjacent direction.")
+        second_axis = face_specs()[second_face]
+        second_turn = Quaternion(
+            second_axis,
+            math.radians(float(second_direction) * float(second_angle)),
+        ).to_matrix()
+
+    transforms = []
+    for x in (-1.0, 0.0, 1.0):
+        for y in (-1.0, 0.0, 1.0):
+            for z in (-1.0, 0.0, 1.0):
+                initial_center = Vector((x, y, z))
+                primary_selected = round(initial_center.dot(primary_axis)) == 1
+                center = primary_turn @ initial_center if primary_selected else initial_center.copy()
+                rotation = primary_turn if primary_selected else Matrix.Identity(3)
+                if second_axis is not None and round(center.dot(second_axis)) == 1:
+                    center = second_turn @ center
+                    rotation = second_turn @ rotation
+                transforms.append((initial_center, center, rotation))
+    return transforms
+
+
+def ray_box_intersection_distance(
+    origin: Vector,
+    direction: Vector,
+    center: Vector,
+    rotation: Matrix,
+    half_extents: Vector,
+) -> float | None:
+    """Return the nearest non-negative ray distance for an oriented box."""
+    inverse_rotation = rotation.transposed()
+    local_origin = inverse_rotation @ (origin - center)
+    local_direction = inverse_rotation @ direction
+    lower = -float("inf")
+    upper = float("inf")
+    for axis in range(3):
+        if abs(local_direction[axis]) <= 1e-8:
+            if abs(local_origin[axis]) > half_extents[axis]:
+                return None
+            continue
+        first = (-half_extents[axis] - local_origin[axis]) / local_direction[axis]
+        second = (half_extents[axis] - local_origin[axis]) / local_direction[axis]
+        lower = max(lower, min(first, second))
+        upper = min(upper, max(first, second))
+        if lower > upper:
+            return None
+    if upper < 0.0:
+        return None
+    return max(0.0, lower)
 
 
 def wireframe_ray_hit_is_visible(
@@ -4495,57 +6641,77 @@ def wireframe_ray_hit_is_visible(
     support_direction: Vector,
     main_cube_names: set[str],
     depsgraph: bpy.types.Depsgraph,
+    allow_gap_if_unblocked: bool = False,
+    candidate_object_names: set[str] | None = None,
+    cube_transform: Matrix | None = None,
+    cube_boxes: list[tuple[Vector, Matrix, Vector]] | None = None,
 ) -> bool:
-    """Return whether a visible face point is unobstructed by the scene."""
+    """Return whether a dimension-defined face point is frontmost and clear."""
     camera = get_camera()
     toward_camera = camera.matrix_world.translation - point
     if toward_camera.length <= 1e-6 or face_normal.dot(toward_camera.normalized()) <= 1e-4:
         return False
 
     scene = bpy.context.scene
-    target_distance_tolerance = 0.08
+    target_distance_tolerance = 0.035
     support_direction = support_direction.normalized()
     # The exact seam can be a small gap between beveled cubies. Probe both
     # adjacent surface strips as well as the seam itself. A hand or prop that
     # truly occludes the line also covers these immediate support probes.
     probe_points = [
+        # Move well inside the adjacent flat sticker/surface.  The idealized
+        # seam is at the edge of a beveled cubie, so probes immediately beside
+        # it can still land in the bevel or the physical gap.
+        point + support_direction * 0.12,
+        point - support_direction * 0.12,
         point,
-        point + support_direction * 0.018,
-        point - support_direction * 0.018,
     ]
     for probe_point in probe_points:
         origin = camera.matrix_world.translation
         direction = (probe_point - origin).normalized()
         point_distance = (probe_point - origin).length
-        ray_origin = origin
-        traveled = 0.0
-        while traveled < point_distance + target_distance_tolerance:
-            hit, location, _normal, _polygon_index, hit_object, _matrix = scene.ray_cast(
-                depsgraph,
-                ray_origin,
-                direction,
-                distance=(point_distance - traveled) + target_distance_tolerance,
+        if cube_transform is not None and cube_boxes is not None:
+            inverse_cube_transform = cube_transform.inverted()
+            local_origin = inverse_cube_transform @ origin
+            local_direction = inverse_cube_transform.to_3x3() @ direction
+            nearest_cube_distance = min(
+                (
+                    distance
+                    for center, rotation, half_extents in cube_boxes
+                    if (distance := ray_box_intersection_distance(
+                        local_origin,
+                        local_direction,
+                        center,
+                        rotation,
+                        half_extents,
+                    )) is not None
+                ),
+                default=None,
             )
-            if not hit or hit_object is None:
-                # Surface seams and the outer silhouette can be tiny gaps in
-                # the beveled mesh. If no scene object blocks the ray before
-                # this front-facing line, the line is still visible in the
-                # rendered image.
-                return True
-
-            hit_distance = (location - origin).length
             if (
-                not getattr(hit_object, "visible_camera", True)
-                or getattr(hit_object, "hide_render", False)
-                or hit_object.name.startswith(SYNTHETIC_WINDOW_BLOCKER_PREFIX)
+                nearest_cube_distance is None
+                or abs(nearest_cube_distance - point_distance) > target_distance_tolerance
             ):
-                ray_origin = location + direction * 1e-4
-                traveled = hit_distance + 1e-4
                 continue
 
-            if hit_object.name in main_cube_names and hit_distance >= point_distance - target_distance_tolerance:
-                return True
-            break
+        hit, location, _normal, _polygon_index, hit_object, _matrix = scene.ray_cast(
+            depsgraph,
+            origin,
+            direction,
+            distance=point_distance + target_distance_tolerance,
+        )
+        if hit and hit_object is not None:
+            hit_distance = (location - origin).length
+            if (
+                getattr(hit_object, "visible_camera", True)
+                and not getattr(hit_object, "hide_render", False)
+                and not hit_object.name.startswith(SYNTHETIC_WINDOW_BLOCKER_PREFIX)
+                and hit_object.name not in main_cube_names
+                and hit_distance <= point_distance + target_distance_tolerance
+            ):
+                continue
+        if allow_gap_if_unblocked or cube_transform is not None:
+            return True
     return False
 
 
@@ -4601,22 +6767,192 @@ def clip_wireframe_segment(
     )
 
 
-def visible_wireframe_segments(
+def merge_wireframe_segments(
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Join adjacent collinear visible pieces into layer-length lines."""
+    merged = list(segments)
+    changed = True
+    while changed:
+        changed = False
+        for first_index in range(len(merged)):
+            first_start, first_end = merged[first_index]
+            first_vector = (first_end[0] - first_start[0], first_end[1] - first_start[1])
+            first_length = math.hypot(*first_vector)
+            if first_length <= 1e-6:
+                continue
+            for second_index in range(first_index + 1, len(merged)):
+                second_start, second_end = merged[second_index]
+                second_vector = (second_end[0] - second_start[0], second_end[1] - second_start[1])
+                second_length = math.hypot(*second_vector)
+                if second_length <= 1e-6:
+                    continue
+                cross = abs(first_vector[0] * second_vector[1] - first_vector[1] * second_vector[0])
+                if cross > 0.025 * first_length * second_length:
+                    continue
+                if min(
+                    math.dist(first_start, second_start),
+                    math.dist(first_start, second_end),
+                    math.dist(first_end, second_start),
+                    math.dist(first_end, second_end),
+                ) > 2.0:
+                    continue
+                direction = (first_vector[0] / first_length, first_vector[1] / first_length)
+                points = [first_start, first_end, second_start, second_end]
+                projection = [point[0] * direction[0] + point[1] * direction[1] for point in points]
+                first = points[projection.index(min(projection))]
+                last = points[projection.index(max(projection))]
+                merged[first_index] = (first, last)
+                del merged[second_index]
+                changed = True
+                break
+            if changed:
+                break
+    return merged
+
+
+def partial_turn_wireframe_line_specs(
+    layer_state: dict[str, object],
+) -> list[dict[str, object]]:
+    """Build dimension-defined surface grids for a partially turned layer."""
+    face = layer_state.get("face")
+    angle_degrees = layer_state.get("angle_degrees")
+    direction = layer_state.get("direction")
+    if not isinstance(face, str) or not isinstance(angle_degrees, (int, float)):
+        raise ValueError("A partial-turn wireframe needs a face and angle.")
+    if not isinstance(direction, (int, float)):
+        raise ValueError("A partial-turn wireframe needs a direction.")
+
+    face_axis = face_specs()[face]
+    turn_axis_index = max(range(3), key=lambda index: abs(face_axis[index]))
+    face_axis_sign = int(round(face_axis[turn_axis_index]))
+    layer_center = face_axis.copy()
+    turn = Quaternion(
+        face_axis,
+        math.radians(float(direction) * float(angle_degrees)),
+    ).to_matrix().to_4x4()
+    layer_transform = (
+        Matrix.Translation(layer_center)
+        @ turn
+        @ Matrix.Translation(-layer_center)
+    )
+    identity = Matrix.Identity(4)
+    specs = []
+
+    for layer_coordinate in (-1.0, 0.0, 1.0):
+        transform = (
+            layer_transform
+            if layer_coordinate == float(face_axis_sign)
+            else identity
+        )
+        rotation = transform.to_3x3()
+        for normal_axis in range(3):
+            tangent_axes = [axis for axis in range(3) if axis != normal_axis]
+            for normal_sign in (-1.0, 1.0):
+                # Along the turn axis, each slab contributes only its outer
+                # face. Along the other axes, all three slabs contribute one
+                # surface strip.
+                if normal_axis == turn_axis_index and layer_coordinate != normal_sign:
+                    continue
+                for varying_axis, fixed_axis in (
+                    (tangent_axes[0], tangent_axes[1]),
+                    (tangent_axes[1], tangent_axes[0]),
+                ):
+                    varying_values = (
+                        (layer_coordinate - 0.5, layer_coordinate + 0.5)
+                        if varying_axis == turn_axis_index
+                        else (-1.5, 1.5)
+                    )
+                    fixed_values = (
+                        (layer_coordinate - 0.5, layer_coordinate + 0.5)
+                        if fixed_axis == turn_axis_index
+                        else (-1.5, -0.5, 0.5, 1.5)
+                    )
+                    for fixed_value in fixed_values:
+                        start = Vector((0.0, 0.0, 0.0))
+                        end = Vector((0.0, 0.0, 0.0))
+                        start[normal_axis] = normal_sign * 1.5
+                        end[normal_axis] = normal_sign * 1.5
+                        start[fixed_axis] = fixed_value
+                        end[fixed_axis] = fixed_value
+                        start[varying_axis] = varying_values[0]
+                        end[varying_axis] = varying_values[1]
+                        specs.append({
+                            "start": transform @ start,
+                            "end": transform @ end,
+                            "normal": (rotation @ axis_vector(normal_axis, normal_sign)).normalized(),
+                            "support_direction": (rotation @ axis_vector(fixed_axis)).normalized(),
+                        })
+    return specs
+
+
+def corner_cut_wireframe_line_specs(
+    layer_state: dict[str, object],
+) -> list[dict[str, object]]:
+    """Build exposed surface-cell edges after sequential dimension turns."""
+    specs = []
+    cubie_transforms = dimension_cubie_transforms(layer_state)
+
+    def inside_box(point: Vector, center: Vector, rotation: Matrix) -> bool:
+        local_point = rotation.transposed() @ (point - center)
+        return all(abs(local_point[axis]) < 0.5 + 1e-4 for axis in range(3))
+
+    for cubie_index, (_initial_center, center, rotation) in enumerate(cubie_transforms):
+        for normal_axis in range(3):
+            for normal_sign in (-1.0, 1.0):
+                local_normal = axis_vector(normal_axis, normal_sign)
+                normal = (rotation @ local_normal).normalized()
+                face_center = center + normal * 0.5
+                if any(
+                    other_index != cubie_index
+                    and inside_box(
+                        face_center + normal * 0.04,
+                        other_center,
+                        other_rotation,
+                    )
+                    for other_index, (_other_initial, other_center, other_rotation)
+                    in enumerate(cubie_transforms)
+                ):
+                    continue
+                tangent_axes = [axis for axis in range(3) if axis != normal_axis]
+                for varying_axis, fixed_axis in (
+                    (tangent_axes[0], tangent_axes[1]),
+                    (tangent_axes[1], tangent_axes[0]),
+                ):
+                    for fixed_offset in (-0.5, 0.5):
+                        local_start = local_normal * 0.5
+                        local_end = local_normal * 0.5
+                        local_start[fixed_axis] = fixed_offset
+                        local_end[fixed_axis] = fixed_offset
+                        local_start[varying_axis] = -0.5
+                        local_end[varying_axis] = 0.5
+                        specs.append({
+                            "start": center + rotation @ local_start,
+                            "end": center + rotation @ local_end,
+                            "normal": normal,
+                            "support_direction": (
+                                rotation @ axis_vector(fixed_axis)
+                            ).normalized(),
+                        })
+    return specs
+
+
+def visible_wireframe_line_segments(
+    line_specs: list[dict[str, object]],
     cube_transform: Matrix,
+    cube_boxes: list[tuple[Vector, Matrix, Vector]],
     main_cube_roots: list[bpy.types.Object],
     width: int,
     height: int,
 ) -> list[tuple[tuple[float, float], tuple[float, float]]]:
-    """Project visible portions of the cube's surface grid into image space."""
+    """Project dimension-defined line specs, keeping only visible portions."""
     camera = get_camera()
     scene = bpy.context.scene
     depsgraph = bpy.context.evaluated_depsgraph_get()
-    main_cube_names = {
-        obj.name for obj in mesh_objects_in_roots(main_cube_roots)
-    }
+    main_cube_names = cube_render_mesh_names(main_cube_roots)
     segments = []
 
-    for spec in wireframe_local_line_specs():
+    for spec in line_specs:
         local_start = spec["start"]
         local_end = spec["end"]
         local_normal = spec["normal"]
@@ -4629,7 +6965,9 @@ def visible_wireframe_segments(
         start = cube_transform @ local_start
         end = cube_transform @ local_end
         normal = (cube_transform.to_3x3() @ local_normal).normalized()
-        support_direction = (cube_transform.to_3x3() @ local_support_direction).normalized()
+        support_direction = (
+            cube_transform.to_3x3() @ local_support_direction
+        ).normalized()
         projected_start = project_world_point_unclipped(start, camera, scene)
         projected_end = project_world_point_unclipped(end, camera, scene)
         if projected_start is None or projected_end is None:
@@ -4643,13 +6981,14 @@ def visible_wireframe_segments(
             cached = visibility_cache.get(t)
             if cached is not None:
                 return cached
-            world_point = start.lerp(end, t)
             visible = wireframe_ray_hit_is_visible(
-                world_point,
+                start.lerp(end, t),
                 normal,
                 support_direction,
                 main_cube_names,
                 depsgraph,
+                cube_transform=cube_transform,
+                cube_boxes=cube_boxes,
             )
             visibility_cache[t] = visible
             return visible
@@ -4669,33 +7008,30 @@ def visible_wireframe_segments(
                 0.0
                 if run_start == 0
                 else interpolate_wireframe_boundary(
-                    samples[run_start - 1],
-                    samples[run_start],
-                    False,
-                    visibility_at,
+                    samples[run_start - 1], samples[run_start], False, visibility_at
                 )
             )
             end_t = (
                 1.0
                 if run_end == sample_count - 1
                 else interpolate_wireframe_boundary(
-                    samples[run_end],
-                    samples[run_end + 1],
-                    True,
-                    visibility_at,
+                    samples[run_end], samples[run_end + 1], True, visibility_at
                 )
             )
             if end_t - start_t > 1e-4:
-                world_start = start.lerp(end, start_t)
-                world_end = start.lerp(end, end_t)
-                image_start = project_world_point_unclipped(world_start, camera, scene)
-                image_end = project_world_point_unclipped(world_end, camera, scene)
+                image_start = project_world_point_unclipped(
+                    start.lerp(end, start_t), camera, scene
+                )
+                image_end = project_world_point_unclipped(
+                    start.lerp(end, end_t), camera, scene
+                )
                 if image_start is not None and image_end is not None:
                     clipped = clip_wireframe_segment(image_start, image_end, width, height)
                     if clipped is not None and math.dist(*clipped) >= 1.0:
                         segments.append(clipped)
             index += 1
 
+    segments = merge_wireframe_segments(segments)
     unique_segments = []
     seen = set()
     for start, end in segments:
@@ -4707,6 +7043,51 @@ def visible_wireframe_segments(
         seen.add(key)
         unique_segments.append((start, end))
     return unique_segments
+
+
+def canonical_wireframe_line_specs() -> list[dict[str, object]]:
+    """Return the standard 4-by-4 grid on each local cube face."""
+    specs = []
+    for normal_axis in range(3):
+        tangent_axes = [axis for axis in range(3) if axis != normal_axis]
+        for normal_sign in (-1.0, 1.0):
+            for varying_axis, fixed_axis in (
+                (tangent_axes[0], tangent_axes[1]),
+                (tangent_axes[1], tangent_axes[0]),
+            ):
+                for fixed_value in (-1.5, -0.5, 0.5, 1.5):
+                    start = [0.0, 0.0, 0.0]
+                    end = [0.0, 0.0, 0.0]
+                    start[normal_axis] = normal_sign * 1.5
+                    end[normal_axis] = normal_sign * 1.5
+                    start[fixed_axis] = fixed_value
+                    end[fixed_axis] = fixed_value
+                    start[varying_axis] = -1.5
+                    end[varying_axis] = 1.5
+                    specs.append({
+                        "start": Vector(start),
+                        "end": Vector(end),
+                        "normal": axis_vector(normal_axis, normal_sign),
+                        "support_direction": axis_vector(fixed_axis),
+                    })
+    return specs
+
+
+def visible_canonical_wireframe_segments(
+    cube_transform: Matrix,
+    main_cube_roots: list[bpy.types.Object],
+    width: int,
+    height: int,
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Project the standard grid for frames without a partial layer turn."""
+    return visible_wireframe_line_segments(
+        canonical_wireframe_line_specs(),
+        cube_transform,
+        dimension_cube_box_specs(),
+        main_cube_roots,
+        width,
+        height,
+    )
 
 
 def write_wireframe_label(
@@ -4744,11 +7125,17 @@ def write_wireframe_overlay(
     if image is None:
         raise RuntimeError(f"Could not read rendered image for wireframe overlay: {image_path}")
     output = image.copy()
+    line_width = scaled_annotation_size(WIREFRAME_LINE_BASE_WIDTH, image.shape[1], image.shape[0])
+    shadow_width = scaled_annotation_size(
+        WIREFRAME_LINE_SHADOW_BASE_WIDTH,
+        image.shape[1],
+        image.shape[0],
+    )
     for start, end in segments:
         start_point = tuple(round(value) for value in start)
         end_point = tuple(round(value) for value in end)
-        cv2.line(output, start_point, end_point, WIREFRAME_LINE_SHADOW_COLOR, 5, cv2.LINE_AA)
-        cv2.line(output, start_point, end_point, WIREFRAME_LINE_COLOR, 2, cv2.LINE_AA)
+        cv2.line(output, start_point, end_point, WIREFRAME_LINE_SHADOW_COLOR, shadow_width, cv2.LINE_AA)
+        cv2.line(output, start_point, end_point, WIREFRAME_LINE_COLOR, line_width, cv2.LINE_AA)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(path), output):
         raise RuntimeError(f"Could not write wireframe verification render: {path}")
@@ -5122,6 +7509,10 @@ def write_pose_keypoint_mask(
         CORNER_EDGE_CENTER_CLASS_ID: (255, 120, 255),
         CENTER_CLASS_ID: (255, 255, 0),
     }
+    segment_fill_width = scaled_annotation_size(POSE_SEGMENT_FILL_BASE_WIDTH, width, height)
+    segment_outline_width = scaled_annotation_size(POSE_SEGMENT_OUTLINE_BASE_WIDTH, width, height)
+    point_radius = scaled_annotation_size(POSE_POINT_BASE_RADIUS, width, height)
+    point_outline_radius = scaled_annotation_size(POSE_POINT_OUTLINE_BASE_RADIUS, width, height)
     for pose_object in pose_objects:
         class_id = int(pose_object["class_id"])
         fill_color = fill_colors.get(class_id, (90, 90, 90))
@@ -5135,12 +7526,19 @@ def write_pose_keypoint_mask(
             points = np.asarray(labeled_points, dtype=np.float32)
             hull = cv2.convexHull(np.round(points).astype(np.int32))
             cv2.fillConvexPoly(output, hull, fill_color, lineType=cv2.LINE_AA)
-            cv2.polylines(output, [hull], isClosed=True, color=outline_color, thickness=1, lineType=cv2.LINE_AA)
+            cv2.polylines(
+                output,
+                [hull],
+                isClosed=True,
+                color=outline_color,
+                thickness=segment_outline_width,
+                lineType=cv2.LINE_AA,
+            )
         elif len(labeled_points) == 2:
             start = tuple(np.round(labeled_points[0]).astype(np.int32))
             end = tuple(np.round(labeled_points[1]).astype(np.int32))
-            cv2.line(output, start, end, fill_color, thickness=9, lineType=cv2.LINE_AA)
-            cv2.line(output, start, end, outline_color, thickness=2, lineType=cv2.LINE_AA)
+            cv2.line(output, start, end, fill_color, thickness=segment_fill_width, lineType=cv2.LINE_AA)
+            cv2.line(output, start, end, outline_color, thickness=segment_outline_width, lineType=cv2.LINE_AA)
 
         for keypoint in pose_object["keypoints"]:
             visibility = int(keypoint["visibility"])
@@ -5151,8 +7549,8 @@ def write_pose_keypoint_mask(
             if visibility == POINT_VISIBILITY_LABELED_OCCLUDED:
                 draw_color = (0, 0, 255)
             center = (round(float(x)), round(float(y)))
-            cv2.circle(output, center, 5, draw_color, thickness=-1, lineType=cv2.LINE_AA)
-            cv2.circle(output, center, 7, (0, 0, 0), thickness=1, lineType=cv2.LINE_AA)
+            cv2.circle(output, center, point_radius, draw_color, thickness=-1, lineType=cv2.LINE_AA)
+            cv2.circle(output, center, point_outline_radius, (0, 0, 0), thickness=segment_outline_width, lineType=cv2.LINE_AA)
 
     cv2.imwrite(str(path), output)
 
@@ -5174,65 +7572,122 @@ def generate_dataset(
     degrade_probability: float,
     render_masks: bool,
     render_segmentations: bool,
-    min_visible_keypoints_with_hands: int,
-    max_hand_placement_attempts: int,
+    hard_case: str = DEFAULT_HARD_CASE,
+    render_pose_labels: bool = True,
 ) -> None:
     images_dir = output_dir / "images"
     masks_dir = output_dir / "masks" if render_masks else None
-    wireframe_renders_dir = output_dir / "wireframes" if render_segmentations else None
     labels_dir = output_dir / "labels"
-    whole_cube_labels_dir = labels_dir / "whole_cube" if render_segmentations else None
-    wireframe_labels_dir = labels_dir / "wireframe" if render_segmentations else None
+    pose_dir = output_dir / POSE_LABEL_DIRECTORY if render_pose_labels else None
     images_dir.mkdir(parents=True, exist_ok=True)
     if masks_dir is not None:
         masks_dir.mkdir(parents=True, exist_ok=True)
-    if wireframe_renders_dir is not None:
-        wireframe_renders_dir.mkdir(parents=True, exist_ok=True)
-    if whole_cube_labels_dir is not None:
-        whole_cube_labels_dir.mkdir(parents=True, exist_ok=True)
-        (whole_cube_labels_dir / "classes.json").write_text(
-            json.dumps(
-                {
-                    str(class_id): name
-                    for class_id, name in enumerate(WHOLE_CUBE_YOLO_CLASS_NAMES)
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-    if wireframe_labels_dir is not None:
-        wireframe_labels_dir.mkdir(parents=True, exist_ok=True)
-        (wireframe_labels_dir / "classes.json").write_text(
-            json.dumps(
-                {
-                    str(class_id): name
-                    for class_id, name in enumerate(WIREFRAME_CLASS_NAMES)
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
     labels_dir.mkdir(parents=True, exist_ok=True)
+    if pose_dir is not None:
+        pose_dir.mkdir(parents=True, exist_ok=True)
+        (pose_dir / "schema.json").write_text(
+            json.dumps(
+                {
+                    "format": POSE_LABEL_FORMAT,
+                    "description": "Direct image-space labels for the custom 1x1x3 articulated-cube pose head.",
+                    "cube_pose": {
+                        "u_colatitude_degrees": "Colatitude from image zenith in [0, 90).",
+                        "v_azimuth_degrees": "Azimuth around image zenith in [-180, 180).",
+                        "twist_degrees": "Twist around the stack axis in [-45, 45).",
+                    },
+                    "projection": "image_projection contains normalized center, normalized image scale, and perspective strength.",
+                    "articulation": "articulation.layer_angles_degrees contains the negative and positive outer-layer angles, signed around each layer's outward normal and modulo 90 degrees in [-45, 45).",
+                    "per_image": "{stem}.json",
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    if render_segmentations:
+        (labels_dir / "classes.json").write_text(
+            json.dumps(
+                {
+                    str(class_id): name
+                    for class_id, name in enumerate(SEGMENTATION_CLASS_NAMES)
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     ensure_hand_assets_loaded()
-    configure_render(width, height)
-
-    metadata = []
+    base_width, base_height = width, height
+    metadata_path = output_dir / "metadata.json"
+    metadata_file = metadata_path.open("w", encoding="utf-8")
+    metadata_file.write("[\n")
+    metadata_count = 0
     for index in range(count):
-        desk_no_hands = random.random() < CUBE_DESK_NO_HANDS_PROBABILITY
-        (
-            moves,
-            layer_state,
-            background_randomization,
-            camera_randomization,
-            light_randomization,
-            cube_pose,
-            sticker_materials,
-        ) = randomize_scene(
-            scramble_length,
-            background_object_count=background_object_count,
-            desk_no_hands=desk_no_hands,
+        auto_sample_hard_case = (
+            hard_case == DEFAULT_HARD_CASE
+            and HARD_CASE_AUTO_SAMPLING_ENABLED
         )
+        if auto_sample_hard_case:
+            active_hard_case = (
+                random.choice(NON_SOLVED_HARD_CASES)
+                if random.random() < HARD_CASE_GLOBAL_PROBABILITY
+                else DEFAULT_HARD_CASE
+            )
+            cube_solved = random.random() < GLOBAL_SOLVED_CUBE_PROBABILITY
+        else:
+            active_hard_case = hard_case
+            cube_solved = hard_case == SOLVED_CUBE_HARD_CASE
+        use_high_resolution = (
+            (base_width, base_height) != HIGH_RESOLUTION_IMAGE_SIZE
+            and random.random() < HIGH_RESOLUTION_PROBABILITY
+        )
+        width, height = (
+            HIGH_RESOLUTION_IMAGE_SIZE
+            if use_high_resolution
+            else (base_width, base_height)
+        )
+        configure_render(width, height)
+        # Deliberate hard cases own their occlusion setup. Keep hands enabled
+        # unless the case explicitly requests a hand-free scene through its
+        # returned metadata.
+        desk_no_hands = (
+            random.random() < CUBE_DESK_NO_HANDS_PROBABILITY
+            if active_hard_case == DEFAULT_HARD_CASE
+            else False
+        )
+        if active_hard_case == DEFAULT_HARD_CASE:
+            (
+                moves,
+                layer_state,
+                background_randomization,
+                camera_randomization,
+                light_randomization,
+                cube_pose,
+                sticker_materials,
+            ) = randomize_scene(
+                scramble_length,
+                background_object_count=background_object_count,
+                desk_no_hands=desk_no_hands,
+                solved=cube_solved,
+            )
+        else:
+            # Deliberate cases own their scene setup.  In particular, do not
+            # call randomize_scene() here: that would erase the controlled
+            # pose/background/occlusion the case is meant to reproduce.
+            (
+                moves,
+                layer_state,
+                background_randomization,
+                camera_randomization,
+                light_randomization,
+                cube_pose,
+                sticker_materials,
+            ) = build_hard_case_scene(
+                active_hard_case,
+                scramble_length=scramble_length,
+                background_object_count=background_object_count,
+                solved=cube_solved,
+            )
         base_cube_pose = cube_pose
         objects = cube_objects()
         core_objects = core_fill_objects()
@@ -5244,105 +7699,101 @@ def generate_dataset(
         stem = f"{(index):06d}"
         image_path = images_dir / f"{stem}.png"
         mask_path = masks_dir / f"{stem}.png" if masks_dir is not None else None
-        whole_cube_label_path = (
-            whole_cube_labels_dir / f"{stem}.txt"
-            if whole_cube_labels_dir is not None
-            else None
-        )
-        wireframe_label_path = (
-            wireframe_labels_dir / f"{stem}.txt"
-            if wireframe_labels_dir is not None
-            else None
-        )
-        wireframe_render_path = (
-            wireframe_renders_dir / f"{stem}.png"
-            if wireframe_renders_dir is not None
-            else None
-        )
-        label_path = labels_dir / f"{stem}.txt"
+        label_path = labels_dir / f"{stem}.txt" if render_segmentations else None
+        pose_label_path = pose_dir / f"{stem}.json" if pose_dir is not None else None
 
         hands = hand_objects()
         hand_rigs = hand_rig_objects()
         hand_states = hand_object_states(hands)
-        hand_attempts = []
-        hand_randomization = None
-        preflight_pose_objects = []
-        preflight_pose_geometry = {}
-        accepted_hand_pose = False
-        attempts = max(1, int(max_hand_placement_attempts))
-        for attempt_index in range(1, attempts + 1):
-            for obj in cube_pose_objects:
-                obj.matrix_world = cube_base_transforms[obj.name]
-            restore_hand_objects(hands, hand_states)
-            hand_randomization = randomize_hands(
-                hands,
-                hand_states,
-                forced_visibility="none" if desk_no_hands else None,
-            )
-            hand_lift = (
-                CUBE_HANDS_TABLE_LIFT
-                if hand_randomization.get("visibility") != "none" and not desk_no_hands
-                else 0.0
-            )
-            hand_visible = hand_randomization.get("visibility") != "none"
-            placement_cube_pose = (
-                base_cube_pose
-                if hand_visible
-                else cube_pose_on_table(base_cube_pose)
-            )
-            attempt_cube_pose = cube_pose_with_hand_lift(placement_cube_pose, hand_lift)
-            apply_shared_cube_pose(cube_pose_objects, hand_rigs, attempt_cube_pose)
-            hand_randomization["follows_cube_pose"] = True
-            hand_randomization["cube_vertical_lift"] = hand_lift
-            _preflight_lines, preflight_pose_objects, preflight_pose_geometry = render_pose_keypoints(None)
-            acceptable, visibility_summary = hand_pose_is_acceptable(
-                hand_randomization,
-                preflight_pose_objects,
-                min_visible_keypoints=min_visible_keypoints_with_hands,
-            )
-            hand_attempts.append({
-                "attempt": attempt_index,
-                "accepted": acceptable,
-                "visibility": visibility_summary,
-                "hands": hand_randomization,
-            })
-            if acceptable:
-                cube_pose = attempt_cube_pose
-                accepted_hand_pose = True
-                break
-            restore_hand_objects(hands, hand_states)
+        for obj in cube_pose_objects:
+            obj.matrix_world = cube_base_transforms[obj.name]
+        restore_hand_objects(hands, hand_states)
+        hand_randomization = randomize_hands(
+            hands,
+            hand_states,
+            forced_visibility=(
+                background_randomization.get("forced_hand_visibility")
+                if not desk_no_hands
+                else "none"
+            ),
+        )
+        hand_lift = (
+            random.uniform(*PALM_HAND_LIFT_RANGE)
+            if active_hard_case == PALM_GAP_HARD_CASE
+            else CUBE_HANDS_TABLE_LIFT
+        ) if (
+            hand_randomization.get("visibility") != "none"
+            and not desk_no_hands
+        ) else 0.0
+        hand_visible = hand_randomization.get("visibility") != "none"
+        placement_cube_pose = base_cube_pose if hand_visible else cube_pose_on_table(base_cube_pose)
+        cube_pose = cube_pose_with_hand_lift(placement_cube_pose, hand_lift)
+        apply_shared_cube_pose(cube_pose_objects, hand_rigs, cube_pose)
+        hand_randomization["follows_cube_pose"] = True
+        hand_randomization["cube_vertical_lift"] = hand_lift
+        hand_attempts = [{"attempt": 1, "accepted": True, "hands": hand_randomization}]
 
-        if not accepted_hand_pose:
-            for obj in cube_pose_objects:
-                obj.matrix_world = cube_base_transforms[obj.name]
-            restore_hand_objects(hands, hand_states)
-            hand_randomization = randomize_hands(hands, hand_states, forced_visibility="none")
-            cube_pose = cube_pose_on_table(base_cube_pose)
-            apply_shared_cube_pose(cube_pose_objects, hand_rigs, cube_pose)
-            hand_randomization["follows_cube_pose"] = True
-            hand_randomization["cube_vertical_lift"] = 0.0
-            _preflight_lines, preflight_pose_objects, preflight_pose_geometry = render_pose_keypoints(None)
-            _acceptable, visibility_summary = hand_pose_is_acceptable(
-                hand_randomization,
-                preflight_pose_objects,
-                min_visible_keypoints=min_visible_keypoints_with_hands,
-            )
-            hand_attempts.append({
-                "attempt": attempts + 1,
-                "accepted": True,
-                "fallback": "hide_hands",
-                "visibility": visibility_summary,
-                "hands": hand_randomization,
-            })
+        if active_hard_case == PALM_GAP_HARD_CASE and hand_randomization is not None:
+            # The palm-gap case holds the cube higher than ordinary desk
+            # samples so the visible palm remains above the tabletop. The
+            # procedural hull must follow that same lift or it can intersect
+            # the table while the real hand is elevated.
+            base_translation = base_cube_pose.get("translation")
+            final_translation = cube_pose.get("translation")
+            if isinstance(base_translation, list) and isinstance(final_translation, list):
+                palm_lift_delta = float(final_translation[2]) - float(base_translation[2])
+                if abs(palm_lift_delta) > 1e-6:
+                    palm_objects = background_randomization.get("objects", [])
+                    hull_names: list[str] = []
+                    if isinstance(palm_objects, list):
+                        for item in palm_objects:
+                            if not isinstance(item, dict):
+                                continue
+                            if item.get("family") != "dark_gap_backdrop":
+                                continue
+                            names = item.get("object_names", [])
+                            if isinstance(names, list):
+                                hull_names.extend(
+                                    name for name in names if isinstance(name, str)
+                                )
+                    for name in hull_names:
+                        hull = bpy.data.objects.get(name)
+                        if hull is not None:
+                            hull.location.z += palm_lift_delta
+                    variant = background_randomization.get("variant")
+                    if isinstance(variant, dict):
+                        geometry = variant.get("palm_hull_geometry")
+                        if isinstance(geometry, dict):
+                            final_center = geometry.get("final_center")
+                            if isinstance(final_center, list) and len(final_center) == 3:
+                                final_center[2] += palm_lift_delta
+                            geometry["hand_lift_followed"] = palm_lift_delta
+
+        secondary_clearance = ensure_secondary_cube_clearance(cube_pose_objects)
+        if secondary_clearance is not None:
+            background_randomization["secondary_cube_clearance"] = secondary_clearance
 
         try:
             render_objects = list(objects) + list(hand_rigs.values())
+            localized_blur_object_names = {
+                rig.name
+                for rig in hand_rigs.values()
+                if not rig.hide_render and not rig.hide_get()
+            }
+            if layer_state.get("mode") != "none":
+                for object_key in ("objects", "adjacent_objects"):
+                    layer_objects = layer_state.get(object_key, [])
+                    if isinstance(layer_objects, list):
+                        localized_blur_object_names.update(
+                            name for name in layer_objects if isinstance(name, str)
+                        )
             rotational_blur = render_cube_rotational_blur_png(
                 image_path,
                 render_objects,
                 probability=cube_rotational_blur_probability,
                 max_degrees=max_cube_rotational_blur_degrees,
                 samples=cube_rotational_blur_samples,
+                local_object_names=localized_blur_object_names,
             )
             camera_degradation = apply_camera_degradation(
                 image_path,
@@ -5350,74 +7801,76 @@ def generate_dataset(
             )
             segmentations = {}
             segmentation_roots = list(objects) + core_objects
-            whole_cube_mask = None
-            if whole_cube_label_path is not None:
-                whole_cube_mask = render_segmentation_masks(
+            if render_segmentations:
+                visibility_class_map, sticker_masks = render_visibility_class_map(
                     segmentation_roots,
+                    list(hand_rigs.values()),
                     width,
                     height,
                 )
-            if whole_cube_label_path is not None:
-                whole_cube_segments = write_yolo_segmentation_label(
-                    whole_cube_mask,
-                    whole_cube_label_path,
-                    {1: 0},
+                sticker_masks = filter_visible_sticker_masks(
+                    sticker_masks,
+                    width,
+                    height,
                 )
-                segmentations["whole_cube"] = {
-                    "path": str(whole_cube_label_path),
+                cube_mask = (visibility_class_map == 1).astype("uint8")
+                segmentation_count = write_yolo_cube_sticker_segmentation_label(
+                    cube_mask,
+                    sticker_masks,
+                    label_path,
+                )
+                sticker_component_count = sum(
+                    1
+                    for line in label_path.read_text(encoding="utf-8").splitlines()
+                    if line.split(maxsplit=1)[0] == "1"
+                )
+                if mask_path is not None:
+                    write_segmentation_mask(mask_path, cube_mask, sticker_masks)
+                segmentations["target"] = {
+                    "path": str(label_path),
                     "classes": {
                         str(class_id): name
-                        for class_id, name in enumerate(WHOLE_CUBE_YOLO_CLASS_NAMES)
+                        for class_id, name in enumerate(SEGMENTATION_CLASS_NAMES)
                     },
                     "format": "YOLO polygon segmentation",
-                    "segments": whole_cube_segments,
+                    "segments": segmentation_count,
+                    "sticker_instances": sum(
+                        1
+                        for sticker_mask in sticker_masks.values()
+                        if getattr(sticker_mask, "any", lambda: False)()
+                    ),
+                    "sticker_components": sticker_component_count,
+                    "mask": str(mask_path) if mask_path is not None else None,
                 }
-            wireframe_segments = []
-            if wireframe_label_path is not None:
-                cube_transform = (
-                    matrix_from_rows(cube_pose["transform"])
-                    @ matrix_from_rows(cube_pose["wireframe_scramble_transform"])
-                )
-                wireframe_segments = visible_wireframe_segments(
-                    cube_transform,
-                    segmentation_roots,
+            if pose_label_path is not None:
+                write_pose_label(
+                    pose_label_path,
+                    cube_pose,
+                    layer_state,
                     width,
                     height,
                 )
-                wireframe_line_count = write_wireframe_label(
-                    wireframe_label_path,
-                    wireframe_segments,
-                    width,
-                    height,
-                )
-                if wireframe_render_path is not None:
-                    write_wireframe_overlay(
-                        wireframe_render_path,
-                        image_path,
-                        wireframe_segments,
-                    )
-                segmentations["wireframe"] = {
-                    "path": str(wireframe_label_path),
-                    "render_path": str(wireframe_render_path) if wireframe_render_path else None,
-                    "classes": {
-                        str(class_id): name
-                        for class_id, name in enumerate(WIREFRAME_CLASS_NAMES)
-                    },
-                    "format": "class_id plus normalized endpoint pairs",
-                    "segments": wireframe_line_count,
-                }
-            yolo_lines, pose_objects, pose_geometry = render_pose_keypoints(mask_path)
-            write_yolo_pose(label_path, yolo_lines)
-            pose_geometry["preflight_visibility"] = pose_visibility_summary(preflight_pose_objects)
-            pose_geometry["hand_attempts"] = len(hand_attempts)
         finally:
             restore_hand_objects(hands, hand_states)
 
-        metadata.append({
+        metadata_entry = {
             "active_random_seed": ACTIVE_RANDOM_SEED,
+            "hard_case": active_hard_case,
+            "hard_case_sampling": {
+                "mode": "automatic" if auto_sample_hard_case else "fixed",
+                "hard_case_probability": HARD_CASE_GLOBAL_PROBABILITY,
+                "global_solved_probability": GLOBAL_SOLVED_CUBE_PROBABILITY,
+                "cube_solved": cube_solved,
+            },
             "image": str(image_path),
+            "image_size": {
+                "width": width,
+                "height": height,
+                "variant": "high" if use_high_resolution else "base",
+            },
             "mask": str(mask_path) if mask_path is not None else None,
             "label": str(label_path),
+            "pose_label": str(pose_label_path) if pose_label_path is not None else None,
             "segmentations": segmentations,
             "moves": moves,
             "layer_state": layer_state,
@@ -5432,36 +7885,41 @@ def generate_dataset(
             "camera_degradation": camera_degradation,
             "hands": hand_randomization,
             "hand_attempts": hand_attempts,
-            "pose_geometry": pose_geometry,
-            "keypoints": pose_objects,
-            "objects": len(yolo_lines),
-        })
+            "objects": sum(
+                int(item.get("segments", 0))
+                for item in segmentations.values()
+                if isinstance(item, dict)
+            ),
+        }
+        if metadata_count:
+            metadata_file.write(",\n")
+        json.dump(metadata_entry, metadata_file, indent=2)
+        metadata_count += 1
+        if (index + 1) % MEMORY_CLEANUP_INTERVAL == 0:
+            metadata_file.flush()
+            cleanup_blender_memory()
         mask_message = f", {mask_path}" if mask_path is not None else ""
-        whole_cube_label_message = f", {whole_cube_label_path}" if whole_cube_label_path else ""
-        wireframe_label_message = f", {wireframe_label_path}" if wireframe_label_path else ""
-        wireframe_render_message = f", {wireframe_render_path}" if wireframe_render_path else ""
         blend_asset_count = background_randomization.get("blend_asset_count", 0)
         blend_asset_sources = background_randomization.get("blend_asset_sources", [])
         print(
-            f"Wrote {image_path}{mask_message}{whole_cube_label_message}"
-            f"{wireframe_label_message}{wireframe_render_message}, "
-            f"and {label_path} "
-            f"with {len(yolo_lines)} pose keypoint objects, "
+            f"Wrote {image_path}{mask_message}, "
+            f"and {label_path if label_path is not None else 'no labels'} "
+            f"with {metadata_entry['objects']} cube/sticker segments, "
             f"{blend_asset_count} blend background assets {blend_asset_sources}, "
             f"{'with' if rotational_blur else 'without'} rotational blur "
             f"and {'with' if camera_degradation else 'without'} camera degradation"
         )
 
-    metadata_path = output_dir / "metadata.json"
-    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    metadata_file.write("\n]\n")
+    metadata_file.close()
     data_yaml = output_dir / "data.yaml"
     data_yaml.write_text(
         "path: " + str(output_dir.resolve()) + "\n"
         "train: images\n"
         "val: images\n"
-        f"kpt_shape: [{POSE_KEYPOINT_COUNT}, 3]\n"
-        "names:\n"
-        + "".join(f"  {index}: {name}\n" for index, name in enumerate(CLASS_NAMES)),
+        + ("pose: pose\n" if pose_dir is not None else "")
+        + "names:\n"
+        + "".join(f"  {index}: {name}\n" for index, name in enumerate(SEGMENTATION_CLASS_NAMES)),
         encoding="utf-8",
     )
 
@@ -5502,32 +7960,22 @@ def cli_args() -> argparse.Namespace:
         "--degrade-probability",
         type=float,
         default=DEFAULT_DEGRADE_PROBABILITY,
-        help="Probability of applying post-render blur, noise, rescale softness, and JPEG artifacts.",
+        help="Probability of applying post-render blur, noise, rescale softness, and video codec artifacts.",
     )
     parser.add_argument(
         "--no-masks",
         action="store_true",
-        help="Skip writing keypoint visualization masks; segmentation label maps are still written.",
+        help="Skip writing RGB cube/sticker segmentation masks.",
     )
     parser.add_argument(
         "--no-segmentations",
         action="store_true",
-        help="Skip writing whole-cube segmentation and cube-wireframe labels.",
+        help="Skip writing cube/sticker YOLO segmentation labels.",
     )
     parser.add_argument(
-        "--min-visible-keypoints-with-hands",
-        type=int,
-        default=DEFAULT_MIN_VISIBLE_KEYPOINTS_WITH_HANDS,
-        help=(
-            "Minimum visible keypoint objects required when hands are visible. "
-            "Hand poses below this threshold are retried."
-        ),
-    )
-    parser.add_argument(
-        "--max-hand-placement-attempts",
-        type=int,
-        default=DEFAULT_MAX_HAND_PLACEMENT_ATTEMPTS,
-        help="Maximum hand randomization attempts before falling back to a no-hand frame.",
+        "--no-pose-labels",
+        action="store_true",
+        help="Skip writing structured cube pose and articulated-layer labels.",
     )
 
     argv = sys.argv
@@ -5559,8 +8007,8 @@ def main() -> None:
         degrade_probability=args.degrade_probability,
         render_masks=not args.no_masks,
         render_segmentations=not args.no_segmentations,
-        min_visible_keypoints_with_hands=args.min_visible_keypoints_with_hands,
-        max_hand_placement_attempts=args.max_hand_placement_attempts,
+        hard_case=DEFAULT_HARD_CASE,
+        render_pose_labels=not args.no_pose_labels,
     )
 
 

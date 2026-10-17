@@ -2,7 +2,8 @@
 
 Example:
 
-    .venv/bin/python scripts/verify_yolo_segmentation.py data/mcp_dataset_v2
+    .venv/bin/python scripts/verify_yolo_segmentation.py data/mcp_dataset_v5
+    .venv/bin/python scripts/verify_yolo_segmentation.py data/mcp_dataset_v5/images
 
 Controls:
     Left/Right or P/N  previous/next image
@@ -12,6 +13,8 @@ Controls:
     R                 show both overlays
     +/-               change opacity
     Q or Esc          quit
+
+The argument may be either the dataset root or its images/ directory.
 """
 
 from __future__ import annotations
@@ -49,8 +52,9 @@ class PolygonLabel:
 class Sample:
     stem: str
     image_path: Path
-    whole_label_path: Path
-    sticker_label_path: Path
+    whole_label_path: Path | None
+    sticker_label_path: Path | None
+    unified_label_path: Path | None = None
 
 
 def load_class_names(path: Path, fallback: tuple[str, ...]) -> tuple[str, ...]:
@@ -97,8 +101,17 @@ def parse_yolo_label(path: Path, width: int, height: int) -> tuple[list[PolygonL
     return labels, errors
 
 
+def normalize_dataset_dir(dataset_dir: Path) -> Path:
+    dataset_dir = dataset_dir.expanduser()
+    if dataset_dir.name == "images" and (dataset_dir.parent / "labels").is_dir():
+        return dataset_dir.parent
+    return dataset_dir
+
+
 def discover_samples(dataset_dir: Path) -> list[Sample]:
+    dataset_dir = normalize_dataset_dir(dataset_dir)
     images_dir = dataset_dir / "images"
+    labels_dir = dataset_dir / "labels"
     whole_labels_dir = dataset_dir / "labels" / "whole_cube"
     sticker_labels_dir = dataset_dir / "labels" / "stickers"
     if not images_dir.is_dir():
@@ -108,12 +121,23 @@ def discover_samples(dataset_dir: Path) -> list[Sample]:
     for image_path in sorted(images_dir.iterdir()):
         if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
+        unified_label_path = labels_dir / f"{image_path.stem}.txt"
+        if unified_label_path.is_file():
+            whole_label_path = None
+            sticker_label_path = None
+        else:
+            unified_label_path = None
+            whole_candidate = whole_labels_dir / f"{image_path.stem}.txt"
+            sticker_candidate = sticker_labels_dir / f"{image_path.stem}.txt"
+            whole_label_path = whole_candidate if whole_candidate.exists() else None
+            sticker_label_path = sticker_candidate if sticker_candidate.exists() else None
         samples.append(
             Sample(
                 stem=image_path.stem,
                 image_path=image_path,
-                whole_label_path=whole_labels_dir / f"{image_path.stem}.txt",
-                sticker_label_path=sticker_labels_dir / f"{image_path.stem}.txt",
+                whole_label_path=whole_label_path,
+                sticker_label_path=sticker_label_path,
+                unified_label_path=unified_label_path,
             )
         )
     if not samples:
@@ -137,27 +161,6 @@ def draw_labels(
         color = colors[label.class_id]
         cv2.fillPoly(overlay, [points], color)
         cv2.polylines(image, [points], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
-        moments = cv2.moments(points)
-        if moments["m00"]:
-            center = (
-                round(moments["m10"] / moments["m00"]),
-                round(moments["m01"] / moments["m00"]),
-            )
-            name = (
-                class_names[label.class_id]
-                if label.class_id < len(class_names)
-                else str(label.class_id)
-            )
-            cv2.putText(
-                image,
-                name,
-                center,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
         visible_count += 1
     return cv2.addWeighted(overlay, opacity, image, 1.0 - opacity, 0.0), visible_count
 
@@ -181,6 +184,7 @@ def build_frame(
     opacity: float,
     whole_class_names: tuple[str, ...],
     sticker_class_names: tuple[str, ...],
+    unified_class_names: tuple[str, ...] = ("cube", "sticker"),
 ) -> tuple[np.ndarray, list[str]]:
     image = cv2.imread(str(sample.image_path), cv2.IMREAD_COLOR)
     if image is None:
@@ -189,7 +193,42 @@ def build_frame(
     frame = image.copy()
     errors = []
 
-    if show_whole:
+    if sample.unified_label_path is not None:
+        unified_labels, unified_errors = parse_yolo_label(
+            sample.unified_label_path,
+            width,
+            height,
+        )
+        errors.extend(unified_errors)
+        cube_ids = {
+            index
+            for index, name in enumerate(unified_class_names)
+            if name.strip().lower() == "cube"
+        } or {0}
+        sticker_ids = {
+            index
+            for index, name in enumerate(unified_class_names)
+            if name.strip().lower() == "sticker"
+        } or {1}
+        if show_whole:
+            frame, _whole_count = draw_labels(
+                frame,
+                [label for label in unified_labels if label.class_id in cube_ids],
+                {class_id: WHOLE_CUBE_COLORS.get(0, (255, 0, 255)) for class_id in cube_ids},
+                unified_class_names,
+                opacity,
+            )
+        if show_stickers:
+            frame, _sticker_count = draw_labels(
+                frame,
+                [label for label in unified_labels if label.class_id in sticker_ids],
+                {class_id: (0, 220, 0) for class_id in sticker_ids},
+                unified_class_names,
+                opacity,
+            )
+        return frame, errors
+
+    if show_whole and sample.whole_label_path is not None:
         whole_labels, whole_errors = parse_yolo_label(sample.whole_label_path, width, height)
         frame, _whole_count = draw_labels(
             frame,
@@ -200,7 +239,7 @@ def build_frame(
         )
         errors.extend(whole_errors)
 
-    if show_stickers:
+    if show_stickers and sample.sticker_label_path is not None:
         sticker_labels, sticker_errors = parse_yolo_label(sample.sticker_label_path, width, height)
         frame, _sticker_count = draw_labels(
             frame,
@@ -251,7 +290,8 @@ def main() -> None:
     parser.add_argument("--max-height", type=int, default=900)
     args = parser.parse_args()
 
-    samples = discover_samples(args.dataset)
+    dataset_dir = normalize_dataset_dir(args.dataset)
+    samples = discover_samples(dataset_dir)
     sample_index = max(0, min(args.start, len(samples) - 1))
     show_whole = True
     show_stickers = True
@@ -261,12 +301,16 @@ def main() -> None:
     cv2.createTrackbar("Opacity", window_name, opacity_percent, 100, lambda _value: None)
 
     whole_class_names = load_class_names(
-        args.dataset / "labels" / "whole_cube" / "classes.json",
+        dataset_dir / "labels" / "whole_cube" / "classes.json",
         ("cube",),
     )
     sticker_class_names = load_class_names(
-        args.dataset / "labels" / "stickers" / "classes.json",
+        dataset_dir / "labels" / "stickers" / "classes.json",
         ("White", "Yellow", "Red", "Orange", "Blue", "Green"),
+    )
+    unified_class_names = load_class_names(
+        dataset_dir / "labels" / "classes.json",
+        ("cube", "sticker"),
     )
 
     while True:
@@ -279,6 +323,7 @@ def main() -> None:
             opacity_percent / 100.0,
             whole_class_names,
             sticker_class_names,
+            unified_class_names,
         )
         frame = fit_to_window(frame, args.max_width, args.max_height - 44)
         display = cv2.copyMakeBorder(
@@ -311,12 +356,13 @@ def main() -> None:
         )
         cv2.imshow(window_name, display)
 
-        key = cv2.waitKey(0) & 0xFF
+        raw_key = cv2.waitKeyEx(0)
+        key = raw_key & 0xFF
         if key in (ord("q"), 27):
             break
-        if key in (81, ord("p")):  # left arrow or previous
+        if raw_key in (81, 2424832, 65361, 123) or key in (ord("p"), ord("a")):
             sample_index = (sample_index - 1) % len(samples)
-        elif key in (83, ord("n")):  # right arrow or next
+        elif raw_key in (83, 2555904, 65363, 124) or key in (ord("n"), ord("d")):
             sample_index = (sample_index + 1) % len(samples)
         elif key == ord("w"):
             show_whole = not show_whole

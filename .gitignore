@@ -1,6 +1,7 @@
 .venv/
 .linea/
 .models/
+.mlsd_pytorch/
 __pycache__/
 *.py[cod]
 .pytest_cache/

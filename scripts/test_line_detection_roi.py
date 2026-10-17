@@ -29,7 +29,7 @@ if str(SRC) not in sys.path:
 
 from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
 from live_recognition.line_detectors import LineDetector, build_line_detector  # noqa: E402
-from live_recognition.roi_tracking import RoiTracker, roi_for_frame  # noqa: E402
+from live_recognition.roi_tracking import RoiTracker, roi_for_frame, square_roi_from_center  # noqa: E402
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
@@ -94,12 +94,30 @@ def process_frame(
     tracker: RoiTracker,
 ) -> np.ndarray:
     output = frame.copy()
-    roi_xyxy, candidate, roi_source = roi_for_frame(
-        frame,
-        bbox_detector,
-        tracker,
-        args.roi_padding,
-    )
+    if getattr(args, "disable_bbox", False):
+        height, width = frame.shape[:2]
+        had_tracker_roi = tracker.roi_xyxy is not None
+        if not had_tracker_roi:
+            roi_xyxy = square_roi_from_center(
+                width / 2.0,
+                height / 2.0,
+                min(width, height),
+                width,
+                height,
+            )
+            tracker.roi_xyxy = roi_xyxy
+            tracker.base_side = min(roi_xyxy[2] - roi_xyxy[0], roi_xyxy[3] - roi_xyxy[1])
+        else:
+            roi_xyxy = tracker.roi_xyxy
+        candidate = None
+        roi_source = "tracker" if had_tracker_roi else "full-frame"
+    else:
+        roi_xyxy, candidate, roi_source = roi_for_frame(
+            frame,
+            bbox_detector,
+            tracker,
+            args.roi_padding,
+        )
     if roi_xyxy is None:
         cv2.putText(
             output,
@@ -296,4 +314,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

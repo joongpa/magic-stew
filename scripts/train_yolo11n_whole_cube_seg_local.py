@@ -2,7 +2,7 @@
 
 Expected input layout:
 
-    synthetic_cube_dataset/
+    mcp_dataset_v4/
       images/*.png
       labels/
         whole_cube/
@@ -11,9 +11,14 @@ Expected input layout:
         stickers/              # ignored by this script
       masks/*.png               # optional visualization masks, not used
 
-The script shuffles image/label pairs with a fixed seed, consolidates any
-disconnected source contours into one whole-cube instance per image, writes a
-local Ultralytics segmentation dataset layout, and trains yolo11n-seg.pt.
+    negative_ROI_backgrounds/
+      *.jpg, *.jpeg, *.png     # background-only images with no cube label
+
+The script combines the positive image/label pairs with the negative images,
+which are written with empty YOLO label files. It shuffles the combined samples
+with a fixed seed, consolidates any disconnected source contours into one
+whole-cube instance per positive image, writes a local Ultralytics segmentation
+dataset layout, and trains yolo11n-seg.pt.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from pathlib import Path
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 MIN_POLYGON_FIELDS = 1 + 3 * 2
+Sample = tuple[Path, Path | None]
 
 
 def label_lines(path: Path) -> list[str]:
@@ -157,7 +163,10 @@ def consolidated_label_lines(path: Path, class_names: list[str]) -> list[str]:
     ]
 
 
-def collect_pairs(source_dir: Path) -> tuple[list[tuple[Path, Path]], list[str]]:
+def collect_pairs(
+    source_dir: Path,
+    negative_dir: Path | None = None,
+) -> tuple[list[Sample], list[str]]:
     images_dir = source_dir / "images"
     labels_dir = source_dir / "labels" / "whole_cube"
     if not images_dir.exists():
@@ -169,13 +178,23 @@ def collect_pairs(source_dir: Path) -> tuple[list[tuple[Path, Path]], list[str]]
         path for path in images_dir.glob("*") if path.suffix.lower() in IMAGE_EXTENSIONS
     )
     label_by_stem = {path.stem: path for path in labels_dir.glob("*.txt")}
-    pairs = [
+    pairs: list[Sample] = [
         (image_path, label_by_stem[image_path.stem])
         for image_path in image_paths
         if image_path.stem in label_by_stem
     ]
     if not pairs:
         raise RuntimeError(f"No image/whole-cube-label pairs found under {source_dir}")
+
+    if negative_dir is not None:
+        if not negative_dir.is_dir():
+            raise FileNotFoundError(f"Missing negative-image directory: {negative_dir}")
+        negative_paths = sorted(
+            path for path in negative_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+        pairs.extend((image_path, None) for image_path in negative_paths)
+
     return pairs, load_class_names(labels_dir)
 
 
@@ -184,11 +203,12 @@ def write_dataset(
     dataset_dir: Path,
     val_fraction: float,
     seed: int,
+    negative_dir: Path | None = None,
 ) -> Path:
     if not 0.0 <= val_fraction < 1.0:
         raise ValueError("val_fraction must be in the range [0, 1)")
 
-    pairs, class_names = collect_pairs(source_dir)
+    pairs, class_names = collect_pairs(source_dir, negative_dir=negative_dir)
     random.Random(seed).shuffle(pairs)
 
     val_count = max(1, round(len(pairs) * val_fraction)) if len(pairs) > 1 and val_fraction else 0
@@ -207,15 +227,24 @@ def write_dataset(
         source_contour_count_distribution: Counter[int] = Counter()
         training_instance_count_distribution: Counter[int] = Counter()
         merged_image_count = 0
+        negative_image_count = 0
 
         for index, (image_path, label_path) in enumerate(split_pairs):
-            source_lines = label_lines(label_path)
+            is_negative = label_path is None
+            if is_negative:
+                source_lines = []
+                lines = []
+            else:
+                assert label_path is not None
+                source_lines = label_lines(label_path)
+                validate_label_file(label_path, class_names)
+                lines = consolidated_label_lines(label_path, class_names)
             source_contour_count_distribution[len(source_lines)] += 1
-            validate_label_file(label_path, class_names)
-            lines = consolidated_label_lines(label_path, class_names)
             training_instance_count_distribution[len(lines)] += 1
             if len(source_lines) > 1:
                 merged_image_count += 1
+            if is_negative:
+                negative_image_count += 1
             class_counts.update(int(line.split()[0]) for line in lines)
 
             target_stem = f"{split}_{index:06d}"
@@ -230,17 +259,19 @@ def write_dataset(
                 {
                     "split": split,
                     "source_image": str(image_path),
-                    "source_label": str(label_path),
+                    "source_label": str(label_path) if label_path is not None else None,
                     "image": str(target_image),
                     "label": str(target_label),
                     "source_contours": len(source_lines),
                     "training_instances": len(lines),
                     "consolidated_contours": len(source_lines) > 1,
+                    "negative": is_negative,
                 }
             )
 
         summary[split] = {
             "images": len(split_pairs),
+            "negative_images": negative_image_count,
             "merged_images": merged_image_count,
             "source_contour_count_distribution": dict(sorted(source_contour_count_distribution.items())),
             "training_instance_count_distribution": dict(sorted(training_instance_count_distribution.items())),
@@ -267,8 +298,9 @@ def write_dataset(
     print("Dataset summary:")
     print(json.dumps(summary, indent=2))
     print(
-        "Training labels contain one consolidated cube instance per non-empty image; "
-        "source contour counts above are pre-consolidation diagnostics."
+        "Training labels contain one consolidated cube instance per positive image "
+        "and empty labels for negative images; source contour counts above are "
+        "pre-consolidation diagnostics."
     )
     print(data_yaml.read_text(encoding="utf-8"))
     return data_yaml
@@ -311,7 +343,18 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source-dir", type=Path, default=Path("data/synthetic_cube_dataset"))
+    parser.add_argument("--source-dir", type=Path, default=Path("data/mcp_dataset_v4"))
+    parser.add_argument(
+        "--negative-dir",
+        type=Path,
+        default=Path("data/negative_examples/negative_ROI_backgrounds"),
+        help="Directory of background-only ROI images to include with empty labels",
+    )
+    parser.add_argument(
+        "--no-negative-examples",
+        action="store_true",
+        help="Train from positive whole-cube samples only",
+    )
     parser.add_argument("--workdir", type=Path, default=Path("runs/cube_whole_seg_local"))
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=17)
@@ -333,6 +376,7 @@ def main() -> None:
         dataset_dir=dataset_dir,
         val_fraction=args.val_fraction,
         seed=args.seed,
+        negative_dir=None if args.no_negative_examples else args.negative_dir,
     )
 
     if args.prepare_only:

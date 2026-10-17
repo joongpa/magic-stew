@@ -161,6 +161,88 @@ The intended next steps are:
 4. Train a PyTorch detector/keypoint model.
 5. Add orientation only after detection quality is acceptable.
 
+## Whole-cube segmentation training
+
+The local YOLO11 whole-cube segmentation trainer defaults to the latest MCP
+dataset and includes the negative ROI backgrounds in
+`data/negative_examples/negative_ROI_backgrounds` as background-only samples
+with empty labels:
+
+```bash
+.venv/bin/python scripts/train_yolo11n_whole_cube_seg_local.py
+```
+
+The prepared dataset and training run are written below
+`runs/cube_whole_seg_local`. Use `--prepare-only` to inspect the converted
+dataset without training, or `--no-negative-examples` to omit the background
+images.
+
+For joint cube-and-sticker segmentation on the combined MCP dataset, use:
+
+```bash
+.venv/bin/python scripts/train_yolo11n_cube_sticker_seg_local.py
+```
+
+This defaults to `data/mcp_dataset_v5.3`, expects class `0` to be `cube` and
+class `1` to be `sticker`, and writes the prepared split and training run below
+`runs/cube_sticker_seg_local`. Use `--prepare-only` to validate and prepare the
+dataset without starting YOLO training. The default segmentation `mask_ratio`
+is `2`; override it with `--mask-ratio` when trading mask detail for memory and
+speed. Overlapping cube/sticker instances are kept as independent masks by
+default; use `--overlap-mask` only if you explicitly want Ultralytics to merge
+overlapping targets.
+
+## Automated whole-cube failure mining
+
+The Blender generator can be paired with the existing whole-cube model to
+search its realistic scene distribution for hard negatives. Each candidate is
+rendered with a ground-truth cube label, scored by model-vs-ground-truth IoU
+and lower-region recall, and the hardest examples are saved with overlays and
+the original scene metadata:
+
+```bash
+.venv/bin/python scripts/mine_whole_cube_failures.py \
+  --candidate-count 256 \
+  --keep 24 \
+  --output-dir runs/whole_cube_failure_mining
+```
+
+The output contains the selected images, whole-cube labels, prediction
+overlays, per-sample metadata, and condition summaries for camera viewpoint,
+lighting, hand visibility, layer state, and background family. The miner only
+selects from the generator's existing physically plausible variations; it does
+not create arbitrary adversarial images.
+
+## F-Clip cube-wireframe training
+
+The MCP dataset also contains cube wireframe endpoint labels. Prepare those
+labels in F-Clip's processed format at 256x256, including the same negative ROI
+images as all-zero line targets:
+
+```bash
+.venv/bin/python scripts/prepare_fclip_cube_dataset.py
+```
+
+Then train the corrected 256x256 F-Clip HG1-D2 configuration. It starts from
+the official HG1-D2 weights, disables random crop augmentation, strengthens
+negative heatmap supervision, and uses resolution 64. The trainer accepts MPS on Apple
+Silicon, CUDA, or CPU through `--device auto`:
+
+```bash
+cd F-Clip
+../.venv/bin/python train.py \
+  --device auto \
+  --datadir data/cube_wireframe_mcp_v4_256 \
+  --logdir ../runs/fclip_cube \
+  --num-workers 0 \
+  -i cube_mcp_HG1_D2_256 \
+  config/fclip_cube_256.yaml
+```
+
+The best checkpoint is written under `runs/fclip_cube/` in the timestamped
+training directory. Use another `config/fclip_*.yaml` file to select a larger
+F-Clip variant.
+
 ## Dense color-map head
 
 `live_recognition.color_segmentation.YOLOColorMapModel` attaches a PyTorch
@@ -209,3 +291,13 @@ To inspect the predictions visually, add `--color-map-model` to
 with the segmentation view, top-1 color mask, top-2 color mask, and a
 distribution panel. Click any pixel inside either color mask to display the
 seven probabilities, predicted class, and normalized entropy for that pixel.
+
+For the combined cube/sticker model (`0: cube`, `1: sticker`), use
+`--segmentation-type combined`. Its display and ROI mask are the pixelwise
+intersection of the predicted cube and sticker masks:
+
+```bash
+.venv/bin/python scripts/render_yolo_sticker_segmentation.py \
+  --source path/to/cube.png \
+  --segmentation-type combined
+```

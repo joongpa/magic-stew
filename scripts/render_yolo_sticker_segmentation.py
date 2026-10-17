@@ -29,10 +29,9 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
-from live_recognition.roi_tracking import (  # noqa: E402
-    RoiTracker,
-    roi_for_frame as shared_roi_for_frame,
-)
+from live_recognition.roi_tracking import RoiTracker  # noqa: E402
+from live_recognition.roi_tracking import \
+    roi_for_frame as shared_roi_for_frame  # noqa: E402
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".avi", ".mkv", ".webm"}
@@ -58,7 +57,12 @@ def default_model_path(segmentation_type: str) -> Path:
     if segmentation_type == "whole-cube":
         candidates = (
             ROOT / "runs/cube_whole_seg_local/runs/cube_whole_yolo11n_seg/weights/best.pt",
-            ROOT / "runs/segment/runs/cube_whole_seg_local/runs/cube_whole_yolo11n_seg/weights/best.pt",
+            ROOT / "runs/segment/runs/cube_whole_seg_local/runs/cube_whole_yolo11n_seg-4/weights/best.pt",
+        )
+    elif segmentation_type == "combined":
+        candidates = (
+            ROOT / "runs/segment/runs/cube_sticker_combined_seg_v2/runs/cube_sticker_yolo11n_seg/weights/best.pt",
+            ROOT / "runs/segment/runs/cube_sticker_combined_seg/runs/cube_sticker_yolo11n_seg/weights/best.pt",
         )
     else:
         candidates = (
@@ -79,10 +83,67 @@ def is_image_source(source: int | str) -> bool:
 
 def class_name(names: object, class_id: int) -> str:
     if isinstance(names, dict):
-        return str(names.get(class_id, class_id))
+        return str(names.get(class_id, names.get(str(class_id), class_id)))
     if isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
         return str(names[class_id])
     return str(class_id)
+
+
+def cube_class_ids(names: object) -> set[int]:
+    """Return class IDs explicitly named cube or whole-cube."""
+
+    if isinstance(names, dict):
+        class_ids = {int(class_id) for class_id in names if str(class_id).lstrip("-").isdigit()}
+    elif isinstance(names, (list, tuple)):
+        class_ids = set(range(len(names)))
+    else:
+        class_ids = set()
+    return {
+        class_id
+        for class_id in class_ids
+        if class_name(names, class_id).strip().lower().replace("_", " ").replace("-", " ")
+        in {"cube", "whole cube"}
+    }
+
+
+def sticker_class_ids(names: object) -> set[int]:
+    """Return class IDs explicitly named sticker."""
+
+    if isinstance(names, dict):
+        class_ids = {int(class_id) for class_id in names if str(class_id).lstrip("-").isdigit()}
+    elif isinstance(names, (list, tuple)):
+        class_ids = set(range(len(names)))
+    else:
+        class_ids = set()
+    return {
+        class_id
+        for class_id in class_ids
+        if class_name(names, class_id).strip().lower().replace("_", " ").replace("-", " ")
+        == "sticker"
+    }
+
+
+def combined_class_ids(names: object) -> tuple[set[int], set[int]]:
+    """Return the cube and sticker class IDs for the combined model."""
+
+    if isinstance(names, dict):
+        class_ids = {int(class_id) for class_id in names if str(class_id).lstrip("-").isdigit()}
+    elif isinstance(names, (list, tuple)):
+        class_ids = set(range(len(names)))
+    else:
+        class_ids = set()
+
+    normalized_names = {
+        class_id: class_name(names, class_id).strip().lower().replace("_", " ").replace("-", " ")
+        for class_id in class_ids
+    }
+    cube_ids = {class_id for class_id, name in normalized_names.items() if name in {"cube", "whole cube"}}
+    sticker_ids = sticker_class_ids(names)
+    if not cube_ids and 0 in class_ids:
+        cube_ids = {0}
+    if not sticker_ids and 1 in class_ids:
+        sticker_ids = {1}
+    return cube_ids, sticker_ids
 
 
 def class_color(names: object, class_id: int, segmentation_type: str) -> tuple[int, int, int]:
@@ -127,12 +188,53 @@ def render_segmentation_overlay(
         for mask in mask_data[: len(class_ids)]
     ]
     rendered_indexes = range(len(rendered_masks))
+    if segmentation_type == "combined":
+        cube_ids, sticker_ids = combined_class_ids(names)
+        cube_mask = np.zeros((height, width), dtype=bool)
+        sticker_masks = []
+        for index, mask in enumerate(rendered_masks):
+            class_id = int(class_ids[index])
+            if class_id in cube_ids:
+                cube_mask |= mask
+            if class_id in sticker_ids:
+                sticker_masks.append(mask)
+        rendered_masks = [mask & cube_mask for mask in sticker_masks]
+        rendered_indexes = range(len(rendered_masks))
+    elif segmentation_type == "sticker":
+        named_sticker_ids = sticker_class_ids(names)
+        if named_sticker_ids:
+            rendered_indexes = tuple(
+                index
+                for index in rendered_indexes
+                if int(class_ids[index]) in named_sticker_ids
+            )
     if segmentation_type == "whole-cube" and rendered_masks:
-        rendered_indexes = (max(rendered_indexes, key=lambda index: int(rendered_masks[index].sum())),)
+        named_cube_ids = cube_class_ids(names)
+        cube_indexes = tuple(
+            index
+            for index in rendered_indexes
+            if int(class_ids[index]) in named_cube_ids
+        )
+        if named_cube_ids:
+            # Combined cube/sticker models must never present a sticker as a
+            # cube when the cube class is absent from the predictions.
+            rendered_indexes = (
+                (max(cube_indexes, key=lambda index: int(rendered_masks[index].sum())),)
+                if cube_indexes
+                else ()
+            )
+        else:
+            # Preserve the legacy behavior for single-class whole-cube models
+            # whose class map does not name the class explicitly.
+            rendered_indexes = (max(rendered_indexes, key=lambda index: int(rendered_masks[index].sum())),)
 
     for index in rendered_indexes:
         mask = rendered_masks[index]
-        color = class_color(names, int(class_ids[index]), segmentation_type)
+        color = (
+            STICKER_COLORS_BGR["yellow"]
+            if segmentation_type == "combined"
+            else class_color(names, int(class_ids[index]), segmentation_type)
+        )
         overlay[mask] = color
 
     output = cv2.addWeighted(overlay, opacity, image, 1.0 - opacity, 0.0)
@@ -147,9 +249,16 @@ def render_segmentation_overlay(
             output,
             contours,
             -1,
-            class_color(names, int(class_ids[index]), segmentation_type),
+            STICKER_COLORS_BGR["yellow"]
+            if segmentation_type == "combined"
+            else class_color(names, int(class_ids[index]), segmentation_type),
             2,
         )
+    if segmentation_type == "combined":
+        combined_mask = np.zeros((height, width), dtype=bool)
+        for mask in rendered_masks:
+            combined_mask |= mask
+        output[~combined_mask] = image[~combined_mask]
     return output
 
 
@@ -524,43 +633,70 @@ def has_segmentation(result: object) -> bool:
 def segmentation_union_mask(
     result: object,
     output_shape: tuple[int, int],
+    segmentation_type: str = "sticker",
 ) -> np.ndarray | None:
-    """Return the union of predicted instance masks at the ROI resolution."""
+    """Return the rendered segmentation mask at the ROI resolution."""
 
     if not has_segmentation(result):
         return None
     masks = getattr(result, "masks")
     mask_data = tensor_to_numpy(masks.data)
+    class_ids = tensor_to_numpy(result.boxes.cls).reshape(-1)
     output_height, output_width = output_shape
     combined = np.zeros((output_height, output_width), dtype=bool)
-    for mask in mask_data:
-        resized = cv2.resize(
+    rendered_masks = [
+        cv2.resize(
             mask.astype(np.float32),
             (output_width, output_height),
             interpolation=cv2.INTER_LINEAR,
-        )
-        combined |= resized > 0.5
+        ) > 0.5
+        for mask in mask_data[: len(class_ids)]
+    ]
+    if segmentation_type == "combined":
+        cube_ids, sticker_ids = combined_class_ids(getattr(result, "names", {}))
+        cube_mask = np.zeros((output_height, output_width), dtype=bool)
+        sticker_mask = np.zeros((output_height, output_width), dtype=bool)
+        for index, mask in enumerate(rendered_masks):
+            class_id = int(class_ids[index])
+            if class_id in cube_ids:
+                cube_mask |= mask
+            if class_id in sticker_ids:
+                sticker_mask |= mask
+        return cube_mask & sticker_mask
+
+    if segmentation_type == "whole-cube":
+        named_cube_ids = cube_class_ids(getattr(result, "names", {}))
+        if named_cube_ids:
+            rendered_masks = [
+                mask
+                for index, mask in enumerate(rendered_masks)
+                if int(class_ids[index]) in named_cube_ids
+            ]
+        elif rendered_masks:
+            rendered_masks = [max(rendered_masks, key=lambda mask: int(mask.sum()))]
+    elif segmentation_type == "sticker":
+        named_sticker_ids = sticker_class_ids(getattr(result, "names", {}))
+        if named_sticker_ids:
+            rendered_masks = [
+                mask
+                for index, mask in enumerate(rendered_masks)
+                if int(class_ids[index]) in named_sticker_ids
+            ]
+
+    for resized in rendered_masks:
+        combined |= resized
     return combined if bool(combined.any()) else None
 
 
 def segmentation_bounds(
     result: object,
     roi_shape: tuple[int, int],
+    segmentation_type: str = "sticker",
 ) -> tuple[int, int, int, int] | None:
-    if not has_segmentation(result):
+    mask = segmentation_union_mask(result, roi_shape, segmentation_type)
+    if mask is None:
         return None
-    masks = result.masks
-    mask_data = tensor_to_numpy(masks.data)
-    roi_height, roi_width = roi_shape
-    combined = np.zeros((roi_height, roi_width), dtype=bool)
-    for mask in mask_data:
-        resized = cv2.resize(
-            mask.astype(np.float32),
-            (roi_width, roi_height),
-            interpolation=cv2.INTER_LINEAR,
-        )
-        combined |= resized > 0.5
-    ys, xs = np.nonzero(combined)
+    ys, xs = np.nonzero(mask)
     if len(xs) == 0:
         return None
     return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
@@ -637,7 +773,7 @@ def predict_and_render(
         return split_screen(output, right_panel), bbox_detector
 
     roi_tracker.observe_tracking_bounds(
-        segmentation_bounds(roi_result, roi.shape[:2]),
+        segmentation_bounds(roi_result, roi.shape[:2], args.segmentation_type),
         width,
         height,
         tracking_gain=args.roi_tracking_gain,
@@ -656,7 +792,11 @@ def predict_and_render(
         cv2.rectangle(output, (x1, y1), (x2 - 1, y2 - 1), roi_color, 2)
     right_panel = None
     if color_model is not None and color_device is not None:
-        valid_mask = segmentation_union_mask(roi_result, roi.shape[:2])
+        valid_mask = segmentation_union_mask(
+            roi_result,
+            roi.shape[:2],
+            args.segmentation_type,
+        )
         probabilities = predict_color_probabilities(color_model, roi, args.imgsz, color_device)
         if distribution_picker is not None:
             distribution_picker.update(
@@ -706,9 +846,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source", required=True, help="Image, video path, or camera index")
     parser.add_argument(
         "--segmentation-type",
-        choices=("sticker", "whole-cube"),
+        choices=("sticker", "whole-cube", "combined"),
         default="sticker",
-        help="Segmentation model and rendering mode",
+        help="Segmentation model and rendering mode; combined renders cube∩sticker",
     )
     parser.add_argument("--model", type=Path, help="Override the selected segmentation model weights path")
     parser.add_argument(
@@ -728,7 +868,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--roi-tracking-gain", type=float, default=1.4, help="How strongly segmentation moves the ROI")
     parser.add_argument("--roi-tracking-padding", type=float, default=0.18, help="Padding around tracked segmentation")
     parser.add_argument("--show-bbox", action=argparse.BooleanOptionalAction, default=True, help="Draw the active ROI")
-    parser.add_argument("--conf", type=float, default=0.35, help="Segmentation confidence threshold")
+    parser.add_argument("--conf", type=float, default=0.25, help="Segmentation confidence threshold")
     parser.add_argument("--imgsz", type=int, default=256, help="YOLO inference image size")
     parser.add_argument("--opacity", type=float, default=0.45, help="Mask opacity in the range [0, 1]")
     parser.add_argument("--once", action="store_true", help="Process one frame and exit")

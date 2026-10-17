@@ -113,9 +113,13 @@ class RoiTracker:
         tracking_point_x = (bx1 + bx2) / 2.0
         tracking_point_y = (by1 + by2) / 2.0
         observed_side = max(bx2 - bx1, by2 - by1)
-        target_side = max(base_side, observed_side) * (
+        observed_padded_side = observed_side * (
             1.0 + max(0.0, float(tracking_padding)) * 2.0
         )
+        # ``base_side`` already includes the initial bbox padding. Apply the
+        # same padding to a newly larger segmentation bound without padding
+        # the already-padded base a second time.
+        target_side = max(base_side, observed_padded_side)
         gain = max(0.0, float(tracking_gain))
         dx = (tracking_point_x - side / 2.0) * gain
         dy = (tracking_point_y - side / 2.0) * gain
@@ -146,4 +150,3 @@ def roi_for_frame(
         return None, None, "none"
 
     return tracker.initialize(candidate, width, height, padding), candidate, "detector"
-
