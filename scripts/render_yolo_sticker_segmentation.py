@@ -157,6 +157,18 @@ def class_color(names: object, class_id: int, segmentation_type: str) -> tuple[i
     return (180, 180, 180)
 
 
+def sticker_instance_color(index: int) -> tuple[int, int, int]:
+    """Return a stable random-looking BGR color for one sticker instance."""
+
+    rng = np.random.default_rng(0x51C0 + int(index))
+    hsv = np.asarray(
+        [[[rng.integers(0, 180), rng.integers(190, 256), rng.integers(190, 256)]]],
+        dtype=np.uint8,
+    )
+    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
+    return tuple(int(channel) for channel in bgr)
+
+
 def tensor_to_numpy(value: object) -> np.ndarray:
     if hasattr(value, "detach"):
         value = value.detach()
@@ -172,12 +184,15 @@ def render_segmentation_overlay(
     result: object,
     opacity: float,
     segmentation_type: str,
+    random_sticker_colors: bool = False,
+    masks_only: bool = False,
 ) -> np.ndarray:
-    overlay = image.copy()
+    background = np.zeros_like(image) if masks_only else image
+    overlay = background.copy()
     masks = getattr(result, "masks", None)
     boxes = getattr(result, "boxes", None)
     if masks is None or boxes is None:
-        return image.copy()
+        return background.copy()
 
     mask_data = tensor_to_numpy(masks.data)
     class_ids = tensor_to_numpy(boxes.cls).reshape(-1)
@@ -231,13 +246,17 @@ def render_segmentation_overlay(
     for index in rendered_indexes:
         mask = rendered_masks[index]
         color = (
-            STICKER_COLORS_BGR["yellow"]
-            if segmentation_type == "combined"
+            sticker_instance_color(index)
+            if random_sticker_colors and segmentation_type in {"sticker", "combined"}
             else class_color(names, int(class_ids[index]), segmentation_type)
         )
         overlay[mask] = color
 
-    output = cv2.addWeighted(overlay, opacity, image, 1.0 - opacity, 0.0)
+    output = (
+        overlay
+        if masks_only
+        else cv2.addWeighted(overlay, opacity, image, 1.0 - opacity, 0.0)
+    )
     for index in rendered_indexes:
         mask = rendered_masks[index]
         contours, _ = cv2.findContours(
@@ -249,8 +268,8 @@ def render_segmentation_overlay(
             output,
             contours,
             -1,
-            STICKER_COLORS_BGR["yellow"]
-            if segmentation_type == "combined"
+            sticker_instance_color(index)
+            if random_sticker_colors and segmentation_type in {"sticker", "combined"}
             else class_color(names, int(class_ids[index]), segmentation_type),
             2,
         )
@@ -258,7 +277,7 @@ def render_segmentation_overlay(
         combined_mask = np.zeros((height, width), dtype=bool)
         for mask in rendered_masks:
             combined_mask |= mask
-        output[~combined_mask] = image[~combined_mask]
+        output[~combined_mask] = background[~combined_mask]
     return output
 
 
@@ -707,6 +726,7 @@ def predict(model: object, image: np.ndarray, args: argparse.Namespace) -> objec
         source=image,
         conf=args.conf,
         imgsz=args.imgsz,
+        retina_masks=True,
         verbose=False,
     )
     return predictions[0] if predictions else None
@@ -746,16 +766,21 @@ def predict_and_render(
             ]
         else:
             right_panel = None
-        return split_screen(image.copy(), right_panel), bbox_detector
+        left_panel = np.zeros_like(image) if getattr(args, "masks_only", False) else image.copy()
+        return split_screen(left_panel, right_panel), bbox_detector
 
     assert roi_xyxy is not None
     x1, y1, x2, y2 = roi_xyxy
     roi = image[y1:y2, x1:x2]
-    model_roi = resize_to_square_size(roi, args.imgsz)
-    roi_result = predict(model, model_roi, args)
+    # Keep the native ROI as the prediction source. Ultralytics still uses
+    # ``imgsz`` for inference, while ``retina_masks`` maps masks back to this
+    # full-resolution source instead of producing a 256px mask that must be
+    # enlarged afterward.
+    roi_result = predict(model, roi, args)
     if roi_result is None or not has_segmentation(roi_result):
-        output = image.copy()
-        if args.show_bbox:
+        masks_only = getattr(args, "masks_only", False)
+        output = np.zeros_like(image) if masks_only else image.copy()
+        if args.show_bbox and not masks_only:
             cv2.rectangle(output, (x1, y1), (x2 - 1, y2 - 1), (0, 0, 255), 2)
         color_map = None
         if distribution_picker is not None:
@@ -784,10 +809,13 @@ def predict_and_render(
         roi_result,
         args.opacity,
         args.segmentation_type,
+        random_sticker_colors=getattr(args, "random_sticker_colors", False),
+        masks_only=getattr(args, "masks_only", False),
     )
-    output = image.copy()
+    masks_only = getattr(args, "masks_only", False)
+    output = np.zeros_like(image) if masks_only else image.copy()
     output[y1:y2, x1:x2] = rendered_roi
-    if args.show_bbox:
+    if args.show_bbox and not masks_only:
         roi_color = (0, 0, 255) if roi_source == "detector" else (40, 220, 40)
         cv2.rectangle(output, (x1, y1), (x2 - 1, y2 - 1), roi_color, 2)
     right_panel = None
@@ -867,6 +895,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--roi-padding", type=float, default=0.08, help="Padding ratio around the bbox ROI")
     parser.add_argument("--roi-tracking-gain", type=float, default=1.4, help="How strongly segmentation moves the ROI")
     parser.add_argument("--roi-tracking-padding", type=float, default=0.18, help="Padding around tracked segmentation")
+    parser.add_argument(
+        "--random-sticker-colors",
+        action="store_true",
+        help="Use a distinct stable random-looking color for each sticker detection",
+    )
+    parser.add_argument(
+        "--masks-only",
+        action="store_true",
+        help="Render masks on a black background without the original input image",
+    )
     parser.add_argument("--show-bbox", action=argparse.BooleanOptionalAction, default=True, help="Draw the active ROI")
     parser.add_argument("--conf", type=float, default=0.25, help="Segmentation confidence threshold")
     parser.add_argument("--imgsz", type=int, default=256, help="YOLO inference image size")

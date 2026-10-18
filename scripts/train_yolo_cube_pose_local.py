@@ -2,21 +2,25 @@
 
 The base model is an Ultralytics segmentation model.  Its multiscale feature
 pyramid is tapped immediately before the segmentation head and passed to the
-custom pose decoder.  The pose target is the compact ``cube_pose_v6`` schema:
+ custom pose decoder.  The pose target is the compact ``cube_pose_v7`` schema:
 
 * direct canonical ``u``, ``v``, and ``twist`` angles,
 * normalized image center and cube scale,
 * perspective strength, and
 * two signed outer-layer angles in ``[-45, 45)`` degrees.
 
-Training combines direct canonical head terms with a closest-projected-line
-geometry loss.  The default schedule is head-heavy early (0.6 / 0.4) and
-geometry-heavy late (0.3 / 0.7), so the head first learns the bounded pose
-coordinates before the rendered geometry becomes the dominant refinement.
+Training combines direct canonical-head terms with an optional
+closest-projected-line geometry loss. The default schedule uses 100% direct
+canonical-head loss for every epoch so the bounded pose coordinates can
+converge without the geometry term competing with them. The geometry weights
+remain configurable from the command line for later refinement experiments.
 
-The head always consumes three predicted soft segmentation maps (cube union,
-sticker union, and a one-pixel sticker boundary) alongside the YOLO feature
-pyramid. Ground-truth masks are not fed to the pose head because that would
+By default the head consumes the YOLO feature pyramid plus two differentiable
+prototype-derived union maps: cube and sticker. The fixed-width postprocessed
+default-head sticker masks can be enabled explicitly for comparison, or all
+mask inputs can be disabled for a strict feature-only run. ``--raw-image-only``
+selects a separate compact CNN baseline that receives only the resized RGB
+image. Ground-truth masks are never fed to the pose head because that would
 create a train/inference mismatch.
 """
 
@@ -33,7 +37,7 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,24 +47,15 @@ if str(SRC) not in sys.path:
 
 from live_recognition.cube_pose import (  # noqa: E402
     ANGLE_PERIOD_DEGREES,
+    PROTOTYPE_MASK_CHANNELS,
+    POSE_MASK_CHANNELS,
+    RawImageCubePoseModel,
     YOLOCubePoseModel,
     cube_pose_loss,
-    head_parameters_to_rotation,
-    rotation_matrix_to_quaternion,
 )
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
-FACE_AXES = {
-    "R": (1.0, 0.0, 0.0),
-    "L": (-1.0, 0.0, 0.0),
-    "U": (0.0, 0.0, 1.0),
-    "D": (0.0, 0.0, -1.0),
-    "F": (0.0, -1.0, 0.0),
-    "B": (0.0, 1.0, 0.0),
-}
-
-
 @dataclass(frozen=True)
 class PoseSample:
     image_path: Path
@@ -92,78 +87,29 @@ def _as_float_tensor(values: Any, *, shape: tuple[int, ...], name: str) -> Tenso
 
 
 def pose_target_from_json(payload: dict[str, Any]) -> dict[str, Tensor]:
-    rotation_payload = payload.get("cube_rotation_camera")
+    if payload.get("format") != "cube_pose_v7":
+        raise ValueError("Training requires cube_pose_v7 labels")
     projection = payload.get("image_projection")
     articulation = payload.get("articulation")
     if not isinstance(projection, dict):
         raise ValueError("Pose label is missing image_projection")
     if not isinstance(articulation, dict):
         raise ValueError("Pose label is missing articulation")
-
-    if payload.get("format") == "cube_pose_v7":
-        cube_pose = payload.get("cube_pose")
-        if not isinstance(cube_pose, dict):
-            raise ValueError("v7 pose label is missing cube_pose")
-        u_value = float(cube_pose.get("u_colatitude_degrees"))
-        v_value = float(cube_pose.get("v_azimuth_degrees"))
-        twist_value = float(cube_pose.get("twist_degrees"))
-        if not 0.0 <= u_value < 90.0:
-            raise ValueError("v7 colatitude must be in [0, 90)")
-        if not -180.0 <= v_value < 180.0:
-            raise ValueError("v7 azimuth must be in [-180, 180)")
-        if not -45.0 <= twist_value < 45.0:
-            raise ValueError("v7 twist must be in [-45, 45)")
-        u = torch.tensor(u_value, dtype=torch.float32)
-        v = torch.tensor(v_value, dtype=torch.float32)
-        twist = torch.tensor(twist_value, dtype=torch.float32)
-        rotation = rotation_matrix_to_quaternion(
-            head_parameters_to_rotation(u[None], v[None], twist[None])
-        )[0]
-    else:
-        if not isinstance(rotation_payload, dict):
-            raise ValueError("Pose label is missing cube_rotation_camera")
-        rotation = _as_float_tensor(
-            rotation_payload.get("quaternion_xyzw"),
-            shape=(4,),
-            name="quaternion_xyzw",
-        )
-
-    # v6 is the native format.  The v5 fallback is retained so a partially
-    # migrated dataset fails gracefully and can still be inspected; the label
-    # generator now writes v6 and training should use that format.
-    # Both compact v5 and v6 files emitted by the current generator already
-    # apply the cube symmetry before writing the quaternion.  The v5/v6
-    # distinction here is only the articulation field layout.
-    is_v6 = payload.get("format") in {"cube_pose_v6", "cube_pose_v7"}
+    cube_pose = payload.get("cube_pose")
+    if not isinstance(cube_pose, dict):
+        raise ValueError("v7 pose label is missing cube_pose")
+    u_value = float(cube_pose.get("u_colatitude_degrees"))
+    v_value = float(cube_pose.get("v_azimuth_degrees"))
+    twist_value = float(cube_pose.get("twist_degrees"))
+    if not 0.0 <= u_value < 90.0:
+        raise ValueError("v7 colatitude must be in [0, 90)")
+    if not -180.0 <= v_value < 180.0:
+        raise ValueError("v7 azimuth must be in [-180, 180)")
+    if not -45.0 <= twist_value < 45.0:
+        raise ValueError("v7 twist must be in [-45, 45)")
     layer_angles = articulation.get("layer_angles_degrees")
-    turn_present = False
-    turn_face_axis = (0.0, 0.0, 0.0)
-    turn_layer_index = -1
-    if layer_angles is None:
-        turn = articulation.get("turn")
-        layer_angles = [0.0, 0.0]
-        if isinstance(turn, dict):
-            turn_layer_index = int(turn.get("layer_index", 1))
-            if turn_layer_index not in (0, 2):
-                raise ValueError(f"Legacy turn has non-outer layer index {turn_layer_index}")
-            face = str(turn.get("face", ""))
-            if face in FACE_AXES:
-                turn_face_axis = FACE_AXES[face]
-            else:
-                # The current compact dataset has already canonicalized its
-                # rotation and intentionally leaves face metadata blank.  A
-                # truly legacy file with a named face is resolved in the loss.
-                is_v6 = True
-            layer_angles[0 if turn_layer_index == 0 else 1] = float(
-                turn.get("signed_angle_degrees", 0.0)
-            )
-            turn_present = abs(layer_angles[0 if turn_layer_index == 0 else 1]) > 1e-8
-    else:
-        layer_angles = list(layer_angles)
-        turn_present = any(abs(float(angle)) > 1e-8 for angle in layer_angles)
-        if turn_present:
-            turn_layer_index = 0 if abs(float(layer_angles[0])) > 1e-8 else 2
-
+    if not isinstance(layer_angles, list) or len(layer_angles) != 2:
+        raise ValueError("v7 articulation must contain two layer angles")
     layer_angles = [
         ((float(angle) + ANGLE_PERIOD_DEGREES / 2.0) % ANGLE_PERIOD_DEGREES)
         - ANGLE_PERIOD_DEGREES / 2.0
@@ -174,7 +120,9 @@ def pose_target_from_json(payload: dict[str, Any]) -> dict[str, Tensor]:
     if perspective <= 0.0:
         raise ValueError("image_projection.perspective_strength must be positive")
     return {
-        "rotation_quaternion": rotation,
+        "u": torch.tensor(u_value, dtype=torch.float32),
+        "v": torch.tensor(v_value, dtype=torch.float32),
+        "twist": torch.tensor(twist_value, dtype=torch.float32),
         "image_center": _as_float_tensor(
             projection.get("cube_center_normalized"),
             shape=(2,),
@@ -190,10 +138,6 @@ def pose_target_from_json(payload: dict[str, Any]) -> dict[str, Tensor]:
             shape=(2,),
             name="layer_angles_degrees",
         ),
-        "turn_present": torch.tensor(turn_present, dtype=torch.bool),
-        "turn_face_axis": torch.tensor(turn_face_axis, dtype=torch.float32),
-        "turn_layer_index": torch.tensor(turn_layer_index, dtype=torch.long),
-        "canonical_rotation": torch.tensor(is_v6, dtype=torch.bool),
     }
 
 
@@ -224,11 +168,36 @@ class CubePoseDataset(Dataset[tuple[Tensor, dict[str, Tensor], str]]):
 
 
 def move_target(target: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
-    return {key: value.to(device=device, non_blocking=True) for key, value in target.items()}
+    non_blocking = device.type == "cuda"
+    return {
+        key: value.to(device=device, non_blocking=non_blocking)
+        for key, value in target.items()
+    }
+
+
+def _require_finite(
+    values: dict[str, Tensor],
+    *,
+    label: str,
+    stems: tuple[str, ...] | list[str],
+    device: torch.device | None = None,
+) -> None:
+    """Fail at the first non-finite training value with useful context."""
+    bad = [
+        name
+        for name, value in values.items()
+        if not bool(torch.isfinite(value).all())
+    ]
+    if bad:
+        raise FloatingPointError(
+            f"Non-finite {label} in batch starting at {stems[0]!r}; "
+            f"bad fields: {', '.join(bad)}; batch stems: {', '.join(stems)}"
+            + (f"; device: {device}" if device is not None else "")
+        )
 
 
 def run_epoch(
-    model: YOLOCubePoseModel,
+    model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
@@ -242,11 +211,13 @@ def run_epoch(
     totals: dict[str, float] = {}
     sample_count = 0
     for images, targets, _stems in loader:
-        images = images.to(device=device, non_blocking=True)
+        images = images.to(device=device, non_blocking=device.type == "cuda")
         targets = move_target(targets, device)
+        _require_finite(targets, label="target", stems=_stems, device=device)
         if training:
             optimizer.zero_grad(set_to_none=True)
         prediction = model(images)
+        _require_finite(prediction, label="model output", stems=_stems, device=device)
         losses = cube_pose_loss(
             prediction,
             targets,
@@ -254,10 +225,31 @@ def run_epoch(
             geometry_weight=geometry_weight,
             head_weight=head_weight,
         )
+        _require_finite(losses, label="loss", stems=_stems, device=device)
         if training:
             losses["total"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            gradient_values = {
+                name: parameter.grad
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad and parameter.grad is not None
+            }
+            _require_finite(gradient_values, label="gradient", stems=_stems, device=device)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=10.0,
+                error_if_nonfinite=True,
+            )
             optimizer.step()
+            _require_finite(
+                {
+                    name: parameter
+                    for name, parameter in model.named_parameters()
+                    if parameter.requires_grad
+                },
+                label="parameter",
+                stems=_stems,
+                device=device,
+            )
         batch_size = int(images.shape[0])
         sample_count += batch_size
         for key, value in losses.items():
@@ -298,9 +290,10 @@ def resolve_device(requested: str) -> torch.device:
 
 def save_checkpoint(
     path: Path,
-    model: YOLOCubePoseModel,
+    model: nn.Module,
     *,
-    base_model: str,
+    base_model: str | None,
+    model_type: str,
     image_size: int,
     epoch: int,
     metrics: dict[str, float],
@@ -310,13 +303,14 @@ def save_checkpoint(
     torch.save(
         {
             "format": "cube_pose_head_v1",
+            "model_type": model_type,
             "base_model": base_model,
             "imgsz": image_size,
             "epoch": epoch,
             "metrics": metrics,
             "model": model.state_dict(),
             "feature_channels": model.pose_head.feature_channels,
-            "mask_channels": model.mask_channels,
+            "mask_channels": getattr(model, "mask_channels", 0),
             "use_soft_masks": use_soft_masks,
         },
         path,
@@ -338,6 +332,22 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--unfreeze-base", action="store_true")
+    mask_group = parser.add_mutually_exclusive_group()
+    mask_group.add_argument(
+        "--feature-only",
+        action="store_true",
+        help="Use only the YOLO feature pyramid; omit all mask inputs.",
+    )
+    mask_group.add_argument(
+        "--use-mask-inputs",
+        action="store_true",
+        help="Use the full postprocessed sticker-mask stack plus prototype unions.",
+    )
+    mask_group.add_argument(
+        "--raw-image-only",
+        action="store_true",
+        help="Use only a compact raw-RGB CNN baseline; do not load YOLO.",
+    )
     parser.add_argument(
         "--no-perspective",
         action="store_true",
@@ -346,26 +356,26 @@ def main() -> int:
     parser.add_argument(
         "--head-weight-start",
         type=float,
-        default=0.6,
-        help="Direct canonical-head loss weight at the first epoch.",
+        default=1.0,
+        help="Direct canonical-head loss weight at the first epoch (default: 1.0).",
     )
     parser.add_argument(
         "--head-weight-end",
         type=float,
-        default=0.3,
-        help="Direct canonical-head loss weight at the final epoch.",
+        default=1.0,
+        help="Direct canonical-head loss weight at the final epoch (default: 1.0).",
     )
     parser.add_argument(
         "--geometry-weight-start",
         type=float,
-        default=0.4,
-        help="Closest-line geometry loss weight at the first epoch.",
+        default=0.0,
+        help="Closest-line geometry loss weight at the first epoch (default: 0.0).",
     )
     parser.add_argument(
         "--geometry-weight-end",
         type=float,
-        default=0.7,
-        help="Closest-line geometry loss weight at the final epoch.",
+        default=0.0,
+        help="Closest-line geometry loss weight at the final epoch (default: 0.0).",
     )
     args = parser.parse_args()
     if not 0.0 <= args.validation_fraction < 1.0:
@@ -402,7 +412,7 @@ def main() -> int:
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.workers,
-        pin_memory=device.type in {"cuda", "mps"},
+        pin_memory=device.type == "cuda",
     )
     validation_loader = (
         DataLoader(
@@ -410,19 +420,35 @@ def main() -> int:
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.workers,
-            pin_memory=device.type in {"cuda", "mps"},
+            pin_memory=device.type == "cuda",
         )
         if validation_dataset is not None
         else None
     )
 
-    model = YOLOCubePoseModel.from_checkpoint(
-        args.model,
-        input_size=args.imgsz,
-        freeze_base=not args.unfreeze_base,
-        use_soft_masks=True,
-        mask_channels=3,
-    ).to(device)
+    if args.raw_image_only:
+        if args.unfreeze_base:
+            parser.error("--unfreeze-base cannot be used with --raw-image-only")
+        model = RawImageCubePoseModel().to(device)
+        use_soft_masks = False
+        model_type = "raw_image"
+        base_model = None
+    else:
+        use_soft_masks = not args.feature_only
+        mask_channels = (
+            POSE_MASK_CHANNELS
+            if args.use_mask_inputs
+            else PROTOTYPE_MASK_CHANNELS
+        )
+        model = YOLOCubePoseModel.from_checkpoint(
+            args.model,
+            input_size=args.imgsz,
+            freeze_base=not args.unfreeze_base,
+            use_soft_masks=use_soft_masks,
+            mask_channels=mask_channels,
+        ).to(device)
+        model_type = "yolo"
+        base_model = args.model
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(
         trainable_parameters,
@@ -494,22 +520,24 @@ def main() -> int:
             save_checkpoint(
                 args.output / "last.pt",
                 model,
-                base_model=args.model,
+                base_model=base_model,
+                model_type=model_type,
                 image_size=args.imgsz,
                 epoch=epoch,
                 metrics=metrics,
-                use_soft_masks=True,
+                use_soft_masks=use_soft_masks,
             )
             if score < best_loss:
                 best_loss = score
                 save_checkpoint(
                     args.output / "best.pt",
                     model,
-                    base_model=args.model,
+                    base_model=base_model,
+                    model_type=model_type,
                     image_size=args.imgsz,
                     epoch=epoch,
                     metrics=metrics,
-                    use_soft_masks=True,
+                    use_soft_masks=use_soft_masks,
                 )
     finally:
         model.close()

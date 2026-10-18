@@ -66,6 +66,7 @@ class RoiTracker:
     roi_xyxy: tuple[int, int, int, int] | None = None
     cube_candidate: Any | None = None
     base_side: int | None = None
+    roi_padding: float | None = None
 
     def reset(self) -> None:
         self.roi_xyxy = None
@@ -77,9 +78,12 @@ class RoiTracker:
         candidate: Any,
         frame_width: int,
         frame_height: int,
-        padding: float,
+        padding: float | None = None,
     ) -> tuple[int, int, int, int]:
         self.cube_candidate = candidate if hasattr(candidate, "bbox_xyxy") else None
+        if padding is not None:
+            self.roi_padding = max(0.0, float(padding))
+        padding = self.roi_padding if self.roi_padding is not None else 0.0
         self.roi_xyxy = square_roi_from_bbox(
             bbox_xyxy_from_candidate(candidate),
             frame_width,
@@ -136,11 +140,13 @@ def roi_for_frame(
     frame: np.ndarray,
     bbox_detector: Any,
     tracker: RoiTracker,
-    padding: float,
+    padding: float | None = None,
 ) -> tuple[tuple[int, int, int, int] | None, Any | None, str]:
     """Get the current ROI, running the bbox detector only after a miss."""
 
     height, width = frame.shape[:2]
+    if tracker.roi_padding is None and padding is not None:
+        tracker.roi_padding = max(0.0, float(padding))
     if tracker.roi_xyxy is not None:
         return tracker.roi_xyxy, tracker.cube_candidate, "tracker"
 
@@ -149,4 +155,4 @@ def roi_for_frame(
         tracker.reset()
         return None, None, "none"
 
-    return tracker.initialize(candidate, width, height, padding), candidate, "detector"
+    return tracker.initialize(candidate, width, height), candidate, "detector"

@@ -14,6 +14,17 @@ class CountingDetector:
         return SimpleNamespace(bbox_xyxy=(10, 10, 30, 30), confidence=0.9)
 
 
+class IndependentBBoxDetector:
+    def __init__(self):
+        self.calls = 0
+        self.boxes = [(10, 10, 30, 30), (20, 20, 50, 50)]
+
+    def detect(self, _frame):
+        bbox = self.boxes[self.calls]
+        self.calls += 1
+        return SimpleNamespace(bbox_xyxy=bbox, confidence=0.9)
+
+
 def test_bbox_runs_once_until_second_stage_miss_then_reacquires():
     frame = np.zeros((60, 60, 3), dtype=np.uint8)
     detector = CountingDetector()
@@ -37,3 +48,22 @@ def test_bbox_runs_once_until_second_stage_miss_then_reacquires():
     assert roi == (10, 10, 30, 30)
     assert candidate is not None
     assert source == "detector"
+
+
+def test_roi_padding_survives_tracker_reset_for_independent_bbox_detection():
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    detector = IndependentBBoxDetector()
+    tracker = RoiTracker()
+
+    roi, _candidate, source = roi_for_frame(frame, detector, tracker, 0.8)
+    assert source == "detector"
+    assert roi == (0, 0, 52, 52)
+    assert tracker.roi_padding == 0.8
+
+    tracker.observe_tracking_bounds(None, 100, 100)
+    roi, _candidate, source = roi_for_frame(frame, detector, tracker, 0.08)
+
+    assert detector.calls == 2
+    assert source == "detector"
+    assert roi == (0, 0, 78, 78)
+    assert tracker.roi_padding == 0.8
