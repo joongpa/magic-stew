@@ -173,8 +173,26 @@ STICKER_COLOR_MATERIAL_NAMES = ("White", "Yellow", "Red", "Orange", "Blue", "Gre
 STICKER_OBJECT_NAME_PREFIX = "StickerlessMaterialRadialPart."
 SEGMENTATION_CLASS_NAMES = ("cube", "sticker")
 MIN_VISIBLE_STICKER_AREA_PX_AT_128 = 8.0
-POSE_LABEL_FORMAT = "cube_pose_v7"
 POSE_LABEL_DIRECTORY = "pose"
+MASK_MODE_SEGMENTATION = "segmentation"
+MASK_MODE_KEYPOINTS = "keypoints"
+MASK_MODE_NONE = "none"
+MASK_MODES = (MASK_MODE_SEGMENTATION, MASK_MODE_KEYPOINTS, MASK_MODE_NONE)
+ORDERED_POSE_CLASS_ID = 0
+ORDERED_KEYPOINT_NAMES = (
+    # Corners: 0..7.  The order follows the existing canonical cube frame.
+    "UBL", "UBR", "UFR", "UFL",
+    "DBL", "DBR", "DFR", "DFL",
+    # Edge midpoints: 8..19.  First the top/bottom face perimeters, then
+    # the four vertical edges.
+    "UB", "UR", "UF", "UL",
+    "DB", "DR", "DF", "DL",
+    "BR", "BL", "FR", "FL",
+    # Face centers: 20..25.
+    "U", "D", "F", "B", "R", "L",
+)
+ORDERED_KEYPOINT_COUNT = len(ORDERED_KEYPOINT_NAMES)
+ORDERED_KEYPOINT_SURFACE_COORDINATE = 1.5
 # Annotation widths are specified at the former 256x256 reference resolution
 # and scaled with the output image so overlays remain visually proportional.
 ANNOTATION_REFERENCE_SIZE = 256.0
@@ -256,7 +274,11 @@ LAYER_RENDER_STATE_WEIGHTS = (
     ("mid_turn", 0.50),
     ("corner_cut", 0.20),
 )
-CUBE_MISALIGNMENT_ENABLED = True
+# Keep discrete scrambles enabled for varied cube states, while leaving
+# partial layer turns disabled for the ordered-keypoint baseline.  The latter
+# includes both mid-turn and corner-cut states.
+CUBE_MISALIGNMENT_ENABLED = False
+SCRAMBLES_ENABLED = True
 MID_TURN_DEGREES_RANGE = (-45.0, 45.0)
 CORNER_CUT_SMALL_DEGREES_RANGE = (0.0, 10.0)
 CORNER_CUT_ADJACENT_DEGREES_RANGE = (5.0, 45.0)
@@ -541,359 +563,6 @@ def matrix_from_rows(rows: list[list[float]]) -> Matrix:
     return Matrix(rows)
 
 
-def cube_symmetry_matrices() -> tuple[Matrix, ...]:
-    """Return the 24 proper rotational symmetries of a cube."""
-    matrices: list[Matrix] = []
-    for permutation in permutations(range(3)):
-        for signs in product((-1.0, 1.0), repeat=3):
-            rows = [[0.0, 0.0, 0.0] for _ in range(3)]
-            for row, column in enumerate(permutation):
-                rows[row][column] = signs[row]
-            rotation = Matrix(rows)
-            if rotation.determinant() > 0.5:
-                matrices.append(rotation)
-    return tuple(matrices)
-
-
-CUBE_SYMMETRY_MATRICES = cube_symmetry_matrices()
-
-
-def canonical_cube_symmetry(rotation: Matrix) -> Matrix:
-    """Choose the no-turn symmetry whose stack axis is closest to image zenith."""
-    image_zenith = Vector((0.0, -1.0, 0.0))
-    candidates: list[tuple[float, tuple[float, ...], Matrix]] = []
-    for symmetry in CUBE_SYMMETRY_MATRICES:
-        candidate = rotation @ symmetry
-        stack_axis = candidate @ Vector((0.0, 0.0, 1.0))
-        colatitude = math.acos(
-            max(-1.0, min(1.0, float(image_zenith.dot(stack_axis.normalized()))))
-        )
-        tie_break = tuple(
-            round(float(candidate[row][column]), 9)
-            for row in range(3)
-            for column in range(3)
-        )
-        candidates.append((colatitude, tie_break, symmetry))
-    return min(candidates, key=lambda item: (item[0], item[1]))[2]
-
-
-def canonical_cube_symmetry_for_turn(rotation: Matrix, layer_state: dict[str, object]) -> Matrix:
-    """Canonicalize a turning cube while keeping its axis on the 1x1x3 stack.
-
-    The pose head has two angle channels, one for each outer layer of a fixed
-    three-slab model.  Therefore the cube symmetry must be selected jointly
-    with the turn: after applying the symmetry, the active layer axis is the
-    canonical Z axis.  Both signs are allowed so the turn can land in either
-    outer-layer channel.  The visible representative is selected by stack
-    colatitude; applying that symmetry then transforms the turn face, which
-    remaps the active layer channel in the written v7 articulation payload.
-    """
-    candidate_turns = []
-    for face_key, angle_key, direction_key, objects_key, role in (
-        ("face", "angle_degrees", "direction", "objects", "primary"),
-        ("adjacent_face", "adjacent_angle_degrees", "adjacent_direction", "adjacent_objects", "adjacent"),
-    ):
-        turn = pose_turn_payload(
-            layer_state,
-            face_key=face_key,
-            angle_key=angle_key,
-            direction_key=direction_key,
-            objects_key=objects_key,
-            role=role,
-        )
-        if turn is not None:
-            candidate_turns.append(turn)
-    if not candidate_turns:
-        return canonical_cube_symmetry(rotation)
-    if str(layer_state.get("mode", "none")) == "corner_cut":
-        selected_turn = max(
-            candidate_turns,
-            key=lambda turn: abs(float(turn["signed_angle_degrees"])),
-        )
-    else:
-        selected_turn = candidate_turns[0]
-    source_axis = face_specs()[str(selected_turn["face"])]
-    candidates: list[tuple[float, tuple[float, ...], Matrix]] = []
-    for symmetry in CUBE_SYMMETRY_MATRICES:
-        transformed_axis = (symmetry.transposed() @ source_axis).normalized()
-        if abs(abs(float(transformed_axis.z)) - 1.0) > 1e-6:
-            continue
-        candidate = rotation @ symmetry
-        stack_axis = (candidate @ Vector((0.0, 0.0, 1.0))).normalized()
-        colatitude = math.acos(
-            max(-1.0, min(1.0, float(image_zenith.dot(stack_axis))))
-        )
-        tie_break = tuple(
-            round(float(candidate[row][column]), 9)
-            for row in range(3)
-            for column in range(3)
-        )
-        candidates.append((colatitude, tie_break, symmetry))
-    if not candidates:
-        raise ValueError("Could not align a turning layer with the canonical Z axis")
-    return min(candidates, key=lambda item: (item[0], item[1]))[2]
-
-
-def canonical_signed_turn_angle(angle_degrees: float) -> float:
-    """Wrap a fourfold-symmetric layer angle into [-45, 45) degrees."""
-    wrapped = ((float(angle_degrees) + 45.0) % 90.0) - 45.0
-    return 0.0 if abs(wrapped) < 1e-8 else wrapped
-
-
-def canonicalize_turn_payload(turn: dict[str, object]) -> dict[str, object]:
-    signed_angle = canonical_signed_turn_angle(float(turn["signed_angle_degrees"]))
-    direction = int(turn["direction"])
-    if abs(signed_angle) > 1e-8:
-        direction = 1 if signed_angle > 0.0 else -1
-    return {
-        **turn,
-        "angle_degrees": abs(signed_angle),
-        "direction": direction,
-        "signed_angle_degrees": signed_angle,
-    }
-
-
-def vector_values(vector: Vector) -> list[float]:
-    return [float(vector[index]) for index in range(len(vector))]
-
-
-def quaternion_values(quaternion: Quaternion) -> list[float]:
-    return [
-        float(quaternion.x),
-        float(quaternion.y),
-        float(quaternion.z),
-        float(quaternion.w),
-    ]
-
-
-def compact_quaternion_values(rotation_matrix: Matrix) -> list[float]:
-    """Return one deterministic quaternion representation for the pose head."""
-    values = quaternion_values(rotation_matrix.to_quaternion())
-    if values[3] < 0.0:
-        values = [-value for value in values]
-    return values
-
-
-def pose_turn_payload(
-    layer_state: dict[str, object],
-    *,
-    face_key: str,
-    angle_key: str,
-    direction_key: str,
-    objects_key: str,
-    role: str,
-) -> dict[str, object] | None:
-    face = layer_state.get(face_key)
-    angle = layer_state.get(angle_key)
-    direction = layer_state.get(direction_key)
-    objects = layer_state.get(objects_key, [])
-    if not isinstance(face, str) or not isinstance(angle, (int, float)):
-        return None
-    if not isinstance(direction, (int, float)):
-        direction = 1
-    axis = face_specs().get(face)
-    if axis is None:
-        return None
-    axis_index = max(range(3), key=lambda index: abs(axis[index]))
-    side = int(round(axis[axis_index]))
-    object_names = [name for name in objects if isinstance(name, str)] if isinstance(objects, list) else []
-    return {
-        "role": role,
-        "face": face,
-        "axis": vector_values(axis),
-        "axis_index": axis_index,
-        "side": side,
-        "layer_index": side + 1,
-        "angle_degrees": float(angle),
-        "direction": int(direction),
-        "signed_angle_degrees": float(angle) * int(direction),
-        "object_names": object_names,
-    }
-
-
-def pose_articulation_payload(layer_state: dict[str, object]) -> dict[str, object]:
-    candidate_turns: list[dict[str, object]] = []
-    primary = pose_turn_payload(
-        layer_state,
-        face_key="face",
-        angle_key="angle_degrees",
-        direction_key="direction",
-        objects_key="objects",
-        role="primary",
-    )
-    if primary is not None:
-        candidate_turns.append(primary)
-    adjacent = pose_turn_payload(
-        layer_state,
-        face_key="adjacent_face",
-        angle_key="adjacent_angle_degrees",
-        direction_key="adjacent_direction",
-        objects_key="adjacent_objects",
-        role="adjacent",
-    )
-    if adjacent is not None:
-        candidate_turns.append(adjacent)
-    source_mode = str(layer_state.get("mode", "none"))
-    if source_mode == "corner_cut" and candidate_turns:
-        selected = max(
-            candidate_turns,
-            key=lambda turn: abs(float(turn["signed_angle_degrees"])),
-        )
-        selected_turn = canonicalize_turn_payload(selected)
-    else:
-        selected_turn = (
-            canonicalize_turn_payload(candidate_turns[0])
-            if candidate_turns
-            else None
-        )
-    layer_angles = [0.0, 0.0]
-    if selected_turn is not None:
-        layer_index = int(selected_turn["layer_index"])
-        if layer_index not in (0, 2):
-            raise ValueError(f"Expected an outer layer index, got {layer_index}")
-        layer_angles[0 if layer_index == 0 else 1] = float(
-            selected_turn["signed_angle_degrees"]
-        )
-    return {
-        "layer_angles_degrees": layer_angles,
-    }
-
-
-def image_projection_payload(
-    camera: bpy.types.Object,
-    cube_to_opencv_camera: Matrix,
-    width: int,
-    height: int,
-) -> dict[str, object]:
-    """Return image-space pose terms useful for a compact projection head."""
-    data = camera.data
-    sensor_size = data.sensor_height if data.sensor_fit == "VERTICAL" else data.sensor_width
-    focal_x = float(data.lens) * width / float(sensor_size)
-    focal_y = float(data.lens) * height / float(sensor_size)
-    principal_x = width * (0.5 - float(data.shift_x))
-    principal_y = height * (0.5 + float(data.shift_y))
-
-    cube_center_camera = cube_to_opencv_camera.translation
-    depth = float(cube_center_camera.z)
-    if abs(depth) < 1e-8:
-        raise ValueError("Cannot label image projection with cube center at camera depth zero.")
-    center_x = focal_x * float(cube_center_camera.x) / depth + principal_x
-    center_y = focal_y * float(cube_center_camera.y) / depth + principal_y
-
-    return {
-        "model": "scaled_perspective",
-        "cube_center_normalized": [center_x / width, center_y / height],
-        "image_scale_normalized": focal_x / (abs(depth) * width),
-        "perspective_strength": 3.0 / depth,
-    }
-
-
-def wrap_pose_angle(angle_degrees: float, period_degrees: float) -> float:
-    wrapped = (float(angle_degrees) + period_degrees / 2.0) % period_degrees
-    wrapped -= period_degrees / 2.0
-    return 0.0 if abs(wrapped) < 1e-8 else wrapped
-
-
-def direct_pose_head_payload(rotation: Matrix) -> dict[str, float]:
-    """Return v7's colatitude/azimuth/twist head coordinates."""
-    image_zenith = Vector((0.0, -1.0, 0.0))
-    image_right = Vector((1.0, 0.0, 0.0))
-    fallback_right = Vector((0.0, 0.0, 1.0))
-    stack_axis = (rotation @ Vector((0.0, 0.0, 1.0))).normalized()
-    colatitude = math.degrees(
-        math.acos(max(-1.0, min(1.0, float(image_zenith.dot(stack_axis)))))
-    )
-    if not 0.0 <= colatitude < 90.0:
-        raise ValueError(
-            "Canonical Blender pose produced colatitude outside [0, 90): "
-            f"{colatitude:.6f}"
-        )
-    azimuth = math.degrees(math.atan2(float(stack_axis.x), float(stack_axis.z)))
-    reference = (
-        fallback_right
-        if abs(float(image_right.dot(stack_axis))) > 0.95
-        else image_right
-    )
-    local_x = (reference - stack_axis * reference.dot(stack_axis)).normalized()
-    local_y = stack_axis.cross(local_x).normalized()
-    rotation_x = (rotation @ Vector((1.0, 0.0, 0.0))).normalized()
-    twist = math.degrees(math.atan2(float(rotation_x.dot(local_y)), float(rotation_x.dot(local_x))))
-    return {
-        "u_colatitude_degrees": float(colatitude),
-        "v_azimuth_degrees": float(wrap_pose_angle(azimuth, 360.0)),
-        "twist_degrees": float(wrap_pose_angle(twist, 90.0)),
-    }
-
-
-def write_pose_label(
-    path: Path,
-    cube_pose: dict[str, object],
-    layer_state: dict[str, object],
-    width: int,
-    height: int,
-) -> None:
-    camera = get_camera()
-    transform_rows = cube_pose.get("transform")
-    if not isinstance(transform_rows, list):
-        raise ValueError("Cube pose is missing its transform matrix.")
-    base_cube_to_world = matrix_from_rows(transform_rows)
-    scramble_rows = cube_pose.get("wireframe_scramble_transform")
-    whole_cube_scramble = (
-        matrix_from_rows(scramble_rows)
-        if isinstance(scramble_rows, list)
-        else Matrix.Identity(4)
-    )
-    # Express the effective cube frame after any whole-cube scramble, then
-    # quotient out the 24 rotational symmetries of the cube. The resulting
-    # frame is an equivalent training target, not necessarily the frame used
-    # by Blender to render the image.
-    pre_symmetry_cube_to_world = base_cube_to_world @ whole_cube_scramble
-    pre_symmetry_world_to_blender_camera = camera.matrix_world.inverted_safe()
-    pre_symmetry_cube_to_blender_camera = (
-        pre_symmetry_world_to_blender_camera @ pre_symmetry_cube_to_world
-    )
-    blender_to_opencv = Matrix((
-        (1.0, 0.0, 0.0, 0.0),
-        (0.0, -1.0, 0.0, 0.0),
-        (0.0, 0.0, -1.0, 0.0),
-        (0.0, 0.0, 0.0, 1.0),
-    ))
-    pre_symmetry_cube_to_opencv_camera = (
-        blender_to_opencv @ pre_symmetry_cube_to_blender_camera
-    )
-    canonical_layer_state = canonical_wireframe_layer_state(
-        layer_state,
-        whole_cube_scramble,
-    )
-    canonical_symmetry = canonical_cube_symmetry_for_turn(
-        pre_symmetry_cube_to_opencv_camera.to_3x3(),
-        canonical_layer_state,
-    )
-    canonical_symmetry_4x4 = canonical_symmetry.to_4x4()
-    cube_to_world = pre_symmetry_cube_to_world @ canonical_symmetry_4x4
-    canonical_layer_state = transform_layer_state_by_symmetry(
-        canonical_layer_state,
-        canonical_symmetry,
-    )
-    world_to_blender_camera = camera.matrix_world.inverted_safe()
-    cube_to_blender_camera = world_to_blender_camera @ cube_to_world
-    cube_to_opencv_camera = blender_to_opencv @ cube_to_blender_camera
-
-    payload = {
-        "format": POSE_LABEL_FORMAT,
-        "cube_pose": direct_pose_head_payload(cube_to_opencv_camera.to_3x3()),
-        "image_projection": image_projection_payload(
-            camera,
-            cube_to_opencv_camera,
-            width,
-            height,
-        ),
-        "articulation": pose_articulation_payload(canonical_layer_state),
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-
-
 def apply_global_pose(objects: list[bpy.types.Object], rotation: Quaternion, translation: Vector) -> Matrix:
     transform = Matrix.Translation(translation) @ rotation.to_matrix().to_4x4()
     for obj in objects:
@@ -1099,6 +768,20 @@ def randomize_layer_render_state(objects: list[bpy.types.Object]) -> dict[str, o
         "adjacent_objects": adjacent_objects,
         "method": "naive_small_layer_then_adjacent_layer",
     }
+
+
+def scene_scramble_moves(scramble_length: int, solved: bool) -> list[str]:
+    """Return discrete scramble moves unless the scene is solved or disabled."""
+    if solved or not SCRAMBLES_ENABLED:
+        return []
+    return random_scramble_moves(scramble_length)
+
+
+def scene_layer_render_state(objects: list[bpy.types.Object]) -> dict[str, object]:
+    """Return a partial-turn state only when mid-turn augmentation is enabled."""
+    if not CUBE_MISALIGNMENT_ENABLED:
+        return {"mode": "none"}
+    return randomize_layer_render_state(objects)
 
 
 def look_at(obj: bpy.types.Object, target: Vector) -> None:
@@ -3730,7 +3413,7 @@ def duplicate_secondary_cube(
         random.random() < SOLVE_STATION_OTHER_CUBE_SOLVED_PROBABILITY
     )
     secondary_move_count = 0 if secondary_solved else random.randint(8, 22)
-    secondary_moves = random_scramble_moves(secondary_move_count)
+    secondary_moves = scene_scramble_moves(secondary_move_count, secondary_solved)
     secondary_scramble_objects = duplicate_objects + duplicate_core_objects
     for move in secondary_moves:
         apply_scramble_move(secondary_scramble_objects, move)
@@ -4455,7 +4138,7 @@ def randomize_scene(
     light_randomization = randomize_light(background_randomization)
     background_randomization["world_color"] = light_randomization["world"]["display_color"]
     background_randomization["world_lighting"] = light_randomization["world"]
-    moves = [] if solved else random_scramble_moves(scramble_length)
+    moves = scene_scramble_moves(scramble_length, solved)
     scramble_objects = objects + core_objects
     wireframe_scramble_transform = Matrix.Identity(4)
     for move in moves:
@@ -4467,7 +4150,7 @@ def randomize_scene(
         apply_scramble_move(scramble_objects, move)
 
     duplicate_secondary_cube(objects, core_objects, background_randomization)
-    layer_state = randomize_layer_render_state(objects)
+    layer_state = scene_layer_render_state(objects)
 
     pose_objects = list(objects) + core_objects
     pose_bounds = []
@@ -4745,7 +4428,7 @@ def build_solid_background_patch_case(
     core_objects = core_fill_objects()
     reset_cube(objects)
     reset_core_fill_objects(core_objects)
-    moves = [] if solved else random_scramble_moves(scramble_length)
+    moves = scene_scramble_moves(scramble_length, solved)
     wireframe_scramble_transform = Matrix.Identity(4)
     for move in moves:
         if move in "xyz":
@@ -4757,7 +4440,7 @@ def build_solid_background_patch_case(
     # Deliberate cases keep the ordinary transient-turn distribution.  The
     # hard-case factor controls the scene condition; it must not silently
     # remove mid-turn/corner-cut examples from the training mixture.
-    layer_state = randomize_layer_render_state(objects)
+    layer_state = scene_layer_render_state(objects)
     pose_objects = objects + core_objects
     yaw_degrees = random.uniform(-28.0, 28.0)
     pitch_degrees = random.uniform(-8.0, 8.0)
@@ -5070,7 +4753,7 @@ def build_controlled_cube_case(
     core_objects = core_fill_objects()
     reset_cube(objects)
     reset_core_fill_objects(core_objects)
-    moves = [] if solved else random_scramble_moves(scramble_length)
+    moves = scene_scramble_moves(scramble_length, solved)
     wireframe_scramble_transform = Matrix.Identity(4)
     for move in moves:
         if move in "xyz":
@@ -5079,7 +4762,7 @@ def build_controlled_cube_case(
                 whole_cube_turn.to_matrix().to_4x4() @ wireframe_scramble_transform
             )
         apply_scramble_move(objects + core_objects, move)
-    layer_state = randomize_layer_render_state(objects)
+    layer_state = scene_layer_render_state(objects)
 
     # Retain the ordinary secondary-cube probability for the general hard
     # cases; the solid-patch builder intentionally isolates its cause.
@@ -6335,6 +6018,102 @@ def cube_keypoint_specs_from_corners_and_centers() -> list[dict[str, object]]:
     return [*corner_relative_keypoint_specs(), *center_keypoint_specs()]
 
 
+def ordered_cube_keypoint_specs() -> list[dict[str, object]]:
+    """Return the fixed 26-point structural cube keypoint layout.
+
+    The points are defined in the cube's canonical local frame rather than by
+    whichever cubie happens to be visible.  This keeps the label order stable:
+    eight corners, twelve outer-edge midpoints, and six face centers.
+    """
+    axes = face_specs()
+    surface = ORDERED_KEYPOINT_SURFACE_COORDINATE
+
+    def make_spec(name: str, faces: tuple[str, ...], index: int) -> dict[str, object]:
+        point = Vector((0.0, 0.0, 0.0))
+        normals = []
+        for face in faces:
+            axis = axes[face]
+            point += axis * surface
+            normals.append(axis.copy())
+        return {
+            "index": index,
+            "name": name,
+            "point": point,
+            "normals": normals,
+            "kind": "corner" if index < 8 else "edge" if index < 20 else "center",
+        }
+
+    specs: list[dict[str, object]] = []
+    for index, name in enumerate(ORDERED_KEYPOINT_NAMES):
+        if index < 8:
+            faces = tuple(name)
+        elif index < 20:
+            faces = (name[0], name[1])
+        else:
+            faces = (name,)
+        specs.append(make_spec(name, faces, index))
+    return specs
+
+
+def ordered_keypoint_symmetry_matrices() -> tuple[Matrix, ...]:
+    """Return the 24 proper rotations of the canonical cube frame."""
+    matrices: list[Matrix] = []
+    for permutation in permutations(range(3)):
+        for signs in product((-1.0, 1.0), repeat=3):
+            rows = [[0.0, 0.0, 0.0] for _ in range(3)]
+            for row, column in enumerate(permutation):
+                rows[row][column] = signs[row]
+            matrix = Matrix(rows)
+            if matrix.determinant() > 0.5:
+                matrices.append(matrix)
+    return tuple(matrices)
+
+
+ORDERED_KEYPOINT_SYMMETRY_MATRICES = ordered_keypoint_symmetry_matrices()
+
+
+def ordered_keypoint_symmetry_permutations() -> tuple[tuple[int, ...], ...]:
+    """Return output-to-source permutations for all 24 cube symmetries.
+
+    A permutation is indexed by the output slot: if ``permutation[j] == i``,
+    rotating source point ``i`` by the associated symmetry lands at output
+    point ``j``.  This convention lets a symmetry-aware loss gather target
+    keypoints directly into the model's canonical output slots.
+    """
+    specs = ordered_cube_keypoint_specs()
+    points = [spec["point"] for spec in specs]
+    permutations_by_symmetry: list[tuple[int, ...]] = []
+    for symmetry in ORDERED_KEYPOINT_SYMMETRY_MATRICES:
+        output_to_source: list[int] = []
+        for output_point in points:
+            matches = [
+                source_index
+                for source_index, source_point in enumerate(points)
+                if (symmetry @ source_point - output_point).length < 1e-6
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    "Cube symmetry did not map the ordered keypoint layout "
+                    f"bijectively; output point {output_point} has {len(matches)} matches."
+                )
+            output_to_source.append(matches[0])
+        if len(set(output_to_source)) != ORDERED_KEYPOINT_COUNT:
+            raise ValueError("Cube symmetry permutation is not bijective.")
+        permutations_by_symmetry.append(tuple(output_to_source))
+
+    if len(permutations_by_symmetry) != 24:
+        raise ValueError(
+            "Expected 24 proper cube symmetries, "
+            f"got {len(permutations_by_symmetry)}."
+        )
+    if len(set(permutations_by_symmetry)) != 24:
+        raise ValueError("Cube symmetry permutations are not unique.")
+    return tuple(permutations_by_symmetry)
+
+
+ORDERED_KEYPOINT_SYMMETRY_PERMUTATIONS = ordered_keypoint_symmetry_permutations()
+
+
 def lowercase_letter(letter: str) -> str:
     return letter.lower()
 
@@ -6507,55 +6286,6 @@ def dimension_cube_box_specs(
             center = face_axis.copy()
         boxes.append((center, rotation, half_extents.copy()))
     return boxes
-
-
-def canonical_wireframe_layer_state(
-    layer_state: dict[str, object],
-    wireframe_scramble_transform: Matrix,
-) -> dict[str, object]:
-    """Express a post-scramble layer turn in canonical cube coordinates."""
-    scramble_rotation = wireframe_scramble_transform.to_3x3()
-    inverse_scramble_rotation = scramble_rotation.transposed()
-    axes = face_specs()
-
-    def canonical_face(face: object) -> object:
-        if not isinstance(face, str) or face not in axes:
-            return face
-        current_axis = axes[face]
-        canonical_axis = (inverse_scramble_rotation @ current_axis).normalized()
-        return max(axes, key=lambda candidate: axes[candidate].dot(canonical_axis))
-
-    canonical_state = dict(layer_state)
-    canonical_state["face"] = canonical_face(layer_state.get("face"))
-    if "adjacent_face" in layer_state:
-        canonical_state["adjacent_face"] = canonical_face(layer_state.get("adjacent_face"))
-    return canonical_state
-
-
-def transform_layer_state_by_symmetry(
-    layer_state: dict[str, object],
-    symmetry: Matrix,
-) -> dict[str, object]:
-    """Express layer axes in the canonical cube frame after a symmetry change."""
-    inverse_symmetry = symmetry.transposed()
-    axes = face_specs()
-
-    def transformed_face(face: object) -> object:
-        if not isinstance(face, str) or face not in axes:
-            return face
-        transformed_axis = (inverse_symmetry @ axes[face]).normalized()
-        return max(
-            axes,
-            key=lambda candidate: axes[candidate].dot(transformed_axis),
-        )
-
-    transformed_state = dict(layer_state)
-    transformed_state["face"] = transformed_face(layer_state.get("face"))
-    if "adjacent_face" in layer_state:
-        transformed_state["adjacent_face"] = transformed_face(
-            layer_state.get("adjacent_face")
-        )
-    return transformed_state
 
 
 def dimension_cubie_transforms(
@@ -7191,6 +6921,116 @@ def keypoint_bbox(
     return (x1 + x2) / 2.0, (y1 + y2) / 2.0, max(1.0, x2 - x1), max(1.0, y2 - y1)
 
 
+def render_ordered_keypoint_label(
+    cube_pose: dict[str, object],
+    width: int,
+    height: int,
+) -> tuple[str | None, dict[str, object]]:
+    """Project the ordered 26-point cube layout into one YOLO pose row."""
+    transform_rows = cube_pose.get("transform")
+    if not isinstance(transform_rows, list):
+        raise ValueError("Cube pose is missing its transform matrix.")
+
+    camera = get_camera()
+    scene = bpy.context.scene
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    cube_to_world = matrix_from_rows(transform_rows)
+    cube_rotation = cube_to_world.to_3x3()
+    ignored_cube_objects = {
+        obj.name
+        for obj in [*cube_objects(), *core_fill_objects()]
+    }
+    hand_object_names = {
+        obj.name
+        for obj in hand_objects().values()
+    }
+
+    projected_keypoints: list[tuple[float, float, int]] = []
+    metadata: list[dict[str, object]] = []
+    counts = {"unlabeled": 0, "occluded": 0, "visible": 0}
+    for spec in ordered_cube_keypoint_specs():
+        local_point = spec["point"]
+        if not isinstance(local_point, Vector):
+            raise ValueError(f"Ordered keypoint {spec['name']} has no local point.")
+        world_point = cube_to_world @ local_point
+        local_normals = spec["normals"]
+        if not isinstance(local_normals, list):
+            raise ValueError(f"Ordered keypoint {spec['name']} has invalid normals.")
+        world_normals = [cube_rotation @ normal for normal in local_normals]
+        projected = project_world_point(world_point, camera, scene)
+        visibility = POINT_VISIBILITY_UNLABELED
+        occluded_by = None
+        hand_occluded = False
+        if projected is not None and point_faces_camera(
+            world_point,
+            world_normals,
+            camera.location,
+        ):
+            occluded_by = object_occluding_point(
+                world_point,
+                depsgraph,
+                ignored_object_names=ignored_cube_objects,
+            )
+            hand_occluded = bool(occluded_by and occluded_by in hand_object_names)
+            visibility = (
+                POINT_VISIBILITY_LABELED_OCCLUDED
+                if occluded_by is not None
+                else POINT_VISIBILITY_VISIBLE
+            )
+
+        if visibility == POINT_VISIBILITY_UNLABELED or projected is None:
+            point_label = unlabeled_pose_keypoint()
+        else:
+            point_label = (float(projected[0]), float(projected[1]), visibility)
+        projected_keypoints.append(point_label)
+        counts[
+            "visible"
+            if visibility == POINT_VISIBILITY_VISIBLE
+            else "occluded"
+            if visibility == POINT_VISIBILITY_LABELED_OCCLUDED
+            else "unlabeled"
+        ] += 1
+        metadata.append({
+            "index": int(spec["index"]),
+            "name": str(spec["name"]),
+            "kind": str(spec["kind"]),
+            "local_point": list(local_point),
+            "world_point": list(world_point),
+            "pixel_point": [point_label[0], point_label[1]],
+            "normalized_point": list(normalize_point(point_label[0], point_label[1], width, height)),
+            "visibility": visibility,
+            "hand_occluded": hand_occluded,
+            "occluded_by": occluded_by,
+        })
+
+    bbox = keypoint_bbox(projected_keypoints, width, height)
+    if bbox is None:
+        return None, {
+            "keypoint_shape": [ORDERED_KEYPOINT_COUNT, 3],
+            "keypoint_names": list(ORDERED_KEYPOINT_NAMES),
+            "keypoints": metadata,
+            **counts,
+        }
+
+    x_center, y_center, bbox_width, bbox_height = bbox
+    return yolo_pose_line(
+        ORDERED_POSE_CLASS_ID,
+        x_center,
+        y_center,
+        bbox_width,
+        bbox_height,
+        projected_keypoints,
+        width,
+        height,
+    ), {
+        "keypoint_shape": [ORDERED_KEYPOINT_COUNT, 3],
+        "keypoint_names": list(ORDERED_KEYPOINT_NAMES),
+        "keypoints": metadata,
+        "bbox_xywh": [x_center, y_center, bbox_width, bbox_height],
+        **counts,
+    }
+
+
 def left_to_right_key(point: tuple[float, float, int]) -> tuple[float, float]:
     return point[0], point[1]
 
@@ -7555,6 +7395,105 @@ def write_pose_keypoint_mask(
     cv2.imwrite(str(path), output)
 
 
+def write_ordered_keypoint_overlay(
+    path: Path,
+    image_path: Path,
+    ordered_pose_metadata: dict[str, object],
+    width: int,
+    height: int,
+) -> None:
+    """Write a half-brightness image with visible ordered keypoints numbered 0-25."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        raise RuntimeError(
+            "OpenCV and NumPy are required to write keypoint overlay masks."
+        ) from None
+
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None or image.shape[:2] != (height, width):
+        raise RuntimeError(f"Could not read rendered image for keypoint overlay: {image_path}")
+    output = np.clip(image.astype(np.float32) * 0.5, 0, 255).astype(np.uint8)
+
+    keypoints = ordered_pose_metadata.get("keypoints", [])
+    if not isinstance(keypoints, list):
+        raise TypeError("Ordered pose metadata must contain a keypoints list.")
+    point_colors = {
+        "corner": (255, 255, 255),
+        "edge": (0, 255, 255),
+        "center": (255, 255, 0),
+    }
+    point_radius = scaled_annotation_size(POSE_POINT_BASE_RADIUS, width, height)
+    point_outline_width = scaled_annotation_size(POSE_SEGMENT_OUTLINE_BASE_WIDTH, width, height)
+    font_scale = max(0.35, min(width, height) / ANNOTATION_REFERENCE_SIZE * 0.55)
+    font_thickness = max(1, scaled_annotation_size(1, width, height))
+
+    for keypoint in keypoints:
+        if not isinstance(keypoint, dict):
+            continue
+        visibility = int(keypoint.get("visibility", POINT_VISIBILITY_UNLABELED))
+        if visibility == POINT_VISIBILITY_UNLABELED:
+            continue
+        pixel_point = keypoint.get("pixel_point")
+        index = keypoint.get("index")
+        if not isinstance(pixel_point, list) or len(pixel_point) != 2 or not isinstance(index, int):
+            continue
+        x, y = (round(float(pixel_point[0])), round(float(pixel_point[1])))
+        center = (x, y)
+        point_kind = "corner" if index < 8 else "edge" if index < 20 else "center"
+        color = (0, 0, 255) if visibility == POINT_VISIBILITY_LABELED_OCCLUDED else point_colors[point_kind]
+        cv2.circle(
+            output,
+            center,
+            point_radius + point_outline_width,
+            (0, 0, 0),
+            thickness=-1,
+            lineType=cv2.LINE_AA,
+        )
+        cv2.circle(output, center, point_radius, color, thickness=-1, lineType=cv2.LINE_AA)
+
+        label = str(index)
+        text_size, _ = cv2.getTextSize(
+            label,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            font_thickness,
+        )
+        text_x = x + point_radius + point_outline_width + 2
+        if text_x + text_size[0] >= width:
+            text_x = x - point_radius - point_outline_width - text_size[0] - 2
+        text_y = y - point_radius - point_outline_width - 2
+        if text_y - text_size[1] < 0:
+            text_y = y + point_radius + point_outline_width + text_size[1] + 2
+        text_x = max(0, min(text_x, width - text_size[0]))
+        text_y = max(text_size[1], min(text_y, height - 1))
+        cv2.putText(
+            output,
+            label,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (0, 0, 0),
+            font_thickness + 2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            output,
+            label,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            color,
+            font_thickness,
+            cv2.LINE_AA,
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), output):
+        raise RuntimeError(f"Could not write ordered keypoint overlay: {path}")
+
+
 def write_yolo_pose(path: Path, lines: list[str]) -> None:
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
@@ -7570,13 +7509,15 @@ def generate_dataset(
     max_cube_rotational_blur_degrees: float,
     cube_rotational_blur_samples: int,
     degrade_probability: float,
-    render_masks: bool,
     render_segmentations: bool,
+    mask_mode: str = MASK_MODE_SEGMENTATION,
     hard_case: str = DEFAULT_HARD_CASE,
     render_pose_labels: bool = True,
 ) -> None:
+    if mask_mode not in MASK_MODES:
+        raise ValueError(f"Unsupported mask mode {mask_mode!r}; choose from {MASK_MODES}")
     images_dir = output_dir / "images"
-    masks_dir = output_dir / "masks" if render_masks else None
+    masks_dir = output_dir / "masks" if mask_mode != MASK_MODE_NONE else None
     labels_dir = output_dir / "labels"
     pose_dir = output_dir / POSE_LABEL_DIRECTORY if render_pose_labels else None
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -7585,19 +7526,18 @@ def generate_dataset(
     labels_dir.mkdir(parents=True, exist_ok=True)
     if pose_dir is not None:
         pose_dir.mkdir(parents=True, exist_ok=True)
-        (pose_dir / "schema.json").write_text(
+        symmetry_manifest = output_dir / "ordered_keypoint_symmetries.json"
+        symmetry_manifest.write_text(
             json.dumps(
                 {
-                    "format": POSE_LABEL_FORMAT,
-                    "description": "Direct image-space labels for the custom 1x1x3 articulated-cube pose head.",
-                    "cube_pose": {
-                        "u_colatitude_degrees": "Colatitude from image zenith in [0, 90).",
-                        "v_azimuth_degrees": "Azimuth around image zenith in [-180, 180).",
-                        "twist_degrees": "Twist around the stack axis in [-45, 45).",
-                    },
-                    "projection": "image_projection contains normalized center, normalized image scale, and perspective strength.",
-                    "articulation": "articulation.layer_angles_degrees contains the negative and positive outer-layer angles, signed around each layer's outward normal and modulo 90 degrees in [-45, 45).",
-                    "per_image": "{stem}.json",
+                    "format": "ordered_cube_keypoint_symmetry_v1",
+                    "keypoint_count": ORDERED_KEYPOINT_COUNT,
+                    "keypoint_names": list(ORDERED_KEYPOINT_NAMES),
+                    "permutation_convention": "permutation[output_index] = source_index",
+                    "permutations": [
+                        list(permutation)
+                        for permutation in ORDERED_KEYPOINT_SYMMETRY_PERMUTATIONS
+                    ],
                 },
                 indent=2,
             )
@@ -7700,7 +7640,7 @@ def generate_dataset(
         image_path = images_dir / f"{stem}.png"
         mask_path = masks_dir / f"{stem}.png" if masks_dir is not None else None
         label_path = labels_dir / f"{stem}.txt" if render_segmentations else None
-        pose_label_path = pose_dir / f"{stem}.json" if pose_dir is not None else None
+        pose_label_path = pose_dir / f"{stem}.txt" if pose_dir is not None else None
 
         hands = hand_objects()
         hand_rigs = hand_rig_objects()
@@ -7824,7 +7764,7 @@ def generate_dataset(
                     for line in label_path.read_text(encoding="utf-8").splitlines()
                     if line.split(maxsplit=1)[0] == "1"
                 )
-                if mask_path is not None:
+                if mask_mode == MASK_MODE_SEGMENTATION and mask_path is not None:
                     write_segmentation_mask(mask_path, cube_mask, sticker_masks)
                 segmentations["target"] = {
                     "path": str(label_path),
@@ -7842,11 +7782,24 @@ def generate_dataset(
                     "sticker_components": sticker_component_count,
                     "mask": str(mask_path) if mask_path is not None else None,
                 }
-            if pose_label_path is not None:
-                write_pose_label(
-                    pose_label_path,
+            ordered_pose_metadata = None
+            if pose_label_path is not None or mask_mode == MASK_MODE_KEYPOINTS:
+                ordered_pose_line, ordered_pose_metadata = render_ordered_keypoint_label(
                     cube_pose,
-                    layer_state,
+                    width,
+                    height,
+                )
+                if ordered_pose_line is None:
+                    raise RuntimeError(f"Could not project ordered keypoints for {image_path}")
+                if pose_label_path is not None:
+                    write_yolo_pose(pose_label_path, [ordered_pose_line])
+            if mask_mode == MASK_MODE_KEYPOINTS and mask_path is not None:
+                if ordered_pose_metadata is None:
+                    raise RuntimeError("Keypoint mask mode did not produce ordered keypoint metadata")
+                write_ordered_keypoint_overlay(
+                    mask_path,
+                    image_path,
+                    ordered_pose_metadata,
                     width,
                     height,
                 )
@@ -7871,6 +7824,7 @@ def generate_dataset(
             "mask": str(mask_path) if mask_path is not None else None,
             "label": str(label_path),
             "pose_label": str(pose_label_path) if pose_label_path is not None else None,
+            "ordered_keypoints": ordered_pose_metadata,
             "segmentations": segmentations,
             "moves": moves,
             "layer_state": layer_state,
@@ -7918,6 +7872,8 @@ def generate_dataset(
         "train: images\n"
         "val: images\n"
         + ("pose: pose\n" if pose_dir is not None else "")
+        + (f"kpt_shape: [{ORDERED_KEYPOINT_COUNT}, 3]\n" if pose_dir is not None else "")
+        + ("kpt_symmetry_file: ordered_keypoint_symmetries.json\n" if pose_dir is not None else "")
         + "names:\n"
         + "".join(f"  {index}: {name}\n" for index, name in enumerate(SEGMENTATION_CLASS_NAMES)),
         encoding="utf-8",
@@ -7963,9 +7919,18 @@ def cli_args() -> argparse.Namespace:
         help="Probability of applying post-render blur, noise, rescale softness, and video codec artifacts.",
     )
     parser.add_argument(
+        "--mask-mode",
+        choices=MASK_MODES,
+        default=MASK_MODE_SEGMENTATION,
+        help=(
+            "Mask visualization to write under masks/: segmentation (default), "
+            "numbered ordered keypoints over a half-brightness image, or none."
+        ),
+    )
+    parser.add_argument(
         "--no-masks",
         action="store_true",
-        help="Skip writing RGB cube/sticker segmentation masks.",
+        help="Compatibility alias for --mask-mode none.",
     )
     parser.add_argument(
         "--no-segmentations",
@@ -7975,7 +7940,19 @@ def cli_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-pose-labels",
         action="store_true",
-        help="Skip writing structured cube pose and articulated-layer labels.",
+        help="Skip writing ordered YOLO pose labels.",
+    )
+    parser.add_argument(
+        "--enable-mid-turns",
+        "--enable-moves",
+        dest="enable_mid_turns",
+        action="store_true",
+        help="Enable partial layer turns and corner-cut states; discrete scrambles remain enabled by default.",
+    )
+    parser.add_argument(
+        "--no-scrambles",
+        action="store_true",
+        help="Disable discrete cube scrambles while leaving scene/appearance augmentations active.",
     )
 
     argv = sys.argv
@@ -7985,8 +7962,10 @@ def cli_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    global ACTIVE_RANDOM_SEED
+    global ACTIVE_RANDOM_SEED, CUBE_MISALIGNMENT_ENABLED, SCRAMBLES_ENABLED
     args = cli_args()
+    CUBE_MISALIGNMENT_ENABLED = bool(args.enable_mid_turns)
+    SCRAMBLES_ENABLED = not args.no_scrambles
     if args.seed is not None:
         ACTIVE_RANDOM_SEED = args.seed
     else:
@@ -8005,8 +7984,8 @@ def main() -> None:
         max_cube_rotational_blur_degrees=args.max_cube_rotational_blur_degrees,
         cube_rotational_blur_samples=args.cube_rotational_blur_samples,
         degrade_probability=args.degrade_probability,
-        render_masks=not args.no_masks,
         render_segmentations=not args.no_segmentations,
+        mask_mode=MASK_MODE_NONE if args.no_masks else args.mask_mode,
         hard_case=DEFAULT_HARD_CASE,
         render_pose_labels=not args.no_pose_labels,
     )
