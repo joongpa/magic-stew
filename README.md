@@ -213,6 +213,15 @@ lighting, hand visibility, layer state, and background family. The miner only
 selects from the generator's existing physically plausible variations; it does
 not create arbitrary adversarial images.
 
+## Ordered cube pose labels
+
+The ordered 26-point pose target represents one rigid cube transform. When
+`scripts/apply_blender_cube_moves.py` is run with `--enable-mid-turns`,
+mid-turn and corner-cut images receive layer-aware keypoints: each point stays
+attached to its owning cubie while that cubie is transformed by the partial
+turn. Empty pose files remain supported for older or deliberately excluded
+samples, and the pose trainer skips those files when building training pairs.
+
 ## F-Clip cube-wireframe training
 
 The MCP dataset also contains cube wireframe endpoint labels. Prepare those

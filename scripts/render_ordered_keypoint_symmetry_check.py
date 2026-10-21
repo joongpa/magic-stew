@@ -51,12 +51,18 @@ def load_manifest(path: Path) -> dict:
         raise ValueError("manifest keypoint names do not match the ordered-pose convention")
 
     permutations = manifest.get("permutations")
-    if not isinstance(permutations, list) or len(permutations) != 24:
-        raise ValueError(f"expected 24 permutations, got {len(permutations or [])}")
+    if not isinstance(permutations, list) or not permutations:
+        raise ValueError("manifest must contain a non-empty permutation list")
+    expected_count = manifest.get("symmetry_count", len(permutations))
+    if len(permutations) != expected_count:
+        raise ValueError(
+            f"manifest symmetry_count={expected_count!r} does not match "
+            f"the permutation list length {len(permutations)}"
+        )
     expected_indices = set(range(26))
     if any(set(permutation) != expected_indices or len(permutation) != 26 for permutation in permutations):
         raise ValueError("every symmetry permutation must be a bijection over 26 keypoints")
-    if len({tuple(permutation) for permutation in permutations}) != 24:
+    if len({tuple(permutation) for permutation in permutations}) != expected_count:
         raise ValueError("symmetry manifest contains duplicate permutations")
     if list(range(26)) not in permutations:
         raise ValueError("symmetry manifest is missing the identity permutation")
@@ -114,7 +120,7 @@ def render_html(manifest_path: Path, manifest: dict) -> str:
     svg = [
         f'<svg id="ordered-symmetry-svg" viewBox="0 0 660 {view_height}" '
         'preserveAspectRatio="xMidYMin meet">',
-        '<title>All 24 proper cube rotations from the Blender permutation manifest</title>',
+        f'<title>{len(orientations)} cube rotations from the Blender permutation manifest</title>',
         '<desc>Each tile shows the standard color on the canonical top and front center after applying one generated permutation.</desc>',
     ]
     for layout_index, orientation in enumerate(grouped):
@@ -183,7 +189,7 @@ def render_html(manifest_path: Path, manifest: dict) -> str:
 
     source_text = esc(manifest_path.as_posix())
     status = f"{len(orientations)} rotations · {len(pair_counts)} unique top/front pairs · source: {source_text}"
-    return f'''<div id="ordered-symmetry-color-check" role="img" aria-label="Twenty-four cube symmetry orientations read from the Blender-generated ordered keypoint permutation manifest.">
+    return f'''<div id="ordered-symmetry-color-check" role="img" aria-label="{len(orientations)} cube symmetry orientations read from the Blender-generated ordered keypoint permutation manifest.">
   <style>
     #ordered-symmetry-color-check {{
       --surface: var(--background);
@@ -262,7 +268,7 @@ def main() -> None:
     manifest = load_manifest(args.manifest)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(render_html(args.manifest, manifest))
-    print(f"wrote {args.output} from {args.manifest}: 24 permutations")
+    print(f"wrote {args.output} from {args.manifest}: {len(manifest['permutations'])} permutations")
 
 
 if __name__ == "__main__":

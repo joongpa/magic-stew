@@ -61,7 +61,7 @@ CAMERA_VIEWPOINT_WEIGHTS = (
 CAMERA_ROI_LENS_RANGE = (42.0, 49.0)
 CAMERA_ROI_SHIFT_X_RANGE = (-0.09, 0.09)
 CAMERA_ROI_SHIFT_Y_RANGE = (-0.07, 0.07)
-CAMERA_ROLL_DEGREES_RANGE = (-20.0, 20.0)
+CAMERA_ROLL_DEGREES_RANGE = (-45.0, 45.0)
 # The existing framing is calibrated around four feet from the cube. Varying
 # distance and focal length together produces different perspective compression
 # without making the cube substantially larger or smaller in the image.
@@ -274,10 +274,11 @@ LAYER_RENDER_STATE_WEIGHTS = (
     ("mid_turn", 0.50),
     ("corner_cut", 0.20),
 )
-# Keep discrete scrambles enabled for varied cube states, while leaving
-# partial layer turns disabled for the ordered-keypoint baseline.  The latter
-# includes both mid-turn and corner-cut states.
-CUBE_MISALIGNMENT_ENABLED = False
+# Keep discrete scrambles enabled for varied cube states. Generate partial
+# layer turns by default so ordered-keypoint datasets contain
+# examples of layer misalignment.  The CLI still exposes an explicit opt-out
+# for legacy rigid-cube datasets.
+CUBE_MISALIGNMENT_ENABLED = True
 SCRAMBLES_ENABLED = True
 MID_TURN_DEGREES_RANGE = (-45.0, 45.0)
 CORNER_CUT_SMALL_DEGREES_RANGE = (0.0, 10.0)
@@ -287,9 +288,14 @@ CUBE_DESK_NO_HANDS_PROBABILITY = 0.10
 CUBE_HANDS_TABLE_LIFT = 0.35
 CUBE_TABLE_CLEARANCE_RANGE = (0.02, 0.18)
 CUBE_FLOAT_CLEARANCE_RANGE = (0.12, 0.55)
-CUBE_FLOAT_TILT_DEGREES = (-15.0, 15.0)
-CUBE_POSE_XY_JITTER_RANGE = (-0.28, 0.28)
-CUBE_POSE_ROTATION_DEGREES = (-15.0, 15.0)
+CUBE_FLOAT_TILT_DEGREES = (-30.0, 30.0)
+CUBE_POSE_XY_JITTER_RANGE = (-0.50, 0.50)
+CUBE_POSE_ROTATION_DEGREES = (-30.0, 30.0)
+# A small fraction of samples intentionally place the target at a frame edge.
+# The overshoot is measured in normalized image coordinates, so at 128x128 it
+# corresponds to roughly 1-3 pixels of cube geometry outside the frame.
+CUBE_EDGE_CLIP_PROBABILITY = 0.18
+CUBE_EDGE_CLIP_OVERSHOOT_RANGE = (0.005, 0.025)
 DEFAULT_CUBE_ROTATIONAL_BLUR_PROBABILITY = 1.0
 DEFAULT_MAX_CUBE_ROTATIONAL_BLUR_DEGREES = 8.0
 DEFAULT_CUBE_ROTATIONAL_BLUR_SAMPLES = 7
@@ -322,6 +328,7 @@ HAND_X_OFFSET_RANGE = (-0.1, 0.1)
 HAND_Z_OFFSET_RANGE = (-0.5, 0.5)
 HAND_SOLVER_FACING_ROTATION_DEGREES = 180.0
 HAND_ORIGIN_X_ROTATION_DEGREES = (-90.0, 0.0, 90.0)
+HAND_TILT_DEGREES_RANGE = (-30.0, 30.0)
 HAND_POSES_WITHOUT_ORIGIN_X_ROTATION = (
     "HandPose.StandardHold",
     "HandPose.OneHandGrip",
@@ -591,10 +598,79 @@ def randomize_cube_global_pose(
         random.uniform(*CUBE_POSE_XY_JITTER_RANGE),
         BACKGROUND_TABLE_Z + clearance - min_z,
     ))
-    transform = (
-        apply_global_pose(objects, rotation, translation)
-        if apply
-        else Matrix.Translation(translation) @ rotation.to_matrix().to_4x4()
+    bounds_for_projection = bounds_objects or objects
+    transform = Matrix.Translation(translation) @ rotation.to_matrix().to_4x4()
+    edge_clip_requested = random.random() < CUBE_EDGE_CLIP_PROBABILITY
+    edge_clip_side: str | None = None
+    edge_clip_overshoot = 0.0
+    projected_bounds = None
+
+    if edge_clip_requested:
+        # Solve a small one-dimensional image-space placement problem. A
+        # direct world-space XY range is useful for ordinary off-center
+        # variation, but it does not produce a consistent amount of clipping
+        # across camera viewpoints. Nudge a sampled pose toward one frame edge
+        # using finite-difference image gradients, while preserving its Z
+        # placement and therefore its table clearance.
+        projected_bounds = projected_object_group_bounds(
+            bounds_for_projection,
+            transform,
+        )
+        if projected_bounds is not None:
+            edge_clip_side = random.choice(("left", "right", "bottom", "top"))
+            edge_index = {
+                "left": 0,
+                "right": 1,
+                "bottom": 2,
+                "top": 3,
+            }[edge_clip_side]
+            edge_clip_overshoot = random.uniform(*CUBE_EDGE_CLIP_OVERSHOOT_RANGE)
+            target_edge = (
+                -edge_clip_overshoot
+                if edge_clip_side in ("left", "bottom")
+                else 1.0 + edge_clip_overshoot
+            )
+            probe_distance = 0.25
+            probe_x = Matrix.Translation(Vector((probe_distance, 0.0, 0.0))) @ transform
+            probe_y = Matrix.Translation(Vector((0.0, probe_distance, 0.0))) @ transform
+            projected_x = projected_object_group_bounds(bounds_for_projection, probe_x)
+            projected_y = projected_object_group_bounds(bounds_for_projection, probe_y)
+            if projected_x is not None and projected_y is not None:
+                gradient = Vector((
+                    (projected_x[edge_index] - projected_bounds[edge_index]) / probe_distance,
+                    (projected_y[edge_index] - projected_bounds[edge_index]) / probe_distance,
+                ))
+                gradient_length_squared = gradient.length_squared
+                if gradient_length_squared > 1e-8:
+                    correction = (
+                        (target_edge - projected_bounds[edge_index])
+                        * gradient
+                        / gradient_length_squared
+                    )
+                    translation.x += correction.x
+                    translation.y += correction.y
+                    transform = Matrix.Translation(translation) @ rotation.to_matrix().to_4x4()
+                    projected_bounds = projected_object_group_bounds(
+                        bounds_for_projection,
+                        transform,
+                    )
+
+    if apply:
+        transform = apply_global_pose(objects, rotation, translation)
+    if projected_bounds is None:
+        projected_bounds = projected_object_group_bounds(
+            bounds_for_projection,
+            transform,
+        )
+
+    actual_edge_clip = bool(
+        projected_bounds is not None
+        and (
+            projected_bounds[0] < 0.0
+            or projected_bounds[1] > 1.0
+            or projected_bounds[2] < 0.0
+            or projected_bounds[3] > 1.0
+        )
     )
     return {
         "mode": "on_table" if force_on_table else ("floating" if floating else "near_table"),
@@ -603,6 +679,11 @@ def randomize_cube_global_pose(
         "table_z": BACKGROUND_TABLE_Z,
         "translation": [translation.x, translation.y, translation.z],
         "transform": matrix_rows(transform),
+        "projected_bounds": list(projected_bounds) if projected_bounds is not None else None,
+        "edge_clip_requested": edge_clip_requested,
+        "edge_clip_applied": actual_edge_clip,
+        "edge_clip_side": edge_clip_side,
+        "edge_clip_overshoot": edge_clip_overshoot if actual_edge_clip else 0.0,
         **rotation_metadata,
     }
 
@@ -615,7 +696,12 @@ def snap_to_cube_grid(location: Vector) -> Vector:
     return Vector((round(location.x), round(location.y), round(location.z)))
 
 
-SCRAMBLE_MOVE_NAMES = tuple("RLUDBFxyz")
+# Face turns vary the cube state without changing its global orientation. The
+# x/y/z whole-cube quarter-turns are intentionally excluded from generated
+# scenes: they introduce discrete 90-degree pose changes that conflict with
+# the continuous +/-30-degree cube-tilt distribution and can put the hands
+# upside down. The whole-cube helpers remain available for legacy label data.
+SCRAMBLE_MOVE_NAMES = tuple("RLUDBF")
 
 
 def whole_cube_move_axis(move: str) -> Vector:
@@ -3852,9 +3938,25 @@ def apply_shared_cube_pose(
     if not isinstance(rows, list):
         raise ValueError("Cube pose is missing its shared transform matrix.")
     transform = matrix_from_rows(rows)
-    for obj in [*cube_objects_to_transform, *hand_rigs_to_transform.values()]:
+    scramble_rows = cube_pose.get("wireframe_scramble_transform")
+    if scramble_rows is None:
+        scramble_transform = Matrix.Identity(4)
+    elif isinstance(scramble_rows, list):
+        scramble_transform = matrix_from_rows(scramble_rows)
+    else:
+        raise ValueError("Cube pose has an invalid whole-cube scramble transform.")
+
+    # The shared pose moves the cube and hands together. Whole-cube x/y/z
+    # scramble moves are a second rigid transform in the cube's local frame,
+    # so the hands must receive that transform as well. Local face turns are
+    # intentionally not applied here: the hands hold the stationary cube body
+    # while a single layer turns underneath them.
+    for obj in cube_objects_to_transform:
         obj.matrix_world = transform @ obj.matrix_world
         obj.rotation_mode = "QUATERNION"
+    for rig in hand_rigs_to_transform.values():
+        rig.matrix_world = transform @ scramble_transform @ rig.matrix_world
+        rig.rotation_mode = "QUATERNION"
     bpy.context.view_layer.update()
     return transform
 
@@ -4057,16 +4159,21 @@ def randomize_hands(
         base_matrix = states[name]["rig_matrix_world"]
         x_offset = random.uniform(*HAND_X_OFFSET_RANGE)
         z_offset = random.uniform(*HAND_Z_OFFSET_RANGE)
-        x_rotation_degrees = (
+        base_x_rotation_degrees = (
             0.0
             if pose_name in HAND_POSES_WITHOUT_ORIGIN_X_ROTATION
             else random.choice(HAND_ORIGIN_X_ROTATION_DEGREES)
         )
+        x_tilt_degrees = random.uniform(*HAND_TILT_DEGREES_RANGE)
+        y_tilt_degrees = random.uniform(*HAND_TILT_DEGREES_RANGE)
+        z_tilt_degrees = random.uniform(*HAND_TILT_DEGREES_RANGE)
+        x_rotation_degrees = base_x_rotation_degrees + x_tilt_degrees
         hidden = name not in visible_hands
         location_offset = Vector((x_offset, 0.0, z_offset))
-        global_rotation = Quaternion(
-            Vector((1.0, 0.0, 0.0)),
-            math.radians(x_rotation_degrees),
+        global_rotation = (
+            Quaternion(Vector((0.0, 0.0, 1.0)), math.radians(z_tilt_degrees))
+            @ Quaternion(Vector((0.0, 1.0, 0.0)), math.radians(y_tilt_degrees))
+            @ Quaternion(Vector((1.0, 0.0, 0.0)), math.radians(x_rotation_degrees))
         ).to_matrix().to_4x4()
         solver_facing_rotation = Quaternion(
             Vector((0.0, 0.0, 1.0)),
@@ -4093,7 +4200,11 @@ def randomize_hands(
             "pose": pose_name,
             "x_offset": x_offset,
             "z_offset": z_offset,
+            "base_x_rotation_degrees": base_x_rotation_degrees,
             "x_rotation_degrees": x_rotation_degrees,
+            "x_tilt_degrees": x_tilt_degrees,
+            "y_tilt_degrees": y_tilt_degrees,
+            "z_tilt_degrees": z_tilt_degrees,
             "solver_facing_rotation_degrees": HAND_SOLVER_FACING_ROTATION_DEGREES,
             "location": [rig.location.x, rig.location.y, rig.location.z],
         }
@@ -4313,7 +4424,7 @@ def build_solid_background_patch_case(
     camera.data.lens = random.uniform(34.0, 42.0)
     camera.data.shift_x = 0.0
     camera.data.shift_y = 0.0
-    camera_roll_degrees = random.uniform(-20.0, 20.0)
+    camera_roll_degrees = random.uniform(*CAMERA_ROLL_DEGREES_RANGE)
     camera.rotation_quaternion = camera.rotation_quaternion @ Quaternion(
         Vector((0.0, 0.0, -1.0)),
         math.radians(camera_roll_degrees),
@@ -4452,7 +4563,11 @@ def build_solid_background_patch_case(
     )
     clearance = random.uniform(0.04, 0.22)
     min_z = transformed_min_z(pose_objects, rotation)
-    translation = Vector((0.0, 0.0, BACKGROUND_TABLE_Z + clearance - min_z))
+    translation = Vector((
+        random.uniform(*CUBE_POSE_XY_JITTER_RANGE),
+        random.uniform(*CUBE_POSE_XY_JITTER_RANGE),
+        BACKGROUND_TABLE_Z + clearance - min_z,
+    ))
     transform = Matrix.Translation(translation) @ rotation.to_matrix().to_4x4()
     cube_pose = {
         "mode": "near_table",
@@ -4620,7 +4735,7 @@ def build_controlled_cube_case(
     else:
         azimuth_degrees = random.choice((-52.0, -38.0)) + random.uniform(-8.0, 8.0)
         elevation_degrees = random.uniform(20.0, 40.0)
-        camera_roll_degrees = random.uniform(-20.0, 20.0)
+        camera_roll_degrees = random.uniform(*CAMERA_ROLL_DEGREES_RANGE)
 
     distance = (
         random.uniform(14.0, 18.0)
@@ -4788,7 +4903,11 @@ def build_controlled_cube_case(
     )
     clearance = random.uniform(0.05, 0.24)
     min_z = transformed_min_z(objects + core_objects, rotation)
-    translation = Vector((0.0, 0.0, BACKGROUND_TABLE_Z + clearance - min_z))
+    translation = Vector((
+        random.uniform(*CUBE_POSE_XY_JITTER_RANGE),
+        random.uniform(*CUBE_POSE_XY_JITTER_RANGE),
+        BACKGROUND_TABLE_Z + clearance - min_z,
+    ))
     transform = Matrix.Translation(translation) @ rotation.to_matrix().to_4x4()
     if backdrop_obj is not None and backdrop_initial_center is not None:
         # Re-anchor the procedural palm envelope to the cube's actual pose,
@@ -6055,6 +6174,88 @@ def ordered_cube_keypoint_specs() -> list[dict[str, object]]:
     return specs
 
 
+def ordered_keypoint_source_cubie_center(name: str) -> Vector:
+    """Return the solved cubie center that owns an ordered surface point."""
+    center = Vector((0.0, 0.0, 0.0))
+    for letter in name:
+        axis_index, value, _normal = cube_keypoint_coordinate(letter)
+        if abs(value) > 1.0:
+            center[axis_index] = 1.0 if value > 0.0 else -1.0
+    return center
+
+
+def ordered_keypoint_local_geometry(
+    spec: dict[str, object],
+    layer_state: dict[str, object] | None,
+    objects: list[bpy.types.Object] | None = None,
+    cube_to_local: Matrix | None = None,
+) -> tuple[Vector, list[Vector]]:
+    """Return one ordered point and its normals after scramble/layer transforms.
+
+    Ordered point names identify the surface point on a solved cubie. During a
+    scramble or partial turn, the owning cubie can move independently from the
+    rest of the cube. When the live Blender objects are available, use the
+    actual object's accumulated transform so the target stays attached to the
+    physical cubie that the rendered stickers belong to. The dimension-only
+    path remains as a fallback for geometry helpers that do not have scene
+    objects available.
+    """
+    local_point = spec["point"]
+    local_normals = spec["normals"]
+    if not isinstance(local_point, Vector) or not isinstance(local_normals, list):
+        raise ValueError(f"Ordered keypoint {spec.get('name')} has invalid geometry.")
+
+    source_center = ordered_keypoint_source_cubie_center(str(spec["name"]))
+
+    # Face centers belong to the fixed cube core for the face-turn data.  They
+    # do not follow an outer-layer cubie, so their canonical local geometry is
+    # still correct.
+    if source_center.length <= 1e-6:
+        return local_point.copy(), [normal.copy() for normal in local_normals]
+
+    if objects is not None and cube_to_local is not None:
+        matches = []
+        for obj in objects:
+            solved_location = Vector(obj.get(SOLVED_LOCATION_PROP, obj.location))
+            if (solved_location - source_center).length < 1e-6:
+                matches.append(obj)
+        if len(matches) != 1:
+            raise ValueError(
+                f"Could not identify the physical cubie for ordered keypoint "
+                f"{spec['name']}: expected one match, got {len(matches)}"
+            )
+
+        obj = matches[0]
+        solved_rotation = Quaternion(
+            obj.get(SOLVED_ROTATION_PROP, (1.0, 0.0, 0.0, 0.0))
+        )
+        local_object_matrix = cube_to_local @ obj.matrix_world
+        current_center = local_object_matrix.translation.copy()
+        current_rotation = local_object_matrix.to_3x3()
+        relative_rotation = current_rotation @ solved_rotation.to_matrix().transposed()
+        transformed_point = current_center + relative_rotation @ (local_point - source_center)
+        transformed_normals = [relative_rotation @ normal for normal in local_normals]
+        return transformed_point, transformed_normals
+
+    if layer_state is None or layer_state.get("mode") == "none":
+        return local_point.copy(), [normal.copy() for normal in local_normals]
+
+    matching_transform = None
+    for initial_center, center, rotation in dimension_cubie_transforms(layer_state):
+        if (initial_center - source_center).length < 1e-6:
+            matching_transform = center, rotation
+            break
+    if matching_transform is None:
+        raise ValueError(
+            f"Could not find source cubie {source_center} for ordered keypoint {spec['name']}"
+        )
+
+    center, rotation = matching_transform
+    transformed_point = center + rotation @ (local_point - source_center)
+    transformed_normals = [rotation @ normal for normal in local_normals]
+    return transformed_point, transformed_normals
+
+
 def ordered_keypoint_symmetry_matrices() -> tuple[Matrix, ...]:
     """Return the 24 proper rotations of the canonical cube frame."""
     matrices: list[Matrix] = []
@@ -6925,6 +7126,7 @@ def render_ordered_keypoint_label(
     cube_pose: dict[str, object],
     width: int,
     height: int,
+    layer_state: dict[str, object] | None = None,
 ) -> tuple[str | None, dict[str, object]]:
     """Project the ordered 26-point cube layout into one YOLO pose row."""
     transform_rows = cube_pose.get("transform")
@@ -6935,6 +7137,7 @@ def render_ordered_keypoint_label(
     scene = bpy.context.scene
     depsgraph = bpy.context.evaluated_depsgraph_get()
     cube_to_world = matrix_from_rows(transform_rows)
+    cube_to_local = cube_to_world.inverted()
     cube_rotation = cube_to_world.to_3x3()
     ignored_cube_objects = {
         obj.name
@@ -6948,14 +7151,29 @@ def render_ordered_keypoint_label(
     projected_keypoints: list[tuple[float, float, int]] = []
     metadata: list[dict[str, object]] = []
     counts = {"unlabeled": 0, "occluded": 0, "visible": 0}
+    label_objects = cube_objects()
     for spec in ordered_cube_keypoint_specs():
-        local_point = spec["point"]
-        if not isinstance(local_point, Vector):
-            raise ValueError(f"Ordered keypoint {spec['name']} has no local point.")
+        local_point, local_normals = ordered_keypoint_local_geometry(
+            spec,
+            layer_state,
+            objects=label_objects,
+            cube_to_local=cube_to_local,
+        )
+        source_center = ordered_keypoint_source_cubie_center(str(spec["name"]))
+        source_cubie_name = None
+        if source_center.length > 1e-6:
+            source_cubie_name = next(
+                (
+                    obj.name
+                    for obj in label_objects
+                    if (
+                        Vector(obj.get(SOLVED_LOCATION_PROP, obj.location)) - source_center
+                    ).length
+                    < 1e-6
+                ),
+                None,
+            )
         world_point = cube_to_world @ local_point
-        local_normals = spec["normals"]
-        if not isinstance(local_normals, list):
-            raise ValueError(f"Ordered keypoint {spec['name']} has invalid normals.")
         world_normals = [cube_rotation @ normal for normal in local_normals]
         projected = project_world_point(world_point, camera, scene)
         visibility = POINT_VISIBILITY_UNLABELED
@@ -6994,7 +7212,9 @@ def render_ordered_keypoint_label(
             "index": int(spec["index"]),
             "name": str(spec["name"]),
             "kind": str(spec["kind"]),
+            "source_cubie": source_cubie_name,
             "local_point": list(local_point),
+            "layer_mode": layer_state.get("mode", "none") if layer_state else "none",
             "world_point": list(world_point),
             "pixel_point": [point_label[0], point_label[1]],
             "normalized_point": list(normalize_point(point_label[0], point_label[1], width, height)),
@@ -7008,6 +7228,7 @@ def render_ordered_keypoint_label(
         return None, {
             "keypoint_shape": [ORDERED_KEYPOINT_COUNT, 3],
             "keypoint_names": list(ORDERED_KEYPOINT_NAMES),
+            "layer_mode": layer_state.get("mode", "none") if layer_state else "none",
             "keypoints": metadata,
             **counts,
         }
@@ -7025,6 +7246,7 @@ def render_ordered_keypoint_label(
     ), {
         "keypoint_shape": [ORDERED_KEYPOINT_COUNT, 3],
         "keypoint_names": list(ORDERED_KEYPOINT_NAMES),
+        "layer_mode": layer_state.get("mode", "none") if layer_state else "none",
         "keypoints": metadata,
         "bbox_xywh": [x_center, y_center, bbox_width, bbox_height],
         **counts,
@@ -7534,6 +7756,8 @@ def generate_dataset(
                     "keypoint_count": ORDERED_KEYPOINT_COUNT,
                     "keypoint_names": list(ORDERED_KEYPOINT_NAMES),
                     "permutation_convention": "permutation[output_index] = source_index",
+                    "symmetry_scope": "full_cube_rotations",
+                    "symmetry_count": 24,
                     "permutations": [
                         list(permutation)
                         for permutation in ORDERED_KEYPOINT_SYMMETRY_PERMUTATIONS
@@ -7670,6 +7894,8 @@ def generate_dataset(
         cube_pose = cube_pose_with_hand_lift(placement_cube_pose, hand_lift)
         apply_shared_cube_pose(cube_pose_objects, hand_rigs, cube_pose)
         hand_randomization["follows_cube_pose"] = True
+        hand_randomization["follows_whole_cube_scramble"] = True
+        hand_randomization["ignores_local_layer_turn"] = True
         hand_randomization["cube_vertical_lift"] = hand_lift
         hand_attempts = [{"attempt": 1, "accepted": True, "hands": hand_randomization}]
 
@@ -7783,11 +8009,14 @@ def generate_dataset(
                     "mask": str(mask_path) if mask_path is not None else None,
                 }
             ordered_pose_metadata = None
+            pose_label_valid = None
             if pose_label_path is not None or mask_mode == MASK_MODE_KEYPOINTS:
+                pose_label_valid = True
                 ordered_pose_line, ordered_pose_metadata = render_ordered_keypoint_label(
                     cube_pose,
                     width,
                     height,
+                    layer_state=layer_state,
                 )
                 if ordered_pose_line is None:
                     raise RuntimeError(f"Could not project ordered keypoints for {image_path}")
@@ -7824,6 +8053,7 @@ def generate_dataset(
             "mask": str(mask_path) if mask_path is not None else None,
             "label": str(label_path),
             "pose_label": str(pose_label_path) if pose_label_path is not None else None,
+            "pose_label_valid": pose_label_valid,
             "ordered_keypoints": ordered_pose_metadata,
             "segmentations": segmentations,
             "moves": moves,
@@ -7947,7 +8177,15 @@ def cli_args() -> argparse.Namespace:
         "--enable-moves",
         dest="enable_mid_turns",
         action="store_true",
-        help="Enable partial layer turns and corner-cut states; discrete scrambles remain enabled by default.",
+        default=True,
+        help="Enable partial layer turns and corner-cut states (default); discrete scrambles remain enabled by default.",
+    )
+    parser.add_argument(
+        "--no-mid-turns",
+        "--disable-mid-turns",
+        dest="enable_mid_turns",
+        action="store_false",
+        help="Disable partial layer turns and generate rigid-cube examples only.",
     )
     parser.add_argument(
         "--no-scrambles",

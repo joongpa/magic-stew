@@ -313,7 +313,21 @@ def main() -> int:
     if device.type == "cuda" and not torch.cuda.is_available():
         print("CUDA is unavailable; falling back to CPU")
         device = torch.device("cpu")
-    checkpoint = torch.load(args.model, map_location="cpu", weights_only=False)
+    try:
+        checkpoint = torch.load(args.model, map_location="cpu", weights_only=False)
+    except AttributeError as exc:
+        # Ultralytics ordered-pose checkpoints contain the custom training
+        # model class under ``__main__``.  They belong to
+        # render_yolo11n_ordered_cube_pose.py, not this custom pose-head
+        # renderer, so turn the opaque pickle error into an actionable one.
+        if "SymmetryAwarePoseModel" in str(exc):
+            raise SystemExit(
+                "This is an ordered Ultralytics pose checkpoint. Use "
+                "scripts/render_yolo11n_ordered_cube_pose.py with the same "
+                "--model path; render_yolo_cube_pose.py expects a "
+                "cube_pose_head_v1 checkpoint."
+            ) from exc
+        raise
     base_model_path = checkpoint.get("base_model")
     if base_model_path is not None:
         base_model_path = Path(base_model_path)
