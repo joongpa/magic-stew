@@ -172,6 +172,7 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
         name=args.name,
         patience=args.patience,
         cache=args.cache,
+        mosaic=args.mosaic,
         plots=True,
     )
 
@@ -207,6 +208,12 @@ def main() -> None:
     parser.add_argument("--model", default="yolo11n-pose.pt")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", type=int, default=256)
+    parser.add_argument(
+        "--mosaic",
+        type=float,
+        default=0.0,
+        help="Mosaic augmentation probability; 0.0 disables mosaic augmentation.",
+    )
     parser.add_argument("--batch", type=int, default=-1)
     parser.add_argument("--device", default="mps")
     parser.add_argument("--name", default="cube_piece_keypoint_yolo11n_pose")
