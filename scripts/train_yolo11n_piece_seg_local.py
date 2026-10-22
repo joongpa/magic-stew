@@ -1,10 +1,10 @@
-"""Train YOLO11 nano pose locally on generated piece-wise cube keypoint labels.
+"""Train YOLO11 nano pose locally on independent cube intersection keypoints.
 
 Expected input layout:
 
     synthetic_cube_dataset/
       images/*.png
-      labels/*.txt
+      pose/*.txt
       masks/*.png          # optional visualization masks, not used for training
 
 The script shuffles image/label pairs with a fixed seed, writes a local
@@ -21,7 +21,7 @@ from collections import Counter
 from pathlib import Path
 
 
-CLASS_NAMES = ["corner", "corner-edge", "corner-edge-center", "center"]
+CLASS_NAMES = ["corner", "corner-edge", "corner-edge-center"]
 KPT_SHAPE = [1, 3]
 POSE_LABEL_FIELD_COUNT = 1 + 4 + (KPT_SHAPE[0] * KPT_SHAPE[1])
 BBOX_FIELD_COUNT = 4
@@ -66,13 +66,13 @@ def validate_label_file(path: Path) -> Counter[int]:
     return counts
 
 
-def collect_pairs(source_dir: Path) -> list[tuple[Path, Path]]:
+def collect_pairs(source_dir: Path, pose_subdir: str) -> list[tuple[Path, Path]]:
     images_dir = source_dir / "images"
-    labels_dir = source_dir / "labels"
+    labels_dir = source_dir / pose_subdir
     if not images_dir.exists():
         raise FileNotFoundError(f"Missing images directory: {images_dir}")
     if not labels_dir.exists():
-        raise FileNotFoundError(f"Missing labels directory: {labels_dir}")
+        raise FileNotFoundError(f"Missing pose-label directory: {labels_dir}")
 
     image_paths = sorted(
         path for path in images_dir.glob("*") if path.suffix.lower() in {".png", ".jpg", ".jpeg"}
@@ -89,8 +89,9 @@ def write_dataset(
     dataset_dir: Path,
     val_fraction: float,
     seed: int,
+    pose_subdir: str,
 ) -> Path:
-    pairs = collect_pairs(source_dir)
+    pairs = collect_pairs(source_dir, pose_subdir)
     random.Random(seed).shuffle(pairs)
 
     val_count = max(1, round(len(pairs) * val_fraction)) if len(pairs) > 1 else 0
@@ -195,6 +196,11 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-dir", type=Path, default=Path("data/synthetic_cube_dataset"))
+    parser.add_argument(
+        "--pose-subdir",
+        default="pose",
+        help="Subdirectory under --source-dir containing independent YOLO pose labels.",
+    )
     parser.add_argument("--workdir", type=Path, default=Path("runs/cube_piece_keypoint_pose_local"))
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=17)
@@ -216,6 +222,7 @@ def main() -> None:
         dataset_dir=dataset_dir,
         val_fraction=args.val_fraction,
         seed=args.seed,
+        pose_subdir=args.pose_subdir,
     )
 
     if args.prepare_only:

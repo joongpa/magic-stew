@@ -213,6 +213,22 @@ lighting, hand visibility, layer state, and background family. The miner only
 selects from the generator's existing physically plausible variations; it does
 not create arbitrary adversarial images.
 
+## Independent cube intersection-point pose labels
+
+The Blender generator writes independent one-keypoint pose objects by default
+when run with `--pose-label-mode independent`. The three pose classes are
+`corner`, `corner-edge`, and `corner-edge-center`, for 56 intersection points
+total. Corner-edge points are attached to the physical edge cubies, corner
+points to corner cubies, and corner-edge-center points to center cubies. Train
+this target with:
+
+```bash
+.venv/bin/python scripts/train_yolo11n_piece_seg_local.py \
+  --source-dir data/synthetic_cube_dataset
+```
+
+Use `--pose-subdir` if the pose labels are stored under another directory.
+
 ## Ordered cube pose labels
 
 The ordered 26-point pose target represents one rigid cube transform. When
@@ -221,6 +237,8 @@ mid-turn and corner-cut images receive layer-aware keypoints: each point stays
 attached to its owning cubie while that cubie is transformed by the partial
 turn. Empty pose files remain supported for older or deliberately excluded
 samples, and the pose trainer skips those files when building training pairs.
+Pass `--pose-label-mode ordered` to the Blender generator when creating this
+26-point target.
 
 ## F-Clip cube-wireframe training
 

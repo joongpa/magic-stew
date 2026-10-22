@@ -32,7 +32,7 @@ DEFAULT_CUBE_POSE_MODEL = (
 )
 DEFAULT_VIEW_SIZE = 256
 POSE_OBJECT_CONFIDENCE = 0.001
-POSE_CLASS_NAMES = {"corner", "corner-edge", "corner-edge-center", "center"}
+POSE_CLASS_NAMES = {"corner", "corner-edge", "corner-edge-center"}
 KEYPOINT_COLORS = {
     "corner": (255, 255, 255),
     "edge": (0, 255, 255),
