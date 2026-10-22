@@ -228,6 +228,9 @@ this target with:
 ```
 
 Use `--pose-subdir` if the pose labels are stored under another directory.
+The trainer also includes cube-free images from
+`data/youtube_solve_frames_hd/cropped-negatives` by default, writing empty pose
+labels for them. Override the directory with `--extra-negative-dir`.
 
 ## Ordered cube pose labels
 

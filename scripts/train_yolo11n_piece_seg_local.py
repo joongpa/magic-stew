@@ -7,6 +7,8 @@ Expected input layout:
       pose/*.txt
       masks/*.png          # optional visualization masks, not used for training
 
+    extra-negative-dir/    # optional cube-free images; written with empty labels
+
 The script shuffles image/label pairs with a fixed seed, writes a local
 Ultralytics dataset layout, and trains yolo11n-pose.pt.
 """
@@ -26,6 +28,8 @@ KPT_SHAPE = [1, 3]
 POSE_LABEL_FIELD_COUNT = 1 + 4 + (KPT_SHAPE[0] * KPT_SHAPE[1])
 BBOX_FIELD_COUNT = 4
 KEYPOINT_VISIBILITY_VALUES = {0, 1, 2}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+DEFAULT_EXTRA_NEGATIVE_DIR = Path("data/youtube_solve_frames_hd/cropped-negatives")
 
 
 def label_lines(path: Path) -> list[str]:
@@ -66,7 +70,11 @@ def validate_label_file(path: Path) -> Counter[int]:
     return counts
 
 
-def collect_pairs(source_dir: Path, pose_subdir: str) -> list[tuple[Path, Path]]:
+def collect_pairs(
+    source_dir: Path,
+    pose_subdir: str,
+    extra_negative_dir: Path | None = None,
+) -> list[tuple[Path, Path | None]]:
     images_dir = source_dir / "images"
     labels_dir = source_dir / pose_subdir
     if not images_dir.exists():
@@ -75,12 +83,22 @@ def collect_pairs(source_dir: Path, pose_subdir: str) -> list[tuple[Path, Path]]
         raise FileNotFoundError(f"Missing pose-label directory: {labels_dir}")
 
     image_paths = sorted(
-        path for path in images_dir.glob("*") if path.suffix.lower() in {".png", ".jpg", ".jpeg"}
+        path for path in images_dir.glob("*") if path.suffix.lower() in IMAGE_EXTENSIONS
     )
     label_by_stem = {path.stem: path for path in labels_dir.glob("*.txt")}
     pairs = [(image_path, label_by_stem[image_path.stem]) for image_path in image_paths if image_path.stem in label_by_stem]
     if not pairs:
         raise RuntimeError(f"No image/label pairs found under {source_dir}")
+
+    if extra_negative_dir is not None:
+        if not extra_negative_dir.is_dir():
+            raise FileNotFoundError(f"Missing extra-negative image directory: {extra_negative_dir}")
+        negative_paths = sorted(
+            path
+            for path in extra_negative_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+        pairs.extend((image_path, None) for image_path in negative_paths)
     return pairs
 
 
@@ -90,8 +108,9 @@ def write_dataset(
     val_fraction: float,
     seed: int,
     pose_subdir: str,
+    extra_negative_dir: Path | None = None,
 ) -> Path:
-    pairs = collect_pairs(source_dir, pose_subdir)
+    pairs = collect_pairs(source_dir, pose_subdir, extra_negative_dir=extra_negative_dir)
     random.Random(seed).shuffle(pairs)
 
     val_count = max(1, round(len(pairs) * val_fraction)) if len(pairs) > 1 else 0
@@ -110,22 +129,27 @@ def write_dataset(
         label_count_distribution: Counter[int] = Counter()
 
         for index, (image_path, label_path) in enumerate(split_pairs):
-            lines = label_lines(label_path)
+            lines = label_lines(label_path) if label_path is not None else []
             label_count_distribution[len(lines)] += 1
-            class_counts.update(validate_label_file(label_path))
+            if label_path is not None:
+                class_counts.update(validate_label_file(label_path))
 
             target_stem = f"{split}_{index:06d}"
             target_image = dataset_dir / "images" / split / f"{target_stem}{image_path.suffix.lower()}"
             target_label = dataset_dir / "labels" / split / f"{target_stem}.txt"
             shutil.copy2(image_path, target_image)
-            shutil.copy2(label_path, target_label)
+            if label_path is None:
+                target_label.write_text("", encoding="utf-8")
+            else:
+                shutil.copy2(label_path, target_label)
             manifest.append({
                 "split": split,
                 "source_image": str(image_path),
-                "source_label": str(label_path),
+                "source_label": str(label_path) if label_path is not None else None,
                 "image": str(target_image),
                 "label": str(target_label),
                 "objects": len(lines),
+                "negative": label_path is None,
             })
 
         summary[split] = {
@@ -202,6 +226,15 @@ def main() -> None:
         default="pose",
         help="Subdirectory under --source-dir containing independent YOLO pose labels.",
     )
+    parser.add_argument(
+        "--extra-negative-dir",
+        type=Path,
+        default=DEFAULT_EXTRA_NEGATIVE_DIR,
+        help=(
+            "Directory of cube-free images to include with empty pose labels "
+            f"(default: {DEFAULT_EXTRA_NEGATIVE_DIR})"
+        ),
+    )
     parser.add_argument("--workdir", type=Path, default=Path("runs/cube_piece_keypoint_pose_local"))
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=17)
@@ -230,6 +263,7 @@ def main() -> None:
         val_fraction=args.val_fraction,
         seed=args.seed,
         pose_subdir=args.pose_subdir,
+        extra_negative_dir=args.extra_negative_dir,
     )
 
     if args.prepare_only:
