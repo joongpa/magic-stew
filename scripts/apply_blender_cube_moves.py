@@ -37,9 +37,26 @@ import bpy
 from bpy_extras.object_utils import world_to_camera_view
 from mathutils import Matrix, Quaternion, Vector
 
-PROJECT = Path("/Users/jeffpark/Documents/LiveRecognition")
+PROJECT = Path(__file__).resolve().parents[1]
 VENV = PROJECT / ".venv"
-site_packages = next((VENV / "lib").glob("python*/site-packages"))
+
+# Blender's embedded Python does not automatically see packages installed in
+# the project's virtual environment.  Unix and Windows use different venv
+# layouts, so try both rather than assuming the author's machine.
+site_package_candidates = [
+    VENV / "Lib" / "site-packages",  # Windows
+    *sorted((VENV / "lib").glob("python*/site-packages")),  # macOS/Linux
+]
+site_packages = next(
+    (path for path in site_package_candidates if path.is_dir()),
+    None,
+)
+if site_packages is None:
+    raise RuntimeError(
+        f"Could not find the virtual-environment site-packages directory under {VENV}. "
+        "Create the project environment first (for example: py -m venv .venv and "
+        ".venv\\Scripts\\python -m pip install -e \".[dev]\")."
+    )
 site.addsitedir(str(site_packages))
 
 
