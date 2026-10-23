@@ -2,7 +2,7 @@
 
 Run inside Blender, for example:
 
-    Blender /path/to/cube.blend --background --python scripts/apply_blender_cube_moves.py -- --count 100 --output-dir ./synthetic_cube
+    Blender /path/to/cube.blend --background --python scripts/apply_blender_cube_moves.py -- --count 100 --output-dir ./synthetic_cube --gpu
 
 Assumptions:
 - The cube is modeled as separate cubie objects, one object per movable cubie.
@@ -5156,6 +5156,56 @@ HARD_CASE_BUILDERS.update({
 })
 
 
+def configure_nvidia_gpu() -> str:
+    """Configure Cycles to render on NVIDIA GPUs, preferring OptiX.
+
+    OptiX is generally fastest on RTX cards because it can use hardware ray
+    tracing. CUDA is kept as a fallback for older NVIDIA cards or installations
+    where the OptiX backend is unavailable. Fail loudly if the flag was given
+    but no NVIDIA device can actually be configured.
+    """
+    cycles_addon = bpy.context.preferences.addons.get("cycles")
+    if cycles_addon is None:
+        raise RuntimeError(
+            "The Cycles Blender add-on is unavailable; cannot enable NVIDIA GPU rendering."
+        )
+
+    cycles_preferences = cycles_addon.preferences
+    failures = []
+    for backend in ("OPTIX", "CUDA"):
+        try:
+            cycles_preferences.compute_device_type = backend
+            cycles_preferences.get_devices()
+            devices = list(cycles_preferences.devices)
+        except Exception as exc:
+            failures.append(f"{backend}: {exc}")
+            continue
+
+        gpu_devices = [
+            device
+            for device in devices
+            if str(getattr(device, "type", "CPU")).upper() != "CPU"
+        ]
+        if not gpu_devices:
+            failures.append(f"{backend}: no NVIDIA devices detected")
+            continue
+
+        # Use all detected NVIDIA devices and avoid adding the CPU as a
+        # rendering device, which can reduce throughput for this workload.
+        for device in devices:
+            device.use = device in gpu_devices
+        bpy.context.scene.cycles.device = "GPU"
+        names = ", ".join(str(device.name) for device in gpu_devices)
+        print(f"Using NVIDIA Cycles backend {backend}: {names}")
+        return backend
+
+    details = "; ".join(failures) if failures else "no backend was available"
+    raise RuntimeError(
+        "--gpu was requested, but Blender could not configure an NVIDIA Cycles device. "
+        f"Tried OptiX and CUDA ({details})."
+    )
+
+
 def configure_render(width: int, height: int) -> None:
     scene = bpy.context.scene
     scene.render.engine = "CYCLES"
@@ -8045,6 +8095,7 @@ def generate_dataset(
     hard_case: str = DEFAULT_HARD_CASE,
     render_pose_labels: bool = True,
     pose_label_mode: str = POSE_LABEL_MODE_INDEPENDENT,
+    nvidia_gpu: bool = False,
 ) -> None:
     if mask_mode not in MASK_MODES:
         raise ValueError(f"Unsupported mask mode {mask_mode!r}; choose from {MASK_MODES}")
@@ -8052,6 +8103,8 @@ def generate_dataset(
         raise ValueError(
             f"Unsupported pose label mode {pose_label_mode!r}; choose from {POSE_LABEL_MODES}"
         )
+    if nvidia_gpu:
+        configure_nvidia_gpu()
     images_dir = output_dir / "images"
     masks_dir = output_dir / "masks" if mask_mode != MASK_MODE_NONE else None
     labels_dir = output_dir / "labels"
@@ -8503,6 +8556,11 @@ def cli_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--count", type=int, default=1)
     parser.add_argument("--output-dir", type=Path, default=Path(DEFAULT_OUTPUT_DIR))
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Render with NVIDIA GPU acceleration; prefer OptiX and fall back to CUDA.",
+    )
     parser.add_argument("--seed", type=int)
     parser.add_argument("--scramble-length", type=int, default=DEFAULT_SCRAMBLE_LENGTH)
     parser.add_argument("--width", type=int, default=DEFAULT_IMAGE_SIZE)
@@ -8626,6 +8684,7 @@ def main() -> None:
         hard_case=DEFAULT_HARD_CASE,
         render_pose_labels=not args.no_pose_labels,
         pose_label_mode=args.pose_label_mode,
+        nvidia_gpu=args.gpu,
     )
 
 

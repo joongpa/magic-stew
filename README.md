@@ -232,6 +232,36 @@ The trainer also includes cube-free images from
 `data/youtube_solve_frames_hd/cropped-negatives` by default, writing empty pose
 labels for them. Override the directory with `--extra-negative-dir`.
 
+Render independent-keypoint model predictions with the same bbox -> padded
+square ROI -> pose -> ROI-tracking flow used by the live pipeline:
+
+```bash
+.venv/bin/python scripts/render_yolo11n_independent_keypoints.py \
+  --source data/independent_keypoints_dataset_v2/images/000000.png \
+  --model runs/pose/runs/independent_keypoint_pose_v2/runs/cube_piece_keypoint_yolo11n_pose/weights/best.pt \
+  --save runs/independent_keypoints_render.png \
+  --no-display
+```
+
+The renderer filters points using the independent pose model's keypoint
+confidence. Set the threshold with `--min-keypoint-conf`; `--track-conf`
+separately controls which points update the tracked ROI.
+
+It also runs the cube/sticker segmentation model on the same ROI and keeps a
+point only when it falls inside the predicted cube mask. Sticker masks are
+ignored. Override the checkpoint or threshold with `--segmentation-model` and
+`--seg-conf`.
+
+For ground-truth overlays on the prepared dataset, use
+`scripts/render_independent_keypoints.py`:
+
+```bash
+.venv/bin/python scripts/render_independent_keypoints.py \
+  --dataset data/independent_keypoints_dataset_v2 \
+  --stems 000000 005000 \
+  --output-dir runs/independent_keypoint_ground_truth
+```
+
 ## Ordered cube pose labels
 
 The ordered 26-point pose target represents one rigid cube transform. When
