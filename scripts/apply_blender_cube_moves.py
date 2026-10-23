@@ -490,7 +490,7 @@ POINT_VISIBILITY_VISIBLE = 2
 # edge-on.  Its geometric keypoints are poorly supported by image evidence,
 # so do not train on them.  The angle is measured from face-on (0 degrees) to
 # edge-on (90 degrees).
-FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES = 8.0
+FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES = 10.0
 # Keep a named independent-mode alias because this policy is part of the
 # independent-keypoint dataset contract.
 INDEPENDENT_FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES = FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES
@@ -8703,7 +8703,7 @@ def cli_args() -> argparse.Namespace:
         default=FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
         help=(
             "Do not label keypoints whose supporting face is within this many "
-            "degrees of edge-on to the camera (default: 8)."
+            "degrees of edge-on to the camera (default: 10)."
         ),
     )
     parser.add_argument(
