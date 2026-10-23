@@ -227,7 +227,14 @@ this target with:
   --source-dir data/synthetic_cube_dataset
 ```
 
-Use `--pose-subdir` if the pose labels are stored under another directory.
+Use `--pose-subdir` if the pose labels are stored under another directory. To
+combine multiple datasets, provide multiple roots, for example:
+
+```bash
+.venv/bin/python scripts/train_yolo11n_piece_seg_local.py \
+  --source-dirs data/independent_keypoints_v2 data/another_dataset
+```
+
 The trainer also includes cube-free images from
 `data/youtube_solve_frames_hd/cropped-negatives` by default, writing empty pose
 labels for them. Override the directory with `--extra-negative-dir`.
@@ -254,11 +261,6 @@ square ROI -> pose -> ROI-tracking flow used by the live pipeline:
 The renderer filters points using the independent pose model's keypoint
 confidence. Set the threshold with `--min-keypoint-conf`; `--track-conf`
 separately controls which points update the tracked ROI.
-
-It also runs the cube/sticker segmentation model on the same ROI and keeps a
-point only when it falls inside the predicted cube mask. Sticker masks are
-ignored. Override the checkpoint or threshold with `--segmentation-model` and
-`--seg-conf`.
 
 For ground-truth overlays on the prepared dataset, use
 `scripts/render_independent_keypoints.py`:

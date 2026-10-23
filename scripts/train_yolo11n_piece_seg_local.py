@@ -73,7 +73,6 @@ def validate_label_file(path: Path) -> Counter[int]:
 def collect_pairs(
     source_dir: Path,
     pose_subdir: str,
-    extra_negative_dir: Path | None = None,
 ) -> list[tuple[Path, Path | None]]:
     images_dir = source_dir / "images"
     labels_dir = source_dir / pose_subdir
@@ -89,7 +88,20 @@ def collect_pairs(
     pairs = [(image_path, label_by_stem[image_path.stem]) for image_path in image_paths if image_path.stem in label_by_stem]
     if not pairs:
         raise RuntimeError(f"No image/label pairs found under {source_dir}")
+    return pairs
 
+
+def write_dataset(
+    source_dirs: list[Path],
+    dataset_dir: Path,
+    val_fraction: float,
+    seed: int,
+    pose_subdir: str,
+    extra_negative_dir: Path | None = None,
+) -> Path:
+    pairs: list[tuple[Path, Path | None]] = []
+    for source_dir in source_dirs:
+        pairs.extend(collect_pairs(source_dir, pose_subdir))
     if extra_negative_dir is not None:
         if not extra_negative_dir.is_dir():
             raise FileNotFoundError(f"Missing extra-negative image directory: {extra_negative_dir}")
@@ -99,18 +111,8 @@ def collect_pairs(
             if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
         )
         pairs.extend((image_path, None) for image_path in negative_paths)
-    return pairs
-
-
-def write_dataset(
-    source_dir: Path,
-    dataset_dir: Path,
-    val_fraction: float,
-    seed: int,
-    pose_subdir: str,
-    extra_negative_dir: Path | None = None,
-) -> Path:
-    pairs = collect_pairs(source_dir, pose_subdir, extra_negative_dir=extra_negative_dir)
+    if not pairs:
+        raise RuntimeError("No image/label pairs found in the supplied dataset directories")
     random.Random(seed).shuffle(pairs)
 
     val_count = max(1, round(len(pairs) * val_fraction)) if len(pairs) > 1 else 0
@@ -220,7 +222,19 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source-dir", type=Path, default=Path("data/synthetic_cube_dataset"))
+    parser.add_argument(
+        "--source-dir",
+        "--source-dirs",
+        dest="source_dir_groups",
+        type=Path,
+        nargs="+",
+        action="append",
+        default=None,
+        help=(
+            "Dataset root(s) containing images and pose labels; provide multiple paths "
+            "after this option or repeat it to combine datasets."
+        ),
+    )
     parser.add_argument(
         "--pose-subdir",
         default="pose",
@@ -255,10 +269,16 @@ def main() -> None:
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
 
+    source_dirs = [
+        source_dir
+        for source_dir_group in (args.source_dir_groups or [[Path("data/synthetic_cube_dataset")]])
+        for source_dir in source_dir_group
+    ]
+
     dataset_dir = args.workdir / "dataset"
     runs_dir = args.workdir / "runs"
     data_yaml = write_dataset(
-        source_dir=args.source_dir,
+        source_dirs=source_dirs,
         dataset_dir=dataset_dir,
         val_fraction=args.val_fraction,
         seed=args.seed,

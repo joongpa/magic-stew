@@ -491,6 +491,7 @@ POINT_VISIBILITY_VISIBLE = 2
 # so do not train on them.  The angle is measured from face-on (0 degrees) to
 # edge-on (90 degrees).
 FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES = 10.0
+CORNER_FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES = 5.0
 # Keep a named independent-mode alias because this policy is part of the
 # independent-keypoint dataset contract.
 INDEPENDENT_FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES = FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES
@@ -7834,6 +7835,12 @@ def render_pose_keypoints(
         if not isinstance(point, Vector):
             continue
         name = str(spec["name"])
+        point_class_id = int(spec["class_id"])
+        point_min_plane_angle_degrees = (
+            CORNER_FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES
+            if point_class_id == CORNER_CLASS_ID
+            else min_plane_angle_degrees
+        )
         normals = spec["normals"]
         projected = project_world_point(point, camera, scene)
         hand_occluded = False
@@ -7847,7 +7854,7 @@ def render_pose_keypoints(
             point,
             normals,
             camera.location,
-            min_plane_angle_degrees=min_plane_angle_degrees,
+            min_plane_angle_degrees=point_min_plane_angle_degrees,
         ):
             x, y = projected
             visibility = POINT_VISIBILITY_UNLABELED
@@ -7883,6 +7890,7 @@ def render_pose_keypoints(
             "name": name,
             "class": spec.get("class"),
             "class_id": spec.get("class_id"),
+            "min_face_plane_angle_degrees": point_min_plane_angle_degrees,
             "source_object": spec.get("source_object"),
             "source_piece_type": spec.get("source_piece_type"),
             "relative_point": spec.get("relative_point"),
@@ -7919,6 +7927,7 @@ def render_pose_keypoints(
         "visible_hands": sorted(visible_hand_names),
         "candidates": len(keypoint_specs),
         "min_face_plane_angle_degrees": min_plane_angle_degrees,
+        "corner_min_face_plane_angle_degrees": CORNER_FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
         "include_occluded_keypoints": include_occluded_keypoints,
         "candidate_counts": candidate_counts,
         "source_piece_objects": (
@@ -8219,6 +8228,7 @@ def generate_dataset(
                         "corner_edge_source": "edge_cubies",
                         "corner_edge_center_source": "center_cubies",
                         "min_face_plane_angle_degrees": min_face_plane_angle_degrees,
+                        "corner_min_face_plane_angle_degrees": CORNER_FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
                         "include_occluded_keypoints": include_occluded_independent_keypoints,
                     },
                     indent=2,
@@ -8710,7 +8720,7 @@ def cli_args() -> argparse.Namespace:
         default=FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
         help=(
             "Do not label keypoints whose supporting face is within this many "
-            "degrees of edge-on to the camera (default: 10)."
+            "degrees of edge-on to the camera (default: 10; corners: 5)."
         ),
     )
     parser.add_argument(

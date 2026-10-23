@@ -5,12 +5,9 @@ Per frame, this renderer:
 
 1. Runs the cube bbox detector when no tracked ROI exists.
 2. Builds the padded square ROI using the shared live-pipeline helper.
-3. Runs the cube/sticker segmentation model inside that ROI and extracts the
-   predicted cube mask.
-4. Runs the independent three-class pose model inside that ROI.
-5. Keeps only points inside the predicted cube mask and maps them back to
-   full-frame coordinates.
-6. Updates the ROI tracker from the retained point extent.
+3. Runs the independent three-class pose model inside that ROI.
+4. Maps each independent point back to full-frame coordinates.
+5. Updates the ROI tracker from the predicted point extent.
 
 Examples:
 
@@ -48,9 +45,6 @@ from live_recognition.roi_tracking import (  # noqa: E402
     RoiTracker,
     roi_for_frame as shared_roi_for_frame,
 )
-from scripts.render_yolo_sticker_segmentation import (  # noqa: E402
-    segmentation_union_mask,
-)
 
 
 CLASS_NAMES = ("corner", "corner-edge", "corner-edge-center")
@@ -67,10 +61,6 @@ DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 DEFAULT_POSE_MODEL = (
     ROOT
     / "runs/pose/runs/independent_keypoint_pose_v2/runs/cube_piece_keypoint_yolo11n_pose/weights/best.pt"
-)
-DEFAULT_SEGMENTATION_MODEL = (
-    ROOT
-    / "runs/segment/runs/cube_sticker_combined_seg_v2/runs/cube_sticker_yolo11n_seg/weights/best.pt"
 )
 
 
@@ -186,17 +176,6 @@ def tracking_bounds(
     )
 
 
-def points_inside_mask(local_roi_points: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Return one boolean per point for the native ROI-resolution mask."""
-
-    height, width = mask.shape[:2]
-    keep = []
-    for point in local_roi_points:
-        x, y = np.round(point).astype(np.int32)
-        keep.append(bool(0 <= x < width and 0 <= y < height and mask[y, x]))
-    return np.asarray(keep, dtype=bool)
-
-
 def draw_label(
     image: np.ndarray,
     text: str,
@@ -232,7 +211,6 @@ def draw_pose(
     point_confidences: np.ndarray,
     class_ids: np.ndarray,
     box_confidences: np.ndarray,
-    segmentation_keep: np.ndarray,
     threshold: float,
     show_labels: bool,
     show_confidences: bool,
@@ -240,16 +218,13 @@ def draw_pose(
     output = image.copy()
     drawn = 0
     per_class_index = {class_id: 0 for class_id in range(len(CLASS_NAMES))}
-    for point, point_confidence, class_id, box_confidence, keep_point in zip(
+    for point, point_confidence, class_id, box_confidence in zip(
         frame_points,
         point_confidences,
         class_ids,
         box_confidences,
-        segmentation_keep,
         strict=True,
     ):
-        if not bool(keep_point):
-            continue
         if float(point_confidence) < threshold:
             continue
         x, y = np.round(point).astype(np.int32)
@@ -297,7 +272,6 @@ def draw_context(
 def render_frame(
     frame: np.ndarray,
     bbox_detector: YOLOCubeDetector,
-    segmentation_model: object,
     pose_model: object,
     roi_tracker: RoiTracker,
     args: argparse.Namespace,
@@ -315,27 +289,6 @@ def render_frame(
     x1, y1, x2, y2 = roi_xyxy
     roi = frame[y1:y2, x1:x2]
     if roi.size == 0:
-        roi_tracker.reset()
-        return draw_context(frame, roi_xyxy, candidate, roi_source, 0, args.show_status), roi_source, 0
-
-    segmentation_results = segmentation_model.predict(
-        source=roi,
-        conf=args.seg_conf,
-        imgsz=args.seg_imgsz,
-        retina_masks=True,
-        verbose=False,
-    )
-    segmentation_result = segmentation_results[0] if segmentation_results else None
-    segmentation_mask = (
-        None
-        if segmentation_result is None
-        else segmentation_union_mask(
-            segmentation_result,
-            roi.shape[:2],
-            segmentation_type="whole-cube",
-        )
-    )
-    if segmentation_mask is None:
         roi_tracker.reset()
         return draw_context(frame, roi_xyxy, candidate, roi_source, 0, args.show_status), roi_source, 0
 
@@ -360,14 +313,12 @@ def render_frame(
         return draw_context(frame, roi_xyxy, candidate, roi_source, 0, args.show_status), roi_source, 0
 
     frame_points, local_roi_points = local_to_frame_points(local_points, roi_xyxy, args.view_size)
-    segmentation_keep = points_inside_mask(local_roi_points, segmentation_mask)
     output, point_count = draw_pose(
         frame,
         frame_points,
         point_confidences,
         class_ids,
         box_confidences,
-        segmentation_keep,
         args.keypoint_conf,
         args.show_labels,
         args.show_confidences,
@@ -379,7 +330,7 @@ def render_frame(
     roi_tracker.observe_tracking_bounds(
         tracking_bounds(
             local_roi_points,
-            np.where(segmentation_keep, point_confidences, 0.0),
+            point_confidences,
             args.track_conf,
             roi.shape[:2],
         ),
@@ -414,12 +365,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source", required=True, help="Image, video path, or camera index.")
     parser.add_argument("--model", type=Path, default=DEFAULT_POSE_MODEL)
     parser.add_argument("--bbox-model", type=Path, default=DEFAULT_BBOX_MODEL)
-    parser.add_argument("--segmentation-model", "--seg-model", dest="segmentation_model", type=Path, default=DEFAULT_SEGMENTATION_MODEL)
     parser.add_argument("--device", default=None, help="Ultralytics device, for example cpu, mps, or 0.")
     parser.add_argument("--bbox-conf", type=float, default=0.25)
     parser.add_argument("--bbox-imgsz", type=int, default=640)
-    parser.add_argument("--seg-conf", type=float, default=0.25)
-    parser.add_argument("--seg-imgsz", type=int, default=256)
     parser.add_argument("--pose-conf", type=float, default=0.001)
     parser.add_argument(
         "--keypoint-conf",
@@ -455,8 +403,6 @@ def main() -> int:
         raise SystemExit(f"Could not find independent pose model: {args.model}")
     if not args.bbox_model.is_file():
         raise SystemExit(f"Could not find bbox model: {args.bbox_model}")
-    if not args.segmentation_model.is_file():
-        raise SystemExit(f"Could not find cube/sticker segmentation model: {args.segmentation_model}")
 
     from ultralytics import YOLO
 
@@ -465,7 +411,6 @@ def main() -> int:
         confidence_threshold=args.bbox_conf,
         image_size=args.bbox_imgsz,
     )
-    segmentation_model = YOLO(str(args.segmentation_model))
     pose_model = YOLO(str(args.model))
     source = parse_source(args.source)
     roi_tracker = RoiTracker()
@@ -477,7 +422,6 @@ def main() -> int:
         rendered, roi_source, point_count = render_frame(
             frame,
             bbox_detector,
-            segmentation_model,
             pose_model,
             roi_tracker,
             args,
@@ -507,7 +451,6 @@ def main() -> int:
             rendered, _roi_source, _point_count = render_frame(
                 frame,
                 bbox_detector,
-                segmentation_model,
                 pose_model,
                 roi_tracker,
                 args,
