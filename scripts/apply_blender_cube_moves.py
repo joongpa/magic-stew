@@ -6769,27 +6769,32 @@ def object_occluding_point(
     point: Vector,
     depsgraph: bpy.types.Depsgraph,
     ignored_object_names: set[str] | None = None,
-    distance_tolerance: float = 0.02,
 ) -> str | None:
+    """Return the first non-ignored object hit strictly before ``point``.
+
+    A hit at the keypoint itself is part of the keypoint's supporting geometry,
+    not an occluder. This exact-before-point rule is important for keypoints
+    that lie on shared cubie or sticker boundaries.
+    """
     ignored_object_names = ignored_object_names or set()
     scene = bpy.context.scene
     camera = get_camera()
     origin, direction, point_distance = ray_to_point(camera, point)
     traveled = 0.0
     epsilon = 0.001
-    while traveled < point_distance - distance_tolerance:
+    while traveled < point_distance:
         hit, location, _normal, _polygon_index, hit_object, _matrix = scene.ray_cast(
             depsgraph,
             origin,
             direction,
-            distance=(point_distance - traveled) + distance_tolerance,
+            distance=point_distance - traveled,
         )
         if not hit or hit_object is None:
             return None
 
         hit_distance = (location - origin).length
         traveled += hit_distance
-        if traveled >= point_distance - distance_tolerance:
+        if traveled >= point_distance:
             return None
         if (
             hit_object.name not in ignored_object_names
@@ -7795,6 +7800,13 @@ def render_pose_keypoints(
         for obj in hand_objects().values()
         if not obj.hide_get() and not obj.hide_viewport and not obj.hide_render
     }
+    # A shared corner or edge lies on multiple cubies and often has detached
+    # sticker meshes. Ignore the complete target cube while testing external
+    # occlusion; otherwise the ray can hit an adjacent cubie/sticker before it
+    # reaches the exact shared point and incorrectly mark it unlabeled.
+    ignored_cube_object_names = cube_render_mesh_names(
+        [*cube_objects(), *core_fill_objects()]
+    )
     lines = []
     pose_objects = []
 
@@ -7837,9 +7849,11 @@ def render_pose_keypoints(
         else:
             x, y = projected
             candidate_counts["projected"] += 1
-            source_object = str(spec.get("source_object", ""))
-            ignored_object_names = {source_object} if source_object else set()
-            occluded_by = object_occluding_point(point, depsgraph, ignored_object_names)
+            occluded_by = object_occluding_point(
+                point,
+                depsgraph,
+                ignored_object_names=ignored_cube_object_names,
+            )
             hand_occluded = occluded_by in visible_hand_names
             if occluded_by is not None:
                 candidate_counts["occluded"] += 1
