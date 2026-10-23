@@ -6797,9 +6797,16 @@ def object_occluding_point(
         if traveled >= point_distance:
             return None
         if (
-            hit_object.name not in ignored_object_names
-            and not hit_object.name.startswith(SYNTHETIC_WINDOW_BLOCKER_PREFIX)
+            not getattr(hit_object, "visible_camera", True)
+            or getattr(hit_object, "hide_render", False)
+            or hit_object.name.startswith(SYNTHETIC_WINDOW_BLOCKER_PREFIX)
         ):
+            # Blender's ray cast can still report geometry that is hidden from
+            # the camera/render path. It must not occlude a training point.
+            origin = location + (direction * epsilon)
+            traveled += epsilon
+            continue
+        if hit_object.name not in ignored_object_names:
             return str(hit_object.name)
 
         origin = location + (direction * epsilon)
