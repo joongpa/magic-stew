@@ -486,12 +486,20 @@ MIN_KEYPOINT_BBOX_RADIUS_PX = 4
 POINT_VISIBILITY_UNLABELED = 0
 POINT_VISIBILITY_LABELED_OCCLUDED = 1
 POINT_VISIBILITY_VISIBLE = 2
-FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES = 10.0
-# Independent intersection points should be kept whenever one of their
-# exposed faces is facing the camera at all.  The ordered target retains the
-# stricter threshold above, but a 10-degree cutoff drops valid points near
-# cube silhouettes from the independent target.
-INDEPENDENT_FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES = 0.0
+# A face whose normal is nearly perpendicular to the camera ray is seen almost
+# edge-on.  Its geometric keypoints are poorly supported by image evidence,
+# so do not train on them.  The angle is measured from face-on (0 degrees) to
+# edge-on (90 degrees).
+FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES = 8.0
+# Keep a named independent-mode alias because this policy is part of the
+# independent-keypoint dataset contract.
+INDEPENDENT_FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES = FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES
+# Visibility=1 is a valid Ultralytics pose target, but it still creates a
+# positive detection for a point that may have no visible image evidence.  The
+# independent detector is intended to find visual intersections, so omit such
+# points by default.  The CLI can opt back into the old behavior for studies
+# that explicitly want occluded-point inference.
+INDEPENDENT_INCLUDE_OCCLUDED_KEYPOINTS = False
 
 
 def parse_axis(axis_name: str) -> Vector:
@@ -7475,6 +7483,7 @@ def render_ordered_keypoint_label(
     width: int,
     height: int,
     layer_state: dict[str, object] | None = None,
+    min_plane_angle_degrees: float = FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
 ) -> tuple[str | None, dict[str, object]]:
     """Project the ordered 26-point cube layout into one YOLO pose row."""
     transform_rows = cube_pose.get("transform")
@@ -7531,6 +7540,7 @@ def render_ordered_keypoint_label(
             world_point,
             world_normals,
             camera.location,
+            min_plane_angle_degrees=min_plane_angle_degrees,
         ):
             occluded_by = object_occluding_point(
                 world_point,
@@ -7577,6 +7587,7 @@ def render_ordered_keypoint_label(
             "keypoint_shape": [ORDERED_KEYPOINT_COUNT, 3],
             "keypoint_names": list(ORDERED_KEYPOINT_NAMES),
             "layer_mode": layer_state.get("mode", "none") if layer_state else "none",
+            "min_face_plane_angle_degrees": min_plane_angle_degrees,
             "keypoints": metadata,
             **counts,
         }
@@ -7595,6 +7606,7 @@ def render_ordered_keypoint_label(
         "keypoint_shape": [ORDERED_KEYPOINT_COUNT, 3],
         "keypoint_names": list(ORDERED_KEYPOINT_NAMES),
         "layer_mode": layer_state.get("mode", "none") if layer_state else "none",
+        "min_face_plane_angle_degrees": min_plane_angle_degrees,
         "keypoints": metadata,
         "bbox_xywh": [x_center, y_center, bbox_width, bbox_height],
         **counts,
@@ -7770,6 +7782,8 @@ def camera_relative_axes(visible_normals: list[Vector]) -> dict[str, Vector]:
 def render_pose_keypoints(
     path: Path | None,
     image_path: Path | None = None,
+    min_plane_angle_degrees: float = INDEPENDENT_FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
+    include_occluded_keypoints: bool = INDEPENDENT_INCLUDE_OCCLUDED_KEYPOINTS,
 ) -> tuple[list[str], list[dict[str, object]], dict[str, object]]:
     scene = bpy.context.scene
     camera = get_camera()
@@ -7788,6 +7802,14 @@ def render_pose_keypoints(
     projected_by_name: dict[str, tuple[float, float, int]] = {}
     metadata_by_name: dict[str, dict[str, object]] = {}
     keypoint_specs = cube_keypoint_specs_from_corners_and_centers()
+    candidate_counts = {
+        "projected": 0,
+        "out_of_frame": 0,
+        "angle_filtered": 0,
+        "visible": 0,
+        "occluded": 0,
+        "occluded_labeled": 0,
+    }
     for index, spec in enumerate(keypoint_specs):
         point = spec["point"]
         if not isinstance(point, Vector):
@@ -7800,21 +7822,39 @@ def render_pose_keypoints(
         if projected is None:
             x, y = 0.0, 0.0
             visibility = POINT_VISIBILITY_UNLABELED
+            raw_visibility = POINT_VISIBILITY_UNLABELED
+            candidate_counts["out_of_frame"] += 1
         elif not isinstance(normals, list) or not point_faces_camera(
             point,
             normals,
             camera.location,
-            min_plane_angle_degrees=INDEPENDENT_FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
+            min_plane_angle_degrees=min_plane_angle_degrees,
         ):
             x, y = projected
             visibility = POINT_VISIBILITY_UNLABELED
+            raw_visibility = POINT_VISIBILITY_UNLABELED
+            candidate_counts["angle_filtered"] += 1
         else:
             x, y = projected
+            candidate_counts["projected"] += 1
             source_object = str(spec.get("source_object", ""))
             ignored_object_names = {source_object} if source_object else set()
             occluded_by = object_occluding_point(point, depsgraph, ignored_object_names)
             hand_occluded = occluded_by in visible_hand_names
-            visibility = POINT_VISIBILITY_LABELED_OCCLUDED if occluded_by is not None else POINT_VISIBILITY_VISIBLE
+            if occluded_by is not None:
+                candidate_counts["occluded"] += 1
+                raw_visibility = POINT_VISIBILITY_LABELED_OCCLUDED
+                visibility = (
+                    raw_visibility
+                    if include_occluded_keypoints
+                    else POINT_VISIBILITY_UNLABELED
+                )
+                if include_occluded_keypoints:
+                    candidate_counts["occluded_labeled"] += 1
+            else:
+                candidate_counts["visible"] += 1
+                raw_visibility = POINT_VISIBILITY_VISIBLE
+                visibility = raw_visibility
 
         projected_by_name[name] = (x, y, visibility)
         metadata_by_name[name] = {
@@ -7829,6 +7869,7 @@ def render_pose_keypoints(
             "pixel_point": [x, y],
             "normalized_point": list(normalize_point(x, y, width, height)),
             "visibility": visibility,
+            "raw_visibility": raw_visibility,
             "hand_occluded": hand_occluded,
             "occluded_by": occluded_by,
         }
@@ -7856,6 +7897,9 @@ def render_pose_keypoints(
         "source_keypoints": len(keypoint_specs),
         "visible_hands": sorted(visible_hand_names),
         "candidates": len(keypoint_specs),
+        "min_face_plane_angle_degrees": min_plane_angle_degrees,
+        "include_occluded_keypoints": include_occluded_keypoints,
+        "candidate_counts": candidate_counts,
         "source_piece_objects": (
             len(corner_cubie_objects())
             + len(edge_cubie_objects())
@@ -8095,6 +8139,8 @@ def generate_dataset(
     hard_case: str = DEFAULT_HARD_CASE,
     render_pose_labels: bool = True,
     pose_label_mode: str = POSE_LABEL_MODE_INDEPENDENT,
+    min_face_plane_angle_degrees: float = FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
+    include_occluded_independent_keypoints: bool = INDEPENDENT_INCLUDE_OCCLUDED_KEYPOINTS,
     nvidia_gpu: bool = False,
 ) -> None:
     if mask_mode not in MASK_MODES:
@@ -8103,6 +8149,8 @@ def generate_dataset(
         raise ValueError(
             f"Unsupported pose label mode {pose_label_mode!r}; choose from {POSE_LABEL_MODES}"
         )
+    if not 0.0 <= min_face_plane_angle_degrees < 90.0:
+        raise ValueError("min_face_plane_angle_degrees must be in [0, 90).")
     if nvidia_gpu:
         configure_nvidia_gpu()
     images_dir = output_dir / "images"
@@ -8126,6 +8174,7 @@ def generate_dataset(
                         "permutation_convention": "permutation[output_index] = source_index",
                         "symmetry_scope": "full_cube_rotations",
                         "symmetry_count": 24,
+                        "min_face_plane_angle_degrees": min_face_plane_angle_degrees,
                         "permutations": [
                             list(permutation)
                             for permutation in ORDERED_KEYPOINT_SYMMETRY_PERMUTATIONS
@@ -8148,6 +8197,8 @@ def generate_dataset(
                         "corner_source": "corner_cubies",
                         "corner_edge_source": "edge_cubies",
                         "corner_edge_center_source": "center_cubies",
+                        "min_face_plane_angle_degrees": min_face_plane_angle_degrees,
+                        "include_occluded_keypoints": include_occluded_independent_keypoints,
                     },
                     indent=2,
                 )
@@ -8436,6 +8487,7 @@ def generate_dataset(
                         width,
                         height,
                         layer_state=layer_state,
+                        min_plane_angle_degrees=min_face_plane_angle_degrees,
                     )
                     if ordered_pose_line is None:
                         raise RuntimeError(f"Could not project ordered keypoints for {image_path}")
@@ -8445,6 +8497,8 @@ def generate_dataset(
                     independent_lines, independent_objects, independent_geometry = render_pose_keypoints(
                         mask_path if mask_mode == MASK_MODE_KEYPOINTS else None,
                         image_path=image_path if mask_mode == MASK_MODE_KEYPOINTS else None,
+                        min_plane_angle_degrees=min_face_plane_angle_degrees,
+                        include_occluded_keypoints=include_occluded_independent_keypoints,
                     )
                     if pose_label_path is not None:
                         write_yolo_pose(pose_label_path, independent_lines)
@@ -8630,6 +8684,24 @@ def cli_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--min-face-plane-angle-degrees",
+        type=float,
+        default=FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
+        help=(
+            "Do not label keypoints whose supporting face is within this many "
+            "degrees of edge-on to the camera (default: 8)."
+        ),
+    )
+    parser.add_argument(
+        "--include-occluded-independent-keypoints",
+        action=argparse.BooleanOptionalAction,
+        default=INDEPENDENT_INCLUDE_OCCLUDED_KEYPOINTS,
+        help=(
+            "Keep independent keypoints hidden by another object as visibility=1 "
+            "targets. Disabled by default because they lack direct visual evidence."
+        ),
+    )
+    parser.add_argument(
         "--enable-mid-turns",
         "--enable-moves",
         dest="enable_mid_turns",
@@ -8684,6 +8756,8 @@ def main() -> None:
         hard_case=DEFAULT_HARD_CASE,
         render_pose_labels=not args.no_pose_labels,
         pose_label_mode=args.pose_label_mode,
+        min_face_plane_angle_degrees=args.min_face_plane_angle_degrees,
+        include_occluded_independent_keypoints=args.include_occluded_independent_keypoints,
         nvidia_gpu=args.gpu,
     )
 

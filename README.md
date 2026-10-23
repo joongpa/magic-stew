@@ -232,6 +232,14 @@ The trainer also includes cube-free images from
 `data/youtube_solve_frames_hd/cropped-negatives` by default, writing empty pose
 labels for them. Override the directory with `--extra-negative-dir`.
 
+The Blender generator uses an 8-degree minimum face-to-camera angle by
+default, so nearly edge-on faces do not contribute weak, clustered keypoints.
+It also omits independent points occluded by another object by default; those
+points have no direct visual evidence and can otherwise teach the detector to
+make confident guesses. To reproduce the older occluded-target behavior, pass
+`--include-occluded-independent-keypoints` when generating the dataset. These
+changes affect labels only, so the model must be retrained on regenerated data.
+
 Render independent-keypoint model predictions with the same bbox -> padded
 square ROI -> pose -> ROI-tracking flow used by the live pipeline:
 
