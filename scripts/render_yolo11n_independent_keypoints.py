@@ -5,8 +5,8 @@ Per frame, this renderer:
 
 1. Runs the cube bbox detector when no tracked ROI exists.
 2. Builds the padded square ROI using the shared live-pipeline helper.
-3. Runs the independent three-class pose model inside that ROI.
-4. Maps each independent point back to full-frame coordinates.
+3. Runs the combined cube/sticker segmentation and independent three-class pose models inside that ROI.
+4. Maps the independent points and sticker masks back to the full frame.
 5. Updates the ROI tracker from the predicted point extent.
 
 Examples:
@@ -71,6 +71,28 @@ DEFAULT_POSE_MODEL = (
     ROOT
     / "runs/pose/runs/independent_keypoint_pose_v2/runs/cube_piece_keypoint_yolo11n_pose/weights/best.pt"
 )
+DEFAULT_COMBINED_SEGMENTATION_MODEL_CANDIDATES = (
+    ROOT / "runs/segment/runs/cube_sticker_combined_seg_v2/runs/cube_sticker_yolo11n_seg/weights/best.pt",
+    ROOT / "runs/segment/runs/cube_sticker_combined_seg/runs/cube_sticker_yolo11n_seg/weights/best.pt",
+)
+DEFAULT_COMBINED_SEGMENTATION_MODEL = next(
+    (
+        path
+        for path in DEFAULT_COMBINED_SEGMENTATION_MODEL_CANDIDATES
+        if path.exists()
+    ),
+    DEFAULT_COMBINED_SEGMENTATION_MODEL_CANDIDATES[0],
+)
+STICKER_COLORS_BGR = {
+    "white": (255, 255, 255),
+    "yellow": (0, 255, 255),
+    "red": (0, 0, 255),
+    "orange": (0, 165, 255),
+    "blue": (255, 0, 0),
+    "green": (0, 180, 0),
+    "sticker": (0, 220, 255),
+}
+STICKER_BORDER_COLOR_BGR = (0, 0, 255)
 
 
 def parse_source(source: str) -> int | str:
@@ -143,6 +165,134 @@ def pose_predictions(result: object) -> tuple[np.ndarray, np.ndarray, np.ndarray
 
     count = min(len(points), len(point_confidence), len(class_ids), len(box_confidence))
     return points[:count], point_confidence[:count], class_ids[:count], box_confidence[:count]
+
+
+def class_name(names: object, class_id: int) -> str:
+    if isinstance(names, dict):
+        return str(names.get(class_id, names.get(str(class_id), class_id)))
+    if isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
+        return str(names[class_id])
+    return str(class_id)
+
+
+def sticker_color(names: object, class_id: int) -> tuple[int, int, int]:
+    name = class_name(names, class_id).strip().lower().replace("_", " ").replace("-", " ")
+    return STICKER_COLORS_BGR.get(name, STICKER_COLORS_BGR["sticker"])
+
+
+def sticker_class_ids(names: object) -> set[int] | None:
+    """Return allowed sticker IDs, or None when model metadata is unknown."""
+
+    if isinstance(names, dict):
+        class_ids = {
+            int(class_id)
+            for class_id in names
+            if str(class_id).lstrip("-").isdigit()
+        }
+    elif isinstance(names, (list, tuple)):
+        class_ids = set(range(len(names)))
+    else:
+        return None
+
+    explicit_sticker_ids = {
+        class_id
+        for class_id in class_ids
+        if class_name(names, class_id).strip().lower() == "sticker"
+    }
+    if explicit_sticker_ids:
+        return explicit_sticker_ids
+
+    color_ids = {
+        class_id
+        for class_id in class_ids
+        if class_name(names, class_id).strip().lower() in STICKER_COLORS_BGR
+    }
+    return color_ids or None
+
+
+def predict_sticker_masks(
+    model: object,
+    model_roi: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[list[np.ndarray], object, np.ndarray] | None:
+    predict_kwargs = {} if args.device is None else {"device": args.device}
+    results = model.predict(
+        source=model_roi,
+        conf=args.sticker_mask_conf,
+        imgsz=args.imgsz,
+        retina_masks=False,
+        verbose=False,
+        **predict_kwargs,
+    )
+    result = results[0] if results else None
+    if result is None:
+        return None
+    masks = getattr(result, "masks", None)
+    if masks is None:
+        return None
+    mask_data = tensor_to_numpy(getattr(masks, "data", None))
+    if mask_data is None or mask_data.ndim < 3 or len(mask_data) == 0:
+        return None
+    boxes = getattr(result, "boxes", None)
+    class_ids = tensor_to_numpy(getattr(boxes, "cls", None)) if boxes is not None else None
+    if class_ids is None:
+        class_ids = np.zeros((len(mask_data),), dtype=np.int32)
+    class_ids = np.asarray(class_ids, dtype=np.int32).reshape(-1)
+    names = getattr(result, "names", {})
+    allowed_sticker_ids = sticker_class_ids(names)
+    # The combined model uses a literal "sticker" class. Keep only that
+    # class, excluding the model's separate "cube" predictions. Resolve the
+    # allowed IDs from the complete class map so cube-only frames do not fall
+    # through to the generic fallback.
+    if allowed_sticker_ids is not None:
+        keep = [
+            index
+            for index, class_id in enumerate(class_ids[: len(mask_data)])
+            if int(class_id) in allowed_sticker_ids
+        ]
+    else:
+        keep = list(range(min(len(mask_data), len(class_ids))))
+    return [np.asarray(mask_data[index]) >= 0.5 for index in keep], names, class_ids[keep]
+
+
+def render_sticker_masks(
+    image: np.ndarray,
+    roi_xyxy: tuple[int, int, int, int],
+    predicted: tuple[list[np.ndarray], object, np.ndarray] | None,
+    opacity: float,
+    border_thickness: int,
+) -> np.ndarray:
+    output = image.copy()
+    if predicted is None:
+        return output
+    local_masks, names, class_ids = predicted
+    x1, y1, x2, y2 = roi_xyxy
+    roi_height, roi_width = y2 - y1, x2 - x1
+    roi = output[y1:y2, x1:x2]
+    for local_mask, class_id in zip(local_masks, class_ids, strict=True):
+        mask = cv2.resize(
+            local_mask.astype(np.uint8),
+            (roi_width, roi_height),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+        color_layer = np.full_like(roi, sticker_color(names, int(class_id)))
+        blended = cv2.addWeighted(roi, 1.0 - opacity, color_layer, opacity, 0.0)
+        roi[mask] = blended[mask]
+        if border_thickness > 0:
+            contours, _ = cv2.findContours(
+                mask.astype(np.uint8),
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
+            cv2.drawContours(
+                roi,
+                contours,
+                -1,
+                STICKER_BORDER_COLOR_BGR,
+                border_thickness,
+                cv2.LINE_AA,
+            )
+    return output
 
 
 def local_to_frame_points(
@@ -236,8 +386,9 @@ def draw_pose(
     class_confidences: dict[str, float],
     show_labels: bool,
     show_confidences: bool,
+    copy_image: bool = True,
 ) -> tuple[np.ndarray, int]:
-    output = image.copy()
+    output = image.copy() if copy_image else image
     drawn = 0
     per_class_index = {class_id: 0 for class_id in range(len(CLASS_NAMES))}
     for point, point_confidence, class_id, box_confidence in zip(
@@ -302,6 +453,7 @@ def render_frame(
     pose_model: object,
     roi_tracker: RoiTracker,
     args: argparse.Namespace,
+    sticker_seg_model: object | None = None,
 ) -> tuple[np.ndarray, str, int]:
     height, width = frame.shape[:2]
     roi_xyxy, candidate, roi_source = shared_roi_for_frame(
@@ -320,6 +472,18 @@ def render_frame(
         return draw_context(frame, roi_xyxy, candidate, roi_source, 0, args.show_status), roi_source, 0
 
     model_roi = resize_to_square(roi, args.view_size)
+    sticker_masks = (
+        predict_sticker_masks(sticker_seg_model, model_roi, args)
+        if sticker_seg_model is not None and args.run_sticker_segmentation
+        else None
+    )
+    output = render_sticker_masks(
+        frame,
+        roi_xyxy,
+        sticker_masks if args.show_sticker_mask else None,
+        args.sticker_mask_opacity,
+        args.sticker_border_thickness,
+    )
     predict_kwargs = {} if args.device is None else {"device": args.device}
     pose_inference_conf = (
         args.pose_conf
@@ -337,16 +501,16 @@ def render_frame(
     result = results[0] if results else None
     if result is None:
         roi_tracker.reset()
-        return draw_context(frame, roi_xyxy, candidate, roi_source, 0, args.show_status), roi_source, 0
+        return draw_context(output, roi_xyxy, candidate, roi_source, 0, args.show_status), roi_source, 0
 
     local_points, point_confidences, class_ids, box_confidences = pose_predictions(result)
     if len(local_points) == 0:
         roi_tracker.reset()
-        return draw_context(frame, roi_xyxy, candidate, roi_source, 0, args.show_status), roi_source, 0
+        return draw_context(output, roi_xyxy, candidate, roi_source, 0, args.show_status), roi_source, 0
 
     frame_points, local_roi_points = local_to_frame_points(local_points, roi_xyxy, args.view_size)
     output, point_count = draw_pose(
-        frame,
+        output,
         frame_points,
         point_confidences,
         class_ids,
@@ -355,6 +519,7 @@ def render_frame(
         args.pose_class_conf,
         args.show_labels,
         args.show_confidences,
+        copy_image=False,
     )
     output = draw_context(output, roi_xyxy, candidate, roi_source, point_count, args.show_status)
 
@@ -394,12 +559,51 @@ def create_video_writer(path: Path, frame: np.ndarray, fps: float) -> cv2.VideoW
     return writer
 
 
+def configure_camera(capture: cv2.VideoCapture, args: argparse.Namespace) -> None:
+    """Request a low-latency camera mode and report what OpenCV negotiated."""
+
+    if args.camera_width > 0:
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, args.camera_width)
+    if args.camera_height > 0:
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, args.camera_height)
+    if args.camera_fps > 0:
+        capture.set(cv2.CAP_PROP_FPS, args.camera_fps)
+
+    try:
+        backend = capture.getBackendName()
+    except cv2.error:
+        backend = "unknown"
+    negotiated = (
+        f"{capture.get(cv2.CAP_PROP_FRAME_WIDTH):.0f}x"
+        f"{capture.get(cv2.CAP_PROP_FRAME_HEIGHT):.0f}@"
+        f"{capture.get(cv2.CAP_PROP_FPS):.1f}"
+    )
+    print(
+        "Camera: "
+        f"backend={backend}, "
+        f"requested={args.camera_width}x{args.camera_height}@{args.camera_fps:g}, "
+        f"negotiated={negotiated}",
+        flush=True,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Render the independent cube-keypoint model with bbox-to-ROI tracking."
     )
     parser.add_argument("--source", required=True, help="Image, video path, or camera index.")
+    parser.add_argument("--camera-width", type=int, default=640, help="Requested camera width (0 leaves it unchanged).")
+    parser.add_argument("--camera-height", type=int, default=480, help="Requested camera height (0 leaves it unchanged).")
+    parser.add_argument("--camera-fps", type=float, default=30.0, help="Requested camera FPS (0 leaves it unchanged).")
     parser.add_argument("--model", type=Path, default=DEFAULT_POSE_MODEL)
+    parser.add_argument(
+        "--combined-seg-model",
+        "--sticker-seg-model",
+        dest="sticker_seg_model",
+        type=Path,
+        default=DEFAULT_COMBINED_SEGMENTATION_MODEL,
+        help="Combined cube/sticker segmentation checkpoint; only its sticker class is rendered.",
+    )
     parser.add_argument("--bbox-model", type=Path, default=DEFAULT_BBOX_MODEL)
     parser.add_argument("--device", default=None, help="Ultralytics device, for example cpu, mps, or 0.")
     parser.add_argument("--bbox-conf", type=float, default=0.25)
@@ -433,6 +637,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imgsz", type=int, default=256)
     parser.add_argument("--view-size", type=int, default=256)
     parser.add_argument("--max-det", type=int, default=64)
+    parser.add_argument("--sticker-mask-conf", type=float, default=0.25)
+    parser.add_argument("--sticker-mask-opacity", type=float, default=0.25)
+    parser.add_argument("--sticker-border-thickness", type=int, default=2)
+    parser.add_argument(
+        "--run-sticker-segmentation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run the combined segmentation model even when its mask is not displayed.",
+    )
+    parser.add_argument("--show-sticker-mask", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--roi-padding", type=float, default=0.08)
     parser.add_argument("--roi-tracking-gain", type=float, default=1.4)
     parser.add_argument("--roi-tracking-padding", type=float, default=0.18)
@@ -456,8 +670,16 @@ def main() -> int:
         raise SystemExit("--pose-conf must be in [0, 1]")
     if args.pose_conf is not None and args.pose_conf > min(args.pose_class_conf.values()):
         raise SystemExit("--pose-conf cannot exceed the lowest --pose-class-conf threshold")
+    if not 0.0 <= args.sticker_mask_conf <= 1.0:
+        raise SystemExit("--sticker-mask-conf must be in [0, 1]")
+    if not 0.0 <= args.sticker_mask_opacity <= 1.0:
+        raise SystemExit("--sticker-mask-opacity must be in [0, 1]")
+    if args.sticker_border_thickness < 0:
+        raise SystemExit("--sticker-border-thickness must be non-negative")
     if not args.model.is_file():
         raise SystemExit(f"Could not find independent pose model: {args.model}")
+    if args.run_sticker_segmentation and not args.sticker_seg_model.is_file():
+        raise SystemExit(f"Could not find sticker segmentation model: {args.sticker_seg_model}")
     if not args.bbox_model.is_file():
         raise SystemExit(f"Could not find bbox model: {args.bbox_model}")
 
@@ -470,6 +692,9 @@ def main() -> int:
         device=args.device,
     )
     pose_model = YOLO(str(args.model))
+    sticker_seg_model = YOLO(str(args.sticker_seg_model)) if args.run_sticker_segmentation else None
+    if sticker_seg_model is not None:
+        print(f"Combined segmentation model (sticker class only): {args.sticker_seg_model}", flush=True)
     source = parse_source(args.source)
     roi_tracker = RoiTracker()
 
@@ -483,6 +708,7 @@ def main() -> int:
             pose_model,
             roi_tracker,
             args,
+            sticker_seg_model,
         )
         if args.save:
             args.save.parent.mkdir(parents=True, exist_ok=True)
@@ -499,34 +725,46 @@ def main() -> int:
     capture = cv2.VideoCapture(source)
     if not capture.isOpened():
         raise SystemExit(f"Could not open source: {source}")
+    if isinstance(source, int):
+        configure_camera(capture, args)
     writer = None
-    previous = perf_counter()
-    smoothed_fps = None
+    previous_loop_end = perf_counter()
+    smoothed_loop_fps = None
+    smoothed_render_fps = None
     try:
         while True:
             ok, frame = capture.read()
             if not ok:
                 break
+            render_start = perf_counter()
+            now = render_start
+            loop_fps = 1.0 / max(now - previous_loop_end, 1e-6)
+            previous_loop_end = now
+            smoothed_loop_fps = (
+                loop_fps
+                if smoothed_loop_fps is None
+                else 0.9 * smoothed_loop_fps + 0.1 * loop_fps
+            )
             rendered, _roi_source, _point_count = render_frame(
                 frame,
                 bbox_detector,
                 pose_model,
                 roi_tracker,
                 args,
+                sticker_seg_model,
             )
-            now = perf_counter()
-            instant_fps = 1.0 / max(now - previous, 1e-6)
-            previous = now
-            smoothed_fps = (
-                instant_fps
-                if smoothed_fps is None
-                else 0.9 * smoothed_fps + 0.1 * instant_fps
+            render_end = perf_counter()
+            render_fps = 1.0 / max(render_end - render_start, 1e-6)
+            smoothed_render_fps = (
+                render_fps
+                if smoothed_render_fps is None
+                else 0.9 * smoothed_render_fps + 0.1 * render_fps
             )
             if args.show_fps:
                 fps_y = 44 if args.show_status else 22
                 cv2.putText(
                     rendered,
-                    f"FPS {smoothed_fps:.1f}",
+                    f"PROC {smoothed_render_fps:.1f} | LOOP {smoothed_loop_fps:.1f}",
                     (8, fps_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
