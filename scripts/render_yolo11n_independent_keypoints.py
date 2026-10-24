@@ -255,7 +255,10 @@ def draw_context(
     show_status: bool,
 ) -> np.ndarray:
     output = image.copy()
-    if candidate is not None and hasattr(candidate, "bbox_xyxy"):
+    # The tracker retains the detector candidate so it can keep the original
+    # ROI geometry, but that candidate is not a fresh detection. Only show the
+    # blue detector box on frames where the detector supplied the ROI.
+    if roi_source == "detector" and candidate is not None and hasattr(candidate, "bbox_xyxy"):
         bx1, by1, bx2, by2 = tuple(int(value) for value in candidate.bbox_xyxy)
         cv2.rectangle(output, (bx1, by1), (bx2 - 1, by2 - 1), (255, 120, 0), 1, cv2.LINE_AA)
     if roi_xyxy is not None:
