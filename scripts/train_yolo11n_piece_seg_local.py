@@ -262,7 +262,11 @@ def main() -> None:
         help="Mosaic augmentation probability; 0.0 disables mosaic augmentation.",
     )
     parser.add_argument("--batch", type=int, default=-1)
-    parser.add_argument("--device", default="mps")
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Training device override, e.g. cpu, mps, 0, or 0,1; default lets Ultralytics choose.",
+    )
     parser.add_argument("--name", default="cube_piece_keypoint_yolo11n_pose")
     parser.add_argument("--patience", type=int, default=25)
     parser.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)

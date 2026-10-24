@@ -258,9 +258,12 @@ square ROI -> pose -> ROI-tracking flow used by the live pipeline:
   --no-display
 ```
 
-The renderer filters points using the independent pose model's keypoint
-confidence. Set the threshold with `--min-keypoint-conf`; `--track-conf`
-separately controls which points update the tracked ROI.
+The renderer filters detections using per-class `boxes.conf` thresholds. The
+defaults are `corner=0.25`, `corner-edge=0.30`, and
+`corner-edge-center=0.25`; override them with, for example,
+`--pose-class-conf corner=0.30,corner-edge=0.40,corner-edge-center=0.30`.
+`--min-keypoint-conf` remains an optional point-visibility filter, and
+`--track-conf` controls the minimum point-visibility score for ROI tracking.
 
 For ground-truth overlays on the prepared dataset, use
 `scripts/render_independent_keypoints.py`:

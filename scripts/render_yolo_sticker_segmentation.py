@@ -28,7 +28,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
+from live_recognition.detectors import YOLOCubeDetector, default_yolo_device  # noqa: E402
 from live_recognition.roi_tracking import RoiTracker  # noqa: E402
 from live_recognition.roi_tracking import \
     roi_for_frame as shared_roi_for_frame  # noqa: E402
@@ -722,12 +722,20 @@ def segmentation_bounds(
 
 
 def predict(model: object, image: np.ndarray, args: argparse.Namespace) -> object | None:
+    # ``render_yolo_cube_pose.py`` imports this helper with a separate custom
+    # pose device, so prefer its explicitly resolved segmentation device when
+    # present.  Keep the fallback tolerant of older callers/tests.
+    device = getattr(args, "segmentation_device", None)
+    if device is None:
+        device = getattr(args, "device", None)
+    predict_kwargs = {} if device in (None, "auto") else {"device": device}
     predictions = model.predict(
         source=image,
         conf=args.conf,
         imgsz=args.imgsz,
-        retina_masks=True,
+        retina_masks=False,
         verbose=False,
+        **predict_kwargs,
     )
     return predictions[0] if predictions else None
 
@@ -748,6 +756,7 @@ def predict_and_render(
             model_name=str(args.bbox_model),
             confidence_threshold=args.bbox_conf,
             image_size=args.bbox_imgsz,
+            device=getattr(args, "device", None),
         )
     roi_xyxy, _candidate, roi_source = shared_roi_for_frame(
         image,
@@ -772,10 +781,9 @@ def predict_and_render(
     assert roi_xyxy is not None
     x1, y1, x2, y2 = roi_xyxy
     roi = image[y1:y2, x1:x2]
-    # Keep the native ROI as the prediction source. Ultralytics still uses
-    # ``imgsz`` for inference, while ``retina_masks`` maps masks back to this
-    # full-resolution source instead of producing a 256px mask that must be
-    # enlarged afterward.
+    # Keep the native ROI as the prediction source. With ``retina_masks`` off,
+    # masks stay at the model output resolution, avoiding the extra
+    # full-resolution mask work that is especially expensive on MPS.
     roi_result = predict(model, roi, args)
     if roi_result is None or not has_segmentation(roi_result):
         masks_only = getattr(args, "masks_only", False)
@@ -880,6 +888,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model", type=Path, help="Override the selected segmentation model weights path")
     parser.add_argument(
+        "--device",
+        default=None,
+        help="YOLO device, for example cpu, mps, cuda, or cuda:0; auto-selects MPS when available",
+    )
+    parser.add_argument(
         "--color-map-model",
         type=Path,
         help="Trained dense color-map checkpoint; enables split-screen rendering",
@@ -917,6 +930,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.device in (None, "auto"):
+        args.device = default_yolo_device()
+    print(f"Inference device: {args.device}")
     if not 0.0 <= args.opacity <= 1.0:
         raise SystemExit("--opacity must be in the range [0, 1]")
     model_path = args.model or default_model_path(args.segmentation_type)

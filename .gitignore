@@ -1,4 +1,5 @@
 .venv/
+.venv-mps/
 .linea/
 .models/
 .mlsd_pytorch/

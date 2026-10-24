@@ -6,11 +6,10 @@ of the training split, while keeping one validation split fixed across every
 run. This makes it possible to tell whether adding data is still improving the
 model or whether the current architecture/labels have reached a plateau.
 
-Example for an NVIDIA GPU::
+Example with automatic device selection::
 
     .venv/bin/python scripts/run_independent_keypoint_learning_curve.py \
         --source-dir data/independent_keypoints_dataset_v2 \
-        --device 0 \
         --batch -1 \
         --workers 8 \
         --epochs 100
@@ -359,7 +358,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=16,
         help="Positive validation batch size; training --batch may use -1 for auto-sizing.",
     )
-    parser.add_argument("--device", default="0", help="NVIDIA GPU index, e.g. 0 or 0,1; use cpu for CPU.")
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Training device override, e.g. cpu, mps, 0, or 0,1; default lets Ultralytics choose.",
+    )
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--patience", type=int, default=25)
     parser.add_argument("--mosaic", type=float, default=0.0)

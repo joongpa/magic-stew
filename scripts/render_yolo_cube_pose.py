@@ -240,6 +240,7 @@ def predict_and_render(
             model_name=str(args.bbox_model),
             confidence_threshold=args.bbox_conf,
             image_size=args.bbox_imgsz,
+            device=getattr(args, "segmentation_device", str(device)),
         )
 
     roi_xyxy, _candidate, roi_source = shared_roi_for_frame(
@@ -313,6 +314,9 @@ def main() -> int:
     if device.type == "cuda" and not torch.cuda.is_available():
         print("CUDA is unavailable; falling back to CPU")
         device = torch.device("cpu")
+    # The imported segmentation renderer uses this separately from the
+    # custom pose model's device argument, which may be the literal "auto".
+    args.segmentation_device = str(device)
     try:
         checkpoint = torch.load(args.model, map_location="cpu", weights_only=False)
     except AttributeError as exc:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 from typing import Protocol
 
 import cv2
@@ -22,6 +22,19 @@ _resolve_sam3_model_path = resolve_sam3_model_path
 class CubeDetector(Protocol):
     def detect(self, frame_bgr: NDArray[np.uint8]) -> CubeCandidate | None:
         """Return the best cube candidate for a frame."""
+
+
+def default_yolo_device() -> str:
+    """Prefer Apple MPS when it is available, otherwise use the CPU."""
+
+    try:
+        import torch
+
+        if torch.backends.mps.is_available():
+            return "mps"
+    except (ImportError, RuntimeError):
+        return "cpu"
+    return "cpu"
 
 
 def _best_confident_box_index(confidences, threshold: float) -> int | None:
@@ -185,6 +198,7 @@ class YOLOCubeDetector:
     model_name: str = "runs/500ExamplesWeights.pt"
     confidence_threshold: float = 0.25
     image_size: int = 640
+    device: str | None = None
 
     def __post_init__(self) -> None:
         ensure_yolo_config_dir()
@@ -192,12 +206,14 @@ class YOLOCubeDetector:
         from ultralytics import YOLO
 
         self.model = YOLO(resolve_model_path(self.model_name, "YOLO"))
+        self.device = self.device or default_yolo_device()
 
     def detect_all(self, frame_bgr: NDArray[np.uint8]) -> list[CubeCandidate]:
         results = self.model.predict(
             source=frame_bgr,
             conf=self.confidence_threshold,
             imgsz=self.image_size,
+            device=self.device,
             verbose=False,
         )
         if not results:

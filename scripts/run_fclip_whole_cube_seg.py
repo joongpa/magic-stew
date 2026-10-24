@@ -25,7 +25,7 @@ SRC_ROOT = ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
+from live_recognition.detectors import YOLOCubeDetector, default_yolo_device  # noqa: E402
 from live_recognition.line_detectors import LineDetector, build_line_detector  # noqa: E402
 from live_recognition.roi_tracking import RoiTracker, square_roi_from_bbox  # noqa: E402
 
@@ -67,13 +67,21 @@ def tensor_to_numpy(value: object) -> np.ndarray:
     return np.asarray(value)
 
 
-def predict_segmentation(model: object, image: np.ndarray, confidence: float, image_size: int):
+def predict_segmentation(
+    model: object,
+    image: np.ndarray,
+    confidence: float,
+    image_size: int,
+    device: str | None = None,
+):
+    predict_kwargs = {} if device in (None, "auto") else {"device": device}
     predictions = model.predict(
         source=image,
         conf=float(confidence),
         imgsz=int(image_size),
-        retina_masks=True,
+        retina_masks=False,
         verbose=False,
+        **predict_kwargs,
     )
     return predictions[0] if predictions else None
 
@@ -226,7 +234,13 @@ def process_frame(
 
     x1, y1, x2, y2 = roi_xyxy
     roi = frame[y1:y2, x1:x2]
-    seg_result = predict_segmentation(segmentation_model, roi, args.seg_conf, args.seg_imgsz)
+    seg_result = predict_segmentation(
+        segmentation_model,
+        roi,
+        args.seg_conf,
+        args.seg_imgsz,
+        args.device,
+    )
     local_mask, seg_confidence = largest_segmentation_mask(seg_result, roi.shape[:2])
 
     output = frame.copy()
@@ -343,6 +357,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fclip-config", type=Path, default=DEFAULT_FCLIP_CONFIG)
     parser.add_argument("--fclip-checkpoint", type=Path, default=DEFAULT_FCLIP_CHECKPOINT)
     parser.add_argument("--fclip-device", default="auto", help="F-Clip device, e.g. auto, cpu, or cuda")
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="YOLO device, for example cpu, mps, cuda, or cuda:0; auto-selects MPS when available",
+    )
     parser.add_argument("--seg-model", type=Path, default=DEFAULT_SEGMENTATION_MODEL)
     parser.add_argument("--bbox-model", type=Path, default=DEFAULT_BBOX_MODEL)
     parser.add_argument("--bbox-conf", type=float, default=0.25, help="Bootstrap bbox confidence")
@@ -388,6 +407,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.device in (None, "auto"):
+        args.device = default_yolo_device()
     required_paths = [(args.seg_model, "segmentation model")]
     if args.line_detector == "mlsd":
         required_paths.append((args.mlsd_model, "M-LSD model"))
@@ -422,6 +443,7 @@ def main() -> int:
             model_name=str(args.bbox_model),
             confidence_threshold=args.bbox_conf,
             image_size=args.bbox_imgsz,
+            device=args.device,
         )
     if args.line_detector == "mlsd":
         line_detector = build_line_detector(
@@ -458,6 +480,7 @@ def main() -> int:
         print(f"F-Clip checkpoint: {args.fclip_checkpoint}")
         print(f"F-Clip device: {args.fclip_device}")
     print(f"Segmentation model: {args.seg_model}")
+    print(f"YOLO inference device: {args.device}")
     print(f"ROI bootstrap bbox: {args.bbox_model if bbox_detector is not None else 'disabled'}")
     print(f"Thresholds: line={args.line_conf:.2f}, segmentation={args.seg_conf:.2f}")
 

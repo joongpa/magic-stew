@@ -28,11 +28,14 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
+from live_recognition.detectors import YOLOCubeDetector, default_yolo_device  # noqa: E402
+from live_recognition.independent_pose_thresholds import (  # noqa: E402
+    DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES,
+    independent_pose_class_threshold, parse_independent_pose_class_confidences)
 from live_recognition.visualization import _reliable_color_mask  # noqa: E402
-from live_recognition.visualization import (save_hsv_samples_interactive_plot,
-                                            save_rgb_samples_interactive_plot,
-                                            save_rgb_samples_plot)
+from live_recognition.visualization import (  # noqa: E402
+    save_hsv_samples_interactive_plot, save_rgb_samples_interactive_plot,
+    save_rgb_samples_plot)
 
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 DEFAULT_STICKER_MODEL = (
@@ -40,7 +43,7 @@ DEFAULT_STICKER_MODEL = (
     / "runs/segment/runs/cube_face_seg_local/runs/cube_face_sticker_yolo11n_seg/weights/best.pt"
 )
 DEFAULT_POSE_MODEL = (
-    "runs/pose/runs/independent_keypoints_v2.pt"
+    "runs/pose/runs/independent_keypoints_v3_weights.pt"
 )
 ENABLE_STICKER_SEGMENTATION = False
 ENABLE_POSE_ESTIMATION = True
@@ -53,6 +56,7 @@ DISPLAY_WINDOW_NAME = "cube sticker segmentations"
 DISPLAY_PREVIEW_BY_DEFAULT = True
 SHOW_ORIGINAL_UNDERLAY_BY_DEFAULT = True
 POSE_IMAGE_SIZE = 256
+YOLO_DEVICE = default_yolo_device()
 POSE_OBJECT_CONFIDENCE = 0.5
 POSE_KEYPOINT_CONFIDENCE = 0.25
 ADJACENCY_REFERENCE_ROI_SIZE_PX = 600.0
@@ -1354,6 +1358,16 @@ def result_box_classes(result) -> np.ndarray | None:
     return np.asarray(classes, dtype=np.int32).reshape(-1)
 
 
+def result_box_confidences(result) -> np.ndarray | None:
+    boxes = getattr(result, "boxes", None)
+    if boxes is None:
+        return None
+    confidences = tensor_to_numpy(getattr(boxes, "conf", None))
+    if confidences is None:
+        return None
+    return np.asarray(confidences, dtype=np.float32).reshape(-1)
+
+
 def collect_pose_graph_points(
     result,
     pose_model,
@@ -1361,6 +1375,8 @@ def collect_pose_graph_points(
     keypoint_conf: np.ndarray | None,
     *,
     confidence_threshold: float,
+    class_confidences: dict[str, float],
+    box_confidence: np.ndarray | None,
     offset_xy: tuple[int, int],
     scale_xy: tuple[float, float],
 ) -> list[PoseGraphPoint]:
@@ -1368,6 +1384,11 @@ def collect_pose_graph_points(
         return []
 
     classes = result_box_classes(result)
+    box_confidences = (
+        None
+        if box_confidence is None
+        else np.asarray(box_confidence, dtype=np.float32).reshape(-1)
+    )
     points_by_detection = np.asarray(xy, dtype=np.float32)
     scores_by_detection = (
         None
@@ -1385,6 +1406,18 @@ def collect_pose_graph_points(
         )
         class_name = class_name_for_id(result, pose_model, class_id).removesuffix("_sticker")
         if class_name not in {"corner", "corner-edge", "corner-edge-center"}:
+            continue
+
+        detection_box_confidence = (
+            1.0
+            if box_confidences is None or detection_index >= len(box_confidences)
+            else float(box_confidences[detection_index])
+        )
+        if detection_box_confidence < independent_pose_class_threshold(
+            class_name,
+            class_confidences,
+            fallback=confidence_threshold,
+        ):
             continue
 
         detection_scores = (
@@ -1838,6 +1871,8 @@ def draw_pose_keypoints(
     keypoint_conf: np.ndarray | None,
     *,
     confidence_threshold: float,
+    class_confidences: dict[str, float],
+    box_confidence: np.ndarray | None,
     offset_xy: tuple[int, int],
     scale_xy: tuple[float, float],
 ) -> int:
@@ -1845,6 +1880,11 @@ def draw_pose_keypoints(
         return 0
 
     classes = result_box_classes(result)
+    box_confidences = (
+        None
+        if box_confidence is None
+        else np.asarray(box_confidence, dtype=np.float32).reshape(-1)
+    )
     points_by_detection = np.asarray(xy, dtype=np.float32)
     scores_by_detection = (
         None
@@ -1862,6 +1902,18 @@ def draw_pose_keypoints(
         )
         class_name = class_name_for_id(result, pose_model, class_id).removesuffix("_sticker")
         if class_name not in POSE_CLASS_NAMES:
+            continue
+
+        detection_box_confidence = (
+            1.0
+            if box_confidences is None or detection_index >= len(box_confidences)
+            else float(box_confidences[detection_index])
+        )
+        if detection_box_confidence < independent_pose_class_threshold(
+            class_name,
+            class_confidences,
+            fallback=confidence_threshold,
+        ):
             continue
 
         detection_scores = (
@@ -3636,8 +3688,13 @@ def draw_pose_estimate(
     started = perf_counter()
     results = pose_model.predict(
         source=model_roi,
-        conf=POSE_OBJECT_CONFIDENCE,
+        conf=getattr(
+            args,
+            "pose_conf",
+            min(DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES.values()),
+        ),
         imgsz=POSE_IMAGE_SIZE,
+        device=YOLO_DEVICE,
         verbose=False,
     )
     if profile is not None:
@@ -3649,6 +3706,12 @@ def draw_pose_estimate(
     started = perf_counter()
     result = results[0]
     xy, conf = result_keypoints(result, POSE_IMAGE_SIZE)
+    box_conf = result_box_confidences(result)
+    class_confidences = getattr(
+        args,
+        "pose_class_conf",
+        DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES,
+    )
     scale_x = (x2 - x1) / float(model_roi.shape[1])
     scale_y = (y2 - y1) / float(model_roi.shape[0])
     pose_points = collect_pose_graph_points(
@@ -3657,6 +3720,8 @@ def draw_pose_estimate(
         xy,
         conf,
         confidence_threshold=POSE_KEYPOINT_CONFIDENCE,
+        class_confidences=class_confidences,
+        box_confidence=box_conf,
         offset_xy=(x1, y1),
         scale_xy=(scale_x, scale_y),
     )
@@ -3693,6 +3758,8 @@ def draw_pose_estimate(
             xy,
             conf,
             confidence_threshold=POSE_KEYPOINT_CONFIDENCE,
+            class_confidences=class_confidences,
+            box_confidence=box_conf,
             offset_xy=(x1, y1),
             scale_xy=(scale_x, scale_y),
         )
@@ -3988,6 +4055,7 @@ def draw_sticker_segments(
         source=model_roi,
         conf=args.sticker_conf,
         imgsz=args.sticker_imgsz,
+        device=YOLO_DEVICE,
         verbose=False,
     )
     bgr_batches = []
@@ -4441,6 +4509,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sticker-model", type=Path, default=DEFAULT_STICKER_MODEL)
     parser.add_argument("--bbox-conf", type=float, default=0.25)
     parser.add_argument("--sticker-conf", type=float, default=0.25)
+    parser.add_argument(
+        "--pose-conf",
+        type=float,
+        default=min(DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES.values()),
+        help="Global independent-pose model pre-filter; keep at or below the lowest class threshold.",
+    )
+    parser.add_argument(
+        "--pose-class-conf",
+        type=parse_independent_pose_class_confidences,
+        default=dict(DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES),
+        help=(
+            "Per-class independent-pose boxes.conf thresholds as class=value pairs, for example "
+            "corner=0.25,corner-edge=0.30,corner-edge-center=0.25."
+        ),
+    )
     parser.add_argument("--bbox-imgsz", type=int, default=640)
     parser.add_argument("--sticker-imgsz", type=int, default=256)
     parser.add_argument("--roi-padding", type=float, default=0.08)
@@ -4645,6 +4728,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if not 0.0 <= args.pose_conf <= 1.0:
+        raise SystemExit("--pose-conf must be in [0, 1]")
+    if args.pose_conf > min(args.pose_class_conf.values()):
+        raise SystemExit("--pose-conf cannot exceed the lowest --pose-class-conf threshold")
 
     from ultralytics import YOLO
 
@@ -4652,6 +4739,7 @@ def main() -> int:
         model_name=str(args.bbox_model),
         confidence_threshold=args.bbox_conf,
         image_size=args.bbox_imgsz,
+        device=YOLO_DEVICE,
     )
     sticker_model = YOLO(str(args.sticker_model)) if ENABLE_STICKER_SEGMENTATION else None
     pose_model = None

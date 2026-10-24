@@ -40,14 +40,23 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
+from live_recognition.detectors import (  # noqa: E402
+    YOLOCubeDetector,
+    default_yolo_device,
+)
+from live_recognition.independent_pose_thresholds import (  # noqa: E402
+    DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES,
+    INDEPENDENT_POSE_CLASS_NAMES,
+    independent_pose_class_threshold,
+    parse_independent_pose_class_confidences,
+)
 from live_recognition.roi_tracking import (  # noqa: E402
     RoiTracker,
     roi_for_frame as shared_roi_for_frame,
 )
 
 
-CLASS_NAMES = ("corner", "corner-edge", "corner-edge-center")
+CLASS_NAMES = INDEPENDENT_POSE_CLASS_NAMES
 # OpenCV uses BGR colors. These match the independent-keypoint generator.
 CLASS_COLORS_BGR = (
     (255, 255, 255),
@@ -152,15 +161,27 @@ def local_to_frame_points(
 
 def tracking_bounds(
     local_roi_points: np.ndarray,
-    confidences: np.ndarray,
-    threshold: float,
+    point_confidences: np.ndarray,
+    class_ids: np.ndarray,
+    box_confidences: np.ndarray,
+    class_confidences: dict[str, float],
+    point_threshold: float,
     roi_shape: tuple[int, int],
 ) -> tuple[int, int, int, int] | None:
     height, width = roi_shape
     usable = [
         (float(point[0]), float(point[1]))
-        for point, confidence in zip(local_roi_points, confidences, strict=True)
-        if float(confidence) >= threshold
+        for point, point_confidence, class_id, box_confidence in zip(
+            local_roi_points,
+            point_confidences,
+            class_ids,
+            box_confidences,
+            strict=True,
+        )
+        if 0 <= int(class_id) < len(CLASS_NAMES)
+        and float(box_confidence)
+        >= independent_pose_class_threshold(CLASS_NAMES[int(class_id)], class_confidences)
+        and float(point_confidence) >= point_threshold
         and np.isfinite(point).all()
         and 0 <= float(point[0]) < width
         and 0 <= float(point[1]) < height
@@ -211,7 +232,8 @@ def draw_pose(
     point_confidences: np.ndarray,
     class_ids: np.ndarray,
     box_confidences: np.ndarray,
-    threshold: float,
+    point_threshold: float,
+    class_confidences: dict[str, float],
     show_labels: bool,
     show_confidences: bool,
 ) -> tuple[np.ndarray, int]:
@@ -225,12 +247,14 @@ def draw_pose(
         box_confidences,
         strict=True,
     ):
-        if float(point_confidence) < threshold:
-            continue
         x, y = np.round(point).astype(np.int32)
         if not (0 <= x < output.shape[1] and 0 <= y < output.shape[0]):
             continue
         if not 0 <= int(class_id) < len(CLASS_NAMES):
+            continue
+        class_name = CLASS_NAMES[int(class_id)]
+        class_threshold = independent_pose_class_threshold(class_name, class_confidences)
+        if float(box_confidence) < class_threshold or float(point_confidence) < point_threshold:
             continue
         class_index = per_class_index[int(class_id)]
         per_class_index[int(class_id)] += 1
@@ -238,7 +262,7 @@ def draw_pose(
         radius = max(1, round(min(output.shape[:2]) / 128.0 * 0.8))
         cv2.circle(output, (int(x), int(y)), radius, color, -1, cv2.LINE_AA)
         if show_labels:
-            label = f"{CLASS_NAMES[int(class_id)]}:{class_index}"
+            label = f"{class_name}:{class_index}"
             if show_confidences:
                 label += f" {float(point_confidence):.2f}/{float(box_confidence):.2f}"
             draw_label(output, label, (int(x) + radius + 3, int(y) - 5), color)
@@ -297,9 +321,14 @@ def render_frame(
 
     model_roi = resize_to_square(roi, args.view_size)
     predict_kwargs = {} if args.device is None else {"device": args.device}
+    pose_inference_conf = (
+        args.pose_conf
+        if args.pose_conf is not None
+        else min(args.pose_class_conf.values())
+    )
     results = pose_model.predict(
         source=model_roi,
-        conf=args.pose_conf,
+        conf=pose_inference_conf,
         imgsz=args.imgsz,
         max_det=args.max_det,
         verbose=False,
@@ -323,6 +352,7 @@ def render_frame(
         class_ids,
         box_confidences,
         args.keypoint_conf,
+        args.pose_class_conf,
         args.show_labels,
         args.show_confidences,
     )
@@ -334,6 +364,9 @@ def render_frame(
         tracking_bounds(
             local_roi_points,
             point_confidences,
+            class_ids,
+            box_confidences,
+            args.pose_class_conf,
             args.track_conf,
             roi.shape[:2],
         ),
@@ -371,7 +404,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=None, help="Ultralytics device, for example cpu, mps, or 0.")
     parser.add_argument("--bbox-conf", type=float, default=0.25)
     parser.add_argument("--bbox-imgsz", type=int, default=640)
-    parser.add_argument("--pose-conf", type=float, default=0.001)
+    parser.add_argument(
+        "--pose-conf",
+        type=float,
+        default=None,
+        help="Global model pre-filter; defaults to the lowest per-class threshold.",
+    )
+    parser.add_argument(
+        "--pose-class-conf",
+        type=parse_independent_pose_class_confidences,
+        default=dict(DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES),
+        help=(
+            "Per-class boxes.conf thresholds as class=value pairs, for example "
+            "corner=0.25,corner-edge=0.30,corner-edge-center=0.25."
+        ),
+    )
     parser.add_argument(
         "--keypoint-conf",
         "--min-keypoint-conf",
@@ -392,6 +439,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--show-labels", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--show-confidences", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--show-status", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--show-fps", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save", type=Path, help="Output image path, or one frame with --once.")
     parser.add_argument("--save-video", type=Path, help="Output path for rendered video.")
     parser.add_argument("--once", action="store_true", help="Process one video/camera frame and exit.")
@@ -402,6 +450,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    args.device = args.device or default_yolo_device()
+    print(f"Inference device: {args.device}", flush=True)
+    if args.pose_conf is not None and not 0.0 <= args.pose_conf <= 1.0:
+        raise SystemExit("--pose-conf must be in [0, 1]")
+    if args.pose_conf is not None and args.pose_conf > min(args.pose_class_conf.values()):
+        raise SystemExit("--pose-conf cannot exceed the lowest --pose-class-conf threshold")
     if not args.model.is_file():
         raise SystemExit(f"Could not find independent pose model: {args.model}")
     if not args.bbox_model.is_file():
@@ -413,6 +467,7 @@ def main() -> int:
         model_name=str(args.bbox_model),
         confidence_threshold=args.bbox_conf,
         image_size=args.bbox_imgsz,
+        device=args.device,
     )
     pose_model = YOLO(str(args.model))
     source = parse_source(args.source)
@@ -446,6 +501,7 @@ def main() -> int:
         raise SystemExit(f"Could not open source: {source}")
     writer = None
     previous = perf_counter()
+    smoothed_fps = None
     try:
         while True:
             ok, frame = capture.read()
@@ -459,10 +515,25 @@ def main() -> int:
                 args,
             )
             now = perf_counter()
-            fps = 1.0 / max(now - previous, 1e-6)
+            instant_fps = 1.0 / max(now - previous, 1e-6)
             previous = now
-            if args.show_status:
-                cv2.putText(rendered, f"FPS {fps:.1f}", (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (40, 220, 40), 1, cv2.LINE_AA)
+            smoothed_fps = (
+                instant_fps
+                if smoothed_fps is None
+                else 0.9 * smoothed_fps + 0.1 * instant_fps
+            )
+            if args.show_fps:
+                fps_y = 44 if args.show_status else 22
+                cv2.putText(
+                    rendered,
+                    f"FPS {smoothed_fps:.1f}",
+                    (8, fps_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (40, 220, 40),
+                    1,
+                    cv2.LINE_AA,
+                )
             if args.save_video:
                 if writer is None:
                     writer = create_video_writer(args.save_video, rendered, float(capture.get(cv2.CAP_PROP_FPS)))
