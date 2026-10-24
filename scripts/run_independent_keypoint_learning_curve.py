@@ -309,7 +309,7 @@ def train_fraction(
         data=str(data_yaml),
         split="val",
         imgsz=args.imgsz,
-        batch=args.batch,
+        batch=args.val_batch,
         device=args.device,
         workers=args.workers,
         plots=True,
@@ -353,6 +353,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", type=int, default=256)
     parser.add_argument("--batch", type=int, default=-1)
+    parser.add_argument(
+        "--val-batch",
+        type=int,
+        default=16,
+        help="Positive validation batch size; training --batch may use -1 for auto-sizing.",
+    )
     parser.add_argument("--device", default="0", help="NVIDIA GPU index, e.g. 0 or 0,1; use cpu for CPU.")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--patience", type=int, default=25)
@@ -370,6 +376,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.val_batch <= 0:
+        raise SystemExit("--val-batch must be a positive integer")
     source_dirs = [
         source_dir
         for group in (args.source_dir_groups or [[DEFAULT_SOURCE_DIR]])
@@ -395,6 +403,7 @@ def main() -> int:
         "device": args.device,
         "epochs": args.epochs,
         "batch": args.batch,
+        "val_batch": args.val_batch,
         "workers": args.workers,
         "input_summary": input_summary,
         "train_images": len(train_pairs),
