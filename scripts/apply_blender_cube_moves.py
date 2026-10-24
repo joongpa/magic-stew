@@ -6471,7 +6471,10 @@ def center_keypoint_specs() -> list[dict[str, object]]:
     return specs
 
 
-def cube_keypoint_specs_from_corners_and_centers() -> list[dict[str, object]]:
+def cube_keypoint_specs_from_corners_and_centers(
+    layer_state: dict[str, object] | None = None,
+    cube_pose: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
     """Return the independent intersection-point candidates.
 
     There are 8 corner points, 24 corner-edge points owned by edge cubies,
@@ -6486,7 +6489,184 @@ def cube_keypoint_specs_from_corners_and_centers() -> list[dict[str, object]]:
     expected_count = 8 + 24 + 24
     if len(specs) != expected_count:
         raise ValueError(f"Expected {expected_count} independent keypoints, got {len(specs)}")
-    return specs
+    return add_partial_turn_intersection_specs(specs, layer_state, cube_pose)
+
+
+def _partial_turn_layers(
+    layer_state: dict[str, object] | None,
+) -> list[tuple[str, float, float, set[str]]]:
+    """Return the partial-turn operations recorded in a layer state.
+
+    The object lists are captured after each turn is applied.  Keeping the
+    operations in application order lets the intersection-label helper undo
+    them in reverse order, including for the two overlapping layers in a
+    corner-cut sample.
+    """
+    if not isinstance(layer_state, dict):
+        return []
+    if layer_state.get("mode") not in {"mid_turn", "corner_cut"}:
+        return []
+
+    operations: list[tuple[str, float, float, set[str]]] = []
+    raw_operations = [
+        ("face", "angle_degrees", "direction", "objects"),
+    ]
+    if layer_state.get("mode") == "corner_cut":
+        raw_operations.append(
+            ("adjacent_face", "adjacent_angle_degrees", "adjacent_direction", "adjacent_objects")
+        )
+    for face_key, angle_key, direction_key, objects_key in raw_operations:
+        face = layer_state.get(face_key)
+        angle = layer_state.get(angle_key)
+        direction = layer_state.get(direction_key, 1.0)
+        object_names = layer_state.get(objects_key)
+        if not isinstance(face, str) or face not in face_specs():
+            continue
+        if not isinstance(angle, (int, float)):
+            continue
+        if not isinstance(direction, (int, float)):
+            direction = 1.0
+        if not isinstance(object_names, list):
+            continue
+        operations.append(
+            (
+                face,
+                float(angle),
+                float(direction),
+                {name for name in object_names if isinstance(name, str)},
+            )
+        )
+    return operations
+
+
+def _rotate_partial_turn_geometry(
+    point: Vector,
+    normals: list[Vector],
+    face: str,
+    angle: float,
+    direction: float,
+    cube_to_world: Matrix,
+    inverse: bool = False,
+) -> tuple[Vector, list[Vector]]:
+    """Rotate a point and its face normals around the cube's turn axis."""
+    pivot = cube_to_world.translation.copy()
+    axis = (cube_to_world.to_3x3() @ face_specs()[face]).normalized()
+    signed_angle = -direction * angle if inverse else direction * angle
+    rotation = Quaternion(axis, math.radians(signed_angle))
+    return (
+        pivot + rotation @ (point - pivot),
+        [rotation @ normal for normal in normals],
+    )
+
+
+def _point_on_partial_turn_seam(
+    point: Vector,
+    face: str,
+    cube_to_local: Matrix,
+    tolerance: float = 1e-4,
+) -> bool:
+    """Return whether a point lies on the inner boundary of a turned layer."""
+    local_point = cube_to_local @ point
+    turn_axis = face_specs()[face]
+    # ``face_specs`` stores signed unit normals.  The boundary is always 0.5
+    # in the outward-normal direction, so use the signed dot product directly.
+    expected_coordinate = 0.5
+    signed_coordinate = local_point.dot(turn_axis)
+    return abs(signed_coordinate - expected_coordinate) <= tolerance
+
+
+def add_partial_turn_intersection_specs(
+    specs: list[dict[str, object]],
+    layer_state: dict[str, object] | None,
+    cube_pose: dict[str, object] | None,
+) -> list[dict[str, object]]:
+    """Add only the edge/center intersections on a partial-turn seam.
+
+    The seam is the inner boundary plane of the turning layer: coordinate
+    ``+0.5`` in the selected outward-face direction.  A seam crossing on an
+    adjacent outer face has two center-sticker points and two edge-sticker
+    points.  Only those points receive a turned-side counterpart; all other
+    non-corner points remain singletons.  The ordinary aligned path retains
+    its original 56 candidates.
+    """
+    operations = _partial_turn_layers(layer_state)
+    if not operations or not isinstance(cube_pose, dict):
+        return specs
+    transform_rows = cube_pose.get("transform")
+    if not isinstance(transform_rows, list):
+        return specs
+
+    cube_to_world = matrix_from_rows(transform_rows)
+    cube_to_local = cube_to_world.inverted()
+
+    augmented = list(specs)
+    for spec in specs:
+        if spec.get("source_piece_type") not in {"edge", "center"}:
+            continue
+        source_object = spec.get("source_object")
+        point = spec.get("point")
+        normals = spec.get("normals")
+        if not isinstance(source_object, str) or not isinstance(point, Vector):
+            continue
+        if not isinstance(normals, list) or not all(isinstance(normal, Vector) for normal in normals):
+            continue
+
+        # The recorded point is in the final scene state.  For each seam, undo
+        # only later operations that affect this source cubie, test the point
+        # in that operation's pre-turn state, then reapply the later motions
+        # to the virtual turned-side counterpart.
+        for operation_index, (face, angle, direction, object_names) in enumerate(operations):
+            if source_object in object_names or abs(angle) <= 1e-8:
+                continue
+
+            seam_point = point.copy()
+            seam_normals = [normal.copy() for normal in normals]
+            later_operations = operations[operation_index + 1:]
+            for later_face, later_angle, later_direction, later_objects in reversed(later_operations):
+                if source_object not in later_objects:
+                    continue
+                seam_point, seam_normals = _rotate_partial_turn_geometry(
+                    seam_point,
+                    seam_normals,
+                    later_face,
+                    later_angle,
+                    later_direction,
+                    cube_to_world,
+                    inverse=True,
+                )
+
+            if not _point_on_partial_turn_seam(seam_point, face, cube_to_local):
+                continue
+
+            intersection_point, intersection_normals = _rotate_partial_turn_geometry(
+                seam_point,
+                seam_normals,
+                face,
+                angle,
+                direction,
+                cube_to_world,
+            )
+            for later_face, later_angle, later_direction, later_objects in later_operations:
+                if source_object not in later_objects:
+                    continue
+                intersection_point, intersection_normals = _rotate_partial_turn_geometry(
+                    intersection_point,
+                    intersection_normals,
+                    later_face,
+                    later_angle,
+                    later_direction,
+                    cube_to_world,
+                )
+
+            augmented.append({
+                **spec,
+                "name": f"{spec['name']}:partial_turn_seam:{face}",
+                "point": intersection_point,
+                "normals": intersection_normals,
+                "intersection_source": "partial_turn_seam",
+                "intersection_face": face,
+            })
+    return augmented
 
 
 def ordered_cube_keypoint_specs() -> list[dict[str, object]]:
@@ -7797,6 +7977,8 @@ def render_pose_keypoints(
     image_path: Path | None = None,
     min_plane_angle_degrees: float = INDEPENDENT_FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
     include_occluded_keypoints: bool = INDEPENDENT_INCLUDE_OCCLUDED_KEYPOINTS,
+    layer_state: dict[str, object] | None = None,
+    cube_pose: dict[str, object] | None = None,
 ) -> tuple[list[str], list[dict[str, object]], dict[str, object]]:
     scene = bpy.context.scene
     camera = get_camera()
@@ -7821,7 +8003,10 @@ def render_pose_keypoints(
     bpy.context.view_layer.update()
     projected_by_name: dict[str, tuple[float, float, int]] = {}
     metadata_by_name: dict[str, dict[str, object]] = {}
-    keypoint_specs = cube_keypoint_specs_from_corners_and_centers()
+    keypoint_specs = cube_keypoint_specs_from_corners_and_centers(
+        layer_state=layer_state,
+        cube_pose=cube_pose,
+    )
     candidate_counts = {
         "projected": 0,
         "out_of_frame": 0,
@@ -7924,6 +8109,10 @@ def render_pose_keypoints(
     return lines, pose_objects, {
         "keypoint_shape": [POSE_KEYPOINT_COUNT, 3],
         "source_keypoints": len(keypoint_specs),
+        "base_source_keypoints": 56,
+        "partial_turn_intersection_keypoints": sum(
+            1 for spec in keypoint_specs if spec.get("intersection_source") == "pre_partial_turn"
+        ),
         "visible_hands": sorted(visible_hand_names),
         "candidates": len(keypoint_specs),
         "min_face_plane_angle_degrees": min_plane_angle_degrees,
@@ -8227,6 +8416,12 @@ def generate_dataset(
                         "corner_source": "corner_cubies",
                         "corner_edge_source": "edge_cubies",
                         "corner_edge_center_source": "center_cubies",
+                        "base_source_keypoint_count": 56,
+                        "partial_turn_intersections": (
+                            "For mid-turn and corner-cut samples, only edge and "
+                            "center-sticker intersections on the layer seam receive a "
+                            "turned-side counterpart; corners remain singletons."
+                        ),
                         "min_face_plane_angle_degrees": min_face_plane_angle_degrees,
                         "corner_min_face_plane_angle_degrees": CORNER_FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
                         "include_occluded_keypoints": include_occluded_independent_keypoints,
@@ -8530,6 +8725,8 @@ def generate_dataset(
                         image_path=image_path if mask_mode == MASK_MODE_KEYPOINTS else None,
                         min_plane_angle_degrees=min_face_plane_angle_degrees,
                         include_occluded_keypoints=include_occluded_independent_keypoints,
+                        layer_state=layer_state,
+                        cube_pose=cube_pose,
                     )
                     if pose_label_path is not None:
                         write_yolo_pose(pose_label_path, independent_lines)

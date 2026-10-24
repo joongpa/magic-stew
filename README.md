@@ -219,8 +219,11 @@ The Blender generator writes independent one-keypoint pose objects by default
 when run with `--pose-label-mode independent`. The three pose classes are
 `corner`, `corner-edge`, and `corner-edge-center`, for 56 intersection points
 total. Corner-edge points are attached to the physical edge cubies, corner
-points to corner cubies, and corner-edge-center points to center cubies. Train
-this target with:
+points to corner cubies, and corner-edge-center points to center cubies. Aligned
+cubes retain the original 56-point set. When
+`--enable-mid-turns` produces a partial layer turn, edge and center-sticker
+intersections on the layer seam receive a turned-side counterpart; all other
+points remain singletons and corner points are never duplicated.
 
 ```bash
 .venv/bin/python scripts/train_yolo11n_piece_seg_local.py \
