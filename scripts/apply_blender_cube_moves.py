@@ -222,8 +222,10 @@ WIREFRAME_LINE_COLOR = (0, 255, 255)
 WIREFRAME_LINE_SHADOW_COLOR = (0, 0, 0)
 POSE_SEGMENT_FILL_BASE_WIDTH = 9
 POSE_SEGMENT_OUTLINE_BASE_WIDTH = 2
-POSE_POINT_BASE_RADIUS = 5
-POSE_POINT_OUTLINE_BASE_RADIUS = 7
+# Keep keypoint-mask dots compact so they mark intersections without covering
+# the rendered sticker detail.  Values are scaled from the 256px reference.
+POSE_POINT_BASE_RADIUS = 2
+POSE_POINT_OUTLINE_BASE_RADIUS = 3
 # Display-space RGB samples taken from the flat sticker centers in the six
 # predefined GAN sticker-set images on TheCubicle's product page. These are
 # visual references rather than manufacturer color specifications; the page
@@ -303,6 +305,9 @@ SCRAMBLES_ENABLED = True
 MID_TURN_DEGREES_RANGE = (-45.0, 45.0)
 CORNER_CUT_SMALL_DEGREES_RANGE = (0.0, 10.0)
 CORNER_CUT_ADJACENT_DEGREES_RANGE = (5.0, 45.0)
+# Seam counterparts are only visually useful once the layer has moved beyond
+# the small alignment tolerance used for corner-cut samples.
+PARTIAL_TURN_INTERSECTION_MIN_DEGREES = 10.0
 CUBE_FLOAT_PROBABILITY = 0.55
 CUBE_DESK_NO_HANDS_PROBABILITY = 0.10
 CUBE_HANDS_TABLE_LIFT = 0.35
@@ -6616,7 +6621,10 @@ def add_partial_turn_intersection_specs(
         # in that operation's pre-turn state, then reapply the later motions
         # to the virtual turned-side counterpart.
         for operation_index, (face, angle, direction, object_names) in enumerate(operations):
-            if source_object in object_names or abs(angle) <= 1e-8:
+            if (
+                source_object in object_names
+                or abs(angle) <= PARTIAL_TURN_INTERSECTION_MIN_DEGREES
+            ):
                 continue
 
             seam_point = point.copy()
@@ -8188,7 +8196,9 @@ def write_pose_keypoint_mask(
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if image is None or image.shape[:2] != (height, width):
             raise RuntimeError(f"Could not read rendered image for keypoint mask: {image_path}")
-        output = np.clip(image.astype(np.float32) * 0.5, 0, 255).astype(np.uint8)
+        # Preserve the rendered image at full brightness; the compact colored
+        # dots provide the annotation without dimming the underlying scene.
+        output = image.copy()
     fill_colors = INDEPENDENT_CLASS_MASK_FILL_COLORS
     point_colors = INDEPENDENT_CLASS_MASK_POINT_COLORS
     segment_fill_width = scaled_annotation_size(POSE_SEGMENT_FILL_BASE_WIDTH, width, height)
@@ -8246,10 +8256,9 @@ def write_ordered_keypoint_overlay(
     width: int,
     height: int,
 ) -> None:
-    """Write a half-brightness image with visible ordered keypoints numbered 0-25."""
+    """Write a full-brightness image with visible ordered keypoints numbered 0-25."""
     try:
         import cv2
-        import numpy as np
     except ImportError:
         raise RuntimeError(
             "OpenCV and NumPy are required to write keypoint overlay masks."
@@ -8258,7 +8267,7 @@ def write_ordered_keypoint_overlay(
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image is None or image.shape[:2] != (height, width):
         raise RuntimeError(f"Could not read rendered image for keypoint overlay: {image_path}")
-    output = np.clip(image.astype(np.float32) * 0.5, 0, 255).astype(np.uint8)
+    output = image.copy()
 
     keypoints = ordered_pose_metadata.get("keypoints", [])
     if not isinstance(keypoints, list):
@@ -8420,7 +8429,9 @@ def generate_dataset(
                         "partial_turn_intersections": (
                             "For mid-turn and corner-cut samples, only edge and "
                             "center-sticker intersections on the layer seam receive a "
-                            "turned-side counterpart; corners remain singletons."
+                            "turned-side counterpart once the turn exceeds "
+                            f"{PARTIAL_TURN_INTERSECTION_MIN_DEGREES:g} degrees; "
+                            "corners remain singletons."
                         ),
                         "min_face_plane_angle_degrees": min_face_plane_angle_degrees,
                         "corner_min_face_plane_angle_degrees": CORNER_FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,

@@ -224,6 +224,7 @@ cubes retain the original 56-point set. When
 `--enable-mid-turns` produces a partial layer turn, edge and center-sticker
 intersections on the layer seam receive a turned-side counterpart; all other
 points remain singletons and corner points are never duplicated.
+Seam counterparts begin only once the partial turn exceeds 10°.
 
 ```bash
 .venv/bin/python scripts/train_yolo11n_piece_seg_local.py \
