@@ -210,11 +210,11 @@ def sticker_class_ids(names: object) -> set[int] | None:
     return color_ids or None
 
 
-def predict_sticker_masks(
+def predict_sticker_result(
     model: object,
     model_roi: np.ndarray,
     args: argparse.Namespace,
-) -> tuple[list[np.ndarray], object, np.ndarray] | None:
+) -> object | None:
     predict_kwargs = {} if args.device is None else {"device": args.device}
     results = model.predict(
         source=model_roi,
@@ -224,7 +224,12 @@ def predict_sticker_masks(
         verbose=False,
         **predict_kwargs,
     )
-    result = results[0] if results else None
+    return results[0] if results else None
+
+
+def sticker_masks_from_result(
+    result: object | None,
+) -> tuple[list[np.ndarray], object, np.ndarray] | None:
     if result is None:
         return None
     masks = getattr(result, "masks", None)
@@ -253,6 +258,75 @@ def predict_sticker_masks(
     else:
         keep = list(range(min(len(mask_data), len(class_ids))))
     return [np.asarray(mask_data[index]) >= 0.5 for index in keep], names, class_ids[keep]
+
+
+def predict_sticker_masks(
+    model: object,
+    model_roi: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[list[np.ndarray], object, np.ndarray] | None:
+    return sticker_masks_from_result(predict_sticker_result(model, model_roi, args))
+
+
+def predict_pose_result(
+    model: object,
+    model_roi: np.ndarray,
+    args: argparse.Namespace,
+) -> object | None:
+    predict_kwargs = {} if args.device is None else {"device": args.device}
+    pose_inference_conf = (
+        args.pose_conf
+        if args.pose_conf is not None
+        else min(args.pose_class_conf.values())
+    )
+    results = model.predict(
+        source=model_roi,
+        conf=pose_inference_conf,
+        imgsz=args.imgsz,
+        max_det=args.max_det,
+        verbose=False,
+        **predict_kwargs,
+    )
+    return results[0] if results else None
+
+
+def cuda_stream_device(torch_module: object, device: object) -> object:
+    device_text = str(device)
+    if device_text.startswith("cuda"):
+        return torch_module.device(device_text)
+    if device_text.isdigit():
+        return torch_module.device(f"cuda:{device_text}")
+    return torch_module.device(f"cuda:{torch_module.cuda.current_device()}")
+
+
+def predict_models_parallel_cuda(
+    sticker_seg_model: object | None,
+    pose_model: object,
+    model_roi: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[tuple[list[np.ndarray], object, np.ndarray] | None, object | None]:
+    """Launch segmentation and pose on separate CUDA streams, then synchronize."""
+
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("--parallel-cuda requires a CUDA-enabled PyTorch installation")
+
+    stream_device = cuda_stream_device(torch, args.device)
+    segmentation_stream = torch.cuda.Stream(device=stream_device)
+    pose_stream = torch.cuda.Stream(device=stream_device)
+    with torch.cuda.device(stream_device):
+        with torch.cuda.stream(segmentation_stream):
+            sticker_result = (
+                predict_sticker_result(sticker_seg_model, model_roi, args)
+                if sticker_seg_model is not None and args.run_sticker_segmentation
+                else None
+            )
+        with torch.cuda.stream(pose_stream):
+            pose_result = predict_pose_result(pose_model, model_roi, args)
+        torch.cuda.synchronize(stream_device)
+
+    return sticker_masks_from_result(sticker_result), pose_result
 
 
 def render_sticker_masks(
@@ -472,11 +546,20 @@ def render_frame(
         return draw_context(frame, roi_xyxy, candidate, roi_source, 0, args.show_status), roi_source, 0
 
     model_roi = resize_to_square(roi, args.view_size)
-    sticker_masks = (
-        predict_sticker_masks(sticker_seg_model, model_roi, args)
-        if sticker_seg_model is not None and args.run_sticker_segmentation
-        else None
-    )
+    if args.parallel_cuda:
+        sticker_masks, result = predict_models_parallel_cuda(
+            sticker_seg_model,
+            pose_model,
+            model_roi,
+            args,
+        )
+    else:
+        sticker_masks = (
+            predict_sticker_masks(sticker_seg_model, model_roi, args)
+            if sticker_seg_model is not None and args.run_sticker_segmentation
+            else None
+        )
+        result = predict_pose_result(pose_model, model_roi, args)
     output = render_sticker_masks(
         frame,
         roi_xyxy,
@@ -484,21 +567,6 @@ def render_frame(
         args.sticker_mask_opacity,
         args.sticker_border_thickness,
     )
-    predict_kwargs = {} if args.device is None else {"device": args.device}
-    pose_inference_conf = (
-        args.pose_conf
-        if args.pose_conf is not None
-        else min(args.pose_class_conf.values())
-    )
-    results = pose_model.predict(
-        source=model_roi,
-        conf=pose_inference_conf,
-        imgsz=args.imgsz,
-        max_det=args.max_det,
-        verbose=False,
-        **predict_kwargs,
-    )
-    result = results[0] if results else None
     if result is None:
         roi_tracker.reset()
         return draw_context(output, roi_xyxy, candidate, roi_source, 0, args.show_status), roi_source, 0
@@ -647,6 +715,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the combined segmentation model even when its mask is not displayed.",
     )
     parser.add_argument("--show-sticker-mask", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--parallel-cuda",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Experimental: launch sticker segmentation and pose inference on separate CUDA streams.",
+    )
     parser.add_argument("--roi-padding", type=float, default=0.08)
     parser.add_argument("--roi-tracking-gain", type=float, default=1.4)
     parser.add_argument("--roi-tracking-padding", type=float, default=0.18)
@@ -666,6 +740,8 @@ def main() -> int:
     args = build_parser().parse_args()
     args.device = args.device or default_yolo_device()
     print(f"Inference device: {args.device}", flush=True)
+    if args.parallel_cuda and not (str(args.device).startswith("cuda") or str(args.device).isdigit()):
+        raise SystemExit("--parallel-cuda requires --device cuda, cuda:N, or a CUDA device index")
     if args.pose_conf is not None and not 0.0 <= args.pose_conf <= 1.0:
         raise SystemExit("--pose-conf must be in [0, 1]")
     if args.pose_conf is not None and args.pose_conf > min(args.pose_class_conf.values()):
