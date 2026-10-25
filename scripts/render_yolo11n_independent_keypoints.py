@@ -25,6 +25,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from dataclasses import dataclass, replace
 from itertools import product
@@ -203,6 +204,12 @@ PNP_ASSIGNMENT_TAIL_WEIGHT = 0.25
 # imperfect because of occlusion and mask spill. Express its penalty in a few
 # pixel-equivalent units so keypoint reprojection error remains dominant.
 PNP_STICKER_BOUNDARY_WEIGHT = 6.0
+# Use the intersection of the cube and all sticker masks as a soft support
+# region during layer-turn scoring.  Sticker pixels outside the projected
+# sticker grid are more informative than empty pixels inside that grid, since
+# segmentation can merge adjacent stickers or miss parts of a sticker.
+PNP_STICKER_GRID_SPILLOUT_WEIGHT = 48.0
+PNP_STICKER_GRID_EMPTY_WEIGHT = 0.25
 # Final-solve observations must be close relative to the displayed cube size.
 # This is deliberately expressed as a fraction of the projected cube diameter
 # so the same setting works at different distances from the camera.
@@ -210,6 +217,8 @@ PNP_FINAL_ASSIGNMENT_ERROR_FRACTION = 0.05
 PNP_LAYER_MISALIGNMENT_MIN_DEGREES = -45.0
 PNP_LAYER_MISALIGNMENT_MAX_DEGREES = 45.0
 PNP_LAYER_MISALIGNMENT_STEP_DEGREES = 3.0
+PNP_TURN_DEBUG_CANDIDATE_COUNT = 6
+PNP_TURN_OVERLAY_CANDIDATE_COUNT = 6
 
 
 @dataclass(frozen=True)
@@ -245,8 +254,11 @@ class StickerPnPCandidate:
     assignment_projected_class_ids: np.ndarray | None = None
     assignment_fixed_mask: np.ndarray | None = None
     sticker_contour: np.ndarray | None = None
+    sticker_support_mask: np.ndarray | None = None
     image_size: tuple[int, int] | None = None
     layer_rotations: tuple["CubeLayerRotation", ...] = ()
+    turn_candidate_scores: tuple[tuple[str, float, int, float, float], ...] = ()
+    turn_candidate_debug: tuple["TurnCandidateDebug", ...] = ()
     final_solve_image_points: np.ndarray | None = None
     pre_final_rvec: np.ndarray | None = None
     pre_final_tvec: np.ndarray | None = None
@@ -260,6 +272,37 @@ class CubeLayerRotation:
     side: int
     angle_degrees: float
     layer_count: int = 1
+
+
+@dataclass(frozen=True)
+class TurnCandidateDebug:
+    """Geometry needed to render one ranked layer-turn hypothesis."""
+
+    label: str
+    layer_rotations: tuple[CubeLayerRotation, ...]
+    assignment_projected_points: np.ndarray
+    assignment_object_points: np.ndarray
+    assignment_projected_class_ids: np.ndarray
+
+
+def layer_rotation_debug_label(
+    layer_rotations: tuple[CubeLayerRotation, ...],
+) -> str:
+    """Return a compact label for a tested layer-turn hypothesis."""
+
+    if not layer_rotations:
+        return "none"
+    axis_names = "XYZ"
+    parts = []
+    for rotation in layer_rotations:
+        axis_index = int(rotation.axis)
+        axis = axis_names[axis_index] if axis_index in range(3) else "?"
+        side = "+" if int(rotation.side) > 0 else "-"
+        angle = float(rotation.angle_degrees)
+        width = int(rotation.layer_count)
+        parts.append(f"{axis}{side}{angle:+.0f}w{width}")
+    return "/".join(parts)
+
 
 def parse_source(source: str) -> int | str:
     source = source.strip().strip("\"'").strip()
@@ -1501,6 +1544,40 @@ def sticker_mask_iou(
     return float(intersection / union) if union else 0.0
 
 
+def segmentation_support_mask(
+    local_sticker_masks: list[np.ndarray] | None,
+    local_cube_mask: np.ndarray | None,
+    roi_xyxy: tuple[int, int, int, int],
+    image_size: tuple[int, int],
+) -> np.ndarray | None:
+    """Return the full-frame intersection of cube and sticker segmentation."""
+
+    if local_cube_mask is None or not local_sticker_masks:
+        return None
+    width, height = image_size
+    x1, y1, x2, y2 = roi_xyxy
+    roi_width = max(0, int(x2 - x1))
+    roi_height = max(0, int(y2 - y1))
+    if roi_width == 0 or roi_height == 0 or width <= 0 or height <= 0:
+        return None
+
+    def to_frame(local_mask: np.ndarray) -> np.ndarray:
+        resized = cv2.resize(
+            np.asarray(local_mask, dtype=np.uint8),
+            (roi_width, roi_height),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+        frame_mask = np.zeros((height, width), dtype=bool)
+        frame_mask[y1:y2, x1:x2] = resized
+        return frame_mask
+
+    sticker_union_mask = np.zeros((height, width), dtype=bool)
+    for local_mask in local_sticker_masks:
+        sticker_union_mask |= to_frame(local_mask)
+    cube_frame_mask = to_frame(local_cube_mask)
+    return sticker_union_mask & cube_frame_mask
+
+
 def sticker_boundary_loss(
     candidate: StickerPnPCandidate,
     layer_rotations: tuple["CubeLayerRotation", ...],
@@ -1529,6 +1606,73 @@ def sticker_boundary_loss(
     return max(
         0.0,
         1.0 - sticker_mask_iou(projected_points, contour, image_size),
+    )
+
+
+def projected_sticker_grid_mask(
+    candidate: StickerPnPCandidate,
+    layer_rotations: tuple["CubeLayerRotation", ...],
+) -> np.ndarray | None:
+    """Rasterize the visible 3x3 sticker grid for a layer hypothesis."""
+
+    image_size = candidate.image_size
+    if image_size is None:
+        return None
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        return None
+    try:
+        trial_candidate = replace(candidate, layer_rotations=layer_rotations)
+        projected_faces = projected_cubelet_faces(
+            trial_candidate,
+            candidate.rvec,
+            candidate.tvec,
+        )
+    except (cv2.error, ValueError):
+        return None
+    grid = np.zeros((height, width), dtype=np.uint8)
+    for _depth, projected_face, _misaligned in projected_faces:
+        polygon = np.asarray(projected_face, dtype=np.float32).reshape(-1, 2)
+        if len(polygon) < 3 or not np.isfinite(polygon).all():
+            continue
+        cv2.fillConvexPoly(
+            grid,
+            np.round(polygon).astype(np.int32),
+            1,
+        )
+    return grid.astype(bool)
+
+
+def sticker_grid_mask_loss(
+    candidate: StickerPnPCandidate,
+    layer_rotations: tuple["CubeLayerRotation", ...],
+) -> float:
+    """Score how well sticker segmentation fits inside the projected grid.
+
+    The observed support is deliberately asymmetric: sticker pixels outside
+    the projected cube are expensive, while empty projected cube area is only
+    a weak penalty because masks may be incomplete or merged.
+    """
+
+    support = candidate.sticker_support_mask
+    if support is None or candidate.image_size is None:
+        return 0.0
+    support = np.asarray(support, dtype=bool)
+    width, height = candidate.image_size
+    if support.shape != (height, width):
+        return 0.0
+    grid = projected_sticker_grid_mask(candidate, layer_rotations)
+    if grid is None or grid.shape != support.shape:
+        return 0.0
+    support_area = int(np.count_nonzero(support))
+    grid_area = int(np.count_nonzero(grid))
+    if support_area == 0 or grid_area == 0:
+        return 0.0
+    spillout_fraction = float(np.count_nonzero(support & ~grid)) / support_area
+    empty_fraction = float(np.count_nonzero(grid & ~support)) / grid_area
+    return (
+        PNP_STICKER_GRID_SPILLOUT_WEIGHT * spillout_fraction
+        + PNP_STICKER_GRID_EMPTY_WEIGHT * empty_fraction
     )
 
 
@@ -1877,8 +2021,15 @@ def cube_layer_mask(
 
     points = np.asarray(object_points, dtype=np.float64).reshape(-1, 3)
     layer_count = int(np.clip(layer_count, 1, 3))
+    # A surface lattice plane on the interface between two cubie layers is
+    # shared geometrically, but it must belong to the stationary side for a
+    # one-layer turn.  Therefore a one-layer turn selects only the outermost
+    # lattice plane; a two-layer turn selects the outer two planes.  This is
+    # one lattice index farther out than the cubie-center boundary.
+    if layer_count >= 3:
+        return np.ones(len(points), dtype=bool)
     inner_layer_coordinate = (
-        CUBE_HALF_SIZE_MM - layer_count * CUBE_LAYER_SIZE_MM
+        CUBE_HALF_SIZE_MM - (layer_count - 1) * CUBE_LAYER_SIZE_MM
     )
     if side > 0:
         return points[:, axis] >= inner_layer_coordinate - 1e-4
@@ -2123,6 +2274,7 @@ def recover_misaligned_cube_layers(
             candidate,
             trial_rotations,
         )
+        robust_error += sticker_grid_mask_loss(candidate, trial_rotations)
         mean_error = float(np.mean(valid_distances))
         p90_error = float(np.percentile(valid_distances, 90))
         rank = (-float(inlier_count), robust_error, p90_error, mean_error)
@@ -2165,6 +2317,7 @@ def recover_misaligned_cube_layers(
                         )
                     )
 
+    ranked_trials = []
     for trial_rotations in hypotheses:
         # A sticker point on the layer being tested cannot remain fixed: the
         # sticker itself moves with that layer.  Release only those anchor
@@ -2219,6 +2372,21 @@ def recover_misaligned_cube_layers(
             trial_assignment_classes,
             trial_rotations,
         )
+        ranked_trials.append(
+            {
+                "is_baseline": trial_rotations == base_rotations,
+                "rank": rank,
+                "label": layer_rotation_debug_label(trial_rotations),
+                "robust_error": robust_error,
+                "inlier_count": inlier_count,
+                "p90_error": float(rank[2]),
+                "mean_error": float(rank[3]),
+                "layer_rotations": trial_rotations,
+                "assignment_projected_points": trial_assignment_projected.copy(),
+                "assignment_object_points": trial_assignment_objects.copy(),
+                "assignment_projected_class_ids": trial_assignment_classes.copy(),
+            }
+        )
         if best is None or rank < best[0]:
             best = (
                 rank,
@@ -2230,8 +2398,47 @@ def recover_misaligned_cube_layers(
                 trial_assignment_classes,
             )
 
+    ordered_trials = sorted(ranked_trials, key=lambda trial: trial["rank"])
+    baseline_trial = next(
+        (trial for trial in ordered_trials if trial["is_baseline"]),
+        None,
+    )
+    debug_trials = []
+    if baseline_trial is not None:
+        debug_trials.append(baseline_trial)
+    debug_trials.extend(
+        trial
+        for trial in ordered_trials
+        if trial is not baseline_trial
+    )
+    debug_trials = debug_trials[:PNP_TURN_DEBUG_CANDIDATE_COUNT]
+    turn_candidate_scores = tuple(
+        (
+            trial["label"],
+            trial["robust_error"],
+            trial["inlier_count"],
+            trial["p90_error"],
+            trial["mean_error"],
+        )
+        for trial in debug_trials
+    )
+    turn_candidate_debug = tuple(
+        TurnCandidateDebug(
+            label=trial["label"],
+            layer_rotations=trial["layer_rotations"],
+            assignment_projected_points=trial["assignment_projected_points"],
+            assignment_object_points=trial["assignment_object_points"],
+            assignment_projected_class_ids=trial["assignment_projected_class_ids"],
+        )
+        for trial in debug_trials
+    )
+
     if best is None:
-        return candidate
+        return replace(
+            candidate,
+            turn_candidate_scores=turn_candidate_scores,
+            turn_candidate_debug=turn_candidate_debug,
+        )
     (
         _rank,
         robust_error,
@@ -2248,6 +2455,8 @@ def recover_misaligned_cube_layers(
         assignment_projected_class_ids=best_projected_classes,
         overall_reprojection_error=robust_error,
         layer_rotations=best_rotations,
+        turn_candidate_scores=turn_candidate_scores,
+        turn_candidate_debug=turn_candidate_debug,
     )
 
 
@@ -2422,6 +2631,7 @@ def best_sticker_pnp_candidate(
     local_masks: list[np.ndarray] | None = None,
     roi_xyxy: tuple[int, int, int, int] | None = None,
     scoring_points: np.ndarray | None = None,
+    sticker_support_mask: np.ndarray | None = None,
 ) -> StickerPnPCandidate | None:
     """Solve prioritized stickers and choose the best full-cube pose.
 
@@ -2482,11 +2692,17 @@ def best_sticker_pnp_candidate(
 
     candidate = solve_matches(four_point_matches)
     if candidate is not None:
-        return candidate
+        return (
+            candidate
+            if sticker_support_mask is None
+            else replace(candidate, sticker_support_mask=sticker_support_mask)
+        )
     candidate = solve_matches(
         tuple(match for match in valid_matches if len(match.keypoint_indices) == 3)
     )
-    return candidate
+    if candidate is None or sticker_support_mask is None:
+        return candidate
+    return replace(candidate, sticker_support_mask=sticker_support_mask)
 
 
 def predict_pose_result(
@@ -2959,11 +3175,102 @@ def draw_projected_cube_pose(
     return True
 
 
+def append_turn_candidate_log(
+    path: Path,
+    candidate: StickerPnPCandidate,
+    frame_index: int | None,
+) -> None:
+    """Append the tested layer-turn scores for one rendered frame as JSONL."""
+
+    scores = getattr(candidate, "turn_candidate_scores", ())
+    if not scores:
+        return
+    record = {
+        "frame_index": frame_index,
+        "selected": layer_rotation_debug_label(candidate.layer_rotations),
+        "candidates": [
+            {
+                "label": label,
+                "robust_score": float(robust_error),
+                "inlier_count": int(inlier_count),
+                "p90_error": float(p90_error),
+                "mean_error": float(mean_error),
+            }
+            for label, robust_error, inlier_count, p90_error, mean_error in scores
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as log_file:
+        json.dump(record, log_file, separators=(",", ":"))
+        log_file.write("\n")
+
+
+def save_turn_candidate_images(
+    base_image: np.ndarray,
+    candidate: StickerPnPCandidate,
+    output_dir: Path,
+    frame_index: int | None,
+) -> None:
+    """Save annotated images for the ranked layer-turn hypotheses."""
+
+    debug_candidates = getattr(candidate, "turn_candidate_debug", ())
+    if not debug_candidates:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frame_label = "unknown" if frame_index is None else f"{frame_index:06d}"
+    for rank, debug_candidate in enumerate(debug_candidates):
+        rendered_candidate = replace(
+            candidate,
+            layer_rotations=debug_candidate.layer_rotations,
+            assignment_projected_points=debug_candidate.assignment_projected_points,
+            assignment_object_points=debug_candidate.assignment_object_points,
+            assignment_projected_class_ids=debug_candidate.assignment_projected_class_ids,
+            turn_candidate_scores=(),
+            turn_candidate_debug=(),
+            final_solve_image_points=None,
+            pre_final_rvec=None,
+            pre_final_tvec=None,
+        )
+        rendered = draw_sticker_pnp_candidate(
+            base_image,
+            rendered_candidate,
+            show_status=False,
+            show_final_pose=False,
+        )
+        if rank < len(candidate.turn_candidate_scores):
+            _label, robust_error, inlier_count, p90_error, mean_error = (
+                candidate.turn_candidate_scores[rank]
+            )
+            cv2.putText(
+                rendered,
+                (
+                    f"turn rank {rank} {debug_candidate.label} | "
+                    f"in {inlier_count} | score {robust_error:.1f} | "
+                    f"p90 {p90_error:.1f} | mean {mean_error:.1f}"
+                ),
+                (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                PNP_ASSIGNMENT_COLOR_BGR,
+                1,
+                cv2.LINE_AA,
+            )
+        safe_label = "".join(
+            character if character.isalnum() else "_"
+            for character in debug_candidate.label
+        ).strip("_")
+        image_path = output_dir / f"frame_{frame_label}_rank_{rank:02d}_{safe_label}.png"
+        cv2.imwrite(str(image_path), rendered)
+
+
 def draw_sticker_pnp_candidate(
     image: np.ndarray,
     candidate: StickerPnPCandidate | None,
     show_status: bool,
     show_final_pose: bool = False,
+    turn_candidate_log: Path | None = None,
+    turn_candidate_image_dir: Path | None = None,
+    frame_index: int | None = None,
 ) -> np.ndarray:
     """Draw the canonical cube pose and selected sticker reprojection."""
 
@@ -3098,6 +3405,7 @@ def draw_sticker_pnp_candidate(
                 cv2.LINE_AA,
             )
 
+    turn_candidate_scores = getattr(candidate, "turn_candidate_scores", ())
     if show_status:
         pose_label = "final" if has_final_pose else "candidate"
         label = (
@@ -3133,6 +3441,40 @@ def draw_sticker_pnp_candidate(
             PNP_ASSIGNMENT_COLOR_BGR,
             1,
             cv2.LINE_AA,
+        )
+    # Turn diagnostics are independent of the general status overlay.  The
+    # latter is off by default, but the turn ranking is useful while debugging
+    # PnP behavior and should remain visible whenever a turn search ran.
+    if turn_candidate_scores:
+        selected_turn_label = layer_rotation_debug_label(candidate.layer_rotations)
+        turn_y = 110 if show_status else 66
+        for index, (label, robust_error, inlier_count, p90_error, mean_error) in enumerate(
+            turn_candidate_scores[:PNP_TURN_OVERLAY_CANDIDATE_COUNT]
+        ):
+            selected_marker = "*" if label == selected_turn_label else " "
+            turn_label = (
+                f"turn {selected_marker}{label} | in {inlier_count} | "
+                f"score {robust_error:.1f} | p90 {p90_error:.1f} | "
+                f"mean {mean_error:.1f}"
+            )
+            cv2.putText(
+                output,
+                turn_label,
+                (8, turn_y + 16 * index),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.40,
+                PNP_ASSIGNMENT_COLOR_BGR,
+                1,
+                cv2.LINE_AA,
+            )
+    if turn_candidate_log is not None:
+        append_turn_candidate_log(turn_candidate_log, candidate, frame_index)
+    if turn_candidate_image_dir is not None:
+        save_turn_candidate_images(
+            image,
+            candidate,
+            turn_candidate_image_dir,
+            frame_index,
         )
     return output
 
@@ -3170,6 +3512,9 @@ def render_frame(
     roi_tracker: RoiTracker,
     args: argparse.Namespace,
     sticker_seg_model: object | None = None,
+    turn_candidate_log: Path | None = None,
+    turn_candidate_image_dir: Path | None = None,
+    frame_index: int | None = None,
 ) -> tuple[np.ndarray, str, int]:
     height, width = frame.shape[:2]
     roi_xyxy, candidate, roi_source = shared_roi_for_frame(
@@ -3266,6 +3611,14 @@ def render_frame(
     )
     output = draw_context(output, roi_xyxy, candidate, roi_source, point_count, args.show_status)
     if args.show_pnp:
+        sticker_support_mask = None
+        if sticker_masks is not None and len(sticker_masks) == 4:
+            sticker_support_mask = segmentation_support_mask(
+                sticker_masks[0],
+                sticker_masks[3],
+                roi_xyxy,
+                (width, height),
+            )
         pnp_candidate = best_sticker_pnp_candidate(
             frame_points,
             class_ids,
@@ -3275,6 +3628,7 @@ def render_frame(
             sticker_masks[0] if sticker_masks is not None else None,
             roi_xyxy,
             frame_points,
+            sticker_support_mask,
         )
         if pnp_candidate is not None:
             pnp_candidate = solve_pnp_from_low_error_assignments(pnp_candidate)
@@ -3283,6 +3637,9 @@ def render_frame(
             pnp_candidate,
             args.show_status,
             getattr(args, "show_final_pnp_pose", False),
+            turn_candidate_log,
+            turn_candidate_image_dir,
+            frame_index,
         )
     # Match the live pipeline: keep using this ROI until the independent pose
     # model fails, then fall back to the bbox detector on the next frame.
@@ -3433,6 +3790,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Draw the final low-error solvePnP pose over the candidate pose.",
     )
     parser.add_argument(
+        "--turn-candidate-log",
+        type=Path,
+        default=None,
+        help="Output directory for turn scores and images (disabled by default).",
+    )
+    parser.add_argument(
+        "--turn-candidate-images",
+        type=Path,
+        default=None,
+        help="Directory for annotated candidate images (default: same directory as the log).",
+    )
+    parser.add_argument(
         "--pnp-assignment-mode",
         choices=("closest", "class-aware"),
         default=PNP_ASSIGNMENT_MODE,
@@ -3458,6 +3827,17 @@ def main() -> int:
     global PNP_ASSIGNMENT_MODE
     PNP_ASSIGNMENT_MODE = args.pnp_assignment_mode
     args.device = args.device or default_yolo_device()
+    if args.turn_candidate_log is not None:
+        turn_candidate_output_dir = args.turn_candidate_log
+        args.turn_candidate_log = turn_candidate_output_dir / "turn_candidate_scores.jsonl"
+        if args.turn_candidate_images is None:
+            args.turn_candidate_images = turn_candidate_output_dir
+        turn_candidate_output_dir.mkdir(parents=True, exist_ok=True)
+        args.turn_candidate_log.write_text("", encoding="utf-8")
+        print(f"Turn candidate log: {args.turn_candidate_log}", flush=True)
+    if args.turn_candidate_images is not None:
+        args.turn_candidate_images.mkdir(parents=True, exist_ok=True)
+        print(f"Turn candidate images: {args.turn_candidate_images}", flush=True)
     print(f"Inference device: {args.device}", flush=True)
     if args.parallel_cuda and not (str(args.device).startswith("cuda") or str(args.device).isdigit()):
         raise SystemExit("--parallel-cuda requires --device cuda, cuda:N, or a CUDA device index")
@@ -3506,6 +3886,9 @@ def main() -> int:
             roi_tracker,
             args,
             sticker_seg_model,
+            args.turn_candidate_log,
+            args.turn_candidate_images,
+            0,
         )
         if args.save:
             args.save.parent.mkdir(parents=True, exist_ok=True)
@@ -3528,6 +3911,7 @@ def main() -> int:
     previous_loop_end = perf_counter()
     smoothed_loop_fps = None
     smoothed_render_fps = None
+    frame_index = 0
     try:
         while True:
             ok, frame = capture.read()
@@ -3549,7 +3933,11 @@ def main() -> int:
                 roi_tracker,
                 args,
                 sticker_seg_model,
+                args.turn_candidate_log,
+                args.turn_candidate_images,
+                frame_index,
             )
+            frame_index += 1
             render_end = perf_counter()
             render_fps = 1.0 / max(render_end - render_start, 1e-6)
             smoothed_render_fps = (

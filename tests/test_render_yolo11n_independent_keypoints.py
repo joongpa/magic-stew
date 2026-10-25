@@ -146,6 +146,24 @@ def test_sticker_mask_parser_preserves_the_model_cube_mask():
     np.testing.assert_array_equal(parsed_cube_mask, cube_mask.astype(bool))
 
 
+def test_segmentation_support_mask_intersects_stickers_with_cube():
+    sticker_mask = np.zeros((8, 8), dtype=bool)
+    sticker_mask[2:6, 2:6] = True
+    cube_mask = np.zeros((8, 8), dtype=bool)
+    cube_mask[4:7, 4:7] = True
+
+    support = render_script.segmentation_support_mask(
+        [sticker_mask],
+        cube_mask,
+        (0, 0, 8, 8),
+        (8, 8),
+    )
+
+    expected = sticker_mask & cube_mask
+    assert support is not None
+    np.testing.assert_array_equal(support, expected)
+
+
 def test_solve_sticker_pnp_uses_canonical_corner_correspondence():
     object_points = render_script.canonical_sticker_object_points("corner")
     camera_matrix = render_script.default_camera_matrix((256, 256), 1.2)
@@ -224,6 +242,17 @@ def test_cube_layer_rotation_changes_only_the_selected_face_layer():
         rotated[mask][:, 2],
         np.full(int(mask.sum()), render_script.CUBE_HALF_SIZE_MM),
     )
+
+
+def test_single_layer_mask_leaves_the_shared_seam_stationary():
+    points = render_script.CUBE_LATTICE_OBJECT_POINTS_MM
+    seam_coordinate = render_script.CUBE_HALF_SIZE_MM - render_script.CUBE_LAYER_SIZE_MM
+
+    positive_mask = render_script.cube_layer_mask(points, axis=2, side=1)
+    negative_mask = render_script.cube_layer_mask(points, axis=2, side=-1)
+
+    assert not np.any(positive_mask[np.isclose(points[:, 2], seam_coordinate)])
+    assert not np.any(negative_mask[np.isclose(points[:, 2], -seam_coordinate)])
 
 
 def test_recover_misaligned_layer_updates_assignment_geometry():
