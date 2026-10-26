@@ -363,6 +363,10 @@ HAND_FIXED_SKIN_COLOR = (0.75, 0.45, 0.30, 1.0)
 # of moving into its top/side geometry.  This is in the cube-local frame.
 HAND_X_OFFSET_RANGE = (-0.1, 0.1)
 HAND_Z_OFFSET_RANGE = (-0.5, 0.5)
+# The imported hand asset is authored facing the opposite direction from the
+# solve station. Keep this fixed asset-to-solver orientation separate from
+# pose-local quarter-turn randomization.
+HAND_SOLVER_FACING_ROTATION_DEGREES = 180.0
 HAND_ORIGIN_X_ROTATION_DEGREES = (-90.0, 0.0, 90.0)
 HAND_POSES_WITHOUT_ORIGIN_X_ROTATION = (
     "HandPose.StandardHold",
@@ -4387,11 +4391,16 @@ def randomize_hands(
             Vector((1.0, 0.0, 0.0)),
             math.radians(x_rotation_degrees),
         ).to_matrix().to_4x4()
+        solver_facing_rotation = Quaternion(
+            Vector((0.0, 0.0, 1.0)),
+            math.radians(HAND_SOLVER_FACING_ROTATION_DEGREES),
+        ).to_matrix().to_4x4()
         # The nudge is authored in the same local frame as the pose. Apply
         # the pose rotation first so a +/-90-degree pose rotates the nudge
         # with the hand instead of leaving it in cube/world X-Z axes.
         local_matrix = (
-            hand_rotation
+            solver_facing_rotation
+            @ hand_rotation
             @ Matrix.Translation(location_offset)
             @ base_matrix
         )
@@ -4410,6 +4419,7 @@ def randomize_hands(
             "x_offset": x_offset,
             "z_offset": z_offset,
             "x_rotation_degrees": x_rotation_degrees,
+            "solver_facing_rotation_degrees": HAND_SOLVER_FACING_ROTATION_DEGREES,
             "randomization_enabled": HAND_RANDOMIZATION_ENABLED,
             "location": [rig.location.x, rig.location.y, rig.location.z],
         }

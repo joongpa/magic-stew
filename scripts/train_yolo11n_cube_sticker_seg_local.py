@@ -238,6 +238,7 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
         mask_ratio=args.mask_ratio,
         overlap_mask=args.overlap_mask,
         mosaic=args.mosaic,
+        workers=args.workers,
         plots=True,
     )
 
@@ -294,6 +295,12 @@ def main() -> None:
     parser.add_argument("--imgsz", type=int, default=256)
     parser.add_argument("--batch", type=int, default=-1)
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="DataLoader worker processes; 0 avoids CUDA shared-memory/event issues.",
+    )
+    parser.add_argument(
         "--device",
         default=None,
         help="Training device override, e.g. cpu, mps, cuda, 0, or 0,1; default lets Ultralytics choose.",
@@ -324,6 +331,8 @@ def main() -> None:
 
     if args.mask_ratio < 1:
         raise SystemExit("--mask-ratio must be at least 1")
+    if args.workers < 0:
+        raise SystemExit("--workers must be non-negative")
     class_names = parse_class_names(args.class_names)
     source_dirs = [
         source_dir

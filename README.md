@@ -204,7 +204,9 @@ YOLO training. The default segmentation `mask_ratio` is `2`; override it with
 `--mask-ratio` when trading mask detail for memory and speed. Overlapping
 cube/sticker instances are kept as independent masks by default; use
 `--overlap-mask` only if you explicitly want Ultralytics to merge overlapping
-targets.
+targets. `--workers` defaults to `0` to avoid CUDA shared-memory/event errors;
+for a CUDA out-of-memory failure, also lower `--batch` (for example,
+`--batch 1`) and use `--no-cache`.
 
 ## Automated whole-cube failure mining
 
