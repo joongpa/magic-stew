@@ -36,7 +36,6 @@ from time import perf_counter
 import cv2
 import numpy as np
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(ROOT) not in sys.path:
@@ -44,26 +43,17 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from live_recognition.detectors import (  # noqa: E402
-    YOLOCubeDetector,
-    default_yolo_device,
-)
+from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
+from live_recognition.detectors import default_yolo_device
 from live_recognition.independent_pose_thresholds import (  # noqa: E402
-    DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES,
-    INDEPENDENT_POSE_CLASS_NAMES,
-    independent_pose_class_threshold,
-    parse_independent_pose_class_confidences,
-)
-from live_recognition.roi_tracking import (  # noqa: E402
-    RoiTracker,
-    roi_for_frame as shared_roi_for_frame,
-)
-from live_recognition.pose_motion import (  # noqa: E402
-    PoseMotionDiagnostics,
-    PoseMotionFilter,
-    PoseMotionFilterConfig,
-)
-
+    DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES, INDEPENDENT_POSE_CLASS_NAMES,
+    independent_pose_class_threshold, parse_independent_pose_class_confidences)
+from live_recognition.pose_motion import PoseMotionDiagnostics  # noqa: E402
+from live_recognition.pose_motion import (PoseMotionFilter,
+                                          PoseMotionFilterConfig)
+from live_recognition.roi_tracking import RoiTracker
+from live_recognition.roi_tracking import \
+    roi_for_frame as shared_roi_for_frame  # noqa: E402
 
 CLASS_NAMES = INDEPENDENT_POSE_CLASS_NAMES
 # OpenCV uses BGR colors. These match the independent-keypoint generator.
@@ -78,10 +68,10 @@ WINDOW_NAME = "independent cube keypoints"
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 DEFAULT_POSE_MODEL = (
     ROOT
-    / "runs/pose/runs/independent_keypoint_pose_v2/runs/cube_piece_keypoint_yolo11n_pose/weights/best.pt"
+    / "runs/pose/runs/independent_keypoints_v3_weights.pt"
 )
 DEFAULT_COMBINED_SEGMENTATION_MODEL_CANDIDATES = (
-    ROOT / "runs/segment/runs/cube_sticker_combined_seg_v2/runs/cube_sticker_yolo11n_seg/weights/best.pt",
+    ROOT / "runs/segment/runs/combinedSegmentWeights.pt",
     ROOT / "runs/segment/runs/cube_sticker_combined_seg/runs/cube_sticker_yolo11n_seg/weights/best.pt",
 )
 DEFAULT_COMBINED_SEGMENTATION_MODEL = next(

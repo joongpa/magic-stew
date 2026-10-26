@@ -28,7 +28,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from live_recognition.detectors import YOLOCubeDetector, default_yolo_device  # noqa: E402
+from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
+from live_recognition.detectors import default_yolo_device
 from live_recognition.roi_tracking import RoiTracker  # noqa: E402
 from live_recognition.roi_tracking import \
     roi_for_frame as shared_roi_for_frame  # noqa: E402
@@ -45,6 +46,7 @@ STICKER_COLORS_BGR = {
     "green": (0, 180, 0),
 }
 STICKER_COLORS_BY_ID = tuple(STICKER_COLORS_BGR[name] for name in STICKER_COLORS_BGR)
+STICKER_BORDER_COLOR_BGR = (0, 0, 255)
 COLOR_MAP_CLASS_NAMES = (*STICKER_COLORS_BGR.keys(), "none")
 COLOR_MAP_COLORS_BGR = np.asarray(
     (*STICKER_COLORS_BY_ID, (72, 72, 72)),
@@ -257,6 +259,11 @@ def render_segmentation_overlay(
         if masks_only
         else cv2.addWeighted(overlay, opacity, image, 1.0 - opacity, 0.0)
     )
+    if segmentation_type == "combined":
+        combined_mask = np.zeros((height, width), dtype=bool)
+        for mask in rendered_masks:
+            combined_mask |= mask
+        output[~combined_mask] = background[~combined_mask]
     for index in rendered_indexes:
         mask = rendered_masks[index]
         contours, _ = cv2.findContours(
@@ -268,16 +275,9 @@ def render_segmentation_overlay(
             output,
             contours,
             -1,
-            sticker_instance_color(index)
-            if random_sticker_colors and segmentation_type in {"sticker", "combined"}
-            else class_color(names, int(class_ids[index]), segmentation_type),
-            2,
+            STICKER_BORDER_COLOR_BGR,
+            1,
         )
-    if segmentation_type == "combined":
-        combined_mask = np.zeros((height, width), dtype=bool)
-        for mask in rendered_masks:
-            combined_mask |= mask
-        output[~combined_mask] = background[~combined_mask]
     return output
 
 
@@ -919,7 +919,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Render masks on a black background without the original input image",
     )
     parser.add_argument("--show-bbox", action=argparse.BooleanOptionalAction, default=True, help="Draw the active ROI")
-    parser.add_argument("--conf", type=float, default=0.25, help="Segmentation confidence threshold")
+    parser.add_argument("--conf", type=float, default=0.4, help="Segmentation confidence threshold")
     parser.add_argument("--imgsz", type=int, default=256, help="YOLO inference image size")
     parser.add_argument("--opacity", type=float, default=0.45, help="Mask opacity in the range [0, 1]")
     parser.add_argument("--once", action="store_true", help="Process one frame and exit")

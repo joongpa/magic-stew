@@ -120,7 +120,7 @@ def test_whole_cube_segmentation_renders_only_largest_mask():
 
     output = render_segmentation_overlay(image, result, opacity=1.0, segmentation_type="whole-cube")
 
-    assert np.all(output[5:9, 5:9] == (255, 0, 255))
+    assert np.all(output[6:8, 6:8] == (255, 0, 255))
     assert np.all(output[1:3, 1:3] == 0)
 
 
@@ -137,7 +137,7 @@ def test_whole_cube_segmentation_prefers_cube_class_over_larger_sticker_mask():
 
     output = render_segmentation_overlay(image, result, opacity=1.0, segmentation_type="whole-cube")
 
-    assert np.all(output[1:4, 1:4] == (255, 0, 255))
+    assert np.all(output[2:3, 2:3] == (255, 0, 255))
     assert np.all(output[4:9, 4:9] == 0)
 
 
@@ -176,13 +176,13 @@ def test_sticker_segmentation_renders_only_sticker_class_for_combined_model():
     )
 
     assert np.all(output[1:5, 1:5] == 0)
-    assert np.all(output[5:9, 5:9] == render_script.sticker_instance_color(1))
+    assert np.all(output[6:8, 6:8] == render_script.sticker_instance_color(1))
 
 
 def test_sticker_segmentation_renders_each_detection_with_a_distinct_stable_color():
     image = np.zeros((10, 10, 3), dtype=np.uint8)
     masks = np.zeros((2, 10, 10), dtype=np.float32)
-    masks[0, 1:3, 1:3] = 1.0
+    masks[0, 1:5, 1:5] = 1.0
     masks[1, 5:9, 5:9] = 1.0
     result = SimpleNamespace(
         masks=SimpleNamespace(data=masks),
@@ -198,11 +198,11 @@ def test_sticker_segmentation_renders_each_detection_with_a_distinct_stable_colo
         random_sticker_colors=True,
     )
 
-    first_color = output[1, 1].tolist()
-    second_color = output[5, 5].tolist()
+    first_color = output[2, 2].tolist()
+    second_color = output[6, 6].tolist()
     assert first_color != second_color
-    assert np.all(output[1:3, 1:3] == first_color)
-    assert np.all(output[5:9, 5:9] == second_color)
+    assert np.all(output[2:4, 2:4] == first_color)
+    assert np.all(output[6:8, 6:8] == second_color)
 
     repeated = render_segmentation_overlay(
         image,
@@ -233,7 +233,7 @@ def test_combined_segmentation_renders_only_cube_sticker_intersection():
         random_sticker_colors=True,
     )
 
-    assert np.all(output[2:5, 2:5] == render_script.sticker_instance_color(0))
+    assert np.all(output[3, 3] == render_script.sticker_instance_color(0))
     assert np.all(output[1:2, 1:5] == 0)
     assert np.all(output[5:8, 5:8] == 0)
 
@@ -258,3 +258,28 @@ def test_combined_segmentation_draws_each_sticker_outline_separately():
         render_segmentation_overlay(image, result, opacity=1.0, segmentation_type="combined")
 
     assert draw_contours.call_count == 2
+    assert all(call.args[4] == 1 for call in draw_contours.call_args_list)
+    assert all(call.args[3] == render_script.STICKER_BORDER_COLOR_BGR for call in draw_contours.call_args_list)
+
+
+def test_combined_segmentation_keeps_sticker_outline_after_mask_cleanup():
+    image = np.zeros((12, 12, 3), dtype=np.uint8)
+    masks = np.zeros((2, 12, 12), dtype=np.float32)
+    masks[0, 3:9, 3:9] = 1.0  # cube
+    masks[1, 3:9, 3:9] = 1.0  # sticker
+    result = SimpleNamespace(
+        masks=SimpleNamespace(data=masks),
+        boxes=SimpleNamespace(cls=np.array([0, 1])),
+        names={0: "cube", 1: "sticker"},
+    )
+
+    output = render_segmentation_overlay(
+        image,
+        result,
+        opacity=1.0,
+        segmentation_type="combined",
+        random_sticker_colors=True,
+    )
+
+    sticker_color = render_script.sticker_instance_color(0)
+    assert np.any(np.all(output == sticker_color, axis=2))
