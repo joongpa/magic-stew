@@ -73,6 +73,7 @@ CAMERA_VIEWPOINT_WEIGHTS = (
     ("over_shoulder", 0.18),
     ("behind_diagonal", 0.18),
     ("low_behind_diagonal", 0.12),
+    ("low_side", 0.12),
     ("overhead", 0.12),
 )
 CAMERA_ROI_LENS_RANGE = (42.0, 49.0)
@@ -993,28 +994,32 @@ def randomize_camera(
         k=1,
     )[0]
     if viewpoint == "front":
-        azimuth_degrees = -90.0 + random.uniform(-12.0, 12.0)
+        azimuth_degrees = -90.0 + random.uniform(-17.0, 17.0)
         elevation_degrees = random.uniform(18.0, 36.0)
         reference_distance = 11.75
     elif viewpoint == "front_diagonal":
-        azimuth_degrees = random.choice((-45.0, -135.0)) + random.uniform(-9.0, 9.0)
+        azimuth_degrees = random.choice((-45.0, -135.0)) + random.uniform(-14.0, 14.0)
         elevation_degrees = random.uniform(20.0, 43.0)
         reference_distance = 12.25
     elif viewpoint == "over_shoulder":
-        azimuth_degrees = random.choice((58.0, 122.0)) + random.uniform(-6.0, 6.0)
+        azimuth_degrees = random.choice((58.0, 122.0)) + random.uniform(-11.0, 11.0)
         elevation_degrees = random.uniform(57.0, 68.0)
         reference_distance = 13.75
     elif viewpoint == "behind_diagonal":
-        azimuth_degrees = random.choice((42.0, 138.0)) + random.uniform(-8.0, 8.0)
+        azimuth_degrees = random.choice((42.0, 138.0)) + random.uniform(-13.0, 13.0)
         elevation_degrees = random.uniform(27.0, 48.0)
         reference_distance = 12.5
     elif viewpoint == "low_behind_diagonal":
-        azimuth_degrees = random.choice((32.0, 148.0)) + random.uniform(-7.0, 7.0)
+        azimuth_degrees = random.choice((32.0, 148.0)) + random.uniform(-12.0, 12.0)
         elevation_degrees = random.uniform(34.0, 50.0)
         reference_distance = 16.0
+    elif viewpoint == "low_side":
+        azimuth_degrees = random.choice((0.0, 180.0)) + random.uniform(-13.0, 13.0)
+        elevation_degrees = random.uniform(10.0, 20.0)
+        reference_distance = 13.0
     else:
         azimuth_degrees = random.choice((-135.0, -90.0, -45.0, 45.0, 90.0, 135.0))
-        azimuth_degrees += random.uniform(-10.0, 10.0)
+        azimuth_degrees += random.uniform(-15.0, 15.0)
         elevation_degrees = random.uniform(64.0, 80.0)
         reference_distance = 13.5
     roll_degrees = random.uniform(*CAMERA_ROLL_DEGREES_RANGE)
@@ -4043,6 +4048,13 @@ def assign_hand_pose(rig: bpy.types.Object, action_name: str) -> None:
     if rig.animation_data is None:
         rig.animation_data_create()
     rig.animation_data.action = action
+    # Blender 5 uses explicit action slots. Assigning only ``action`` can
+    # leave the rig bound to the previous slot, so different named poses may
+    # evaluate to the same visible hand pose.
+    if hasattr(rig.animation_data, "action_slot") and len(action.slots):
+        suitable_slots = getattr(rig.animation_data, "action_suitable_slots", ())
+        slot = suitable_slots[0] if suitable_slots else action.slots[0]
+        rig.animation_data.action_slot = slot
 
 
 def hand_pose_assignments(
