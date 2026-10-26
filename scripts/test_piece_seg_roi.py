@@ -15,7 +15,7 @@ import random
 import sys
 from collections import deque
 from dataclasses import dataclass
-from itertools import permutations, product
+from itertools import combinations, permutations, product
 from pathlib import Path
 from time import perf_counter
 
@@ -32,6 +32,10 @@ from live_recognition.detectors import YOLOCubeDetector, default_yolo_device  # 
 from live_recognition.independent_pose_thresholds import (  # noqa: E402
     DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES,
     independent_pose_class_threshold, parse_independent_pose_class_confidences)
+from live_recognition.pose_motion import (  # noqa: E402
+    PoseMotionFilter,
+    PoseMotionFilterConfig,
+)
 from live_recognition.visualization import _reliable_color_mask  # noqa: E402
 from live_recognition.visualization import (  # noqa: E402
     save_hsv_samples_interactive_plot, save_rgb_samples_interactive_plot,
@@ -70,6 +74,14 @@ PNP_MAX_REFINEMENT_ATTEMPTS = 16
 PNP_INLIER_THRESHOLD_PX = 10.0
 PNP_MAX_OBSERVED_OUTLIER_FRACTION = 0.10
 PNP_PRUNE_REPROJECTION_ERROR_PX = 18.0
+POSE_ANCHOR_RESIDUAL_THRESHOLD_PX = 12.0
+POSE_ANCHOR_MIN_POINTS = 3
+POSE_MOTION_FILTER_BY_DEFAULT = False
+POSE_MOTION_DT_SECONDS = 1.0 / 30.0
+POSE_MOTION_MAX_ACCELERATION_UNITS_S2 = 6000.0
+POSE_MOTION_MAX_JERK_UNITS_S3 = 120000.0
+POSE_MOTION_MAX_ANGULAR_ACCELERATION_RAD_S2 = 12.0
+POSE_MOTION_MAX_ANGULAR_JERK_RAD_S3 = 180.0
 ADJACENCY_CANNY_BLUR_KERNEL = 1
 ADJACENCY_CANNY_LOW = 30
 ADJACENCY_CANNY_HIGH = 180
@@ -305,6 +317,57 @@ class PosePnPResult:
     refinement_graph_index: int | None = None
     refinement_lattice_coord: tuple[int, int, int] | None = None
     debug_pose_candidates: tuple["PosePnPResult", ...] = tuple()
+    raw_rvec: np.ndarray | None = None
+    raw_tvec: np.ndarray | None = None
+    motion_diagnostics: object | None = None
+    orientation_anchor: "OrientationAnchor | None" = None
+
+
+@dataclass(frozen=True)
+class OrientationAnchor:
+    """The cube layers whose motion currently defines the rigid pose."""
+
+    axis: int | None
+    layers: tuple[int, ...]
+    point_indexes: tuple[int, ...]
+
+    @property
+    def label(self) -> str:
+        if self.axis is None:
+            return "all"
+        return f"axis {self.axis} layers {','.join(str(layer) for layer in self.layers)}"
+
+
+def refresh_pose_pnp_result_projection(result: PosePnPResult) -> None:
+    """Reproject the display geometry after temporal pose filtering."""
+
+    if any(
+        getattr(result, attribute, None) is None
+        for attribute in ("rvec", "tvec", "camera_matrix", "dist_coeffs")
+    ):
+        return
+    try:
+        projected_object_points, _ = cv2.projectPoints(
+            np.asarray(result.object_points, dtype=np.float32).reshape(-1, 3),
+            result.rvec,
+            result.tvec,
+            result.camera_matrix,
+            result.dist_coeffs,
+        )
+        projected_display_points = None
+        if getattr(result, "display_points", None) is not None:
+            projected_display_points, _ = cv2.projectPoints(
+                np.asarray(result.display_points, dtype=np.float32).reshape(-1, 3),
+                result.rvec,
+                result.tvec,
+                result.camera_matrix,
+                result.dist_coeffs,
+            )
+    except cv2.error:
+        return
+    result.projected_object_points = projected_object_points.reshape(-1, 2)
+    if projected_display_points is not None:
+        result.projected_display_points = projected_display_points.reshape(-1, 2)
 
 
 @dataclass(frozen=True)
@@ -357,6 +420,199 @@ class PoseGraphCorrespondence:
         return (tuple(self.graph_indexes), tuple(self.lattice_coords))
 
 
+def physical_layer_index(lattice_value: int) -> int:
+    """Map four lattice samples onto the three physical cube layers."""
+
+    if lattice_value <= 0:
+        return 0
+    if lattice_value >= CUBE_GRID_MAX_INDEX:
+        return 2
+    return 1
+
+
+def all_cube_orientation_anchor(point_count: int) -> OrientationAnchor:
+    return OrientationAnchor(
+        axis=None,
+        layers=(0, 1, 2),
+        point_indexes=tuple(range(max(0, int(point_count)))),
+    )
+
+
+def select_orientation_anchor(
+    result: PosePnPResult,
+    correspondence: PoseGraphCorrespondence,
+    motion_filter: PoseMotionFilter,
+) -> OrientationAnchor:
+    """Choose the largest layer subset consistent with the prior rigid pose.
+
+    The full cube wins when all observed points agree with the prior.  When a
+    turn makes one layer disagree, a one- or two-layer subset can retain the
+    stable part as the rigid anchor.  No turn angle or turn duration is
+    constrained here.
+    """
+
+    full_anchor = all_cube_orientation_anchor(len(correspondence.lattice_coords))
+    previous_pose = motion_filter.current_pose()
+    if previous_pose is None or any(
+        getattr(result, attribute, None) is None
+        for attribute in ("object_points", "image_points", "camera_matrix", "dist_coeffs")
+    ):
+        return full_anchor
+
+    prior_rvec, prior_tvec = previous_pose
+    try:
+        projected_points, _ = cv2.projectPoints(
+            np.asarray(result.object_points, dtype=np.float32).reshape(-1, 3),
+            prior_rvec,
+            prior_tvec,
+            result.camera_matrix,
+            result.dist_coeffs,
+        )
+    except cv2.error:
+        return full_anchor
+    observed_points = np.asarray(result.image_points, dtype=np.float32).reshape(-1, 2)
+    projected_points = projected_points.reshape(-1, 2)
+    if len(observed_points) != len(projected_points) or len(observed_points) != len(correspondence.lattice_coords):
+        return full_anchor
+    residuals = np.linalg.norm(projected_points - observed_points, axis=1)
+    layer_indexes_by_axis = tuple(
+        tuple(
+            physical_layer_index(
+                transform_lattice_coord(
+                    coord,
+                    getattr(result, "lattice_transform", CUBE_LATTICE_IDENTITY_TRANSFORM),
+                )[axis]
+            )
+            for coord in correspondence.lattice_coords
+        )
+        for axis in range(3)
+    )
+
+    candidates: list[tuple[tuple[float, ...], OrientationAnchor]] = []
+    full_inliers = int(np.count_nonzero(residuals <= POSE_ANCHOR_RESIDUAL_THRESHOLD_PX))
+    full_median = float(np.median(residuals)) if len(residuals) else float("inf")
+    candidates.append(
+        (
+            (float(full_inliers), -3.0, -full_median),
+            full_anchor,
+        )
+    )
+    for axis in range(3):
+        layer_indexes = layer_indexes_by_axis[axis]
+        for layer_count in (1, 2):
+            for layers in combinations((0, 1, 2), layer_count):
+                point_indexes = tuple(
+                    index
+                    for index, layer_index in enumerate(layer_indexes)
+                    if layer_index in layers
+                )
+                if len(point_indexes) < POSE_ANCHOR_MIN_POINTS:
+                    continue
+                layer_residuals = residuals[list(point_indexes)]
+                inlier_count = int(
+                    np.count_nonzero(layer_residuals <= POSE_ANCHOR_RESIDUAL_THRESHOLD_PX)
+                )
+                if inlier_count < POSE_ANCHOR_MIN_POINTS:
+                    continue
+                median_error = float(np.median(layer_residuals))
+                candidates.append(
+                    (
+                        (float(inlier_count), float(-layer_count), -median_error),
+                        OrientationAnchor(
+                            axis=axis,
+                            layers=tuple(layers),
+                            point_indexes=point_indexes,
+                        ),
+                    )
+                )
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def refit_pose_to_orientation_anchor(
+    result: PosePnPResult,
+    correspondence: PoseGraphCorrespondence,
+    anchor: OrientationAnchor,
+) -> bool:
+    """Refit PnP using only points from the selected anchor layers."""
+
+    if anchor.axis is None or len(anchor.point_indexes) < POSE_ANCHOR_MIN_POINTS:
+        return anchor.axis is None
+    if any(
+        getattr(result, attribute, None) is None
+        for attribute in ("object_points", "image_points", "camera_matrix", "dist_coeffs")
+    ):
+        return False
+    indexes = np.asarray(anchor.point_indexes, dtype=np.int32)
+    object_points = np.asarray(result.object_points, dtype=np.float32).reshape(-1, 3)[indexes]
+    image_points = np.asarray(result.image_points, dtype=np.float32).reshape(-1, 2)[indexes]
+    if len(object_points) < POSE_ANCHOR_MIN_POINTS:
+        return False
+    try:
+        ok, rvecs, tvecs, _ = cv2.solvePnPGeneric(
+            object_points,
+            image_points,
+            result.camera_matrix,
+            result.dist_coeffs,
+            flags=cv2.SOLVEPNP_SQPNP,
+        )
+    except cv2.error:
+        return False
+    if not ok or not rvecs or not tvecs:
+        return False
+
+    best_pose = None
+    best_error = float("inf")
+    for rvec, tvec in zip(rvecs, tvecs, strict=True):
+        candidate_rvec = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+        candidate_tvec = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
+        if len(object_points) >= 4:
+            try:
+                candidate_rvec, candidate_tvec = cv2.solvePnPRefineLM(
+                    object_points,
+                    image_points,
+                    result.camera_matrix,
+                    result.dist_coeffs,
+                    candidate_rvec,
+                    candidate_tvec,
+                )
+            except cv2.error:
+                pass
+        projected, _ = cv2.projectPoints(
+            object_points,
+            candidate_rvec,
+            candidate_tvec,
+            result.camera_matrix,
+            result.dist_coeffs,
+        )
+        error = float(
+            np.mean(
+                np.linalg.norm(
+                    projected.reshape(-1, 2) - image_points,
+                    axis=1,
+                )
+            )
+        )
+        if error < best_error:
+            best_error = error
+            best_pose = (candidate_rvec, candidate_tvec)
+    if best_pose is None:
+        return False
+    result.rvec, result.tvec = best_pose
+    refresh_pose_pnp_result_projection(result)
+    return True
+
+
+def assign_orientation_anchor(
+    result: PosePnPResult,
+    correspondence: PoseGraphCorrespondence,
+    motion_filter: PoseMotionFilter,
+) -> None:
+    anchor = select_orientation_anchor(result, correspondence, motion_filter)
+    if not refit_pose_to_orientation_anchor(result, correspondence, anchor):
+        anchor = all_cube_orientation_anchor(len(correspondence.lattice_coords))
+    result.orientation_anchor = anchor
+
+
 @dataclass(frozen=True)
 class PoseGraphNodeAssignment:
     coord: tuple[int, int, int]
@@ -383,8 +639,8 @@ class PoseGraphPnPSolver:
     camera_matrix: np.ndarray | None = None
     lattice_transform: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
     rejected_pose_result: PosePnPResult | None = None
-    last_tvec: np.ndarray | None = None
     accepted_pose_count: int = 0
+    motion_filter: PoseMotionFilter | None = None
 
     def solve_correspondence_candidates(
         self,
@@ -409,7 +665,7 @@ class PoseGraphPnPSolver:
             )
             if result is not None:
                 return result
-        self.clear_last_tvec()
+        self.clear_motion_state()
         return None
 
     def solve_correspondences(
@@ -424,7 +680,7 @@ class PoseGraphPnPSolver:
         if clear_rejected:
             self.rejected_pose_result = None
         if correspondence is None:
-            return self.miss_pose_result(clear_temporal=clear_rejected)
+            return self.miss_pose_result(clear_motion=clear_rejected)
 
         original_correspondence = correspondence
         camera_matrix = (
@@ -447,11 +703,10 @@ class PoseGraphPnPSolver:
             focal_steps=self.focal_steps,
             camera_matrix=camera_matrix,
             lattice_transforms=lattice_transforms,
-            previous_tvec=self.last_tvec,
             profile=profile,
         )
         if result is None:
-            return self.miss_pose_result(clear_temporal=clear_rejected)
+            return self.miss_pose_result(clear_motion=clear_rejected)
         self.remember_rejected_pose_result(result, correspondence)
         backface_only_count = pose_correspondence_backface_only_point_count(
             correspondence,
@@ -460,7 +715,7 @@ class PoseGraphPnPSolver:
         if profile is not None:
             profile["pnp_backface_only_correspondence_points"] = backface_only_count
         if backface_only_count > 0:
-            return self.miss_pose_result(clear_temporal=clear_rejected)
+            return self.miss_pose_result(clear_motion=clear_rejected)
         if observed_graph is None:
             observed_error, observed_inlier_count, observed_point_count = observed_pose_graph_reprojection_score(
                 correspondence,
@@ -491,9 +746,9 @@ class PoseGraphPnPSolver:
                 profile["pnp_backface_fit_points"] = backface_fit_count
             if backface_fit_count >= 3:
                 self.remember_rejected_pose_result(result, correspondence, observed_error)
-                return self.miss_pose_result(clear_temporal=clear_rejected)
+                return self.miss_pose_result(clear_motion=clear_rejected)
         if observed_point_count < 3:
-            return self.miss_pose_result(clear_temporal=clear_rejected)
+            return self.miss_pose_result(clear_motion=clear_rejected)
         self.remember_rejected_pose_result(result, correspondence, observed_error)
         if observed_error <= self.max_reprojection_error_px:
             refined = refine_pose_correspondence_with_visible_observed_points(
@@ -506,7 +761,6 @@ class PoseGraphPnPSolver:
                 focal_steps=self.focal_steps,
                 camera_matrix=camera_matrix,
                 lattice_transforms=lattice_transforms,
-                previous_tvec=self.last_tvec,
                 max_attempts=1,
                 refinement_budget=refinement_budget,
                 accept_error_px=self.max_reprojection_error_px,
@@ -521,7 +775,7 @@ class PoseGraphPnPSolver:
                 return self.accept_pose_result(refined_result, refined_correspondence, refined_error)
             return self.accept_pose_result(result, correspondence, observed_error)
         if observed_error > self.refinement_reprojection_error_px:
-            return self.miss_pose_result(clear_temporal=clear_rejected)
+            return self.miss_pose_result(clear_motion=clear_rejected)
 
         refined = refine_pose_correspondence_with_visible_observed_points(
             correspondence,
@@ -533,7 +787,6 @@ class PoseGraphPnPSolver:
             focal_steps=self.focal_steps,
             camera_matrix=camera_matrix,
             lattice_transforms=lattice_transforms,
-            previous_tvec=self.last_tvec,
             max_attempts=self.max_refinement_attempts,
             refinement_budget=refinement_budget,
             accept_error_px=self.max_reprojection_error_px,
@@ -541,16 +794,17 @@ class PoseGraphPnPSolver:
             profile=profile,
         )
         if refined is None:
-            return self.miss_pose_result(clear_temporal=clear_rejected)
+            return self.miss_pose_result(clear_motion=clear_rejected)
         refined_correspondence, refined_result, refined_error = refined
         return self.accept_pose_result(refined_result, refined_correspondence, refined_error)
 
-    def clear_last_tvec(self) -> None:
-        self.last_tvec = None
+    def clear_motion_state(self) -> None:
+        if self.motion_filter is not None:
+            self.motion_filter.reset()
 
-    def miss_pose_result(self, *, clear_temporal: bool = True) -> None:
-        if clear_temporal:
-            self.clear_last_tvec()
+    def miss_pose_result(self, *, clear_motion: bool = True) -> None:
+        if clear_motion:
+            self.clear_motion_state()
         return None
 
     def remember_rejected_pose_result(
@@ -581,20 +835,42 @@ class PoseGraphPnPSolver:
         result.observed_reprojection_error = observed_error
         result.point_names = tuple(str(coord) for coord in correspondence.lattice_coords)
         result.pose_label = "graph"
+        if self.motion_filter is not None:
+            assign_orientation_anchor(result, correspondence, self.motion_filter)
+        else:
+            result.orientation_anchor = all_cube_orientation_anchor(
+                len(correspondence.lattice_coords)
+            )
+        if self.motion_filter is not None and all(
+            getattr(result, attribute, None) is not None
+            for attribute in ("rvec", "tvec", "camera_matrix", "dist_coeffs")
+        ):
+            raw_rvec = np.asarray(result.rvec, dtype=np.float64).reshape(3, 1).copy()
+            raw_tvec = np.asarray(result.tvec, dtype=np.float64).reshape(3, 1).copy()
+            filtered_rvec, filtered_tvec, diagnostics = self.motion_filter.update(
+                raw_rvec,
+                raw_tvec,
+            )
+            result.raw_rvec = raw_rvec
+            result.raw_tvec = raw_tvec
+            result.motion_diagnostics = diagnostics
+            result.rvec = filtered_rvec
+            result.tvec = filtered_tvec
+            refresh_pose_pnp_result_projection(result)
+            result.pose_label = "graph-motion-filtered"
         if getattr(result, "camera_matrix", None) is not None:
             self.camera_matrix = np.asarray(result.camera_matrix, dtype=np.float64).reshape(3, 3).copy()
-        if getattr(result, "tvec", None) is not None:
-            self.last_tvec = np.asarray(result.tvec, dtype=np.float64).reshape(3, 1).copy()
         self.lattice_transform = getattr(result, "lattice_transform", CUBE_LATTICE_IDENTITY_TRANSFORM)
         self.accepted_pose_count += 1
         return result
 
-    def reset_temporal_tracking(self) -> None:
+    def reset_pose_state(self) -> None:
         self.camera_matrix = None
         self.lattice_transform = None
         self.rejected_pose_result = None
-        self.last_tvec = None
         self.accepted_pose_count = 0
+        if self.motion_filter is not None:
+            self.motion_filter.reset()
 
 
 def prune_high_error_pose_graph_correspondence(
@@ -727,7 +1003,6 @@ def refine_pose_correspondence_with_visible_observed_points(
     refinement_budget: dict[str, int] | None,
     accept_error_px: float,
     inlier_threshold_px: float,
-    previous_tvec: np.ndarray | None = None,
     profile: dict[str, float | int] | None = None,
     return_first_result: bool = False,
 ) -> tuple[PoseGraphCorrespondence, PosePnPResult, float] | None:
@@ -791,7 +1066,6 @@ def refine_pose_correspondence_with_visible_observed_points(
             focal_steps=focal_steps,
             camera_matrix=camera_matrix,
             lattice_transforms=lattice_transforms,
-            previous_tvec=previous_tvec,
             profile=profile,
         )
         if refined_result is None:
@@ -1683,7 +1957,6 @@ def solve_best_lattice_graph_pnp_current(
     focal_steps: int,
     camera_matrix: np.ndarray | None = None,
     lattice_transforms: tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...] = CUBE_LATTICE_AXIS_TRANSFORMS,
-    previous_tvec: np.ndarray | None = None,
     profile: dict[str, float | int] | None = None,
 ) -> PosePnPResult | None:
     image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
@@ -1692,11 +1965,6 @@ def solve_best_lattice_graph_pnp_current(
 
     best_result: PosePnPResult | None = None
     best_score: tuple[float, ...] | None = None
-    previous_tvec_array = (
-        None
-        if previous_tvec is None
-        else np.asarray(previous_tvec, dtype=np.float64).reshape(3, 1)
-    )
     camera_matrices = (
         [np.asarray(camera_matrix, dtype=np.float64).reshape(3, 3)]
         if camera_matrix is not None
@@ -1732,16 +2000,7 @@ def solve_best_lattice_graph_pnp_current(
             result.lattice_transform = lattice_transform
             invisible_count = float(getattr(result, "invisible_point_count", 0))
             matched_error = float(result.matched_error)
-            if previous_tvec_array is None or getattr(result, "tvec", None) is None:
-                score = (invisible_count, matched_error)
-            else:
-                translation_jump = float(
-                    np.linalg.norm(
-                        np.asarray(result.tvec, dtype=np.float64).reshape(3, 1)
-                        - previous_tvec_array
-                    )
-                )
-                score = (invisible_count, translation_jump, matched_error)
+            score = (invisible_count, matched_error)
             if best_score is None or score < best_score:
                 best_score = score
                 best_result = result
@@ -1976,12 +2235,19 @@ def draw_pnp_cube(
         cv2.line(target, observed, projected_match, (0, 0, 0), 4, lineType=cv2.LINE_AA)
         cv2.line(target, observed, projected_match, PNP_REPROJECTION_RESIDUAL_COLOR, 2, lineType=cv2.LINE_AA)
 
-    projected = np.asarray(result.projected_display_points, dtype=np.float32)
-    edge_indexes = result.display_edge_indexes or result.edge_indexes
-    for start, end in edge_indexes:
-        start_point = tuple(np.round(projected[start]).astype(int))
-        end_point = tuple(np.round(projected[end]).astype(int))
-        color = PNP_CUBE_LINE_COLOR
+    anchor_segments = projected_orientation_anchor_segments(result)
+    if anchor_segments is None:
+        projected = np.asarray(result.projected_display_points, dtype=np.float32)
+        edge_indexes = result.display_edge_indexes or result.edge_indexes
+        anchor_segments = tuple(
+            (
+                tuple(np.round(projected[start]).astype(int)),
+                tuple(np.round(projected[end]).astype(int)),
+                PNP_CUBE_LINE_COLOR,
+            )
+            for start, end in edge_indexes
+        )
+    for start_point, end_point, color in anchor_segments:
         cv2.line(target, start_point, end_point, (0, 0, 0), 4, lineType=cv2.LINE_AA)
         cv2.line(target, start_point, end_point, color, 2, lineType=cv2.LINE_AA)
     for point in projected_object_points:
@@ -2005,11 +2271,13 @@ def draw_pnp_cube(
         face = getattr(result, "correspondence_face", None)
         face_normal_z = getattr(result, "correspondence_face_normal_z", None)
         face_label = "" if face is None or face_normal_z is None else f" face {face} nz {face_normal_z:.2f}"
+        orientation_anchor = getattr(result, "orientation_anchor", None)
+        anchor_label = "" if orientation_anchor is None else f" anchor {orientation_anchor.label}"
         rejected_label = " rejected" if getattr(result, "pose_label", "") == "graph-rejected" else ""
         attempt_label = pose_attempt_summary(profile)
         label = (
             f"pnp{rejected_label} {attempt_label} obj {object_error:.1f} err {display_error:.1f}{fit_label} max {float(np.max(residuals)):.1f} "
-            f"f {focal:.0f}{face_label} axes {axis_order} signs {signs}"
+            f"f {focal:.0f}{face_label}{anchor_label} axes {axis_order} signs {signs}"
         )
         cv2.putText(
             target,
@@ -2033,6 +2301,63 @@ def draw_pnp_cube(
         )
     if alpha < 1.0:
         cv2.addWeighted(target, alpha, frame, 1.0 - alpha, 0.0, dst=frame)
+
+
+def projected_orientation_anchor_segments(
+    result: PosePnPResult,
+) -> tuple[tuple[tuple[int, int], tuple[int, int], tuple[int, int, int]], ...] | None:
+    """Return projected slab wireframes colored by the current orientation anchor."""
+
+    anchor = getattr(result, "orientation_anchor", None)
+    if anchor is None or anchor.axis is None:
+        return None
+    if any(
+        getattr(result, attribute, None) is None
+        for attribute in ("rvec", "tvec", "camera_matrix", "dist_coeffs")
+    ):
+        return None
+
+    segments = []
+    corner_bit_values = tuple(product((0, 1), repeat=3))
+    for layer in range(3):
+        low = layer
+        high = layer + 1
+        slab_points = []
+        for corner_bits in corner_bit_values:
+            coord = [0.0, 0.0, 0.0]
+            for axis in range(3):
+                if axis == anchor.axis:
+                    coord[axis] = float(high if corner_bits[axis] else low)
+                else:
+                    coord[axis] = float(CUBE_GRID_MAX_INDEX if corner_bits[axis] else 0.0)
+            slab_points.append(cube_lattice_point_mm(tuple(coord)))
+        projected, _ = cv2.projectPoints(
+            np.asarray(slab_points, dtype=np.float32),
+            result.rvec,
+            result.tvec,
+            result.camera_matrix,
+            result.dist_coeffs,
+        )
+        projected = projected.reshape(-1, 2)
+        for start in range(8):
+            for end in range(start + 1, 8):
+                if sum(
+                    first != second
+                    for first, second in zip(
+                        corner_bit_values[start],
+                        corner_bit_values[end],
+                    )
+                ) != 1:
+                    continue
+                start_point = tuple(np.round(projected[start]).astype(int))
+                end_point = tuple(np.round(projected[end]).astype(int))
+                color = (
+                    PNP_CUBE_LINE_COLOR
+                    if layer in anchor.layers
+                    else PNP_CUBE_STATIC_LINE_COLOR
+                )
+                segments.append((start_point, end_point, color))
+    return tuple(segments)
 
 
 def draw_observed_model_distance_lines(
@@ -3700,7 +4025,7 @@ def draw_pose_estimate(
     if profile is not None:
         profile["pose_model_ms"] = (perf_counter() - started) * 1000.0
     if not results:
-        reset_pose_solver_temporal_tracking(pose_solver)
+        reset_pose_solver_state(pose_solver)
         return 0, None, None
 
     started = perf_counter()
@@ -3823,9 +4148,9 @@ def draw_pose_estimate(
             for graph_index in correspondence.graph_indexes:
                 point_weights[graph_index] = float(point_weights.get(graph_index, 1.0)) * 0.5
         if pnp_result is None:
-            clear_last_tvec = getattr(pose_solver, "clear_last_tvec", None)
-            if callable(clear_last_tvec):
-                clear_last_tvec()
+            clear_motion_state = getattr(pose_solver, "clear_motion_state", None)
+            if callable(clear_motion_state):
+                clear_motion_state()
         if profile is not None:
             profile["correspondence_ms"] = (perf_counter() - started) * 1000.0
             profile["solve_ms"] = (perf_counter() - solve_started) * 1000.0
@@ -3857,10 +4182,49 @@ def draw_pose_estimate(
     return point_count, pnp_result, pose_tracking_bounds_xyxy
 
 
-def reset_pose_solver_temporal_tracking(pose_solver: PoseGraphPnPSolver | None) -> None:
-    reset = getattr(pose_solver, "reset_temporal_tracking", None)
+def reset_pose_solver_state(pose_solver: PoseGraphPnPSolver | None) -> None:
+    reset = getattr(pose_solver, "reset_pose_state", None)
     if callable(reset):
         reset()
+
+
+def pose_motion_filter_from_args(args) -> PoseMotionFilter | None:
+    if not getattr(args, "pose_motion_filter", POSE_MOTION_FILTER_BY_DEFAULT):
+        return None
+    return PoseMotionFilter(
+        PoseMotionFilterConfig(
+            dt_seconds=getattr(args, "pose_motion_dt", POSE_MOTION_DT_SECONDS),
+            max_acceleration_units_s2=getattr(
+                args,
+                "pose_motion_max_acceleration",
+                POSE_MOTION_MAX_ACCELERATION_UNITS_S2,
+            ),
+            max_jerk_units_s3=getattr(
+                args,
+                "pose_motion_max_jerk",
+                POSE_MOTION_MAX_JERK_UNITS_S3,
+            ),
+            max_angular_acceleration_rad_s2=getattr(
+                args,
+                "pose_motion_max_angular_acceleration",
+                POSE_MOTION_MAX_ANGULAR_ACCELERATION_RAD_S2,
+            ),
+            max_angular_jerk_rad_s3=getattr(
+                args,
+                "pose_motion_max_angular_jerk",
+                POSE_MOTION_MAX_ANGULAR_JERK_RAD_S3,
+            ),
+        )
+    )
+
+
+def pose_solver_from_args(args) -> PoseGraphPnPSolver:
+    return PoseGraphPnPSolver(
+        focal_min=PNP_FOCAL_SCALE_MIN,
+        focal_max=PNP_FOCAL_SCALE_MAX,
+        focal_steps=PNP_FOCAL_SCALE_STEPS,
+        motion_filter=pose_motion_filter_from_args(args),
+    )
 
 
 def mask_color_for_segment(class_name: str, segment_index: int) -> tuple[int, int, int]:
@@ -4385,11 +4749,7 @@ def process_frame(
     setattr(args, "_pose_profile", pose_profile)
     if pose_model is not None:
         if ENABLE_POSE_ESTIMATION and pose_solver is None:
-            pose_solver = PoseGraphPnPSolver(
-                focal_min=PNP_FOCAL_SCALE_MIN,
-                focal_max=PNP_FOCAL_SCALE_MAX,
-                focal_steps=PNP_FOCAL_SCALE_STEPS,
-            )
+            pose_solver = pose_solver_from_args(args)
         pose_keypoint_count, pnp_result, pose_tracking_bounds_xyxy = draw_pose_estimate(
             output,
             roi,
@@ -4644,6 +5004,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print per-frame pose timing buckets for model, graph, correspondence, PnP, and drawing.",
     )
     parser.add_argument(
+        "--pose-motion-filter",
+        action="store_true",
+        help="Filter accepted rigid pose with a stationary/acceleration/jerk prior.",
+    )
+    parser.add_argument(
+        "--pose-motion-dt",
+        type=float,
+        default=POSE_MOTION_DT_SECONDS,
+        help="Frame interval in seconds used by the pose motion filter.",
+    )
+    parser.add_argument(
+        "--pose-motion-max-acceleration",
+        type=float,
+        default=POSE_MOTION_MAX_ACCELERATION_UNITS_S2,
+        help="Maximum translation acceleration in PnP translation units per second squared.",
+    )
+    parser.add_argument(
+        "--pose-motion-max-jerk",
+        type=float,
+        default=POSE_MOTION_MAX_JERK_UNITS_S3,
+        help="Maximum translation jerk in PnP translation units per second cubed.",
+    )
+    parser.add_argument(
+        "--pose-motion-max-angular-acceleration",
+        type=float,
+        default=POSE_MOTION_MAX_ANGULAR_ACCELERATION_RAD_S2,
+        help="Maximum angular acceleration in radians per second squared.",
+    )
+    parser.add_argument(
+        "--pose-motion-max-angular-jerk",
+        type=float,
+        default=POSE_MOTION_MAX_ANGULAR_JERK_RAD_S3,
+        help="Maximum angular jerk in radians per second cubed.",
+    )
+    parser.add_argument(
         "--show-original-underlay",
         dest="show_original_underlay",
         action="store_true",
@@ -4766,11 +5161,7 @@ def main() -> int:
     invalid_pose_frames = 0
     roi_tracker = RoiTracker()
     pose_solver = (
-        PoseGraphPnPSolver(
-            focal_min=PNP_FOCAL_SCALE_MIN,
-            focal_max=PNP_FOCAL_SCALE_MAX,
-            focal_steps=PNP_FOCAL_SCALE_STEPS,
-        )
+        pose_solver_from_args(args)
         if ENABLE_POSE_ESTIMATION
         else None
     )

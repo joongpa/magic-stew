@@ -224,8 +224,8 @@ POSE_SEGMENT_FILL_BASE_WIDTH = 9
 POSE_SEGMENT_OUTLINE_BASE_WIDTH = 2
 # Keep keypoint-mask dots compact so they mark intersections without covering
 # the rendered sticker detail.  Values are scaled from the 256px reference.
-POSE_POINT_BASE_RADIUS = 2
-POSE_POINT_OUTLINE_BASE_RADIUS = 3
+POSE_POINT_BASE_RADIUS = 1
+POSE_POINT_OUTLINE_WIDTH = 1
 # Display-space RGB samples taken from the flat sticker centers in the six
 # predefined GAN sticker-set images on TheCubicle's product page. These are
 # visual references rather than manufacturer color specifications; the page
@@ -285,7 +285,8 @@ STICKER_ROUGHNESS_RANGE = (0.18, 0.38)
 STICKER_SPECULAR_RANGE = (0.45, 0.75)
 STICKER_COAT_WEIGHT_RANGE = (0.08, 0.24)
 STICKER_COAT_ROUGHNESS_RANGE = (0.12, 0.32)
-STICKER_IMPERFECTIONS_ENABLED = True
+# Disable procedural scratches/dents; retain randomized sticker color and gloss.
+STICKER_IMPERFECTIONS_ENABLED = False
 STICKER_IMPERFECTION_FINE_SCALE_RANGE = (120.0, 240.0)
 STICKER_IMPERFECTION_SCRATCH_SCALE_RANGE = (28.0, 70.0)
 STICKER_IMPERFECTION_BUMP_STRENGTH_RANGE = (0.012, 0.035)
@@ -308,6 +309,10 @@ CORNER_CUT_ADJACENT_DEGREES_RANGE = (5.0, 45.0)
 # Seam counterparts are only visually useful once the layer has moved beyond
 # the small alignment tolerance used for corner-cut samples.
 PARTIAL_TURN_INTERSECTION_MIN_DEGREES = 10.0
+# Preserve the small boundary tolerance used by the distance-based keypoint
+# visibility test. It only covers numerical/render-boundary differences around
+# the mathematical point; it does not exempt turn seams or any cube piece.
+KEYPOINT_DISTANCE_TOLERANCE = 0.02
 CUBE_FLOAT_PROBABILITY = 0.55
 CUBE_DESK_NO_HANDS_PROBABILITY = 0.10
 CUBE_HANDS_TABLE_LIFT = 0.35
@@ -350,11 +355,15 @@ HAND_VISIBILITY_WEIGHTS = (
     ("onehandgrip", 0.10),
     ("both", 0.90),
 )
+# Randomize hand placement while retaining the shared cube pose and the
+# permitted R/L partial-turn motion.
+HAND_RANDOMIZATION_ENABLED = True
+HAND_FIXED_SKIN_COLOR = (0.75, 0.45, 0.30, 1.0)
+# Keep lateral hand nudging narrow so the hand stays beside the cube instead
+# of moving into its top/side geometry.  This is in the cube-local frame.
 HAND_X_OFFSET_RANGE = (-0.1, 0.1)
 HAND_Z_OFFSET_RANGE = (-0.5, 0.5)
-HAND_SOLVER_FACING_ROTATION_DEGREES = 180.0
 HAND_ORIGIN_X_ROTATION_DEGREES = (-90.0, 0.0, 90.0)
-HAND_TILT_DEGREES_RANGE = (-30.0, 30.0)
 HAND_POSES_WITHOUT_ORIGIN_X_ROTATION = (
     "HandPose.StandardHold",
     "HandPose.OneHandGrip",
@@ -3242,6 +3251,46 @@ def move_rear_station_cluster_for_camera(
     return placements
 
 
+def move_solve_station_cluster_for_camera(
+    background_randomization: dict[str, object],
+) -> dict[str, object] | None:
+    """Move the solve-station torso/solver aside after a camera is blocked.
+
+    The station is appended before the cube receives its final global pose.
+    That pose can move the cube into a torso that was clear during the earlier
+    probe, so this recovery is intentionally available at the final probe as
+    well.  Return ``None`` for scenes without the solve-station background.
+    """
+    station_entries = background_randomization.get("objects", [])
+    if not isinstance(station_entries, list):
+        return None
+    station_metadata = next(
+        (
+            entry
+            for entry in station_entries
+            if isinstance(entry, dict) and entry.get("family") == "solve_station"
+        ),
+        None,
+    )
+    if not isinstance(station_metadata, dict):
+        return None
+    collection_name = station_metadata.get("collection")
+    if not isinstance(collection_name, str):
+        return None
+    asset_collection = bpy.data.collections.get(collection_name)
+    if asset_collection is None:
+        return None
+
+    camera_direction, _camera_right, _camera_up = camera_basis()
+    placements = move_rear_station_cluster_for_camera(
+        asset_collection,
+        camera_direction,
+    )
+    if placements:
+        station_metadata["rear_camera_cluster_layout"] = placements
+    return placements or None
+
+
 def remove_solve_station_forearm_stubs(
     asset_collection: bpy.types.Collection,
 ) -> list[str]:
@@ -4034,27 +4083,77 @@ def apply_shared_cube_pose(
     if not isinstance(rows, list):
         raise ValueError("Cube pose is missing its shared transform matrix.")
     transform = matrix_from_rows(rows)
-    scramble_rows = cube_pose.get("wireframe_scramble_transform")
-    if scramble_rows is None:
-        scramble_transform = Matrix.Identity(4)
-    elif isinstance(scramble_rows, list):
-        scramble_transform = matrix_from_rows(scramble_rows)
-    else:
-        raise ValueError("Cube pose has an invalid whole-cube scramble transform.")
 
-    # The shared pose moves the cube and hands together. Whole-cube x/y/z
-    # scramble moves are a second rigid transform in the cube's local frame,
-    # so the hands must receive that transform as well. Local face turns are
-    # intentionally not applied here: the hands hold the stationary cube body
-    # while a single layer turns underneath them.
+    # The shared pose moves the cube and hands together for the global tilt and
+    # translation. The cube's discrete scramble is already present in the
+    # cubie transforms, but it must not rotate the hand rigs: hand placement is
+    # randomized independently of cube orientation. The permitted R/L local
+    # hand turns are applied separately before this shared global transform.
     for obj in cube_objects_to_transform:
         obj.matrix_world = transform @ obj.matrix_world
         obj.rotation_mode = "QUATERNION"
     for rig in hand_rigs_to_transform.values():
-        rig.matrix_world = transform @ scramble_transform @ rig.matrix_world
+        rig.matrix_world = transform @ rig.matrix_world
         rig.rotation_mode = "QUATERNION"
     bpy.context.view_layer.update()
     return transform
+
+
+def apply_partial_turn_to_hands(
+    layer_state: dict[str, object],
+    hand_rigs: dict[str, bpy.types.Object],
+) -> list[str]:
+    """Move the hand holding a side layer with an R/L partial turn.
+
+    The hand placement is authored independently from the cube scramble. A
+    transient R turn moves the right hand with the R layer, and an L turn
+    moves the left hand with the L layer. U/D/F/B partial turns leave both
+    hands in place. Corner-cut states can contain two components; apply the
+    same rule independently to each component.
+    """
+    if layer_state.get("mode") not in {"mid_turn", "corner_cut"}:
+        return []
+
+    components = [("face", "angle_degrees", "direction")]
+    if layer_state.get("mode") == "corner_cut":
+        components.append(("adjacent_face", "adjacent_angle_degrees", "adjacent_direction"))
+
+    moved_hands: list[str] = []
+    for face_key, angle_key, direction_key in components:
+        face = layer_state.get(face_key)
+        angle = layer_state.get(angle_key)
+        direction = layer_state.get(direction_key)
+        if face not in {"R", "L"}:
+            continue
+        if not isinstance(angle, (int, float)):
+            continue
+        if not isinstance(direction, (int, float)):
+            direction = 1.0
+
+        hand_name = "right-hand" if face == "R" else "left-hand"
+        rig = hand_rigs.get(hand_name)
+        if rig is None:
+            continue
+        face_axis = face_specs()[face]
+        turn = Quaternion(
+            face_axis,
+            float(direction) * math.radians(float(angle)),
+        ).to_matrix().to_4x4()
+        # A face turn rotates around the face-center axis, not the cube's
+        # origin. For R/L that pivot is the corresponding +/-1 face center.
+        turn_about_face = (
+            Matrix.Translation(face_axis)
+            @ turn
+            @ Matrix.Translation(-face_axis)
+        )
+        rig.matrix_world = turn_about_face @ rig.matrix_world
+        rig.rotation_mode = "QUATERNION"
+        if hand_name not in moved_hands:
+            moved_hands.append(hand_name)
+
+    if moved_hands:
+        bpy.context.view_layer.update()
+    return moved_hands
 
 
 def cube_pose_with_hand_lift(
@@ -4218,13 +4317,23 @@ def randomize_hands(
         # resulting render state explicitly OneHandGrip-only.
         visibility = "onehandgrip"
         one_hand_side = f"{forced_visibility}-hand"
+    elif forced_visibility == "none":
+        visibility = "none"
+    elif not HAND_RANDOMIZATION_ENABLED:
+        visibility = "both"
     else:
         visibility = forced_visibility or random.choices(
             [mode for mode, _weight in HAND_VISIBILITY_WEIGHTS],
             weights=[weight for _mode, weight in HAND_VISIBILITY_WEIGHTS],
             k=1,
         )[0]
-    assignments = hand_pose_assignments(visibility, one_hand_side=one_hand_side)
+    if not HAND_RANDOMIZATION_ENABLED and visibility == "both":
+        assignments = {
+            "left-hand": "HandPose.StandardHold",
+            "right-hand": "HandPose.StandardHold",
+        }
+    else:
+        assignments = hand_pose_assignments(visibility, one_hand_side=one_hand_side)
     visible_hands = (
         set(HAND_NAMES)
         if visibility == "both"
@@ -4240,7 +4349,11 @@ def randomize_hands(
     }
     if visibility == "onehandgrip":
         randomization["one_hand_side"] = next(iter(visible_hands))
-    skin_color = random_hand_skin_color()
+    skin_color = (
+        random_hand_skin_color()
+        if HAND_RANDOMIZATION_ENABLED
+        else HAND_FIXED_SKIN_COLOR
+    )
     skin_material = hand_skin_material(skin_color)
     apply_hand_material(objects, skin_material)
     randomization["skin_color"] = list(skin_color)
@@ -4253,32 +4366,32 @@ def randomize_hands(
         pose_name = assignments[name]
         assign_hand_pose(rig, pose_name)
         base_matrix = states[name]["rig_matrix_world"]
-        x_offset = random.uniform(*HAND_X_OFFSET_RANGE)
-        z_offset = random.uniform(*HAND_Z_OFFSET_RANGE)
-        base_x_rotation_degrees = (
-            0.0
-            if pose_name in HAND_POSES_WITHOUT_ORIGIN_X_ROTATION
-            else random.choice(HAND_ORIGIN_X_ROTATION_DEGREES)
-        )
-        x_tilt_degrees = random.uniform(*HAND_TILT_DEGREES_RANGE)
-        y_tilt_degrees = random.uniform(*HAND_TILT_DEGREES_RANGE)
-        z_tilt_degrees = random.uniform(*HAND_TILT_DEGREES_RANGE)
-        x_rotation_degrees = base_x_rotation_degrees + x_tilt_degrees
+        if HAND_RANDOMIZATION_ENABLED:
+            x_offset = random.uniform(*HAND_X_OFFSET_RANGE)
+            z_offset = random.uniform(*HAND_Z_OFFSET_RANGE)
+            x_rotation_degrees = (
+                0.0
+                if pose_name in HAND_POSES_WITHOUT_ORIGIN_X_ROTATION
+                else random.choice(HAND_ORIGIN_X_ROTATION_DEGREES)
+            )
+        else:
+            x_offset = 0.0
+            z_offset = 0.0
+            x_rotation_degrees = 0.0
         hidden = name not in visible_hands
         location_offset = Vector((x_offset, 0.0, z_offset))
-        global_rotation = (
-            Quaternion(Vector((0.0, 0.0, 1.0)), math.radians(z_tilt_degrees))
-            @ Quaternion(Vector((0.0, 1.0, 0.0)), math.radians(y_tilt_degrees))
-            @ Quaternion(Vector((1.0, 0.0, 0.0)), math.radians(x_rotation_degrees))
+        # The imported hand rigs already contain the correct placement for
+        # every pose. Randomization only nudges and applies the permitted
+        # pose-local quarter-turn to that authored placement.
+        hand_rotation = Quaternion(
+            Vector((1.0, 0.0, 0.0)),
+            math.radians(x_rotation_degrees),
         ).to_matrix().to_4x4()
-        solver_facing_rotation = Quaternion(
-            Vector((0.0, 0.0, 1.0)),
-            math.radians(HAND_SOLVER_FACING_ROTATION_DEGREES),
-        ).to_matrix().to_4x4()
-
+        # The nudge is authored in the same local frame as the pose. Apply
+        # the pose rotation first so a +/-90-degree pose rotates the nudge
+        # with the hand instead of leaving it in cube/world X-Z axes.
         local_matrix = (
-            solver_facing_rotation
-            @ global_rotation
+            hand_rotation
             @ Matrix.Translation(location_offset)
             @ base_matrix
         )
@@ -4296,12 +4409,8 @@ def randomize_hands(
             "pose": pose_name,
             "x_offset": x_offset,
             "z_offset": z_offset,
-            "base_x_rotation_degrees": base_x_rotation_degrees,
             "x_rotation_degrees": x_rotation_degrees,
-            "x_tilt_degrees": x_tilt_degrees,
-            "y_tilt_degrees": y_tilt_degrees,
-            "z_tilt_degrees": z_tilt_degrees,
-            "solver_facing_rotation_degrees": HAND_SOLVER_FACING_ROTATION_DEGREES,
+            "randomization_enabled": HAND_RANDOMIZATION_ENABLED,
             "location": [rig.location.x, rig.location.y, rig.location.z],
         }
 
@@ -5256,6 +5365,43 @@ def mesh_objects_in_roots(roots: list[bpy.types.Object]) -> list[bpy.types.Objec
     return objects
 
 
+def set_mesh_objects_render_visible(
+    roots: list[bpy.types.Object],
+) -> list[tuple[bpy.types.Object, bool, bool, bool]]:
+    """Temporarily expose cube meshes for ray casts and return their states."""
+    objects = mesh_objects_in_roots(roots)
+    root_names = {obj.name for obj in roots}
+    seen = {obj.as_pointer() for obj in objects}
+    for obj in bpy.data.objects:
+        if obj.type != "MESH" or obj.as_pointer() in seen:
+            continue
+        dotted_name = f".{obj.name}."
+        if any(f".{root_name}." in dotted_name for root_name in root_names):
+            objects.append(obj)
+            seen.add(obj.as_pointer())
+    original_visibility = [
+        (obj, obj.hide_render, obj.hide_viewport, obj.hide_get())
+        for obj in objects
+    ]
+    for obj in objects:
+        obj.hide_render = False
+        obj.hide_viewport = False
+        obj.hide_set(False)
+    bpy.context.view_layer.update()
+    return original_visibility
+
+
+def restore_mesh_object_visibility(
+    states: list[tuple[bpy.types.Object, bool, bool, bool]],
+) -> None:
+    """Restore mesh visibility after a temporary ray-cast pass."""
+    for obj, hide_render, hide_viewport, hide in states:
+        obj.hide_render = hide_render
+        obj.hide_viewport = hide_viewport
+        obj.hide_set(hide)
+    bpy.context.view_layer.update()
+
+
 def cube_render_mesh_names(roots: list[bpy.types.Object]) -> set[str]:
     """Return cube body and detached sticker mesh names used by ray casts."""
     names = {obj.name for obj in mesh_objects_in_roots(roots)}
@@ -5710,11 +5856,10 @@ def layer_turn_blur_object_axes(
 ) -> dict[str, tuple[Vector, float]]:
     """Return world-space blur axes for objects participating in layer motion.
 
-    A corner cut can contain two simultaneous layer turns.  Objects shared by
-    both layers use the axis of the larger turn. Visible hand rigs receive
-    the dominant layer axis at a reduced magnitude because they can move
-    slightly with the turn without following the cubie motion exactly. With
-    no layer turn, no localized blur is added.
+    A corner cut can contain two simultaneous layer turns. Objects shared by
+    both layers use the axis of the larger turn. Only the hand corresponding
+    to an R/L component receives localized blur, matching the actual hand
+    transform; U/D/F/B components do not move either hand.
     """
     mode = layer_state.get("mode")
     if mode == "none":
@@ -5736,8 +5881,7 @@ def layer_turn_blur_object_axes(
         return {}
 
     object_axes: dict[str, tuple[float, Vector]] = {}
-    dominant_axis: Vector | None = None
-    dominant_magnitude = -1.0
+    hand_axes: dict[str, Vector] = {}
     for object_key, face_key, angle_key in layer_specs:
         face = layer_state.get(face_key)
         angle = layer_state.get(angle_key)
@@ -5758,9 +5902,9 @@ def layer_turn_blur_object_axes(
         axis = (world_rotation @ face_specs()[face]).normalized()
         if float(direction) < 0.0:
             axis = -axis
-        if magnitude > dominant_magnitude:
-            dominant_magnitude = magnitude
-            dominant_axis = axis
+        if face in {"R", "L"}:
+            hand_name = "right-hand" if face == "R" else "left-hand"
+            hand_axes[f"{hand_name}-rig"] = axis
         for name in object_names:
             if not isinstance(name, str):
                 continue
@@ -5772,9 +5916,10 @@ def layer_turn_blur_object_axes(
         name: (axis, 1.0)
         for name, (_magnitude, axis) in object_axes.items()
     }
-    if dominant_axis is not None:
-        for name in hand_rig_names:
-            result[name] = (dominant_axis, HAND_LOCAL_ROTATIONAL_BLUR_FRACTION)
+    for name in hand_rig_names:
+        hand_axis = hand_axes.get(name)
+        if hand_axis is not None:
+            result[name] = (hand_axis, HAND_LOCAL_ROTATIONAL_BLUR_FRACTION)
     return result
 
 
@@ -6957,49 +7102,55 @@ def ray_to_point(camera: bpy.types.Object, point: Vector) -> tuple[Vector, Vecto
 def object_occluding_point(
     point: Vector,
     depsgraph: bpy.types.Depsgraph,
-    ignored_object_names: set[str] | None = None,
 ) -> str | None:
-    """Return the first non-ignored object hit strictly before ``point``.
+    """Return the first render-visible object hit strictly before ``point``.
 
-    A hit at the keypoint itself is part of the keypoint's supporting geometry,
-    not an occluder. This exact-before-point rule is important for keypoints
-    that lie on shared cubie or sticker boundaries.
+    Every cube piece participates in the same test, including at a partial-turn
+    seam. A hit at the mathematical keypoint itself is not an occluder; only a
+    hit strictly before that distance is.
     """
-    ignored_object_names = ignored_object_names or set()
     scene = bpy.context.scene
     camera = get_camera()
+    cube_mesh_names = cube_render_mesh_names([
+        *cube_objects(),
+        *core_fill_objects(),
+    ])
     origin, direction, point_distance = ray_to_point(camera, point)
     traveled = 0.0
     epsilon = 0.001
-    while traveled < point_distance:
+    while traveled < point_distance - KEYPOINT_DISTANCE_TOLERANCE:
         hit, location, _normal, _polygon_index, hit_object, _matrix = scene.ray_cast(
             depsgraph,
             origin,
             direction,
-            distance=point_distance - traveled,
+            distance=(point_distance - traveled) + KEYPOINT_DISTANCE_TOLERANCE,
         )
         if not hit or hit_object is None:
             return None
 
         hit_distance = (location - origin).length
         traveled += hit_distance
-        if traveled >= point_distance:
-            return None
         if (
             not getattr(hit_object, "visible_camera", True)
             or getattr(hit_object, "hide_render", False)
             or hit_object.name.startswith(SYNTHETIC_WINDOW_BLOCKER_PREFIX)
         ):
-            # Blender's ray cast can still report geometry that is hidden from
-            # the camera/render path. It must not occlude a training point.
             origin = location + (direction * epsilon)
             traveled += epsilon
             continue
-        if hit_object.name not in ignored_object_names:
-            return str(hit_object.name)
+        if traveled >= point_distance:
+            return None
+        if (
+            traveled >= point_distance - KEYPOINT_DISTANCE_TOLERANCE
+            and hit_object.name in cube_mesh_names
+        ):
+            # The mathematical point can lie just beyond a bevel or shared
+            # cubie boundary. Keep the small tolerance for cube support
+            # geometry, but never use it to discard an external occluder such
+            # as a hand that is genuinely in front of the point.
+            return None
+        return str(hit_object.name)
 
-        origin = location + (direction * epsilon)
-        traveled += epsilon
     return None
 
 
@@ -7679,12 +7830,82 @@ def keypoint_bbox(
     return (x1 + x2) / 2.0, (y1 + y2) / 2.0, max(1.0, x2 - x1), max(1.0, y2 - y1)
 
 
+def cube_pixel_owns_point(
+    visibility_class_map: object | None,
+    projected: tuple[float, float],
+    width: int,
+    height: int,
+) -> bool:
+    """Return whether the rendered pixel contains target-cube geometry."""
+    if visibility_class_map is None:
+        return False
+    shape = getattr(visibility_class_map, "shape", ())
+    if len(shape) != 2 or shape[0] != height or shape[1] != width:
+        return False
+    x = max(0, min(width - 1, round(float(projected[0]))))
+    y = max(0, min(height - 1, round(float(projected[1]))))
+    try:
+        return int(visibility_class_map[y, x]) == 1
+    except (IndexError, TypeError, ValueError):
+        return False
+
+
+def partial_turn_interior_seam_point(
+    spec: dict[str, object],
+    point: Vector,
+    layer_state: dict[str, object] | None,
+    cube_pose: dict[str, object] | None,
+) -> bool:
+    """Return whether a corner-edge point lies on an exposed turn seam.
+
+    Edge-on outer stickers remain subject to the normal view-angle rule.  The
+    exception is limited to edge cubies on the fixed side of a partial-turn
+    boundary, where a turn can expose the cube interior. Corner-edge-center
+    points remain subject to the normal view-angle rule. The test mirrors the
+    seam reconstruction used for partial-turn intersection labels, including
+    undoing later operations before checking the seam plane.
+    """
+    if spec.get("source_piece_type") != "edge":
+        return False
+    if not isinstance(layer_state, dict) or not isinstance(cube_pose, dict):
+        return False
+    operations = _partial_turn_layers(layer_state)
+    transform_rows = cube_pose.get("transform")
+    source_object = spec.get("source_object")
+    if not operations or not isinstance(transform_rows, list) or not isinstance(source_object, str):
+        return False
+
+    cube_to_world = matrix_from_rows(transform_rows)
+    cube_to_local = cube_to_world.inverted()
+    for operation_index, (face, angle, direction, object_names) in enumerate(operations):
+        if source_object in object_names or abs(angle) <= PARTIAL_TURN_INTERSECTION_MIN_DEGREES:
+            continue
+        seam_point = point.copy()
+        later_operations = operations[operation_index + 1:]
+        for later_face, later_angle, later_direction, later_objects in reversed(later_operations):
+            if source_object not in later_objects:
+                continue
+            seam_point, _seam_normals = _rotate_partial_turn_geometry(
+                seam_point,
+                [],
+                later_face,
+                later_angle,
+                later_direction,
+                cube_to_world,
+                inverse=True,
+            )
+        if _point_on_partial_turn_seam(seam_point, face, cube_to_local):
+            return True
+    return False
+
+
 def render_ordered_keypoint_label(
     cube_pose: dict[str, object],
     width: int,
     height: int,
     layer_state: dict[str, object] | None = None,
     min_plane_angle_degrees: float = FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
+    visibility_class_map: object | None = None,
 ) -> tuple[str | None, dict[str, object]]:
     """Project the ordered 26-point cube layout into one YOLO pose row."""
     transform_rows = cube_pose.get("transform")
@@ -7697,10 +7918,6 @@ def render_ordered_keypoint_label(
     cube_to_world = matrix_from_rows(transform_rows)
     cube_to_local = cube_to_world.inverted()
     cube_rotation = cube_to_world.to_3x3()
-    ignored_cube_objects = {
-        obj.name
-        for obj in [*cube_objects(), *core_fill_objects()]
-    }
     hand_object_names = {
         obj.name
         for obj in hand_objects().values()
@@ -7746,7 +7963,6 @@ def render_ordered_keypoint_label(
             occluded_by = object_occluding_point(
                 world_point,
                 depsgraph,
-                ignored_object_names=ignored_cube_objects,
             )
             hand_occluded = bool(occluded_by and occluded_by in hand_object_names)
             visibility = (
@@ -7987,6 +8203,7 @@ def render_pose_keypoints(
     include_occluded_keypoints: bool = INDEPENDENT_INCLUDE_OCCLUDED_KEYPOINTS,
     layer_state: dict[str, object] | None = None,
     cube_pose: dict[str, object] | None = None,
+    visibility_class_map: object | None = None,
 ) -> tuple[list[str], list[dict[str, object]], dict[str, object]]:
     scene = bpy.context.scene
     camera = get_camera()
@@ -7998,13 +8215,9 @@ def render_pose_keypoints(
         for obj in hand_objects().values()
         if not obj.hide_get() and not obj.hide_viewport and not obj.hide_render
     }
-    # A shared corner or edge lies on multiple cubies and often has detached
-    # sticker meshes. Ignore the complete target cube while testing external
-    # occlusion; otherwise the ray can hit an adjacent cubie/sticker before it
-    # reaches the exact shared point and incorrectly mark it unlabeled.
-    ignored_cube_object_names = cube_render_mesh_names(
-        [*cube_objects(), *core_fill_objects()]
-    )
+    # The mathematical keypoint is on the cube boundary. A hit at that exact
+    # distance is supporting geometry; any cube hit strictly before it is a
+    # real occluder, including during a partial layer turn.
     lines = []
     pose_objects = []
 
@@ -8019,6 +8232,7 @@ def render_pose_keypoints(
         "projected": 0,
         "out_of_frame": 0,
         "angle_filtered": 0,
+        "interior_seam_visible": 0,
         "visible": 0,
         "occluded": 0,
         "occluded_labeled": 0,
@@ -8038,28 +8252,47 @@ def render_pose_keypoints(
         projected = project_world_point(point, camera, scene)
         hand_occluded = False
         occluded_by = None
+        interior_seam_visible = False
         if projected is None:
             x, y = 0.0, 0.0
             visibility = POINT_VISIBILITY_UNLABELED
             raw_visibility = POINT_VISIBILITY_UNLABELED
             candidate_counts["out_of_frame"] += 1
-        elif not isinstance(normals, list) or not point_faces_camera(
-            point,
-            normals,
-            camera.location,
-            min_plane_angle_degrees=point_min_plane_angle_degrees,
-        ):
+        else:
+            angle_visible = isinstance(normals, list) and point_faces_camera(
+                point,
+                normals,
+                camera.location,
+                min_plane_angle_degrees=point_min_plane_angle_degrees,
+            )
+            interior_seam_visible = (
+                not angle_visible
+                and partial_turn_interior_seam_point(
+                    spec,
+                    point,
+                    layer_state,
+                    cube_pose,
+                )
+                and cube_pixel_owns_point(
+                    visibility_class_map,
+                    projected,
+                    width,
+                    height,
+                )
+            )
+        if projected is not None and not angle_visible and not interior_seam_visible:
             x, y = projected
             visibility = POINT_VISIBILITY_UNLABELED
             raw_visibility = POINT_VISIBILITY_UNLABELED
             candidate_counts["angle_filtered"] += 1
-        else:
+        elif projected is not None:
             x, y = projected
             candidate_counts["projected"] += 1
+            if interior_seam_visible:
+                candidate_counts["interior_seam_visible"] += 1
             occluded_by = object_occluding_point(
                 point,
                 depsgraph,
-                ignored_object_names=ignored_cube_object_names,
             )
             hand_occluded = occluded_by in visible_hand_names
             if occluded_by is not None:
@@ -8094,6 +8327,7 @@ def render_pose_keypoints(
             "raw_visibility": raw_visibility,
             "hand_occluded": hand_occluded,
             "occluded_by": occluded_by,
+            "interior_seam_visible": interior_seam_visible,
         }
 
     for point_index, spec in enumerate(keypoint_specs, start=1):
@@ -8204,7 +8438,6 @@ def write_pose_keypoint_mask(
     segment_fill_width = scaled_annotation_size(POSE_SEGMENT_FILL_BASE_WIDTH, width, height)
     segment_outline_width = scaled_annotation_size(POSE_SEGMENT_OUTLINE_BASE_WIDTH, width, height)
     point_radius = scaled_annotation_size(POSE_POINT_BASE_RADIUS, width, height)
-    point_outline_radius = scaled_annotation_size(POSE_POINT_OUTLINE_BASE_RADIUS, width, height)
     for pose_object in pose_objects:
         class_id = int(pose_object["class_id"])
         if class_id not in fill_colors or class_id not in point_colors:
@@ -8243,8 +8476,22 @@ def write_pose_keypoint_mask(
             if visibility == POINT_VISIBILITY_LABELED_OCCLUDED:
                 draw_color = (0, 0, 255)
             center = (round(float(x)), round(float(y)))
-            cv2.circle(output, center, point_radius, draw_color, thickness=-1, lineType=cv2.LINE_AA)
-            cv2.circle(output, center, point_outline_radius, (0, 0, 0), thickness=segment_outline_width, lineType=cv2.LINE_AA)
+            cv2.circle(
+                output,
+                center,
+                point_radius + POSE_POINT_OUTLINE_WIDTH,
+                (0, 0, 0),
+                thickness=-1,
+                lineType=cv2.LINE_AA,
+            )
+            cv2.circle(
+                output,
+                center,
+                point_radius,
+                draw_color,
+                thickness=-1,
+                lineType=cv2.LINE_AA,
+            )
 
     cv2.imwrite(str(path), output)
 
@@ -8278,7 +8525,7 @@ def write_ordered_keypoint_overlay(
         "center": (255, 255, 0),
     }
     point_radius = scaled_annotation_size(POSE_POINT_BASE_RADIUS, width, height)
-    point_outline_width = scaled_annotation_size(POSE_SEGMENT_OUTLINE_BASE_WIDTH, width, height)
+    point_outline_width = POSE_POINT_OUTLINE_WIDTH
     font_scale = max(0.35, min(width, height) / ANNOTATION_REFERENCE_SIZE * 0.55)
     font_thickness = max(1, scaled_annotation_size(1, width, height))
 
@@ -8351,6 +8598,91 @@ def write_yolo_pose(path: Path, lines: list[str]) -> None:
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
+def atomic_write_text(path: Path, text: str) -> None:
+    """Replace a text file without exposing a partially written document."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary_path.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def atomic_write_json(path: Path, value: object) -> None:
+    atomic_write_text(path, json.dumps(value, indent=2) + "\n")
+
+
+def sample_indices_in_output_dir(output_dir: Path) -> set[int]:
+    indices: set[int] = set()
+    for directory_name in ("images", "masks", "labels", POSE_LABEL_DIRECTORY):
+        directory = output_dir / directory_name
+        if not directory.is_dir():
+            continue
+        for path in directory.iterdir():
+            if path.is_file() and path.stem.isdigit():
+                indices.add(int(path.stem))
+    return indices
+
+
+def load_metadata_records(path: Path) -> list[dict[str, object]]:
+    """Load metadata, recovering the completed prefix after an interruption."""
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        position = 0
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position >= len(text) or text[position] != "[":
+            return []
+        position += 1
+        records: list[dict[str, object]] = []
+        while True:
+            while position < len(text) and text[position].isspace():
+                position += 1
+            if position >= len(text) or text[position] == "]":
+                break
+            try:
+                item, end = decoder.raw_decode(text, position)
+            except json.JSONDecodeError:
+                break
+            if isinstance(item, dict):
+                records.append(item)
+            position = end
+            while position < len(text) and text[position].isspace():
+                position += 1
+            if position < len(text) and text[position] == ",":
+                position += 1
+                continue
+            if position < len(text) and text[position] == "]":
+                break
+            break
+        return records
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def metadata_sample_indices(records: list[dict[str, object]]) -> set[int]:
+    indices: set[int] = set()
+    for record in records:
+        for key in ("image", "mask", "label", "pose_label"):
+            value = record.get(key)
+            if not isinstance(value, str):
+                continue
+            stem = Path(value).stem
+            if stem.isdigit():
+                indices.add(int(stem))
+    return indices
+
+
 def generate_dataset(
     output_dir: Path,
     count: int,
@@ -8393,7 +8725,8 @@ def generate_dataset(
         pose_dir.mkdir(parents=True, exist_ok=True)
         if pose_label_mode == POSE_LABEL_MODE_ORDERED:
             symmetry_manifest = output_dir / "ordered_keypoint_symmetries.json"
-            symmetry_manifest.write_text(
+            atomic_write_text(
+                symmetry_manifest,
                 json.dumps(
                     {
                         "format": "ordered_cube_keypoint_symmetry_v1",
@@ -8411,11 +8744,11 @@ def generate_dataset(
                     indent=2,
                 )
                 + "\n",
-                encoding="utf-8",
             )
         else:
             independent_manifest = output_dir / "independent_keypoint_manifest.json"
-            independent_manifest.write_text(
+            atomic_write_text(
+                independent_manifest,
                 json.dumps(
                     {
                         "format": "independent_cube_keypoints_v1",
@@ -8433,6 +8766,14 @@ def generate_dataset(
                             f"{PARTIAL_TURN_INTERSECTION_MIN_DEGREES:g} degrees; "
                             "corners remain singletons."
                         ),
+                        "interior_seam_angle_override": (
+                            "A corner-edge point that fails the ordinary view-angle "
+                            "rule may still be visible when it lies on the fixed-side "
+                            "partial-turn seam and its projected pixel is owned by the "
+                            "target cube. Corner-edge-center points remain subject to "
+                            "the ordinary rule. Hand/background ownership and the "
+                            "normal occlusion test still exclude it."
+                        ),
                         "min_face_plane_angle_degrees": min_face_plane_angle_degrees,
                         "corner_min_face_plane_angle_degrees": CORNER_FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
                         "include_occluded_keypoints": include_occluded_independent_keypoints,
@@ -8440,10 +8781,10 @@ def generate_dataset(
                     indent=2,
                 )
                 + "\n",
-                encoding="utf-8",
             )
     if render_segmentations:
-        (labels_dir / "classes.json").write_text(
+        atomic_write_text(
+            labels_dir / "classes.json",
             json.dumps(
                 {
                     str(class_id): name
@@ -8451,15 +8792,18 @@ def generate_dataset(
                 },
                 indent=2,
             ),
-            encoding="utf-8",
         )
 
     ensure_hand_assets_loaded()
     base_width, base_height = width, height
     metadata_path = output_dir / "metadata.json"
-    metadata_file = metadata_path.open("w", encoding="utf-8")
-    metadata_file.write("[\n")
-    metadata_count = 0
+    metadata_records = load_metadata_records(metadata_path)
+    existing_indices = sample_indices_in_output_dir(output_dir)
+    existing_indices.update(metadata_sample_indices(metadata_records))
+    next_sample_index = max(existing_indices, default=-1) + 1
+    # Repair an interrupted/partial metadata file before generating anything.
+    # Every completed sample below replaces this file atomically as well.
+    atomic_write_json(metadata_path, metadata_records)
     for index in range(count):
         auto_sample_hard_case = (
             hard_case == DEFAULT_HARD_CASE
@@ -8534,7 +8878,8 @@ def generate_dataset(
             obj.name: obj.matrix_world.copy() for obj in cube_pose_objects
         }
 
-        stem = f"{(index):06d}"
+        sample_index = next_sample_index + index
+        stem = f"{sample_index:06d}"
         image_path = images_dir / f"{stem}.png"
         mask_path = masks_dir / f"{stem}.png" if masks_dir is not None else None
         label_path = labels_dir / f"{stem}.txt" if render_segmentations else None
@@ -8566,10 +8911,12 @@ def generate_dataset(
         hand_visible = hand_randomization.get("visibility") != "none"
         placement_cube_pose = base_cube_pose if hand_visible else cube_pose_on_table(base_cube_pose)
         cube_pose = cube_pose_with_hand_lift(placement_cube_pose, hand_lift)
+        partial_turn_hands = apply_partial_turn_to_hands(layer_state, hand_rigs)
         apply_shared_cube_pose(cube_pose_objects, hand_rigs, cube_pose)
         hand_randomization["follows_cube_pose"] = True
-        hand_randomization["follows_whole_cube_scramble"] = True
-        hand_randomization["ignores_local_layer_turn"] = True
+        hand_randomization["follows_whole_cube_scramble"] = False
+        hand_randomization["follows_local_layer_turn"] = partial_turn_hands
+        hand_randomization["ignores_local_layer_turn"] = False
         hand_randomization["cube_vertical_lift"] = hand_lift
         hand_attempts = [{"attempt": 1, "accepted": True, "hands": hand_randomization}]
 
@@ -8630,6 +8977,16 @@ def generate_dataset(
         # render.  If necessary, recover with a clear camera before rendering.
         final_visibility_probe = camera_cube_visibility_probe(objects)
         if not final_visibility_probe["accepted"]:
+            blockers = final_visibility_probe.get("blockers", {})
+            station_is_blocking = isinstance(blockers, dict) and any(
+                isinstance(name, str)
+                and name.startswith(f"{BACKGROUND_SCENE_PREFIX}.solve_station.")
+                for name in blockers
+            )
+            if station_is_blocking:
+                move_solve_station_cluster_for_camera(background_randomization)
+                final_visibility_probe = camera_cube_visibility_probe(objects)
+        if not final_visibility_probe["accepted"]:
             camera_randomization = ensure_camera_has_clear_cube_view(
                 objects,
                 camera_randomization,
@@ -8672,6 +9029,7 @@ def generate_dataset(
             )
             segmentations = {}
             segmentation_roots = list(objects) + core_objects
+            visibility_class_map = None
             if render_segmentations:
                 visibility_class_map, sticker_masks = render_visibility_class_map(
                     segmentation_roots,
@@ -8713,38 +9071,55 @@ def generate_dataset(
                     "sticker_components": sticker_component_count,
                     "mask": str(mask_path) if mask_path is not None else None,
                 }
+            if visibility_class_map is None and (
+                pose_label_path is not None or mask_mode == MASK_MODE_KEYPOINTS
+            ):
+                visibility_class_map, _ = render_visibility_class_map(
+                    segmentation_roots,
+                    list(hand_rigs.values()),
+                    width,
+                    height,
+                )
             ordered_pose_metadata = None
             independent_pose_metadata = None
             pose_label_valid = None
             if pose_label_path is not None or mask_mode == MASK_MODE_KEYPOINTS:
-                pose_label_valid = True
-                if pose_label_mode == POSE_LABEL_MODE_ORDERED:
-                    ordered_pose_line, ordered_pose_metadata = render_ordered_keypoint_label(
-                        cube_pose,
-                        width,
-                        height,
-                        layer_state=layer_state,
-                        min_plane_angle_degrees=min_face_plane_angle_degrees,
-                    )
-                    if ordered_pose_line is None:
-                        raise RuntimeError(f"Could not project ordered keypoints for {image_path}")
-                    if pose_label_path is not None:
-                        write_yolo_pose(pose_label_path, [ordered_pose_line])
-                else:
-                    independent_lines, independent_objects, independent_geometry = render_pose_keypoints(
-                        mask_path if mask_mode == MASK_MODE_KEYPOINTS else None,
-                        image_path=image_path if mask_mode == MASK_MODE_KEYPOINTS else None,
-                        min_plane_angle_degrees=min_face_plane_angle_degrees,
-                        include_occluded_keypoints=include_occluded_independent_keypoints,
-                        layer_state=layer_state,
-                        cube_pose=cube_pose,
-                    )
-                    if pose_label_path is not None:
-                        write_yolo_pose(pose_label_path, independent_lines)
-                    independent_pose_metadata = {
-                        **independent_geometry,
-                        "objects": independent_objects,
-                    }
+                cube_visibility_states = set_mesh_objects_render_visible(
+                    segmentation_roots,
+                )
+                try:
+                    pose_label_valid = True
+                    if pose_label_mode == POSE_LABEL_MODE_ORDERED:
+                        ordered_pose_line, ordered_pose_metadata = render_ordered_keypoint_label(
+                            cube_pose,
+                            width,
+                            height,
+                            layer_state=layer_state,
+                            min_plane_angle_degrees=min_face_plane_angle_degrees,
+                            visibility_class_map=visibility_class_map,
+                        )
+                        if ordered_pose_line is None:
+                            raise RuntimeError(f"Could not project ordered keypoints for {image_path}")
+                        if pose_label_path is not None:
+                            write_yolo_pose(pose_label_path, [ordered_pose_line])
+                    else:
+                        independent_lines, independent_objects, independent_geometry = render_pose_keypoints(
+                            mask_path if mask_mode == MASK_MODE_KEYPOINTS else None,
+                            image_path=image_path if mask_mode == MASK_MODE_KEYPOINTS else None,
+                            min_plane_angle_degrees=min_face_plane_angle_degrees,
+                            include_occluded_keypoints=include_occluded_independent_keypoints,
+                            layer_state=layer_state,
+                            cube_pose=cube_pose,
+                            visibility_class_map=visibility_class_map,
+                        )
+                        if pose_label_path is not None:
+                            write_yolo_pose(pose_label_path, independent_lines)
+                        independent_pose_metadata = {
+                            **independent_geometry,
+                            "objects": independent_objects,
+                        }
+                finally:
+                    restore_mesh_object_visibility(cube_visibility_states)
             if mask_mode == MASK_MODE_KEYPOINTS and mask_path is not None:
                 if pose_label_mode == POSE_LABEL_MODE_ORDERED:
                     if ordered_pose_metadata is None:
@@ -8801,12 +9176,9 @@ def generate_dataset(
                 if isinstance(item, dict)
             ),
         }
-        if metadata_count:
-            metadata_file.write(",\n")
-        json.dump(metadata_entry, metadata_file, indent=2)
-        metadata_count += 1
+        metadata_records.append(metadata_entry)
+        atomic_write_json(metadata_path, metadata_records)
         if (index + 1) % MEMORY_CLEANUP_INTERVAL == 0:
-            metadata_file.flush()
             cleanup_blender_memory()
         mask_message = f", {mask_path}" if mask_path is not None else ""
         blend_asset_count = background_randomization.get("blend_asset_count", 0)
@@ -8820,10 +9192,9 @@ def generate_dataset(
             f"and {'with' if camera_degradation else 'without'} camera degradation"
         )
 
-    metadata_file.write("\n]\n")
-    metadata_file.close()
     data_yaml = output_dir / "data.yaml"
-    data_yaml.write_text(
+    atomic_write_text(
+        data_yaml,
         "path: " + str(output_dir.resolve()) + "\n"
         "train: images\n"
         "val: images\n"
@@ -8841,7 +9212,6 @@ def generate_dataset(
         + (f"pose_label_mode: {pose_label_mode}\n" if pose_dir is not None else "")
         + "names:\n"
         + "".join(f"  {index}: {name}\n" for index, name in enumerate(SEGMENTATION_CLASS_NAMES)),
-        encoding="utf-8",
     )
 
 

@@ -197,7 +197,7 @@ class StubCornerPoseModel:
 class StubNoPoseModel:
     names = {0: "corner"}
 
-    def predict(self, source, conf, imgsz, verbose):
+    def predict(self, source, conf, imgsz, device=None, verbose=False):
         return []
 
 
@@ -213,7 +213,7 @@ class ResetRecordingPoseSolver:
     def solve_correspondences(self, correspondence, image_size, observed_graph=None):
         return None
 
-    def reset_temporal_tracking(self):
+    def reset_pose_state(self):
         self.reset_count += 1
 
 
@@ -786,7 +786,7 @@ def test_pose_keypoints_draw_even_when_pnp_pose_estimation_is_disabled(monkeypat
     assert np.any(frame != 0)
 
 
-def test_pose_estimate_resets_temporal_tracking_when_pose_model_misses():
+def test_pose_estimate_resets_pose_state_when_pose_model_misses():
     frame = np.zeros((24, 24, 3), dtype=np.uint8)
     roi = frame[2:22, 2:22]
     pose_solver = ResetRecordingPoseSolver()
@@ -1952,7 +1952,6 @@ def test_graph_pnp_solver_limits_initial_seed_attempts(monkeypatch):
         ),
     ]
     solver = piece_seg_script.PoseGraphPnPSolver(max_refinement_attempts=1)
-    solver.last_tvec = np.asarray([[0.0], [0.0], [100.0]], dtype=np.float64)
     calls = []
 
     def fake_solve_correspondences(correspondence, *args, **kwargs):
@@ -1965,7 +1964,6 @@ def test_graph_pnp_solver_limits_initial_seed_attempts(monkeypatch):
 
     assert result is None
     assert calls == [(0, 1, 2)]
-    assert solver.last_tvec is None
 
 
 def test_graph_pnp_solver_keeps_cached_pose_solve_calls_to_seed_plus_refinement_budget(monkeypatch):
@@ -2018,7 +2016,6 @@ def test_graph_pnp_solver_keeps_cached_pose_solve_calls_to_seed_plus_refinement_
         max_reprojection_error_px=1.0,
         refinement_reprojection_error_px=5.0,
     )
-    solver.last_tvec = np.asarray([[0.0], [0.0], [100.0]], dtype=np.float64)
     profile = {}
 
     result = solver.solve_correspondence_candidates(
@@ -2032,7 +2029,6 @@ def test_graph_pnp_solver_keeps_cached_pose_solve_calls_to_seed_plus_refinement_
     assert profile["seed_attempts"] == 3
     assert profile["refinement_attempts"] == 3
     assert profile["pnp_solve_calls"] == 6
-    assert solver.last_tvec is None
 
 
 def test_graph_pnp_solver_rejects_high_error_result(monkeypatch):
@@ -2433,7 +2429,7 @@ def test_refinement_tries_farthest_observed_point_from_seed_first(monkeypatch):
     assert result.refinement_graph_index == 4
 
 
-def test_graph_pnp_solver_allows_single_frame_translation_jump(monkeypatch):
+def test_graph_pnp_solver_does_not_cache_previous_translation(monkeypatch):
     correspondence = piece_seg_script.PoseGraphCorrespondence(
         image_points=np.asarray([[20.0, 20.0], [40.0, 20.0], [20.0, 40.0]], dtype=np.float32),
         object_points=piece_seg_script.cube_lattice_points_for_coords(
@@ -2479,10 +2475,9 @@ def test_graph_pnp_solver_allows_single_frame_translation_jump(monkeypatch):
     assert first_result is not None
     assert second_result is not None
     assert third_result is not None
-    np.testing.assert_allclose(solver.last_tvec, results[-1].tvec if results else third_result.tvec)
 
 
-def test_graph_pnp_solver_missing_correspondence_clears_last_tvec(monkeypatch):
+def test_graph_pnp_solver_missing_correspondence_clears_motion_state(monkeypatch):
     correspondence = piece_seg_script.PoseGraphCorrespondence(
         image_points=np.asarray([[20.0, 20.0], [40.0, 20.0], [20.0, 40.0]], dtype=np.float32),
         object_points=piece_seg_script.cube_lattice_points_for_coords(
@@ -2518,14 +2513,11 @@ def test_graph_pnp_solver_missing_correspondence_clears_last_tvec(monkeypatch):
 
     first_result = solver.solve_correspondences(correspondence, (100, 100))
     missed_result = solver.solve_correspondences(None, (100, 100))
-    last_tvec_after_miss = solver.last_tvec
     second_result = solver.solve_correspondences(correspondence, (100, 100))
 
     assert first_result is not None
     assert missed_result is None
-    assert last_tvec_after_miss is None
     assert second_result is not None
-    np.testing.assert_allclose(solver.last_tvec, second_result.tvec)
 
 
 def test_graph_pnp_solver_rejects_high_error_points_without_prune_resolve(monkeypatch):
@@ -2762,56 +2754,6 @@ def test_graph_pnp_solver_reuses_camera_matrix_after_bootstrap(monkeypatch):
     assert second_calls == [100.0]
     np.testing.assert_allclose(solver.camera_matrix, piece_seg_script.default_camera_matrix((100, 80), focal_scale=1.0))
     assert solver.lattice_transform is not None
-
-
-def test_solve_best_lattice_graph_pnp_prefers_lower_translation_jump_when_available(monkeypatch):
-    correspondence = piece_seg_script.PoseGraphCorrespondence(
-        image_points=np.asarray([[20.0, 20.0], [40.0, 20.0], [20.0, 40.0]], dtype=np.float32),
-        object_points=np.asarray(
-            [[-27.5, -27.5, -27.5], [0.0, -27.5, -27.5], [-27.5, 0.0, -27.5]],
-            dtype=np.float32,
-        ),
-        graph_indexes=(0, 1, 2),
-        lattice_coords=((0, 0, 0), (1, 0, 0), (0, 1, 0)),
-    )
-    transforms = (
-        piece_seg_script.CUBE_LATTICE_IDENTITY_TRANSFORM,
-        ((0, 1, 2), (1, 1, -1)),
-    )
-    tvecs = [
-        np.asarray([[0.0], [0.0], [250.0]], dtype=np.float64),
-        np.asarray([[0.0], [0.0], [112.0]], dtype=np.float64),
-    ]
-
-    def fake_solve_lattice_graph_pnp(_image_points, _object_points, camera_matrix, **_kwargs):
-        tvec = tvecs.pop(0)
-        return SimpleNamespace(
-            projected_object_points=correspondence.image_points,
-            matched_error=0.0,
-            camera_matrix=camera_matrix,
-            tvec=tvec,
-        )
-
-    monkeypatch.setattr(
-        piece_seg_script,
-        "solve_lattice_graph_pnp",
-        fake_solve_lattice_graph_pnp,
-    )
-
-    result = piece_seg_script.solve_best_lattice_graph_pnp_current(
-        correspondence.image_points,
-        correspondence.lattice_coords,
-        (100, 80),
-        focal_min=1.0,
-        focal_max=1.0,
-        focal_steps=1,
-        lattice_transforms=transforms,
-        previous_tvec=np.asarray([[0.0], [0.0], [100.0]], dtype=np.float64),
-    )
-
-    assert result is not None
-    np.testing.assert_allclose(result.tvec, np.asarray([[0.0], [0.0], [112.0]], dtype=np.float64))
-    assert result.lattice_transform == transforms[1]
 
 
 def test_graph_pnp_camera_fit_can_use_non_identity_lattice_embedding():
@@ -3168,6 +3110,81 @@ def test_draw_pnp_cube_hides_refinement_marker_when_pose_graph_coords_are_disabl
     assert any(call[0][1] == (50, 50) and call[0][2] == (20, 20) for call in line_calls)
     assert not any(call[0][3] == piece_seg_script.PNP_REFINEMENT_POINT_COLOR for call in circle_calls)
     assert not any("refine" in call[0][1] for call in text_calls)
+
+
+def test_orientation_anchor_selects_stationary_two_layer_support():
+    camera_matrix = piece_seg_script.default_camera_matrix((320, 240), focal_scale=1.0)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    lattice_coords = (
+        (0, 0, 0), (0, 3, 0), (0, 0, 3),
+        (1, 0, 0), (1, 3, 0), (1, 0, 3),
+        (3, 0, 0), (3, 3, 0), (3, 0, 3),
+    )
+    object_points = piece_seg_script.cube_lattice_points_for_coords(lattice_coords)
+    stationary_image_points, _ = piece_seg_script.cv2.projectPoints(
+        object_points[:6],
+        np.zeros((3, 1), dtype=np.float64),
+        np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64),
+        camera_matrix,
+        dist_coeffs,
+    )
+    moved_image_points, _ = piece_seg_script.cv2.projectPoints(
+        object_points[6:],
+        np.asarray([[0.5], [0.0], [0.0]], dtype=np.float64),
+        np.asarray([[12.0], [0.0], [180.0]], dtype=np.float64),
+        camera_matrix,
+        dist_coeffs,
+    )
+    correspondence = piece_seg_script.PoseGraphCorrespondence(
+        image_points=np.concatenate(
+            (stationary_image_points.reshape(-1, 2), moved_image_points.reshape(-1, 2)),
+        ).astype(np.float32),
+        object_points=object_points,
+        graph_indexes=tuple(range(9)),
+        lattice_coords=lattice_coords,
+    )
+    result = SimpleNamespace(
+        object_points=object_points,
+        image_points=correspondence.image_points,
+        camera_matrix=camera_matrix,
+        dist_coeffs=dist_coeffs,
+        lattice_transform=piece_seg_script.CUBE_LATTICE_IDENTITY_TRANSFORM,
+    )
+    motion_filter = piece_seg_script.PoseMotionFilter()
+    motion_filter.update(
+        np.zeros((3, 1), dtype=np.float64),
+        np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64),
+    )
+
+    piece_seg_script.assign_orientation_anchor(result, correspondence, motion_filter)
+    anchor = result.orientation_anchor
+
+    assert anchor is not None
+    assert anchor.axis == 0
+    assert anchor.layers == (0, 1)
+    assert anchor.point_indexes == tuple(range(6))
+
+
+def test_projected_orientation_anchor_segments_colors_selected_layers():
+    camera_matrix = piece_seg_script.default_camera_matrix((320, 240), focal_scale=1.0)
+    result = SimpleNamespace(
+        rvec=np.zeros((3, 1), dtype=np.float64),
+        tvec=np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64),
+        camera_matrix=camera_matrix,
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+        orientation_anchor=piece_seg_script.OrientationAnchor(
+            axis=0,
+            layers=(0, 1),
+            point_indexes=(0, 1, 2),
+        ),
+    )
+
+    segments = piece_seg_script.projected_orientation_anchor_segments(result)
+
+    assert segments is not None
+    assert len(segments) == 36
+    assert sum(color == piece_seg_script.PNP_CUBE_LINE_COLOR for _start, _end, color in segments) == 24
+    assert sum(color == piece_seg_script.PNP_CUBE_STATIC_LINE_COLOR for _start, _end, color in segments) == 12
 
 
 def test_draw_pose_graph_correspondence_highlights_used_graph_and_labels_coords():

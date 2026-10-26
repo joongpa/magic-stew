@@ -36,6 +36,88 @@ def test_sticker_type_patterns_and_three_point_fallbacks():
     assert classify([0, 2, 2]) == "unknown"
 
 
+def test_cube_symmetries_are_the_24_proper_rotations():
+    matrices = render_script.CUBE_SYMMETRY_MATRICES
+
+    assert len(matrices) == 24
+    assert len({tuple(matrix.reshape(-1)) for matrix in matrices}) == 24
+    assert all(np.isclose(np.linalg.det(matrix), 1.0) for matrix in matrices)
+    np.testing.assert_array_equal(matrices[0], np.eye(3))
+
+
+def test_symmetry_transformation_preserves_projected_cube_geometry():
+    camera_matrix = render_script.default_camera_matrix((256, 256), 1.2)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    rvec = np.asarray([[0.12], [-0.18], [0.08]], dtype=np.float64)
+    tvec = np.asarray([[4.0], [-3.0], [180.0]], dtype=np.float64)
+    symmetry = render_script.CUBE_SYMMETRY_MATRICES[7]
+    points = render_script.CUBE_LATTICE_OBJECT_POINTS_MM
+    transformed_points = render_script.transform_object_points_by_symmetry(
+        points,
+        symmetry,
+    )
+    transformed_rvec = render_script.transform_rvec_by_symmetry(rvec, symmetry)
+    original_projection, _ = cv2.projectPoints(
+        points,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    transformed_projection, _ = cv2.projectPoints(
+        transformed_points,
+        transformed_rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+
+    np.testing.assert_allclose(
+        transformed_projection,
+        original_projection,
+        atol=1e-4,
+    )
+
+
+def test_symmetry_tracker_selects_equivalent_pose_near_previous_frame():
+    object_points = render_script.canonical_sticker_object_points("corner")
+    camera_matrix = render_script.default_camera_matrix((256, 256), 1.2)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    rvec = np.asarray([[0.12], [-0.18], [0.08]], dtype=np.float64)
+    tvec = np.asarray([[4.0], [-3.0], [180.0]], dtype=np.float64)
+    image_points, _ = cv2.projectPoints(
+        object_points,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    match = render_script.StickerKeypointMatch(
+        mask_index=0,
+        keypoint_indices=(0, 1, 2, 3),
+        sticker_type="corner",
+        average_confidence=0.95,
+    )
+    candidate = render_script.solve_sticker_pnp(
+        image_points.reshape(-1, 2),
+        np.asarray([0, 1, 2, 1], dtype=np.int32),
+        match,
+        (256, 256),
+        1.2,
+    )
+    assert candidate is not None
+    target_rvec = render_script.transform_rvec_by_symmetry(
+        candidate.rvec,
+        render_script.CUBE_SYMMETRY_MATRICES[9],
+    )
+    tracker = render_script.CubeSymmetryTracker()
+    tracker.observe(target_rvec)
+
+    canonical = render_script.canonicalize_pose_symmetry(candidate, tracker)
+
+    assert render_script.rotation_symmetry_distance(canonical.rvec, target_rvec) < 1e-6
+
+
 def test_sticker_keypoint_matches_returns_a_consistent_circular_order():
     mask = np.zeros((32, 32), dtype=np.uint8)
     mask[8:24, 8:24] = 1
@@ -146,24 +228,6 @@ def test_sticker_mask_parser_preserves_the_model_cube_mask():
     np.testing.assert_array_equal(parsed_cube_mask, cube_mask.astype(bool))
 
 
-def test_segmentation_support_mask_intersects_stickers_with_cube():
-    sticker_mask = np.zeros((8, 8), dtype=bool)
-    sticker_mask[2:6, 2:6] = True
-    cube_mask = np.zeros((8, 8), dtype=bool)
-    cube_mask[4:7, 4:7] = True
-
-    support = render_script.segmentation_support_mask(
-        [sticker_mask],
-        cube_mask,
-        (0, 0, 8, 8),
-        (8, 8),
-    )
-
-    expected = sticker_mask & cube_mask
-    assert support is not None
-    np.testing.assert_array_equal(support, expected)
-
-
 def test_solve_sticker_pnp_uses_canonical_corner_correspondence():
     object_points = render_script.canonical_sticker_object_points("corner")
     camera_matrix = render_script.default_camera_matrix((256, 256), 1.2)
@@ -253,6 +317,188 @@ def test_single_layer_mask_leaves_the_shared_seam_stationary():
 
     assert not np.any(positive_mask[np.isclose(points[:, 2], seam_coordinate)])
     assert not np.any(negative_mask[np.isclose(points[:, 2], -seam_coordinate)])
+
+
+def test_orientation_anchor_uses_stationary_complement_of_turn_layer():
+    candidate = SimpleNamespace(
+        layer_rotations=(
+            render_script.CubeLayerRotation(axis=2, side=1, angle_degrees=30.0),
+        )
+    )
+
+    anchor = render_script.orientation_anchor_for_candidate(candidate)
+
+    assert anchor == render_script.OrientationAnchor(axis=2, layers=(0, 1))
+
+
+def test_orientation_anchor_is_whole_cube_without_a_turn():
+    candidate = SimpleNamespace(layer_rotations=())
+
+    assert render_script.orientation_anchor_for_candidate(candidate) == (
+        render_script.all_cube_orientation_anchor()
+    )
+
+
+def test_projected_cube_faces_mark_only_anchor_layers():
+    image_size = (256, 256)
+    candidate = SimpleNamespace(
+        layer_rotations=(),
+        orientation_anchor=render_script.OrientationAnchor(axis=2, layers=(0, 1)),
+        camera_matrix=render_script.default_camera_matrix(image_size, 1.2),
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+    )
+    rvec = np.asarray([[0.12], [-0.18], [0.08]], dtype=np.float64)
+    tvec = np.asarray([[4.0], [-3.0], [180.0]], dtype=np.float64)
+
+    faces = render_script.projected_cubelet_faces(candidate, rvec, tvec)
+
+    assert faces
+    assert any(not is_anchor for _depth, _face, is_anchor in faces)
+    assert any(is_anchor for _depth, _face, is_anchor in faces)
+
+
+def test_temporal_pose_filter_refits_from_stationary_layers():
+    image_size = (256, 256)
+    camera_matrix = render_script.default_camera_matrix(image_size, 1.2)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    rvec = np.asarray([[0.12], [-0.18], [0.08]], dtype=np.float64)
+    tvec = np.asarray([[4.0], [-3.0], [180.0]], dtype=np.float64)
+    rotation = render_script.CubeLayerRotation(axis=2, side=1, angle_degrees=30.0)
+    assignment_object_points = render_script.apply_cube_layer_rotations(
+        render_script.CUBE_LATTICE_OBJECT_POINTS_MM,
+        (rotation,),
+    )
+    assignment_image_points, _ = cv2.projectPoints(
+        assignment_object_points,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    sticker_object_points = render_script.canonical_sticker_object_points("corner")
+    sticker_image_points, _ = cv2.projectPoints(
+        sticker_object_points,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    candidate = render_script.StickerPnPCandidate(
+        sticker_type="corner",
+        sticker_average_confidence=0.9,
+        image_points=sticker_image_points.reshape(-1, 2),
+        object_points=sticker_object_points,
+        projected_sticker_points=sticker_image_points.reshape(-1, 2),
+        camera_matrix=camera_matrix,
+        dist_coeffs=dist_coeffs,
+        rvec=rvec,
+        tvec=tvec,
+        reprojection_error=0.0,
+        assignment_image_points=assignment_image_points.reshape(-1, 2),
+        assignment_projected_points=assignment_image_points.reshape(-1, 2),
+        assignment_object_points=assignment_object_points,
+        layer_rotations=(rotation,),
+    )
+
+    filtered = render_script.apply_temporal_pose_filter(
+        candidate,
+        render_script.PoseMotionFilter(),
+    )
+
+    assert filtered.orientation_anchor == render_script.OrientationAnchor(
+        axis=2,
+        layers=(0, 1),
+    )
+    assert filtered.motion_diagnostics is not None
+    assert filtered.raw_rvec is not None
+    assert filtered.assignment_projected_points is not None
+
+
+def test_rank_misaligned_layer_faces_prefers_fewest_explained_observations():
+    points = render_script.CUBE_LATTICE_OBJECT_POINTS_MM
+    distances = np.zeros(len(points), dtype=np.float32)
+    positive_z = render_script.cube_layer_mask(points, axis=2, side=1)
+    distances[positive_z] = 12.0
+
+    ranked = render_script.rank_misaligned_layer_faces(
+        points,
+        points,
+        distances,
+        fixed_mask=np.zeros(len(points), dtype=bool),
+        assignment_error_limit=4.0,
+        max_face_candidates=2,
+    )
+
+    assert ranked[0][:2] == (2, 1)
+    assert ranked[0][2] == 0.0
+    assert len(ranked) == 2
+
+
+def test_transformed_visibility_rejects_occluded_lattice_points():
+    rvec = np.zeros((3, 1), dtype=np.float64)
+    tvec = np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64)
+    back_center_index = render_script.CUBE_LATTICE_COORDS.index((1, 1, 3))
+
+    unturned_points = render_script.CUBE_LATTICE_OBJECT_POINTS_MM
+    unturned_hidden = render_script.transformed_surface_occlusion_mask(
+        unturned_points,
+        rvec,
+        tvec,
+        (),
+    )
+    assert unturned_hidden[back_center_index]
+
+    rvec = np.asarray([[0.5], [0.3], [0.0]], dtype=np.float64)
+    rotation = render_script.CubeLayerRotation(axis=0, side=-1, angle_degrees=30.0)
+    turned_points = render_script.apply_cube_layer_rotations(
+        unturned_points,
+        (rotation,),
+    )
+    turned_hidden = render_script.transformed_surface_occlusion_mask(
+        turned_points,
+        rvec,
+        tvec,
+        (rotation,),
+    )
+    visible_points, _class_ids = render_script.visible_transformed_cube_lattice_points(
+        rvec,
+        tvec,
+        (rotation,),
+    )
+
+    transformed_normals = render_script.CUBE_LATTICE_BOUNDARY_NORMALS.copy()
+    layer_mask = render_script.cube_layer_mask(
+        unturned_points,
+        rotation.axis,
+        rotation.side,
+        rotation.layer_count,
+    )
+    layer_rvec = np.zeros((3, 1), dtype=np.float64)
+    layer_rvec[rotation.axis, 0] = rotation.side * np.deg2rad(
+        rotation.angle_degrees
+    )
+    layer_matrix, _ = cv2.Rodrigues(layer_rvec)
+    transformed_normals[layer_mask] = np.einsum(
+        "ij,nfj->nfi",
+        layer_matrix,
+        transformed_normals[layer_mask],
+    )
+    camera_matrix, _ = cv2.Rodrigues(rvec)
+    front_facing = np.any(
+        render_script.CUBE_LATTICE_BOUNDARY_FACE_MASK
+        & (
+            np.einsum(
+                "ij,nfj->nfi",
+                camera_matrix,
+                transformed_normals,
+            )[..., 2]
+            < 0.0
+        ),
+        axis=1,
+    )
+
+    assert np.any(turned_hidden & front_facing)
+    assert len(visible_points) < len(turned_points)
 
 
 def test_recover_misaligned_layer_updates_assignment_geometry():
@@ -346,6 +592,22 @@ def test_recover_misaligned_layer_updates_assignment_geometry():
     )
 
     recovered = render_script.recover_misaligned_cube_layers(candidate, limit)
+    exhaustive = render_script.recover_misaligned_cube_layers(
+        candidate,
+        limit,
+        max_face_candidates=6,
+    )
+    shortlisted = render_script.recover_misaligned_cube_layers(
+        candidate,
+        limit,
+        max_face_candidates=2,
+    )
+    logged = render_script.recover_misaligned_cube_layers(
+        candidate,
+        limit,
+        max_face_candidates=6,
+        record_all_turn_candidates=True,
+    )
 
     assert recovered.layer_rotations
     assert recovered.assignment_projected_points is not None
@@ -355,6 +617,13 @@ def test_recover_misaligned_layer_updates_assignment_geometry():
         axis=1,
     )
     assert np.min(recovered_distances) <= limit
+    assert shortlisted.layer_rotations == exhaustive.layer_rotations
+    np.testing.assert_allclose(
+        shortlisted.assignment_projected_points,
+        exhaustive.assignment_projected_points,
+    )
+    assert len(logged.turn_candidate_scores) > render_script.PNP_TURN_DEBUG_CANDIDATE_COUNT
+    assert len(logged.turn_candidate_debug) == len(logged.turn_candidate_scores)
 
 
 def test_three_point_edge_uses_image_gap_to_preserve_cyclic_correspondence():
@@ -482,6 +751,167 @@ def test_best_sticker_tries_all_four_point_stickers_and_chooses_lowest_overall_e
 
     assert result.match is matches[1]
     assert selected == [0, 1, 2]
+
+
+def test_best_sticker_candidates_retains_ranked_alternatives(monkeypatch):
+    matches = tuple(
+        render_script.StickerKeypointMatch(
+            index,
+            (index * 4, index * 4 + 1, index * 4 + 2, index * 4 + 3),
+            "corner",
+            0.9,
+        )
+        for index in range(3)
+    )
+
+    def fake_solve(_points, _classes, match, _image_size, _focal_scale, *_args):
+        return SimpleNamespace(
+            match=match,
+            overall_reprojection_error=float(3 - match.mask_index),
+            reprojection_error=0.0,
+            sticker_average_confidence=match.average_confidence,
+        )
+
+    monkeypatch.setattr(render_script, "solve_sticker_pnp", fake_solve)
+    candidates = render_script.best_sticker_pnp_candidates(
+        np.zeros((12, 2), dtype=np.float32),
+        np.zeros((12,), dtype=np.int32),
+        matches,
+        (128, 128),
+        1.2,
+    )
+
+    assert [candidate.match.mask_index for candidate in candidates] == [2, 1, 0]
+
+
+def test_pose_hypothesis_buffer_keeps_current_set_separate_from_history():
+    buffer = render_script.PoseHypothesisBuffer(max_frames=2)
+    first = SimpleNamespace(rvec=np.zeros((3, 1)), tvec=np.zeros((3, 1)))
+    second = SimpleNamespace(rvec=np.ones((3, 1)), tvec=np.ones((3, 1)))
+    third = SimpleNamespace(rvec=np.full((3, 1), 2.0), tvec=np.full((3, 1), 2.0))
+
+    buffer.append((first,), 10)
+    buffer.append((second,), 11)
+    assert buffer.previous_candidates() == (first,)
+    buffer.append((third,), 12)
+
+    assert [frame.frame_index for frame in buffer.frames] == [11, 12]
+    assert buffer.previous_candidates() == (second,)
+
+
+def test_pose_hypothesis_buffer_exposes_only_best_candidate_for_fast_graph():
+    buffer = render_script.PoseHypothesisBuffer(max_frames=2)
+    first = SimpleNamespace()
+    alternate = SimpleNamespace()
+    second = SimpleNamespace()
+    buffer.append((first, alternate), 10)
+    buffer.append((second,), 11)
+
+    fast_frames = buffer.best_candidate_frames()
+
+    assert [frame.candidates for frame in fast_frames] == [(first,), (second,)]
+
+
+def test_hypothesis_selection_prefers_continuity_only_for_close_visual_scores():
+    def candidate(error, angle):
+        return SimpleNamespace(
+            overall_reprojection_error=error,
+            reprojection_error=0.0,
+            rvec=np.asarray([[0.0], [0.0], [angle]], dtype=np.float64),
+            tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+        )
+
+    near = candidate(10.0, 0.01)
+    far = candidate(10.5, 1.0)
+    selected = render_script.select_pose_hypothesis(
+        (far, near),
+        (near.rvec, near.tvec),
+    )
+
+    assert selected is near
+
+
+def test_hypothesis_selection_keeps_much_better_visual_candidate_on_turn():
+    good_turn = SimpleNamespace(
+        overall_reprojection_error=2.0,
+        reprojection_error=0.0,
+        rvec=np.asarray([[0.0], [0.0], [1.0]], dtype=np.float64),
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    stale = SimpleNamespace(
+        overall_reprojection_error=8.0,
+        reprojection_error=0.0,
+        rvec=np.zeros((3, 1), dtype=np.float64),
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+
+    selected = render_script.select_pose_hypothesis(
+        (good_turn, stale),
+        (stale.rvec, stale.tvec),
+    )
+
+    assert selected is good_turn
+
+
+def test_pose_graph_prefers_path_with_bounded_derivatives():
+    def candidate(position, error=0.0):
+        return SimpleNamespace(
+            overall_reprojection_error=error,
+            reprojection_error=0.0,
+            rvec=np.zeros((3, 1), dtype=np.float64),
+            tvec=np.asarray([[position], [0.0], [200.0]], dtype=np.float64),
+        )
+
+    frames = (
+        render_script.PoseHypothesisFrame(0, (candidate(0.0),)),
+        render_script.PoseHypothesisFrame(
+            1,
+            (candidate(1.0), candidate(50.0)),
+        ),
+        render_script.PoseHypothesisFrame(2, (candidate(2.0),)),
+    )
+    selection = render_script.select_pose_graph_path(
+        frames,
+        render_script.PoseMotionFilterConfig(
+            dt_seconds=1.0,
+            max_acceleration_units_s2=5.0,
+            max_jerk_units_s3=5.0,
+            max_angular_acceleration_rad_s2=5.0,
+            max_angular_jerk_rad_s3=5.0,
+        ),
+    )
+
+    assert selection is not None
+    assert selection.path[1].tvec[0, 0] == 1.0
+    assert selection.violates_limits is False
+
+
+def test_pose_graph_does_not_use_jerk_as_a_constraint():
+    def candidate(position):
+        return SimpleNamespace(
+            overall_reprojection_error=0.0,
+            reprojection_error=0.0,
+            rvec=np.zeros((3, 1), dtype=np.float64),
+            tvec=np.asarray([[position], [0.0], [200.0]], dtype=np.float64),
+        )
+
+    frames = tuple(
+        render_script.PoseHypothesisFrame(index, (candidate(position),))
+        for index, position in enumerate((0.0, 0.0, 0.0, 1.0))
+    )
+    selection = render_script.select_pose_graph_path(
+        frames,
+        render_script.PoseMotionFilterConfig(
+            dt_seconds=1.0,
+            max_acceleration_units_s2=2.0,
+            max_jerk_units_s3=0.001,
+            max_angular_acceleration_rad_s2=5.0,
+            max_angular_jerk_rad_s3=0.001,
+        ),
+    )
+
+    assert selection is not None
+    assert selection.violates_limits is False
 
 
 def test_pose_assignment_keeps_selected_sticker_correspondences_fixed():

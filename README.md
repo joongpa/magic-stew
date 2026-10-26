@@ -185,12 +185,26 @@ For joint cube-and-sticker segmentation on the combined MCP dataset, use:
 
 This defaults to `data/mcp_dataset_v5.3`, expects class `0` to be `cube` and
 class `1` to be `sticker`, and writes the prepared split and training run below
-`runs/cube_sticker_seg_local`. Use `--prepare-only` to validate and prepare the
-dataset without starting YOLO training. The default segmentation `mask_ratio`
-is `2`; override it with `--mask-ratio` when trading mask detail for memory and
-speed. Overlapping cube/sticker instances are kept as independent masks by
-default; use `--overlap-mask` only if you explicitly want Ultralytics to merge
-overlapping targets.
+`runs/cube_sticker_seg_local`. Multiple datasets can be combined by passing
+several roots after `--source-dirs` or by repeating the option. For example:
+
+```bash
+.venv/bin/python scripts/train_yolo11n_cube_sticker_seg_local.py \
+  --source-dirs data/mcp_dataset_v5.3 data/another_cube_dataset \
+  --extra-negative-dir data/negative_examples/negative_ROI_backgrounds \
+  --device cuda
+```
+
+`--device` also accepts `cuda:0`, a GPU index such as `0`, `mps`, or `cpu`;
+omitting it lets Ultralytics choose. Negative examples are included by default
+from `data/youtube_solve_frames_hd/cropped-negatives`; disable them with
+`--no-extra-negatives`. Mosaic augmentation is disabled by default (`--mosaic
+0.0`). Use `--prepare-only` to validate and prepare the dataset without starting
+YOLO training. The default segmentation `mask_ratio` is `2`; override it with
+`--mask-ratio` when trading mask detail for memory and speed. Overlapping
+cube/sticker instances are kept as independent masks by default; use
+`--overlap-mask` only if you explicitly want Ultralytics to merge overlapping
+targets.
 
 ## Automated whole-cube failure mining
 
@@ -243,6 +257,59 @@ The trainer also includes cube-free images from
 `data/youtube_solve_frames_hd/cropped-negatives` by default, writing empty pose
 labels for them. Override the directory with `--extra-negative-dir`.
 
+To prepare a fixed direct-correspondence target from the v3 independent
+dataset, use the 37-point three-face converter:
+
+```bash
+.venv/bin/python scripts/prepare_three_face_correspondence_dataset.py
+```
+
+The output is written to
+`data/independent_keypoints_dataset_v3_three_face/`. It maps the three
+camera-facing source faces into a canonical U/F/R frame, emits the 37 unique
+boundary-lattice points in face-major row-major order, uses visibility `0` for
+blank observations, and inverse-applies recorded partial turns before lattice
+assignment. The converter tolerates the currently truncated final v3 metadata
+record and skips its orphan image.
+
+To inspect the generated correspondence labels on their original images,
+render selected samples with the point indices overlaid:
+
+```bash
+.venv/bin/python scripts/render_three_face_correspondence.py \
+  --stems 000000 000001 000349 \
+  --show-blank \
+  --output-dir runs/three_face_correspondence_renders
+```
+
+By default the viewer renders the first sample only; use `--all` to render
+the full dataset or `--show` to step through the rendered images in an
+OpenCV window. Visible points are colored by canonical face (`U`, `F`, or
+`R`) and annotated with their fixed correspondence index. Blank indices are
+listed in the lower-left legend when `--show-blank` is enabled.
+
+Train the separate 37-point correspondence model with the symmetry-aware
+criterion:
+
+```bash
+.venv/bin/python scripts/train_yolo11n_three_face_correspondence_local.py \
+  --source-dir data/independent_keypoints_dataset_v3_three_face \
+  --workdir runs/three_face_correspondence_pose_local \
+  --device mps
+```
+
+The model uses the standard YOLO11 pose backbone and a 37-point pose head.
+Its loss derives the proper rotations that preserve the observed face subset:
+four in-plane relabelings for one visible face, two relabelings for two
+adjacent visible faces, and three cyclic relabelings for all three faces. It
+uses face-exclusive points to identify that subset, so shared seams such as
+the F face's indices 12–15 are not incorrectly counted as evidence for both
+faces. If only shared points remain, it uses a conservative union of valid
+relabelings. It routes gradients through the lowest-cost valid relabeling for
+each sample. Blank points are handled through the visibility term and do not
+contribute coordinate error. Use `--prepare-only` to inspect the generated
+training layout without starting training.
+
 The Blender generator uses an 8-degree minimum face-to-camera angle by
 default, so nearly edge-on faces do not contribute weak, clustered keypoints.
 It also omits independent points occluded by another object by default; those
@@ -268,6 +335,13 @@ defaults are `corner=0.25`, `corner-edge=0.30`, and
 `--pose-class-conf corner=0.30,corner-edge=0.40,corner-edge-center=0.30`.
 `--min-keypoint-conf` remains an optional point-visibility filter, and
 `--track-conf` controls the minimum point-visibility score for ROI tracking.
+Misaligned-layer recovery still evaluates the layer angle on its existing
+fixed grid, while optionally ranking face directions from the initial
+assignment residuals first. It evaluates all six face directions by default;
+use `--pnp-turn-face-candidates 2` (or `1` for maximum speed) to opt into the
+smaller face search, and return to `6` if recall changes.
+When `--turn-candidate-log OUTPUT_DIR` is supplied, the JSONL log records every
+turn permutation evaluated and saves an annotated image for each one.
 
 For ground-truth overlays on the prepared dataset, use
 `scripts/render_independent_keypoints.py`:

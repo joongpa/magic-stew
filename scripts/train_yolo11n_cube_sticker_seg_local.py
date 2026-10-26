@@ -6,6 +6,8 @@ Expected input layout:
       images/*.png
       labels/*.txt
 
+    extra-negative-dir/    # optional cube-free images; written with empty labels
+
 Each label file uses standard YOLO segmentation rows:
 
     <class_id> <x1> <y1> <x2> <y2> ...
@@ -27,6 +29,8 @@ from pathlib import Path
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 MIN_POLYGON_FIELDS = 1 + 3 * 2
+DEFAULT_EXTRA_NEGATIVE_DIR = Path("data/youtube_solve_frames_hd/cropped-negatives")
+Sample = tuple[Path, Path | None]
 
 
 def label_lines(path: Path) -> list[str]:
@@ -70,7 +74,7 @@ def validate_label_file(path: Path, class_names: list[str]) -> Counter[int]:
 def collect_pairs(
     source_dir: Path,
     class_names: list[str],
-) -> tuple[list[tuple[Path, Path]], Counter[int]]:
+) -> tuple[list[Sample], Counter[int]]:
     images_dir = source_dir / "images"
     labels_dir = source_dir / "labels"
     if not images_dir.is_dir():
@@ -90,7 +94,7 @@ def collect_pairs(
             f"{missing_labels[0].stem}.txt"
         )
 
-    pairs = [(image_path, label_by_stem[image_path.stem]) for image_path in image_paths]
+    pairs: list[Sample] = [(image_path, label_by_stem[image_path.stem]) for image_path in image_paths]
     if not pairs:
         raise RuntimeError(f"No image/label pairs found under {source_dir}")
 
@@ -98,25 +102,44 @@ def collect_pairs(
     for _image_path, label_path in pairs:
         class_counts.update(validate_label_file(label_path, class_names))
 
-    missing_classes = [
-        class_names[class_id] for class_id in range(len(class_names)) if not class_counts[class_id]
-    ]
-    if missing_classes:
-        raise RuntimeError(f"Dataset contains no instances of: {', '.join(missing_classes)}")
     return pairs, class_counts
 
 
 def write_dataset(
-    source_dir: Path,
+    source_dirs: list[Path],
     dataset_dir: Path,
     val_fraction: float,
     seed: int,
     class_names: list[str],
+    extra_negative_dir: Path | None = None,
 ) -> Path:
     if not 0.0 <= val_fraction < 1.0:
         raise ValueError("val_fraction must be in the range [0, 1)")
 
-    pairs, source_class_counts = collect_pairs(source_dir, class_names)
+    pairs: list[Sample] = []
+    source_class_counts: Counter[int] = Counter()
+    for source_dir in source_dirs:
+        source_pairs, class_counts = collect_pairs(source_dir, class_names)
+        pairs.extend(source_pairs)
+        source_class_counts.update(class_counts)
+    if extra_negative_dir is not None:
+        if not extra_negative_dir.is_dir():
+            raise FileNotFoundError(f"Missing extra-negative image directory: {extra_negative_dir}")
+        negative_paths = sorted(
+            path
+            for path in extra_negative_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+        pairs.extend((image_path, None) for image_path in negative_paths)
+    if not pairs:
+        raise RuntimeError("No image/label pairs found in the supplied dataset directories")
+    missing_classes = [
+        class_names[class_id]
+        for class_id in range(len(class_names))
+        if not source_class_counts[class_id]
+    ]
+    if missing_classes:
+        raise RuntimeError(f"Combined datasets contain no instances of: {', '.join(missing_classes)}")
     random.Random(seed).shuffle(pairs)
 
     val_count = max(1, round(len(pairs) * val_fraction)) if len(pairs) > 1 and val_fraction else 0
@@ -134,30 +157,40 @@ def write_dataset(
         class_counts: Counter[int] = Counter()
         object_count_distribution: Counter[int] = Counter()
 
+        negative_image_count = 0
         for index, (image_path, label_path) in enumerate(split_pairs):
-            lines = label_lines(label_path)
-            counts = validate_label_file(label_path, class_names)
-            class_counts.update(counts)
+            is_negative = label_path is None
+            lines = label_lines(label_path) if label_path is not None else []
+            if label_path is not None:
+                counts = validate_label_file(label_path, class_names)
+                class_counts.update(counts)
+            else:
+                negative_image_count += 1
             object_count_distribution[len(lines)] += 1
 
             target_stem = f"{split}_{index:06d}"
             target_image = dataset_dir / "images" / split / f"{target_stem}{image_path.suffix.lower()}"
             target_label = dataset_dir / "labels" / split / f"{target_stem}.txt"
             shutil.copy2(image_path, target_image)
-            shutil.copy2(label_path, target_label)
+            if label_path is None:
+                target_label.write_text("", encoding="utf-8")
+            else:
+                shutil.copy2(label_path, target_label)
             manifest.append(
                 {
                     "split": split,
                     "source_image": str(image_path),
-                    "source_label": str(label_path),
+                    "source_label": str(label_path) if label_path is not None else None,
                     "image": str(target_image),
                     "label": str(target_label),
                     "objects": len(lines),
+                    "negative": is_negative,
                 }
             )
 
         summary[split] = {
             "images": len(split_pairs),
+            "negative_images": negative_image_count,
             "object_count_distribution": dict(sorted(object_count_distribution.items())),
             "class_objects": {
                 class_names[class_id]: class_counts[class_id]
@@ -204,6 +237,7 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
         cache=args.cache,
         mask_ratio=args.mask_ratio,
         overlap_mask=args.overlap_mask,
+        mosaic=args.mosaic,
         plots=True,
     )
 
@@ -224,7 +258,33 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source-dir", type=Path, default=Path("data/mcp_dataset_v5.3"))
+    parser.add_argument(
+        "--source-dir",
+        "--source-dirs",
+        dest="source_dir_groups",
+        type=Path,
+        nargs="+",
+        action="append",
+        default=None,
+        help=(
+            "Dataset root(s) containing images and YOLO segmentation labels; provide multiple "
+            "paths after this option or repeat it to combine datasets."
+        ),
+    )
+    parser.add_argument(
+        "--extra-negative-dir",
+        type=Path,
+        default=DEFAULT_EXTRA_NEGATIVE_DIR,
+        help=(
+            "Directory of cube-free images to include with empty labels "
+            f"(default: {DEFAULT_EXTRA_NEGATIVE_DIR})"
+        ),
+    )
+    parser.add_argument(
+        "--no-extra-negatives",
+        action="store_true",
+        help="Train from positive cube/sticker samples only",
+    )
     parser.add_argument("--workdir", type=Path, default=Path("runs/cube_sticker_seg_local"))
     parser.add_argument("--class-names", default="cube,sticker")
     parser.add_argument("--val-fraction", type=float, default=0.2)
@@ -233,9 +293,19 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", type=int, default=256)
     parser.add_argument("--batch", type=int, default=-1)
-    parser.add_argument("--device", default="mps")
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Training device override, e.g. cpu, mps, cuda, 0, or 0,1; default lets Ultralytics choose.",
+    )
     parser.add_argument("--name", default="cube_sticker_yolo11n_seg")
     parser.add_argument("--patience", type=int, default=25)
+    parser.add_argument(
+        "--mosaic",
+        type=float,
+        default=0.0,
+        help="Mosaic augmentation probability; 0.0 disables mosaic augmentation.",
+    )
     parser.add_argument(
         "--mask-ratio",
         type=int,
@@ -255,14 +325,20 @@ def main() -> None:
     if args.mask_ratio < 1:
         raise SystemExit("--mask-ratio must be at least 1")
     class_names = parse_class_names(args.class_names)
+    source_dirs = [
+        source_dir
+        for source_dir_group in (args.source_dir_groups or [[Path("data/mcp_dataset_v5.3")]])
+        for source_dir in source_dir_group
+    ]
     dataset_dir = args.workdir / "dataset"
     runs_dir = args.workdir / "runs"
     data_yaml = write_dataset(
-        source_dir=args.source_dir,
+        source_dirs=source_dirs,
         dataset_dir=dataset_dir,
         val_fraction=args.val_fraction,
         seed=args.seed,
         class_names=class_names,
+        extra_negative_dir=None if args.no_extra_negatives else args.extra_negative_dir,
     )
 
     if args.prepare_only:

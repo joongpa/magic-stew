@@ -27,8 +27,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import deque
 from dataclasses import dataclass, replace
-from itertools import product
+from itertools import permutations, product
 from pathlib import Path
 from time import perf_counter
 
@@ -56,6 +57,11 @@ from live_recognition.independent_pose_thresholds import (  # noqa: E402
 from live_recognition.roi_tracking import (  # noqa: E402
     RoiTracker,
     roi_for_frame as shared_roi_for_frame,
+)
+from live_recognition.pose_motion import (  # noqa: E402
+    PoseMotionDiagnostics,
+    PoseMotionFilter,
+    PoseMotionFilterConfig,
 )
 
 
@@ -178,12 +184,37 @@ CUBE_CORNER_POINTS_MM = np.asarray(
     ],
     dtype=np.float32,
 )
+
+
+def _cube_symmetry_matrices() -> tuple[np.ndarray, ...]:
+    """Return the 24 proper rotational symmetries of a cube."""
+
+    matrices: list[np.ndarray] = []
+    for permutation in permutations(range(3)):
+        permutation_matrix = np.zeros((3, 3), dtype=np.int32)
+        for row, column in enumerate(permutation):
+            permutation_matrix[row, column] = 1
+        for signs in product((-1, 1), repeat=3):
+            matrix = permutation_matrix * np.asarray(signs, dtype=np.int32)[:, None]
+            if int(round(np.linalg.det(matrix))) == 1:
+                matrices.append(matrix.astype(np.float64))
+    identity = np.eye(3, dtype=np.float64)
+    matrices.sort(
+        key=lambda matrix: (
+            0 if np.array_equal(matrix, identity) else 1,
+            tuple(matrix.reshape(-1).tolist()),
+        )
+    )
+    return tuple(matrices)
+
+
+CUBE_SYMMETRY_MATRICES = _cube_symmetry_matrices()
 PNP_CUBE_COLOR_BGR = (255, 80, 30)
 PNP_CANDIDATE_CUBE_COLOR_BGR = (0, 165, 255)
 PNP_STICKER_COLOR_BGR = (0, 220, 255)
 PNP_FINAL_SOLVE_COLOR_BGR = (0, 255, 0)
 PNP_ASSIGNMENT_COLOR_BGR = (255, 0, 255)
-PNP_MISALIGNED_LAYER_COLOR_BGR = (0, 0, 255)
+PNP_ORIENTATION_ANCHOR_COLOR_BGR = (0, 0, 255)
 MAX_STICKER_PNP_CANDIDATES = 3
 # A class is correct about 90% of the time.  Make a mismatch expensive enough
 # to prevent a one-cubie row/column slip, while keeping it finite so an
@@ -200,16 +231,6 @@ PNP_PIVOT_P90_WEIGHT = 0.40
 PNP_PIVOT_P95_WEIGHT = 0.20
 PNP_PIVOT_MAX_WEIGHT = 0.05
 PNP_ASSIGNMENT_TAIL_WEIGHT = 0.25
-# Segmentation is useful as a soft geometric cue, but its boundary can be
-# imperfect because of occlusion and mask spill. Express its penalty in a few
-# pixel-equivalent units so keypoint reprojection error remains dominant.
-PNP_STICKER_BOUNDARY_WEIGHT = 6.0
-# Use the intersection of the cube and all sticker masks as a soft support
-# region during layer-turn scoring.  Sticker pixels outside the projected
-# sticker grid are more informative than empty pixels inside that grid, since
-# segmentation can merge adjacent stickers or miss parts of a sticker.
-PNP_STICKER_GRID_SPILLOUT_WEIGHT = 48.0
-PNP_STICKER_GRID_EMPTY_WEIGHT = 0.25
 # Final-solve observations must be close relative to the displayed cube size.
 # This is deliberately expressed as a fraction of the projected cube diameter
 # so the same setting works at different distances from the camera.
@@ -217,6 +238,10 @@ PNP_FINAL_ASSIGNMENT_ERROR_FRACTION = 0.05
 PNP_LAYER_MISALIGNMENT_MIN_DEGREES = -45.0
 PNP_LAYER_MISALIGNMENT_MAX_DEGREES = 45.0
 PNP_LAYER_MISALIGNMENT_STEP_DEGREES = 3.0
+# A moved layer is likely to have the fewest low-error assignments under the
+# initial rigid-cube pose. Only these face directions need the expensive angle
+# sweep; callers can set this to 6 for exhaustive diagnostics.
+PNP_TURN_FACE_CANDIDATES = 2
 PNP_TURN_DEBUG_CANDIDATE_COUNT = 6
 PNP_TURN_OVERLAY_CANDIDATE_COUNT = 6
 
@@ -254,7 +279,6 @@ class StickerPnPCandidate:
     assignment_projected_class_ids: np.ndarray | None = None
     assignment_fixed_mask: np.ndarray | None = None
     sticker_contour: np.ndarray | None = None
-    sticker_support_mask: np.ndarray | None = None
     image_size: tuple[int, int] | None = None
     layer_rotations: tuple["CubeLayerRotation", ...] = ()
     turn_candidate_scores: tuple[tuple[str, float, int, float, float], ...] = ()
@@ -262,6 +286,274 @@ class StickerPnPCandidate:
     final_solve_image_points: np.ndarray | None = None
     pre_final_rvec: np.ndarray | None = None
     pre_final_tvec: np.ndarray | None = None
+    raw_rvec: np.ndarray | None = None
+    raw_tvec: np.ndarray | None = None
+    motion_diagnostics: PoseMotionDiagnostics | None = None
+    orientation_anchor: "OrientationAnchor | None" = None
+
+
+@dataclass(frozen=True)
+class PoseHypothesisFrame:
+    """The current frame's retained pose hypotheses."""
+
+    frame_index: int | None
+    candidates: tuple[StickerPnPCandidate, ...]
+
+
+class PoseHypothesisBuffer:
+    """Short history of candidate sets, without buffering rendered images."""
+
+    def __init__(self, max_frames: int = 8) -> None:
+        if max_frames <= 0:
+            raise ValueError("max_frames must be positive")
+        self.max_frames = int(max_frames)
+        self._frames: deque[PoseHypothesisFrame] = deque(maxlen=self.max_frames)
+
+    def clear(self) -> None:
+        self._frames.clear()
+
+    def append(
+        self,
+        candidates: tuple[StickerPnPCandidate, ...],
+        frame_index: int | None,
+    ) -> None:
+        self._frames.append(
+            PoseHypothesisFrame(
+                frame_index=frame_index,
+                candidates=tuple(candidates),
+            )
+        )
+
+    @property
+    def frames(self) -> tuple[PoseHypothesisFrame, ...]:
+        return tuple(self._frames)
+
+    def previous_candidates(self) -> tuple[StickerPnPCandidate, ...]:
+        """Return candidates from prior frames, never the current frame."""
+
+        return tuple(
+            candidate
+            for frame in list(self._frames)[:-1]
+            for candidate in frame.candidates
+        )
+
+    def best_candidate_frames(self) -> tuple[PoseHypothesisFrame, ...]:
+        """Return one best candidate per frame for the cheap graph pass."""
+
+        return tuple(
+            PoseHypothesisFrame(frame.frame_index, frame.candidates[:1])
+            for frame in self._frames
+            if frame.candidates
+        )
+
+
+@dataclass(frozen=True)
+class PoseGraphSelection:
+    """The best candidate path through the recent hypothesis graph."""
+
+    candidate: StickerPnPCandidate
+    path: tuple[StickerPnPCandidate, ...]
+    visual_cost: float
+    constraint_cost: float
+    violates_limits: bool
+
+
+def _pose_path_deltas(
+    path: tuple[StickerPnPCandidate, ...],
+    frame_indices: tuple[int | None, ...],
+    dt_seconds: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return linear/angular velocity and acceleration for one candidate path."""
+
+    positions = [
+        np.asarray(candidate.tvec, dtype=np.float64).reshape(3)
+        for candidate in path
+    ]
+    rotations = [
+        cv2.Rodrigues(
+            np.asarray(candidate.rvec, dtype=np.float64).reshape(3, 1)
+        )[0]
+        for candidate in path
+    ]
+    velocities: list[np.ndarray] = []
+    angular_velocities: list[np.ndarray] = []
+    for index in range(1, len(path)):
+        frame_delta = 1
+        if frame_indices[index] is not None and frame_indices[index - 1] is not None:
+            frame_delta = max(
+                int(frame_indices[index]) - int(frame_indices[index - 1]),
+                1,
+            )
+        local_dt = float(dt_seconds) * frame_delta
+        velocities.append((positions[index] - positions[index - 1]) / local_dt)
+        relative = rotations[index - 1].T @ rotations[index]
+        angular_velocities.append(cv2.Rodrigues(relative)[0].reshape(3) / local_dt)
+    accelerations = [
+        (velocities[index] - velocities[index - 1]) / float(dt_seconds)
+        for index in range(1, len(velocities))
+    ]
+    angular_accelerations = [
+        (angular_velocities[index] - angular_velocities[index - 1])
+        / float(dt_seconds)
+        for index in range(1, len(angular_velocities))
+    ]
+    return (
+        np.asarray(velocities, dtype=np.float64),
+        np.asarray(angular_velocities, dtype=np.float64),
+        np.asarray(accelerations, dtype=np.float64),
+        np.asarray(angular_accelerations, dtype=np.float64),
+    )
+
+
+def _pose_path_constraint_metrics(
+    path: tuple[StickerPnPCandidate, ...],
+    frame_indices: tuple[int | None, ...],
+    config: PoseMotionFilterConfig,
+) -> tuple[float, float, bool]:
+    """Score acceleration/jerk violations for one graph path."""
+
+    if len(path) < 3:
+        return 0.0, 0.0, False
+    _velocities, _angular_velocities, accelerations, angular_accelerations = (
+        _pose_path_deltas(path, frame_indices, float(config.dt_seconds))
+    )
+    if len(accelerations) == 0:
+        return 0.0, 0.0, False
+    acceleration_excess = np.maximum(
+        np.linalg.norm(accelerations, axis=1)
+        / max(float(config.max_acceleration_units_s2), 1e-9)
+        - 1.0,
+        0.0,
+    )
+    angular_acceleration_excess = np.maximum(
+        np.linalg.norm(angular_accelerations, axis=1)
+        / max(float(config.max_angular_acceleration_rad_s2), 1e-9)
+        - 1.0,
+        0.0,
+    )
+    excess = np.concatenate(
+        (
+            acceleration_excess,
+            angular_acceleration_excess,
+        )
+    )
+    constraint_cost = float(np.sum(excess * excess))
+    maximum_excess = float(np.max(excess)) if len(excess) else 0.0
+    return constraint_cost, maximum_excess, bool(maximum_excess > 0.0)
+
+
+def _pose_transition_constraint_metrics(
+    path: tuple[StickerPnPCandidate, ...],
+    frame_indices: tuple[int | None, ...],
+    config: PoseMotionFilterConfig,
+) -> tuple[float, bool]:
+    """Score only the new acceleration/jerk terms at a path extension."""
+
+    if len(path) < 3:
+        return 0.0, False
+    tail = path[-4:]
+    tail_indices = frame_indices[-4:]
+    _velocities, _angular_velocities, accelerations, angular_accelerations = (
+        _pose_path_deltas(tail[-3:], tail_indices[-3:], float(config.dt_seconds))
+    )
+    if len(accelerations) == 0:
+        return 0.0, False
+    excess_values = [
+        max(
+            float(np.linalg.norm(accelerations[-1]))
+            / max(float(config.max_acceleration_units_s2), 1e-9)
+            - 1.0,
+            0.0,
+        ),
+        max(
+            float(np.linalg.norm(angular_accelerations[-1]))
+            / max(float(config.max_angular_acceleration_rad_s2), 1e-9)
+            - 1.0,
+            0.0,
+        ),
+    ]
+    excess = np.asarray(excess_values, dtype=np.float64)
+    return float(np.sum(excess * excess)), bool(np.any(excess > 0.0))
+
+
+def select_pose_graph_path(
+    frames: tuple[PoseHypothesisFrame, ...],
+    config: PoseMotionFilterConfig,
+    predicted_pose: tuple[np.ndarray, np.ndarray] | None = None,
+) -> PoseGraphSelection | None:
+    """Choose one candidate path using visual fit and bounded derivatives."""
+
+    usable_frames = tuple(frame for frame in frames if frame.candidates)
+    if not usable_frames:
+        return None
+    frame_indices = tuple(frame.frame_index for frame in usable_frames)
+    # The local derivative state only needs the last three nodes: the newest
+    # acceleration uses three poses and the newest jerk uses four poses. A
+    # dynamic-programming state therefore consists of the last three indices,
+    # rather than an exhaustive 3^8 path enumeration.
+    states: dict[tuple[int, ...], tuple[tuple[StickerPnPCandidate, ...], float, float, bool]] = {}
+    for index, candidate in enumerate(usable_frames[0].candidates):
+        states[(index,)] = (
+            (candidate,),
+            0.15 * pose_hypothesis_visual_score(candidate),
+            0.0,
+            False,
+        )
+    for frame_number, frame in enumerate(usable_frames[1:], start=1):
+        next_states: dict[
+            tuple[int, ...], tuple[tuple[StickerPnPCandidate, ...], float, float, bool]
+        ] = {}
+        for state_key, (path, visual_cost, constraint_cost, violates_limits) in states.items():
+            for candidate_index, candidate in enumerate(frame.candidates):
+                extended_path = path + (candidate,)
+                extended_indices = frame_indices[max(0, frame_number - 3) : frame_number + 1]
+                transition_cost, transition_violation = _pose_transition_constraint_metrics(
+                    extended_path[-4:],
+                    extended_indices,
+                    config,
+                )
+                extended_key = (*state_key, candidate_index)[-3:]
+                extended = (
+                    extended_path,
+                    visual_cost + 0.15 * pose_hypothesis_visual_score(candidate),
+                    constraint_cost + transition_cost,
+                    violates_limits or transition_violation,
+                )
+                previous = next_states.get(extended_key)
+                if previous is None or (
+                    extended[1] + 8.0 * extended[2]
+                    < previous[1] + 8.0 * previous[2]
+                ):
+                    next_states[extended_key] = extended
+        states = next_states
+
+    evaluated = []
+    for path, visual_cost, constraint_cost, violates_limits in states.values():
+        visual_cost = (
+            visual_cost
+            + 0.85 * pose_hypothesis_visual_score(path[-1])
+        )
+        if predicted_pose is not None:
+            visual_cost += 0.5 * pose_hypothesis_distance(path[-1], predicted_pose)
+        evaluated.append(
+            PoseGraphSelection(
+                candidate=path[-1],
+                path=path,
+                visual_cost=visual_cost,
+                constraint_cost=constraint_cost,
+                violates_limits=violates_limits,
+            )
+        )
+    feasible = [selection for selection in evaluated if not selection.violates_limits]
+    pool = feasible if feasible else evaluated
+    selected = min(
+        pool,
+        key=lambda selection: (
+            selection.visual_cost + 8.0 * selection.constraint_cost,
+            selection.visual_cost,
+        ),
+    )
+    return selected
 
 
 @dataclass(frozen=True)
@@ -283,6 +575,92 @@ class TurnCandidateDebug:
     assignment_projected_points: np.ndarray
     assignment_object_points: np.ndarray
     assignment_projected_class_ids: np.ndarray
+
+
+@dataclass(frozen=True)
+class OrientationAnchor:
+    """The stationary cube layers used as the rigid-pose support."""
+
+    axis: int | None
+    layers: tuple[int, ...]
+
+    @property
+    def label(self) -> str:
+        if self.axis is None:
+            return "all"
+        return f"{chr(ord('X') + int(self.axis))}:{','.join(str(layer) for layer in self.layers)}"
+
+
+class CubeSymmetryTracker:
+    """Keep equivalent cube poses in one continuous coordinate frame."""
+
+    def __init__(self) -> None:
+        self._rotation: np.ndarray | None = None
+
+    def reset(self) -> None:
+        self._rotation = None
+
+    def observe(self, rvec: np.ndarray) -> None:
+        self._rotation = cv2.Rodrigues(
+            np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+        )[0]
+
+    @property
+    def rotation(self) -> np.ndarray | None:
+        return None if self._rotation is None else self._rotation.copy()
+
+
+def transform_object_points_by_symmetry(
+    object_points: np.ndarray,
+    symmetry: np.ndarray,
+) -> np.ndarray:
+    """Relabel object coordinates under one whole-cube symmetry."""
+
+    points = np.asarray(object_points, dtype=np.float64).reshape(-1, 3)
+    return (np.asarray(symmetry, dtype=np.float64) @ points.T).T.astype(np.float32)
+
+
+def transform_layer_rotation_by_symmetry(
+    layer_rotation: CubeLayerRotation,
+    symmetry: np.ndarray,
+) -> CubeLayerRotation:
+    """Transform a layer axis and side into a relabeled cube frame."""
+
+    matrix = np.asarray(symmetry, dtype=np.float64).reshape(3, 3)
+    source_axis = int(layer_rotation.axis)
+    if source_axis not in (0, 1, 2):
+        return layer_rotation
+    target_axis = int(np.argmax(np.abs(matrix[:, source_axis])))
+    axis_sign = int(round(matrix[target_axis, source_axis]))
+    return CubeLayerRotation(
+        axis=target_axis,
+        side=int(layer_rotation.side) * axis_sign,
+        angle_degrees=float(layer_rotation.angle_degrees),
+        layer_count=int(layer_rotation.layer_count),
+    )
+
+
+def transform_rvec_by_symmetry(
+    rvec: np.ndarray,
+    symmetry: np.ndarray,
+) -> np.ndarray:
+    """Return the equivalent camera pose after relabeling object axes."""
+
+    rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    transformed_rotation = rotation @ np.asarray(symmetry, dtype=np.float64).T
+    return cv2.Rodrigues(transformed_rotation)[0].reshape(3, 1)
+
+
+def rotation_symmetry_distance(
+    first: np.ndarray,
+    second: np.ndarray,
+) -> float:
+    """Return the geodesic distance between two camera rotations."""
+
+    first_matrix, _ = cv2.Rodrigues(np.asarray(first, dtype=np.float64).reshape(3, 1))
+    second_matrix, _ = cv2.Rodrigues(np.asarray(second, dtype=np.float64).reshape(3, 1))
+    relative = first_matrix.T @ second_matrix
+    return float(np.linalg.norm(cv2.Rodrigues(relative)[0]))
 
 
 def layer_rotation_debug_label(
@@ -881,6 +1259,116 @@ def visible_cube_lattice_points(
     )
 
 
+def transformed_cube_surface_triangles(
+    layer_rotations: tuple["CubeLayerRotation", ...]
+    | list["CubeLayerRotation"],
+) -> np.ndarray:
+    """Return triangles for the transformed exterior cubie surfaces."""
+
+    triangles: list[np.ndarray] = []
+    for x_index in range(3):
+        for y_index in range(3):
+            for z_index in range(3):
+                center = cubelet_center_object_point(x_index, y_index, z_index)
+                for axis, side in (
+                    (axis, side)
+                    for axis in range(3)
+                    for side in (-1, 1)
+                    if (
+                        (axis == 0 and ((side == -1 and x_index == 0) or (side == 1 and x_index == 2)))
+                        or (axis == 1 and ((side == -1 and y_index == 0) or (side == 1 and y_index == 2)))
+                        or (axis == 2 and ((side == -1 and z_index == 0) or (side == 1 and z_index == 2)))
+                    )
+                ):
+                    face = cubelet_face_object_points(center, axis, side)
+                    _transformed_center, transformed_face = apply_cubelet_layer_rotations(
+                        center,
+                        face,
+                        tuple(layer_rotations),
+                    )
+                    triangles.append(
+                        np.asarray(
+                            (transformed_face[0], transformed_face[1], transformed_face[2]),
+                            dtype=np.float64,
+                        )
+                    )
+                    triangles.append(
+                        np.asarray(
+                            (transformed_face[0], transformed_face[2], transformed_face[3]),
+                            dtype=np.float64,
+                        )
+                    )
+    if not triangles:
+        return np.empty((0, 3, 3), dtype=np.float64)
+    return np.asarray(triangles, dtype=np.float64)
+
+
+def transformed_surface_occlusion_mask(
+    object_points: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    layer_rotations: tuple["CubeLayerRotation", ...]
+    | list["CubeLayerRotation"],
+) -> np.ndarray:
+    """Return transformed lattice points hidden by another exterior surface.
+
+    This is a small 3-D ray/triangle test rather than a rendered depth pass.
+    The target point itself is excluded with a small endpoint margin, so the
+    face containing that point does not count as an occluder.
+    """
+
+    points = np.asarray(object_points, dtype=np.float64).reshape(-1, 3)
+    if len(points) == 0:
+        return np.zeros(0, dtype=bool)
+    triangles = transformed_cube_surface_triangles(layer_rotations)
+    if len(triangles) == 0:
+        return np.zeros(len(points), dtype=bool)
+
+    rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    camera_origin = (
+        -rotation.T @ np.asarray(tvec, dtype=np.float64).reshape(3, 1)
+    ).reshape(3)
+    directions = points - camera_origin
+    edge_1 = triangles[:, 1] - triangles[:, 0]
+    edge_2 = triangles[:, 2] - triangles[:, 0]
+    ray_cross_edge_2 = np.cross(directions[:, None, :], edge_2[None, :, :])
+    determinant = np.einsum(
+        "mj,nmj->nm",
+        edge_1,
+        ray_cross_edge_2,
+    )
+    valid = np.abs(determinant) > 1e-9
+    inverse_determinant = np.divide(
+        1.0,
+        determinant,
+        out=np.zeros_like(determinant),
+        where=valid,
+    )
+    origin_to_vertex = -triangles[None, :, 0] + camera_origin
+    barycentric_u = inverse_determinant * np.sum(
+        origin_to_vertex * ray_cross_edge_2,
+        axis=2,
+    )
+    cross_q = np.cross(origin_to_vertex, edge_1[None, :, :])
+    barycentric_v = inverse_determinant * np.sum(
+        directions[:, None, :] * cross_q,
+        axis=2,
+    )
+    distance = inverse_determinant * np.sum(
+        edge_2[None, :, :] * cross_q,
+        axis=2,
+    )
+    triangle_hits = (
+        valid
+        & (barycentric_u >= -1e-6)
+        & (barycentric_v >= -1e-6)
+        & (barycentric_u + barycentric_v <= 1.0 + 1e-6)
+        & (distance > 1e-5)
+        & (distance < 1.0 - 1e-4)
+    )
+    return np.any(triangle_hits, axis=1)
+
+
 def visible_transformed_cube_lattice_points(
     rvec: np.ndarray,
     tvec: np.ndarray,
@@ -959,7 +1447,13 @@ def visible_transformed_cube_lattice_points(
     t_exit = np.minimum(1.0, np.min(slab_far, axis=1))
     ray_intersects_cube = np.all(parallel_inside, axis=1) & (t_enter <= t_exit)
     if layer_rotations:
-        visible_mask = front_facing
+        hidden_by_transformed_surface = transformed_surface_occlusion_mask(
+            points,
+            rvec,
+            tvec,
+            layer_rotations,
+        )
+        visible_mask = front_facing & ~hidden_by_transformed_surface
     else:
         hidden_by_front_face = (
             ray_intersects_cube
@@ -1544,138 +2038,6 @@ def sticker_mask_iou(
     return float(intersection / union) if union else 0.0
 
 
-def segmentation_support_mask(
-    local_sticker_masks: list[np.ndarray] | None,
-    local_cube_mask: np.ndarray | None,
-    roi_xyxy: tuple[int, int, int, int],
-    image_size: tuple[int, int],
-) -> np.ndarray | None:
-    """Return the full-frame intersection of cube and sticker segmentation."""
-
-    if local_cube_mask is None or not local_sticker_masks:
-        return None
-    width, height = image_size
-    x1, y1, x2, y2 = roi_xyxy
-    roi_width = max(0, int(x2 - x1))
-    roi_height = max(0, int(y2 - y1))
-    if roi_width == 0 or roi_height == 0 or width <= 0 or height <= 0:
-        return None
-
-    def to_frame(local_mask: np.ndarray) -> np.ndarray:
-        resized = cv2.resize(
-            np.asarray(local_mask, dtype=np.uint8),
-            (roi_width, roi_height),
-            interpolation=cv2.INTER_NEAREST,
-        ).astype(bool)
-        frame_mask = np.zeros((height, width), dtype=bool)
-        frame_mask[y1:y2, x1:x2] = resized
-        return frame_mask
-
-    sticker_union_mask = np.zeros((height, width), dtype=bool)
-    for local_mask in local_sticker_masks:
-        sticker_union_mask |= to_frame(local_mask)
-    cube_frame_mask = to_frame(local_cube_mask)
-    return sticker_union_mask & cube_frame_mask
-
-
-def sticker_boundary_loss(
-    candidate: StickerPnPCandidate,
-    layer_rotations: tuple["CubeLayerRotation", ...],
-) -> float:
-    """Return a soft loss for moving the selected sticker away from its mask."""
-
-    contour = candidate.sticker_contour
-    image_size = candidate.image_size
-    if contour is None or image_size is None:
-        return 0.0
-    try:
-        sticker_object_points = apply_cube_layer_rotations(
-            canonical_sticker_object_points(candidate.sticker_type),
-            layer_rotations,
-        )
-        projected_points, _ = cv2.projectPoints(
-            sticker_object_points,
-            candidate.rvec,
-            candidate.tvec,
-            candidate.camera_matrix,
-            candidate.dist_coeffs,
-        )
-    except (cv2.error, ValueError):
-        return 1.0
-    projected_points = projected_points.reshape(-1, 2)
-    return max(
-        0.0,
-        1.0 - sticker_mask_iou(projected_points, contour, image_size),
-    )
-
-
-def projected_sticker_grid_mask(
-    candidate: StickerPnPCandidate,
-    layer_rotations: tuple["CubeLayerRotation", ...],
-) -> np.ndarray | None:
-    """Rasterize the visible 3x3 sticker grid for a layer hypothesis."""
-
-    image_size = candidate.image_size
-    if image_size is None:
-        return None
-    width, height = image_size
-    if width <= 0 or height <= 0:
-        return None
-    try:
-        trial_candidate = replace(candidate, layer_rotations=layer_rotations)
-        projected_faces = projected_cubelet_faces(
-            trial_candidate,
-            candidate.rvec,
-            candidate.tvec,
-        )
-    except (cv2.error, ValueError):
-        return None
-    grid = np.zeros((height, width), dtype=np.uint8)
-    for _depth, projected_face, _misaligned in projected_faces:
-        polygon = np.asarray(projected_face, dtype=np.float32).reshape(-1, 2)
-        if len(polygon) < 3 or not np.isfinite(polygon).all():
-            continue
-        cv2.fillConvexPoly(
-            grid,
-            np.round(polygon).astype(np.int32),
-            1,
-        )
-    return grid.astype(bool)
-
-
-def sticker_grid_mask_loss(
-    candidate: StickerPnPCandidate,
-    layer_rotations: tuple["CubeLayerRotation", ...],
-) -> float:
-    """Score how well sticker segmentation fits inside the projected grid.
-
-    The observed support is deliberately asymmetric: sticker pixels outside
-    the projected cube are expensive, while empty projected cube area is only
-    a weak penalty because masks may be incomplete or merged.
-    """
-
-    support = candidate.sticker_support_mask
-    if support is None or candidate.image_size is None:
-        return 0.0
-    support = np.asarray(support, dtype=bool)
-    width, height = candidate.image_size
-    if support.shape != (height, width):
-        return 0.0
-    grid = projected_sticker_grid_mask(candidate, layer_rotations)
-    if grid is None or grid.shape != support.shape:
-        return 0.0
-    support_area = int(np.count_nonzero(support))
-    grid_area = int(np.count_nonzero(grid))
-    if support_area == 0 or grid_area == 0:
-        return 0.0
-    spillout_fraction = float(np.count_nonzero(support & ~grid)) / support_area
-    empty_fraction = float(np.count_nonzero(grid & ~support)) / grid_area
-    return (
-        PNP_STICKER_GRID_SPILLOUT_WEIGHT * spillout_fraction
-        + PNP_STICKER_GRID_EMPTY_WEIGHT * empty_fraction
-    )
-
-
 def sticker_correspondence_object_indices(
     sticker_type: str,
     observed_class_ids: list[int],
@@ -2079,9 +2441,391 @@ def corrected_candidate_object_points(
     return apply_cube_layer_rotations(object_points, candidate.layer_rotations)
 
 
+def all_cube_orientation_anchor() -> OrientationAnchor:
+    """Return the anchor representing the entire cube."""
+
+    return OrientationAnchor(axis=None, layers=(0, 1, 2))
+
+
+def orientation_anchor_for_candidate(
+    candidate: StickerPnPCandidate,
+) -> OrientationAnchor:
+    """Choose the layers unaffected by the selected turn hypothesis.
+
+    The turn search currently produces at most one new layer rotation.  The
+    complement of that layer is the rigid support for the global pose.  If no
+    meaningful turn was selected, all three layers remain the anchor.
+    """
+
+    rotations = tuple(
+        rotation
+        for rotation in candidate.layer_rotations
+        if (
+            int(rotation.axis) in (0, 1, 2)
+            and int(rotation.side) in (-1, 1)
+            and abs(float(rotation.angle_degrees)) > 1e-6
+        )
+    )
+    if not rotations:
+        return all_cube_orientation_anchor()
+    axes = {int(rotation.axis) for rotation in rotations}
+    if len(axes) != 1:
+        # A multi-axis hypothesis does not have a single slab-shaped support;
+        # do not claim a narrower anchor than the geometry can justify.
+        return all_cube_orientation_anchor()
+    axis = axes.pop()
+    moved_layers: set[int] = set()
+    for rotation in rotations:
+        layer_count = int(np.clip(rotation.layer_count, 1, 3))
+        if int(rotation.side) > 0:
+            moved_layers.update(range(3 - layer_count, 3))
+        else:
+            moved_layers.update(range(layer_count))
+    stationary_layers = tuple(layer for layer in range(3) if layer not in moved_layers)
+    if not stationary_layers:
+        return all_cube_orientation_anchor()
+    return OrientationAnchor(axis=axis, layers=stationary_layers)
+
+
+def _cubelet_layer_index(center: np.ndarray, axis: int) -> int:
+    coordinate = float(np.asarray(center, dtype=np.float64).reshape(3)[axis])
+    return int(np.clip(round(coordinate / CUBE_LAYER_SIZE_MM) + 1, 0, 2))
+
+
+def orientation_anchor_assignment_mask(
+    candidate: StickerPnPCandidate,
+    anchor: OrientationAnchor,
+) -> np.ndarray:
+    """Return assignment rows whose 3-D targets lie in the anchor layers."""
+
+    object_points = candidate.assignment_object_points
+    if object_points is None:
+        object_points = candidate.object_points
+    points = np.asarray(object_points, dtype=np.float64).reshape(-1, 3)
+    if anchor.axis is None or len(points) == 0:
+        return np.ones(len(points), dtype=bool)
+
+    transformed_lattice = apply_cube_layer_rotations(
+        CUBE_LATTICE_OBJECT_POINTS_MM,
+        candidate.layer_rotations,
+    ).astype(np.float64)
+    distances = np.linalg.norm(
+        points[:, None, :] - transformed_lattice[None, :, :],
+        axis=2,
+    )
+    nearest = np.argmin(distances, axis=1)
+    valid = np.min(distances, axis=1) <= 1e-3
+    layer_indices = np.asarray(
+        [
+            _cubelet_layer_index(CUBE_LATTICE_OBJECT_POINTS_MM[index], anchor.axis)
+            for index in nearest
+        ],
+        dtype=np.int32,
+    )
+    return valid & np.isin(layer_indices, np.asarray(anchor.layers, dtype=np.int32))
+
+
+def refit_pose_to_orientation_anchor(
+    candidate: StickerPnPCandidate,
+    anchor: OrientationAnchor,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Refit the pose from observations belonging to the stationary support."""
+
+    image_points = candidate.assignment_image_points
+    object_points = candidate.assignment_object_points
+    if image_points is None or object_points is None:
+        image_points = candidate.image_points
+        object_points = candidate.object_points
+    image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
+    object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
+    if len(image_points) != len(object_points) or len(image_points) < 3:
+        return None
+    mask = orientation_anchor_assignment_mask(candidate, anchor)
+    finite = np.isfinite(image_points).all(axis=1) & np.isfinite(object_points).all(axis=1)
+    indexes = np.flatnonzero(mask & finite).astype(np.int32)
+    if len(indexes) < 3:
+        return None
+    _unique_objects, unique_indexes = np.unique(
+        object_points[indexes],
+        axis=0,
+        return_index=True,
+    )
+    indexes = indexes[np.sort(unique_indexes)]
+    if len(indexes) < 3:
+        return None
+    try:
+        if len(indexes) >= 4:
+            ok, rvec, tvec = cv2.solvePnP(
+                object_points[indexes],
+                image_points[indexes],
+                candidate.camera_matrix,
+                candidate.dist_coeffs,
+                rvec=np.asarray(candidate.rvec, dtype=np.float64).reshape(3, 1),
+                tvec=np.asarray(candidate.tvec, dtype=np.float64).reshape(3, 1),
+                useExtrinsicGuess=True,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+        else:
+            ok, rvec, tvec = cv2.solvePnP(
+                object_points[indexes],
+                image_points[indexes],
+                candidate.camera_matrix,
+                candidate.dist_coeffs,
+                flags=cv2.SOLVEPNP_SQPNP,
+            )
+    except cv2.error:
+        return None
+    if not ok or not np.isfinite(rvec).all() or not np.isfinite(tvec).all():
+        return None
+    return (
+        np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+        np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+    )
+
+
+def refresh_candidate_pose_projection(
+    candidate: StickerPnPCandidate,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+) -> StickerPnPCandidate:
+    """Reproject stored display geometry after temporal pose filtering."""
+
+    projected_sticker_points = candidate.projected_sticker_points
+    projected_assignment_points = candidate.assignment_projected_points
+    try:
+        projected_sticker_points, _ = cv2.projectPoints(
+            candidate.object_points,
+            rvec,
+            tvec,
+            candidate.camera_matrix,
+            candidate.dist_coeffs,
+        )
+        projected_sticker_points = projected_sticker_points.reshape(-1, 2)
+        if candidate.assignment_object_points is not None:
+            projected_assignment_points, _ = cv2.projectPoints(
+                candidate.assignment_object_points,
+                rvec,
+                tvec,
+                candidate.camera_matrix,
+                candidate.dist_coeffs,
+            )
+            projected_assignment_points = projected_assignment_points.reshape(-1, 2)
+    except cv2.error:
+        return candidate
+    return replace(
+        candidate,
+        rvec=np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+        tvec=np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+        projected_sticker_points=projected_sticker_points,
+        assignment_projected_points=projected_assignment_points,
+    )
+
+
+def transform_candidate_by_symmetry(
+    candidate: StickerPnPCandidate,
+    symmetry: np.ndarray,
+) -> StickerPnPCandidate:
+    """Transform every pose-bearing field into an equivalent cube frame."""
+
+    transformed_rvec = transform_rvec_by_symmetry(candidate.rvec, symmetry)
+    transformed_layer_rotations = tuple(
+        transform_layer_rotation_by_symmetry(rotation, symmetry)
+        for rotation in candidate.layer_rotations
+    )
+    transformed_debug = tuple(
+        replace(
+            debug_candidate,
+            label=layer_rotation_debug_label(
+                tuple(
+                    transform_layer_rotation_by_symmetry(rotation, symmetry)
+                    for rotation in debug_candidate.layer_rotations
+                )
+            ),
+            layer_rotations=tuple(
+                transform_layer_rotation_by_symmetry(rotation, symmetry)
+                for rotation in debug_candidate.layer_rotations
+            ),
+            assignment_object_points=transform_object_points_by_symmetry(
+                debug_candidate.assignment_object_points,
+                symmetry,
+            ),
+        )
+        for debug_candidate in candidate.turn_candidate_debug
+    )
+    transformed_scores = tuple(
+        (
+            (
+                transformed_debug[index].label
+                if index < len(transformed_debug)
+                else label
+            ),
+            robust_error,
+            inlier_count,
+            p90_error,
+            mean_error,
+        )
+        for index, (label, robust_error, inlier_count, p90_error, mean_error)
+        in enumerate(candidate.turn_candidate_scores)
+    )
+
+    def transform_optional_rvec(value: np.ndarray | None) -> np.ndarray | None:
+        return None if value is None else transform_rvec_by_symmetry(value, symmetry)
+
+    return replace(
+        candidate,
+        object_points=transform_object_points_by_symmetry(
+            candidate.object_points,
+            symmetry,
+        ),
+        assignment_object_points=(
+            None
+            if candidate.assignment_object_points is None
+            else transform_object_points_by_symmetry(
+                candidate.assignment_object_points,
+                symmetry,
+            )
+        ),
+        layer_rotations=transformed_layer_rotations,
+        turn_candidate_scores=transformed_scores,
+        turn_candidate_debug=transformed_debug,
+        rvec=transformed_rvec,
+        pre_final_rvec=transform_optional_rvec(candidate.pre_final_rvec),
+        raw_rvec=transform_optional_rvec(candidate.raw_rvec),
+        orientation_anchor=None,
+    )
+
+
+def canonicalize_pose_symmetry(
+    candidate: StickerPnPCandidate,
+    symmetry_tracker: CubeSymmetryTracker,
+) -> StickerPnPCandidate:
+    """Select the symmetry-equivalent pose closest to the prior frame."""
+
+    reference_rotation = symmetry_tracker.rotation
+    if reference_rotation is None:
+        # There is no observable preference on the first frame.  Identity is
+        # deterministic and preserves the existing canonical convention.
+        return transform_candidate_by_symmetry(candidate, CUBE_SYMMETRY_MATRICES[0])
+
+    reference_rvec = cv2.Rodrigues(reference_rotation)[0]
+    symmetry = min(
+        CUBE_SYMMETRY_MATRICES,
+        key=lambda matrix: rotation_symmetry_distance(
+            transform_rvec_by_symmetry(candidate.rvec, matrix),
+            reference_rvec,
+        ),
+    )
+    return transform_candidate_by_symmetry(candidate, symmetry)
+
+
+def apply_temporal_pose_filter(
+    candidate: StickerPnPCandidate,
+    motion_filter: PoseMotionFilter | None,
+) -> StickerPnPCandidate:
+    """Commit a selected current pose without blending it with prediction."""
+
+    anchor = orientation_anchor_for_candidate(candidate)
+    if motion_filter is None:
+        # Keep the visualization honest even when temporal filtering is
+        # disabled for an A/B run: the selected turn still identifies the
+        # stationary support that would anchor the pose.
+        return replace(candidate, orientation_anchor=anchor)
+    measured_rvec = np.asarray(candidate.rvec, dtype=np.float64).copy()
+    measured_tvec = np.asarray(candidate.tvec, dtype=np.float64).copy()
+    accepted_rvec, accepted_tvec, diagnostics = motion_filter.accept_measurement(
+        measured_rvec,
+        measured_tvec,
+    )
+    accepted = refresh_candidate_pose_projection(
+        candidate,
+        accepted_rvec,
+        accepted_tvec,
+    )
+    return replace(
+        accepted,
+        raw_rvec=measured_rvec,
+        raw_tvec=measured_tvec,
+        motion_diagnostics=diagnostics,
+        orientation_anchor=anchor,
+    )
+
+
+def rank_misaligned_layer_faces(
+    base_object_points: np.ndarray,
+    assignment_object_points: np.ndarray,
+    assignment_distances: np.ndarray,
+    fixed_mask: np.ndarray | None,
+    assignment_error_limit: float,
+    max_face_candidates: int,
+) -> tuple[tuple[int, int, float], ...]:
+    """Rank face directions by the number of explained observations.
+
+    A moved layer is least compatible with the initial rigid-cube pose, so it
+    should have the fewest low-error assignments. Mapping the current
+    assignment back to the canonical lattice is cheap compared with projecting
+    and assigning a complete cube for every angle. The returned entries are
+    ``(axis, side, explained_count)``; layer widths are intentionally not
+    selected here because both width one and width two are inexpensive once
+    the face is shortlisted.
+    """
+
+    if max_face_candidates <= 0 or not np.isfinite(assignment_error_limit):
+        return tuple()
+    base = np.asarray(base_object_points, dtype=np.float64).reshape(-1, 3)
+    assigned = np.asarray(assignment_object_points, dtype=np.float64).reshape(-1, 3)
+    distances = np.asarray(assignment_distances, dtype=np.float64).reshape(-1)
+    if (
+        len(base) == 0
+        or len(assigned) != len(distances)
+        or len(assigned) == 0
+        or not np.isfinite(base).all()
+    ):
+        return tuple()
+
+    finite = np.isfinite(assigned).all(axis=1) & np.isfinite(distances)
+    if fixed_mask is None:
+        free = np.ones(len(assigned), dtype=bool)
+    else:
+        fixed = np.asarray(fixed_mask, dtype=bool).reshape(-1)
+        if len(fixed) != len(assigned):
+            free = np.ones(len(assigned), dtype=bool)
+        else:
+            free = ~fixed
+    usable = finite & free
+    if not np.any(usable):
+        return tuple()
+
+    nearest = np.argmin(
+        np.linalg.norm(assigned[:, None, :] - base[None, :, :], axis=2),
+        axis=1,
+    )
+    # Ignore malformed assignments that are not actually lattice points.
+    nearest_error = np.linalg.norm(assigned - base[nearest], axis=1)
+    usable &= nearest_error <= 1e-3
+    if not np.any(usable):
+        return tuple()
+
+    scores: list[tuple[int, int, float]] = []
+    for axis in range(3):
+        for side in (-1, 1):
+            layer_mask = cube_layer_mask(base, axis, side, layer_count=1)
+            members = usable & layer_mask[nearest]
+            explained_count = int(
+                np.count_nonzero(
+                    members & (distances <= float(assignment_error_limit))
+                )
+            )
+            scores.append((axis, side, float(explained_count)))
+
+    scores.sort(key=lambda item: (item[2], item[0], item[1]))
+    return tuple(scores[:max_face_candidates])
+
+
 def recover_misaligned_cube_layers(
     candidate: StickerPnPCandidate,
     assignment_error_limit: float,
+    max_face_candidates: int = PNP_TURN_FACE_CANDIDATES,
+    record_all_turn_candidates: bool = False,
 ) -> StickerPnPCandidate:
     """Search layer turns using a complete, robust assignment score.
 
@@ -2270,15 +3014,30 @@ def recover_misaligned_cube_layers(
                     np.mean(observed_classes[known] != assigned_classes[known])
                     * PNP_CLASS_MISMATCH_PENALTY
                 )
-        robust_error += PNP_STICKER_BOUNDARY_WEIGHT * sticker_boundary_loss(
-            candidate,
-            trial_rotations,
-        )
-        robust_error += sticker_grid_mask_loss(candidate, trial_rotations)
         mean_error = float(np.mean(valid_distances))
         p90_error = float(np.percentile(valid_distances, 90))
         rank = (-float(inlier_count), robust_error, p90_error, mean_error)
         return rank, robust_error, inlier_count
+
+    best = None
+    base_rotations = tuple(candidate.layer_rotations)
+    shortlisted_faces = rank_misaligned_layer_faces(
+        base_object_points,
+        object_points,
+        distances,
+        fixed_mask,
+        assignment_error_limit,
+        max_face_candidates,
+    )
+    # Preserve the old exhaustive behavior when explicitly requested, and use
+    # all faces if the cheap pre-filter cannot map enough assignments back to
+    # the canonical lattice.
+    if not shortlisted_faces or max_face_candidates >= 6:
+        shortlisted_faces = tuple(
+            (axis, side, 0.0)
+            for axis in range(3)
+            for side in (-1, 1)
+        )
 
     angles = np.arange(
         PNP_LAYER_MISALIGNMENT_MIN_DEGREES,
@@ -2288,34 +3047,31 @@ def recover_misaligned_cube_layers(
         dtype=np.float64,
     )
 
-    best = None
-    base_rotations = tuple(candidate.layer_rotations)
     hypotheses: list[tuple[CubeLayerRotation, ...]] = [base_rotations]
-    for axis in range(3):
-        for side in (-1, 1):
-            for layer_count in (1, 2):
-                layer_mask = cube_layer_mask(
-                    base_object_points,
-                    axis,
-                    side,
-                    layer_count,
-                )
-                if int(layer_mask.sum()) < 3:
+    for axis, side, _score in shortlisted_faces:
+        for layer_count in (1, 2):
+            layer_mask = cube_layer_mask(
+                base_object_points,
+                axis,
+                side,
+                layer_count,
+            )
+            if int(layer_mask.sum()) < 3:
+                continue
+            for angle in angles:
+                if abs(float(angle)) < 1e-6:
                     continue
-                for angle in angles:
-                    if abs(float(angle)) < 1e-6:
-                        continue
-                    hypotheses.append(
-                        base_rotations
-                        + (
-                            CubeLayerRotation(
-                                axis,
-                                side,
-                                float(angle),
-                                layer_count,
-                            ),
-                        )
+                hypotheses.append(
+                    base_rotations
+                    + (
+                        CubeLayerRotation(
+                            axis,
+                            side,
+                            float(angle),
+                            layer_count,
+                        ),
                     )
+                )
 
     ranked_trials = []
     for trial_rotations in hypotheses:
@@ -2411,7 +3167,8 @@ def recover_misaligned_cube_layers(
         for trial in ordered_trials
         if trial is not baseline_trial
     )
-    debug_trials = debug_trials[:PNP_TURN_DEBUG_CANDIDATE_COUNT]
+    display_trials = debug_trials[:PNP_TURN_DEBUG_CANDIDATE_COUNT]
+    recorded_trials = ordered_trials if record_all_turn_candidates else display_trials
     turn_candidate_scores = tuple(
         (
             trial["label"],
@@ -2420,7 +3177,7 @@ def recover_misaligned_cube_layers(
             trial["p90_error"],
             trial["mean_error"],
         )
-        for trial in debug_trials
+        for trial in recorded_trials
     )
     turn_candidate_debug = tuple(
         TurnCandidateDebug(
@@ -2430,7 +3187,7 @@ def recover_misaligned_cube_layers(
             assignment_object_points=trial["assignment_object_points"],
             assignment_projected_class_ids=trial["assignment_projected_class_ids"],
         )
-        for trial in debug_trials
+        for trial in recorded_trials
     )
 
     if best is None:
@@ -2463,6 +3220,8 @@ def recover_misaligned_cube_layers(
 def solve_pnp_from_low_error_assignments(
     candidate: StickerPnPCandidate,
     validate_sticker_facing: bool = True,
+    max_turn_face_candidates: int = PNP_TURN_FACE_CANDIDATES,
+    record_all_turn_candidates: bool = False,
 ) -> StickerPnPCandidate:
     """Run one final PnP solve using the candidate's full assignment."""
 
@@ -2488,6 +3247,8 @@ def solve_pnp_from_low_error_assignments(
     candidate = recover_misaligned_cube_layers(
         candidate,
         assignment_error_limit,
+        max_face_candidates=max_turn_face_candidates,
+        record_all_turn_candidates=record_all_turn_candidates,
     )
     image_points = np.asarray(candidate.assignment_image_points, dtype=np.float32).reshape(-1, 2)
     object_points = np.asarray(candidate.assignment_object_points, dtype=np.float32).reshape(-1, 3)
@@ -2622,7 +3383,7 @@ def solve_pnp_from_low_error_assignments(
     )
 
 
-def best_sticker_pnp_candidate(
+def best_sticker_pnp_candidates(
     frame_points: np.ndarray,
     point_class_ids: np.ndarray,
     matches: tuple[StickerKeypointMatch, ...],
@@ -2631,13 +3392,13 @@ def best_sticker_pnp_candidate(
     local_masks: list[np.ndarray] | None = None,
     roi_xyxy: tuple[int, int, int, int] | None = None,
     scoring_points: np.ndarray | None = None,
-    sticker_support_mask: np.ndarray | None = None,
-) -> StickerPnPCandidate | None:
-    """Solve prioritized stickers and choose the best full-cube pose.
+) -> tuple[StickerPnPCandidate, ...]:
+    """Solve prioritized stickers and retain the best full-cube hypotheses.
 
     Up to three four-point stickers are tried in descending confidence order.
-    If none yields a pose, the same process falls back to up to three
-    three-point stickers.
+    All successful candidates are returned in score order so temporal logic
+    can keep alternatives alive. If none of the four-point stickers yields a
+    pose, the same process falls back to three-point stickers.
     """
 
     valid_matches = tuple(
@@ -2646,15 +3407,15 @@ def best_sticker_pnp_candidate(
         if match.sticker_type != "unknown" and len(match.keypoint_indices) in (3, 4)
     )
     if not valid_matches:
-        return None
+        return tuple()
     four_point_matches = tuple(
         match for match in valid_matches if len(match.keypoint_indices) == 4
     )
 
     def solve_matches(
         prioritized_matches: tuple[StickerKeypointMatch, ...],
-    ) -> StickerPnPCandidate | None:
-        candidates = []
+    ) -> tuple[StickerPnPCandidate, ...]:
+        candidates: list[StickerPnPCandidate] = []
         prioritized = sorted(prioritized_matches, key=sticker_match_priority_key)[
             :MAX_STICKER_PNP_CANDIDATES
         ]
@@ -2680,29 +3441,117 @@ def best_sticker_pnp_candidate(
             )
             if candidate is not None:
                 candidates.append(candidate)
-        if not candidates:
-            return None
-        return min(
-            candidates,
+        candidates.sort(
             key=lambda candidate: (
                 candidate.overall_reprojection_error,
                 -candidate.sticker_average_confidence,
-            ),
+            )
         )
+        return tuple(candidates)
 
-    candidate = solve_matches(four_point_matches)
-    if candidate is not None:
-        return (
-            candidate
-            if sticker_support_mask is None
-            else replace(candidate, sticker_support_mask=sticker_support_mask)
-        )
-    candidate = solve_matches(
+    candidates = solve_matches(four_point_matches)
+    if candidates:
+        return candidates
+    return solve_matches(
         tuple(match for match in valid_matches if len(match.keypoint_indices) == 3)
     )
-    if candidate is None or sticker_support_mask is None:
-        return candidate
-    return replace(candidate, sticker_support_mask=sticker_support_mask)
+
+
+def best_sticker_pnp_candidate(
+    frame_points: np.ndarray,
+    point_class_ids: np.ndarray,
+    matches: tuple[StickerKeypointMatch, ...],
+    image_size: tuple[int, int],
+    focal_scale: float,
+    local_masks: list[np.ndarray] | None = None,
+    roi_xyxy: tuple[int, int, int, int] | None = None,
+    scoring_points: np.ndarray | None = None,
+) -> StickerPnPCandidate | None:
+    """Compatibility wrapper returning the best retained candidate."""
+
+    candidates = best_sticker_pnp_candidates(
+        frame_points,
+        point_class_ids,
+        matches,
+        image_size,
+        focal_scale,
+        local_masks,
+        roi_xyxy,
+        scoring_points,
+    )
+    return candidates[0] if candidates else None
+
+
+def pose_hypothesis_distance(
+    candidate: StickerPnPCandidate,
+    predicted_pose: tuple[np.ndarray, np.ndarray] | None,
+) -> float:
+    """Return a scale-normalized distance from a predicted pose."""
+
+    if predicted_pose is None:
+        return 0.0
+    predicted_rvec, predicted_tvec = predicted_pose
+    translation_scale = max(float(abs(np.asarray(candidate.tvec).reshape(3)[2])), 1.0)
+    translation_distance = float(
+        np.linalg.norm(
+            np.asarray(candidate.tvec, dtype=np.float64).reshape(3)
+            - np.asarray(predicted_tvec, dtype=np.float64).reshape(3)
+        )
+    ) / translation_scale
+    rotation_distance = rotation_symmetry_distance(candidate.rvec, predicted_rvec)
+    return translation_distance + rotation_distance
+
+
+def pose_hypothesis_visual_score(candidate: StickerPnPCandidate) -> float:
+    """Return the candidate's direct geometric quality score."""
+
+    overall = float(candidate.overall_reprojection_error)
+    sticker = float(candidate.reprojection_error)
+    if not np.isfinite(overall):
+        overall = 1e6
+    if not np.isfinite(sticker):
+        sticker = 1e6
+    return overall + 0.25 * sticker
+
+
+def select_pose_hypothesis(
+    candidates: tuple[StickerPnPCandidate, ...],
+    predicted_pose: tuple[np.ndarray, np.ndarray] | None,
+    previous_candidates: tuple[StickerPnPCandidate, ...] = (),
+) -> StickerPnPCandidate | None:
+    """Select one current measurement without averaging it with prediction.
+
+    Reprojection quality is primary. Prediction and the recent hypothesis
+    history only break close quality ties; they cannot force a good current
+    measurement to move toward an old pose. This keeps one-frame turns
+    observable while still making equivalent candidates temporally stable.
+    """
+
+    if not candidates:
+        return None
+    scored = []
+    for candidate in candidates:
+        visual_score = pose_hypothesis_visual_score(candidate)
+        prediction_distance = pose_hypothesis_distance(candidate, predicted_pose)
+        history_distance = (
+            min(
+                pose_hypothesis_distance(candidate, (prior.rvec, prior.tvec))
+                for prior in previous_candidates
+            )
+            if previous_candidates
+            else 0.0
+        )
+        scored.append((candidate, visual_score, prediction_distance, history_distance))
+    best_visual = min(item[1] for item in scored)
+    # Only candidates within a small geometric-quality band are allowed to
+    # use temporal continuity as a tie-breaker. The best visual candidate is
+    # otherwise kept, which is important when a turn is genuinely abrupt.
+    quality_band = max(1.0, 0.15 * best_visual)
+    eligible = [item for item in scored if item[1] <= best_visual + quality_band]
+    return min(
+        eligible,
+        key=lambda item: (item[2] + 0.5 * item[3], item[1]),
+    )[0]
 
 
 def predict_pose_result(
@@ -3079,10 +3928,13 @@ def projected_cubelet_faces(
     rvec: np.ndarray,
     tvec: np.ndarray,
 ) -> list[tuple[float, np.ndarray, bool]]:
-    """Project the camera-facing outer faces of all 27 corrected cubies."""
+    """Project visible cubie faces with anchor and turn metadata."""
 
     rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
     projected_faces: list[tuple[float, np.ndarray, bool]] = []
+    orientation_anchor = getattr(candidate, "orientation_anchor", None)
+    if orientation_anchor is None:
+        orientation_anchor = all_cube_orientation_anchor()
     for x_index in range(3):
         for y_index in range(3):
             for z_index in range(3):
@@ -3121,23 +3973,15 @@ def projected_cubelet_faces(
                         candidate.camera_matrix,
                         candidate.dist_coeffs,
                     )
-                    misaligned = any(
-                        abs(float(layer_rotation.angle_degrees)) > 1e-6
-                        and int(layer_rotation.axis) in (0, 1, 2)
-                        and int(layer_rotation.side) in (-1, 1)
-                        and np.isclose(
-                            float(center[int(layer_rotation.axis)]),
-                            int(layer_rotation.side)
-                            * (CUBE_HALF_SIZE_MM - CUBE_LAYER_SIZE_MM / 2.0),
-                            atol=1e-4,
-                        )
-                        for layer_rotation in candidate.layer_rotations
+                    anchor = orientation_anchor.axis is None or (
+                        _cubelet_layer_index(center, orientation_anchor.axis)
+                        in orientation_anchor.layers
                     )
                     projected_faces.append(
                         (
                             float(center_camera[2]),
                             projected_face.reshape(-1, 2),
-                            misaligned,
+                            anchor,
                         )
                     )
     projected_faces.sort(key=lambda item: item[0], reverse=True)
@@ -3161,11 +4005,9 @@ def draw_projected_cube_pose(
         return False
     if not projected_faces:
         return False
-    for _depth, projected_face, misaligned in projected_faces:
+    for _depth, projected_face, anchor in projected_faces:
         projected_face = np.round(projected_face).astype(np.int32)
-        face_color = (
-            PNP_MISALIGNED_LAYER_COLOR_BGR if misaligned else color
-        )
+        face_color = PNP_ORIENTATION_ANCHOR_COLOR_BGR if anchor else color
         for index in range(4):
             start = tuple(int(value) for value in projected_face[index])
             end = tuple(int(value) for value in projected_face[(index + 1) % 4])
@@ -3291,16 +4133,12 @@ def draw_sticker_pnp_candidate(
             PNP_CANDIDATE_CUBE_COLOR_BGR,
             1,
         )
-    display_rvec = (
-        candidate.rvec
-        if has_final_pose or not has_pre_final_pose
-        else candidate.pre_final_rvec
-    )
-    display_tvec = (
-        candidate.tvec
-        if has_final_pose or not has_pre_final_pose
-        else candidate.pre_final_tvec
-    )
+    # The candidate stored in the buffer is always the current finalized
+    # measurement. ``show_final_pose`` controls whether the pre-final pose is
+    # shown as an additional diagnostic, never which pose is displayed as the
+    # main result.
+    display_rvec = candidate.rvec
+    display_tvec = candidate.tvec
     if not draw_projected_cube_pose(
         output,
         candidate,
@@ -3318,27 +4156,6 @@ def draw_sticker_pnp_candidate(
         cv2.circle(output, (int(x), int(y)), 4, PNP_STICKER_COLOR_BGR, -1, cv2.LINE_AA)
     projected_sticker_points = candidate.projected_sticker_points
     assignment_projected_points = candidate.assignment_projected_points
-    if not has_final_pose and has_pre_final_pose:
-        try:
-            projected_sticker_points, _ = cv2.projectPoints(
-                candidate.object_points,
-                display_rvec,
-                display_tvec,
-                candidate.camera_matrix,
-                candidate.dist_coeffs,
-            )
-            projected_sticker_points = projected_sticker_points.reshape(-1, 2)
-            if candidate.assignment_object_points is not None:
-                assignment_projected_points, _ = cv2.projectPoints(
-                    candidate.assignment_object_points,
-                    display_rvec,
-                    display_tvec,
-                    candidate.camera_matrix,
-                    candidate.dist_coeffs,
-                )
-                assignment_projected_points = assignment_projected_points.reshape(-1, 2)
-        except cv2.error:
-            return output
     for point in projected_sticker_points:
             x, y = np.round(point).astype(np.int32)
             cv2.drawMarker(
@@ -3412,7 +4229,8 @@ def draw_sticker_pnp_candidate(
             f"{pose_label} sticker {candidate.sticker_type} | "
             f"kp {candidate.sticker_average_confidence:.2f} | "
             f"sticker {candidate.reprojection_error:.1f}px | "
-            f"all {candidate.overall_reprojection_error:.1f}"
+            f"all {candidate.overall_reprojection_error:.1f} | "
+            f"anchor {getattr(candidate.orientation_anchor, 'label', 'all')}"
         )
         cv2.putText(
             output,
@@ -3505,6 +4323,41 @@ def draw_context(
     return output
 
 
+def reset_pose_temporal_state(
+    pose_motion_filter: PoseMotionFilter | None,
+    symmetry_tracker: CubeSymmetryTracker | None,
+    pose_hypothesis_buffer: PoseHypothesisBuffer | None,
+) -> None:
+    """Drop temporal state after the tracked cube is no longer observable."""
+
+    if pose_motion_filter is not None:
+        pose_motion_filter.reset()
+    if symmetry_tracker is not None:
+        symmetry_tracker.reset()
+    if pose_hypothesis_buffer is not None:
+        pose_hypothesis_buffer.clear()
+
+
+def prepare_pose_hypotheses(
+    candidates: tuple[StickerPnPCandidate, ...],
+    symmetry_tracker: CubeSymmetryTracker | None,
+) -> tuple[StickerPnPCandidate, ...]:
+    """Canonicalize the cheap current-frame hypotheses before ranking them."""
+
+    prepared: list[StickerPnPCandidate] = []
+    for candidate in candidates:
+        finalized = candidate
+        if symmetry_tracker is not None:
+            finalized = canonicalize_pose_symmetry(finalized, symmetry_tracker)
+        prepared.append(
+            replace(
+                finalized,
+                orientation_anchor=orientation_anchor_for_candidate(finalized),
+            )
+        )
+    return tuple(prepared)
+
+
 def render_frame(
     frame: np.ndarray,
     bbox_detector: YOLOCubeDetector,
@@ -3515,6 +4368,9 @@ def render_frame(
     turn_candidate_log: Path | None = None,
     turn_candidate_image_dir: Path | None = None,
     frame_index: int | None = None,
+    pose_motion_filter: PoseMotionFilter | None = None,
+    symmetry_tracker: CubeSymmetryTracker | None = None,
+    pose_hypothesis_buffer: PoseHypothesisBuffer | None = None,
 ) -> tuple[np.ndarray, str, int]:
     height, width = frame.shape[:2]
     roi_xyxy, candidate, roi_source = shared_roi_for_frame(
@@ -3524,12 +4380,22 @@ def render_frame(
         args.roi_padding,
     )
     if roi_xyxy is None:
+        reset_pose_temporal_state(
+            pose_motion_filter,
+            symmetry_tracker,
+            pose_hypothesis_buffer,
+        )
         return draw_context(frame, None, None, "none", 0, args.show_status), "none", 0
 
     x1, y1, x2, y2 = roi_xyxy
     roi = frame[y1:y2, x1:x2]
     if roi.size == 0:
         roi_tracker.reset()
+        reset_pose_temporal_state(
+            pose_motion_filter,
+            symmetry_tracker,
+            pose_hypothesis_buffer,
+        )
         return draw_context(frame, roi_xyxy, candidate, roi_source, 0, args.show_status), roi_source, 0
 
     model_roi = resize_to_square(roi, args.view_size)
@@ -3549,6 +4415,11 @@ def render_frame(
         result = predict_pose_result(pose_model, model_roi, args)
     if result is None:
         roi_tracker.reset()
+        reset_pose_temporal_state(
+            pose_motion_filter,
+            symmetry_tracker,
+            pose_hypothesis_buffer,
+        )
         output = render_sticker_masks(
             frame,
             roi_xyxy,
@@ -3561,6 +4432,11 @@ def render_frame(
     local_points, point_confidences, class_ids, box_confidences = pose_predictions(result)
     if len(local_points) == 0:
         roi_tracker.reset()
+        reset_pose_temporal_state(
+            pose_motion_filter,
+            symmetry_tracker,
+            pose_hypothesis_buffer,
+        )
         output = render_sticker_masks(
             frame,
             roi_xyxy,
@@ -3611,15 +4487,7 @@ def render_frame(
     )
     output = draw_context(output, roi_xyxy, candidate, roi_source, point_count, args.show_status)
     if args.show_pnp:
-        sticker_support_mask = None
-        if sticker_masks is not None and len(sticker_masks) == 4:
-            sticker_support_mask = segmentation_support_mask(
-                sticker_masks[0],
-                sticker_masks[3],
-                roi_xyxy,
-                (width, height),
-            )
-        pnp_candidate = best_sticker_pnp_candidate(
+        current_candidates = best_sticker_pnp_candidates(
             frame_points,
             class_ids,
             sticker_matches,
@@ -3628,10 +4496,74 @@ def render_frame(
             sticker_masks[0] if sticker_masks is not None else None,
             roi_xyxy,
             frame_points,
-            sticker_support_mask,
+        )
+        prepared_candidates = prepare_pose_hypotheses(
+            current_candidates,
+            symmetry_tracker,
+        )
+        if pose_hypothesis_buffer is not None:
+            pose_hypothesis_buffer.append(prepared_candidates, frame_index)
+            graph_frames = pose_hypothesis_buffer.best_candidate_frames()
+        else:
+            graph_frames = (
+                PoseHypothesisFrame(frame_index, prepared_candidates),
+            )
+        predicted_pose = (
+            pose_motion_filter.predict_pose()
+            if pose_motion_filter is not None
+            else None
+        )
+        pose_graph_selection = (
+            select_pose_graph_path(
+                graph_frames,
+                pose_motion_filter.config
+                if pose_motion_filter is not None
+                else PoseMotionFilterConfig(),
+                predicted_pose,
+            )
+            if prepared_candidates
+            else None
+        )
+        if (
+            pose_graph_selection is not None
+            and pose_graph_selection.violates_limits
+            and pose_hypothesis_buffer is not None
+        ):
+            # The common path has already used one candidate per frame. Only
+            # expand to the retained alternatives after the best-candidate
+            # trajectory breaks the motion envelope.
+            reconsidered_selection = select_pose_graph_path(
+                pose_hypothesis_buffer.frames,
+                pose_motion_filter.config
+                if pose_motion_filter is not None
+                else PoseMotionFilterConfig(),
+                predicted_pose,
+            )
+            if reconsidered_selection is not None:
+                pose_graph_selection = reconsidered_selection
+        pnp_candidate = (
+            pose_graph_selection.candidate
+            if pose_graph_selection is not None
+            else None
         )
         if pnp_candidate is not None:
-            pnp_candidate = solve_pnp_from_low_error_assignments(pnp_candidate)
+            if pose_graph_selection is not None and pose_graph_selection.violates_limits:
+                pnp_candidate = solve_pnp_from_low_error_assignments(
+                    pnp_candidate,
+                    max_turn_face_candidates=args.pnp_turn_face_candidates,
+                    record_all_turn_candidates=turn_candidate_log is not None,
+                )
+                if symmetry_tracker is not None:
+                    pnp_candidate = canonicalize_pose_symmetry(
+                        pnp_candidate,
+                        symmetry_tracker,
+                    )
+            pnp_candidate = apply_temporal_pose_filter(
+                pnp_candidate,
+                pose_motion_filter,
+            )
+            if symmetry_tracker is not None:
+                symmetry_tracker.observe(pnp_candidate.rvec)
         output = draw_sticker_pnp_candidate(
             output,
             pnp_candidate,
@@ -3790,10 +4722,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="Draw the final low-error solvePnP pose over the candidate pose.",
     )
     parser.add_argument(
+        "--pose-motion-filter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Temporally filter pose using the stationary layers of the selected "
+            "turn hypothesis (disabled by default)."
+        ),
+    )
+    parser.add_argument("--pose-motion-dt", type=float, default=1.0 / 30.0)
+    parser.add_argument(
+        "--pose-motion-max-acceleration",
+        type=float,
+        default=20000.0,
+        help="Maximum linear acceleration in mm/s^2 (20 m/s^2 by default).",
+    )
+    parser.add_argument(
+        "--pose-motion-max-jerk",
+        type=float,
+        default=float("inf"),
+        help="Linear jerk limit; disabled by default.",
+    )
+    parser.add_argument(
+        "--pose-motion-max-angular-acceleration",
+        type=float,
+        default=12.0,
+    )
+    parser.add_argument(
+        "--pose-motion-max-angular-jerk",
+        type=float,
+        default=float("inf"),
+        help="Angular jerk limit; disabled by default.",
+    )
+    parser.add_argument(
         "--turn-candidate-log",
         type=Path,
         default=None,
-        help="Output directory for turn scores and images (disabled by default).",
+        help=(
+            "Output directory for turn scores and images; logging retains every "
+            "evaluated turn permutation (disabled by default)."
+        ),
     )
     parser.add_argument(
         "--turn-candidate-images",
@@ -3806,6 +4774,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("closest", "class-aware"),
         default=PNP_ASSIGNMENT_MODE,
         help="Full-cube assignment strategy: geometric closest or class-aware.",
+    )
+    parser.add_argument(
+        "--pnp-turn-face-candidates",
+        type=int,
+        default=PNP_TURN_FACE_CANDIDATES,
+        help=(
+            "Number of face directions retained by the cheap turn pre-filter "
+            "before the angle sweep (1-6; 6 is exhaustive, default: "
+            f"{PNP_TURN_FACE_CANDIDATES})."
+        ),
     )
     parser.add_argument(
         "--pnp-focal-scale",
@@ -3851,6 +4829,8 @@ def main() -> int:
         raise SystemExit("--sticker-mask-opacity must be in [0, 1]")
     if args.pnp_focal_scale <= 0.0:
         raise SystemExit("--pnp-focal-scale must be positive")
+    if not 1 <= args.pnp_turn_face_candidates <= 6:
+        raise SystemExit("--pnp-turn-face-candidates must be between 1 and 6")
     if args.sticker_border_thickness < 0:
         raise SystemExit("--sticker-border-thickness must be non-negative")
     if not args.model.is_file():
@@ -3874,6 +4854,19 @@ def main() -> int:
         print(f"Combined segmentation model (sticker class only): {args.sticker_seg_model}", flush=True)
     source = parse_source(args.source)
     roi_tracker = RoiTracker()
+    symmetry_tracker = CubeSymmetryTracker()
+    pose_hypothesis_buffer = PoseHypothesisBuffer(max_frames=8)
+    pose_motion_filter = None
+    if args.pose_motion_filter:
+        pose_motion_filter = PoseMotionFilter(
+            PoseMotionFilterConfig(
+                dt_seconds=args.pose_motion_dt,
+                max_acceleration_units_s2=args.pose_motion_max_acceleration,
+                max_jerk_units_s3=args.pose_motion_max_jerk,
+                max_angular_acceleration_rad_s2=args.pose_motion_max_angular_acceleration,
+                max_angular_jerk_rad_s3=args.pose_motion_max_angular_jerk,
+            )
+        )
 
     if is_image_source(source):
         frame = cv2.imread(str(source), cv2.IMREAD_COLOR)
@@ -3889,6 +4882,9 @@ def main() -> int:
             args.turn_candidate_log,
             args.turn_candidate_images,
             0,
+            pose_motion_filter,
+            symmetry_tracker,
+            pose_hypothesis_buffer,
         )
         if args.save:
             args.save.parent.mkdir(parents=True, exist_ok=True)
@@ -3936,6 +4932,9 @@ def main() -> int:
                 args.turn_candidate_log,
                 args.turn_candidate_images,
                 frame_index,
+                pose_motion_filter,
+                symmetry_tracker,
+                pose_hypothesis_buffer,
             )
             frame_index += 1
             render_end = perf_counter()
