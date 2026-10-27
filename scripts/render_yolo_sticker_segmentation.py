@@ -171,6 +171,17 @@ def sticker_instance_color(index: int) -> tuple[int, int, int]:
     return tuple(int(channel) for channel in bgr)
 
 
+def erode_binary_mask(mask: np.ndarray, pixels: int) -> np.ndarray:
+    """Erode a binary mask by a requested number of pixels."""
+
+    pixels = max(0, int(pixels))
+    if pixels == 0:
+        return mask
+    kernel_size = pixels * 2 + 1
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    return cv2.erode(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+
+
 def tensor_to_numpy(value: object) -> np.ndarray:
     if hasattr(value, "detach"):
         value = value.detach()
@@ -188,6 +199,7 @@ def render_segmentation_overlay(
     segmentation_type: str,
     random_sticker_colors: bool = False,
     masks_only: bool = False,
+    sticker_mask_erosion: int = 0,
 ) -> np.ndarray:
     background = np.zeros_like(image) if masks_only else image
     overlay = background.copy()
@@ -244,6 +256,12 @@ def render_segmentation_overlay(
             # Preserve the legacy behavior for single-class whole-cube models
             # whose class map does not name the class explicitly.
             rendered_indexes = (max(rendered_indexes, key=lambda index: int(rendered_masks[index].sum())),)
+
+    if segmentation_type in {"sticker", "combined"}:
+        rendered_masks = [
+            erode_binary_mask(mask, sticker_mask_erosion)
+            for mask in rendered_masks
+        ]
 
     for index in rendered_indexes:
         mask = rendered_masks[index]
@@ -653,6 +671,7 @@ def segmentation_union_mask(
     result: object,
     output_shape: tuple[int, int],
     segmentation_type: str = "sticker",
+    sticker_mask_erosion: int = 0,
 ) -> np.ndarray | None:
     """Return the rendered segmentation mask at the ROI resolution."""
 
@@ -674,13 +693,16 @@ def segmentation_union_mask(
     if segmentation_type == "combined":
         cube_ids, sticker_ids = combined_class_ids(getattr(result, "names", {}))
         cube_mask = np.zeros((output_height, output_width), dtype=bool)
-        sticker_mask = np.zeros((output_height, output_width), dtype=bool)
+        sticker_masks = []
         for index, mask in enumerate(rendered_masks):
             class_id = int(class_ids[index])
             if class_id in cube_ids:
                 cube_mask |= mask
             if class_id in sticker_ids:
-                sticker_mask |= mask
+                sticker_masks.append(erode_binary_mask(mask, sticker_mask_erosion))
+        sticker_mask = np.zeros((output_height, output_width), dtype=bool)
+        for mask in sticker_masks:
+            sticker_mask |= mask
         return cube_mask & sticker_mask
 
     if segmentation_type == "whole-cube":
@@ -701,6 +723,12 @@ def segmentation_union_mask(
                 for index, mask in enumerate(rendered_masks)
                 if int(class_ids[index]) in named_sticker_ids
             ]
+
+    if segmentation_type == "sticker":
+        rendered_masks = [
+            erode_binary_mask(mask, sticker_mask_erosion)
+            for mask in rendered_masks
+        ]
 
     for resized in rendered_masks:
         combined |= resized
@@ -819,6 +847,7 @@ def predict_and_render(
         args.segmentation_type,
         random_sticker_colors=getattr(args, "random_sticker_colors", False),
         masks_only=getattr(args, "masks_only", False),
+        sticker_mask_erosion=getattr(args, "sticker_mask_erosion", 0),
     )
     masks_only = getattr(args, "masks_only", False)
     output = np.zeros_like(image) if masks_only else image.copy()
@@ -832,6 +861,7 @@ def predict_and_render(
             roi_result,
             roi.shape[:2],
             args.segmentation_type,
+            getattr(args, "sticker_mask_erosion", 0),
         )
         probabilities = predict_color_probabilities(color_model, roi, args.imgsz, color_device)
         if distribution_picker is not None:
@@ -918,6 +948,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Render masks on a black background without the original input image",
     )
+    parser.add_argument(
+        "--sticker-mask-erosion",
+        type=int,
+        default=0,
+        help="Erode each sticker mask by this many pixels before rendering",
+    )
     parser.add_argument("--show-bbox", action=argparse.BooleanOptionalAction, default=True, help="Draw the active ROI")
     parser.add_argument("--conf", type=float, default=0.4, help="Segmentation confidence threshold")
     parser.add_argument("--imgsz", type=int, default=256, help="YOLO inference image size")
@@ -935,6 +971,8 @@ def main() -> int:
     print(f"Inference device: {args.device}")
     if not 0.0 <= args.opacity <= 1.0:
         raise SystemExit("--opacity must be in the range [0, 1]")
+    if args.sticker_mask_erosion < 0:
+        raise SystemExit("--sticker-mask-erosion must be non-negative")
     model_path = args.model or default_model_path(args.segmentation_type)
     if not model_path.is_file():
         raise SystemExit(f"Could not find model weights: {model_path}")

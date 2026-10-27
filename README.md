@@ -337,13 +337,51 @@ defaults are `corner=0.25`, `corner-edge=0.30`, and
 `--pose-class-conf corner=0.30,corner-edge=0.40,corner-edge-center=0.30`.
 `--min-keypoint-conf` remains an optional point-visibility filter, and
 `--track-conf` controls the minimum point-visibility score for ROI tracking.
-Misaligned-layer recovery still evaluates the layer angle on its existing
-fixed grid, while optionally ranking face directions from the initial
-assignment residuals first. It evaluates all six face directions by default;
-use `--pnp-turn-face-candidates 2` (or `1` for maximum speed) to opt into the
-smaller face search, and return to `6` if recall changes.
-When `--turn-candidate-log OUTPUT_DIR` is supplied, the JSONL log records every
-turn permutation evaluated and saves an annotated image for each one.
+
+To collect grouped sticker colors from a video, add `--rgb-html-plot` and use
+the combined cube/sticker segmentation model. The renderer projects all 54
+canonical stickers from the tracked pose, intersects each projected sticker
+with the predicted sticker/cube mask, averages up to 128 reliable pixels per
+sticker per frame, and omits stickers with no sampleable pixels. The plot has
+stable center (`C`), edge (`E`), and corner (`K`) traces, plus a normalized RGB
+companion file:
+
+```bash
+.venv/bin/python scripts/render_yolo11n_independent_keypoints.py \
+  --source /path/to/solve.mp4 \
+  --model runs/pose/runs/independent_keypoints_v3_weights.pt \
+  --combined-seg-model runs/segment/runs/combinedSegmentWeights.pt \
+  --rgb-html-plot runs/sticker_colors.html \
+  --color-plot-frames 180 \
+  --no-display
+```
+
+Use `--color-samples-per-sticker` and `--color-min-samples-per-sticker` to
+control the per-frame averaging and the minimum reliable mask area. Use
+`--sticker-mask-erosion N` to shrink each predicted sticker mask by `N` ROI
+pixels before rendering and color sampling, which avoids sampling near sticker
+boundaries.
+By default the renderer is in static-pose mode: it selects a sticker, refines
+the full-cube pose from the independent keypoint assignment, and keeps the
+cube symmetry continuous across video frames. A projected red/green/blue XYZ
+gizmo is shown at the cube center; use `--no-show-orientation-axes` to hide it
+or `--orientation-axis-length MM` to resize it. Layer-turn recovery and the
+motion graph are disabled until explicitly enabled with `--recognize-moves`.
+When move recognition is enabled, `--turn-candidate-log OUTPUT_DIR` records
+the evaluated turn permutations and saves annotated candidate images.
+For a debugging overlay that labels only the currently visible projected
+stickers, add `--show-sticker-identities`; the labels use the stable `C##`,
+`E##`, and `K##` identity numbers used by the HTML plot.
+To classify center colors from the collected traces, classify the remaining
+stickers against those center profiles, and replay the source in a second pass
+with visible projected stickers colored, add `--show-classified-colors` (the
+older `--show-classified-stickers` and `--show-classified-centers` spellings
+remain supported). The standard
+color scheme is evaluated over its 24 legal cube rotations in OKLab, while
+sticker profiles are compared using piecewise OKLab trajectories and legal
+edge/corner constraints, including unique use of all 12 edge pieces and all 8
+corner pieces. Use `--save-colored-video OUTPUT.mp4` if the second pass should
+also be written to a separate video.
 
 For ground-truth overlays on the prepared dataset, use
 `scripts/render_independent_keypoints.py`:

@@ -1,4 +1,5 @@
 import importlib.util
+from itertools import permutations
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -118,6 +119,471 @@ def test_symmetry_tracker_selects_equivalent_pose_near_previous_frame():
     assert render_script.rotation_symmetry_distance(canonical.rvec, target_rvec) < 1e-6
 
 
+def test_static_refinement_skips_layer_turn_recovery(monkeypatch):
+    object_points = render_script.canonical_sticker_object_points("corner")
+    camera_matrix = render_script.default_camera_matrix((256, 256), 1.2)
+    image_points, _ = cv2.projectPoints(
+        object_points,
+        np.zeros((3, 1), dtype=np.float64),
+        np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64),
+        camera_matrix,
+        np.zeros((4, 1), dtype=np.float64),
+    )
+    match = render_script.StickerKeypointMatch(
+        mask_index=0,
+        keypoint_indices=(0, 1, 2, 3),
+        sticker_type="corner",
+        average_confidence=0.95,
+    )
+    candidate = render_script.solve_sticker_pnp(
+        image_points.reshape(-1, 2),
+        np.asarray([0, 1, 2, 1], dtype=np.int32),
+        match,
+        (256, 256),
+        1.2,
+    )
+    assert candidate is not None
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("static refinement must not recover layer turns")
+
+    monkeypatch.setattr(
+        render_script,
+        "recover_misaligned_cube_layers",
+        fail_if_called,
+    )
+    refined = render_script.solve_pnp_from_low_error_assignments(candidate)
+
+    assert refined.layer_rotations == ()
+    assert refined.turn_candidate_scores == ()
+    assert refined.final_solve_image_points is not None
+    assert len(refined.final_solve_image_points) >= 3
+
+
+def test_project_cube_orientation_axes_follow_camera_projection():
+    candidate = SimpleNamespace(
+        camera_matrix=render_script.default_camera_matrix((256, 256), 1.2),
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+    )
+    projected = render_script.project_cube_orientation_axes(
+        candidate,
+        np.zeros((3, 1), dtype=np.float64),
+        np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64),
+        axis_length=24.0,
+    )
+
+    assert projected is not None
+    assert projected.shape == (4, 2)
+    assert projected[1, 0] > projected[0, 0]  # +X points right
+    assert projected[2, 1] > projected[0, 1]  # +Y points down in the image
+    np.testing.assert_allclose(projected[3], projected[0], atol=1e-5)
+
+
+def test_canonical_sticker_identities_cover_54_stickers_in_intuitive_groups():
+    identities = render_script.canonical_sticker_identities()
+
+    assert len(identities) == 54
+    assert len({identity.label for identity in identities}) == 54
+    assert {identity.category for identity in identities} == {"center", "edge", "corner"}
+    assert sum(identity.category == "center" for identity in identities) == 6
+    assert sum(identity.category == "edge" for identity in identities) == 24
+    assert sum(identity.category == "corner" for identity in identities) == 24
+    assert [identity.label for identity in identities[:6]] == [
+        "C01 U", "C02 D", "C03 F", "C04 B", "C05 R", "C06 L",
+    ]
+
+
+def test_center_color_classifier_chooses_a_legal_standard_scheme():
+    trace = render_script.StickerColorTrace.create()
+    expected = {
+        "U": "white",
+        "D": "yellow",
+        "F": "green",
+        "B": "blue",
+        "R": "red",
+        "L": "orange",
+    }
+    labels_by_face = {
+        identity.face: identity.label
+        for identity in trace.identities
+        if identity.category == "center"
+    }
+    observations = {
+        labels_by_face[face]: np.asarray(render_script.PURE_COLOR_RGB[color], dtype=np.uint8)
+        for face, color in expected.items()
+    }
+    trace.observe(0, observations)
+    trace.observe(1, observations)
+
+    classified = render_script.classify_center_color_names(trace)
+
+    assert {
+        next(identity.face for identity in trace.identities if identity.label == label): color
+        for label, color in classified.items()
+    } == expected
+    assert len(render_script.legal_center_color_assignments()) == 24
+
+
+def test_oklab_conversion_round_trips_rgb_values():
+    rgb = np.asarray(tuple(render_script.PURE_COLOR_RGB.values()), dtype=np.float64)
+
+    np.testing.assert_allclose(
+        render_script.oklab_to_rgb(render_script.rgb_to_oklab(rgb)),
+        rgb,
+        atol=0.01,
+    )
+
+
+def test_piecewise_profiles_compare_trajectories_in_oklab():
+    trace = render_script.StickerColorTrace.create()
+    center_labels = {
+        identity.face: identity.label
+        for identity in trace.identities
+        if identity.category == "center"
+    }
+    red_values = np.asarray(
+        [[64, 8, 8], [128, 16, 16], [220, 40, 40], [255, 110, 110]],
+        dtype=np.uint8,
+    )
+    blue_values = np.asarray(
+        [[8, 8, 64], [16, 16, 128], [40, 40, 220], [110, 110, 255]],
+        dtype=np.uint8,
+    )
+    for frame_index, (red, blue) in enumerate(zip(red_values, blue_values, strict=True)):
+        trace.observe(
+            frame_index,
+            {
+                center_labels["R"]: red,
+                center_labels["B"]: blue,
+            },
+        )
+
+    red_profile = render_script.fit_sticker_color_profile(trace, center_labels["R"])
+    blue_profile = render_script.fit_sticker_color_profile(trace, center_labels["B"])
+
+    assert red_profile is not None
+    assert blue_profile is not None
+    assert render_script.sticker_color_profile_distance(red_profile, red_profile) < 1e-8
+    assert render_script.sticker_color_profile_distance(red_profile, blue_profile) > 0.02
+
+
+def test_sticker_assignment_rejects_opposite_colors_on_one_edge():
+    trace = render_script.StickerColorTrace.create()
+    center_labels = {
+        identity.face: identity.label
+        for identity in trace.identities
+        if identity.category == "center"
+    }
+    centers = {
+        face: np.asarray(render_script.PURE_COLOR_RGB[color], dtype=np.uint8)
+        for face, color in {
+            "U": "white",
+            "D": "yellow",
+            "F": "green",
+            "B": "blue",
+            "R": "red",
+            "L": "orange",
+        }.items()
+    }
+    edge_identities = [
+        identity
+        for identity in trace.identities
+        if identity.category == "edge" and identity.cubie_label == "UF"
+    ]
+    observations = {
+        center_labels[face]: value for face, value in centers.items()
+    }
+    observations[edge_identities[0].label] = np.asarray(
+        render_script.PURE_COLOR_RGB["red"], dtype=np.uint8
+    )
+    observations[edge_identities[1].label] = np.asarray(
+        render_script.PURE_COLOR_RGB["orange"], dtype=np.uint8
+    )
+    trace.observe(0, observations)
+
+    center_colors = render_script.classify_center_color_names(trace)
+    classified = render_script.classify_sticker_color_names(trace, center_colors)
+    assigned_edge_colors = tuple(classified[label] for label in observations if label.startswith("E"))
+
+    assert len(assigned_edge_colors) == 2
+    assert render_script._legal_cubie_color_tuple(assigned_edge_colors)
+    assert frozenset(assigned_edge_colors) not in render_script.OPPOSITE_COLOR_PAIRS
+
+
+def test_sticker_assignment_does_not_reuse_the_same_edge_piece():
+    trace = render_script.StickerColorTrace.create()
+    center_labels = {
+        identity.face: identity.label
+        for identity in trace.identities
+        if identity.category == "center"
+    }
+    center_colors = {
+        "U": "white",
+        "D": "yellow",
+        "F": "green",
+        "B": "blue",
+        "R": "red",
+        "L": "orange",
+    }
+    observations = {
+        center_labels[face]: np.asarray(render_script.PURE_COLOR_RGB[color], dtype=np.uint8)
+        for face, color in center_colors.items()
+    }
+    edge_groups = {}
+    for identity in trace.identities:
+        if identity.category == "edge":
+            edge_groups.setdefault(identity.cubie_label, []).append(identity)
+    for group_name in ("UF", "UR"):
+        for identity in edge_groups[group_name]:
+            observations[identity.label] = np.asarray(
+                render_script.PURE_COLOR_RGB["red" if identity.face == "U" else "orange"],
+                dtype=np.uint8,
+            )
+    trace.observe(0, observations)
+
+    classified = render_script.classify_sticker_color_names(
+        trace,
+        render_script.classify_center_color_names(trace),
+    )
+    assigned_pairs = []
+    for group_name in ("UF", "UR"):
+        assigned_pairs.append(
+            frozenset(classified[identity.label] for identity in edge_groups[group_name])
+        )
+
+    assert assigned_pairs[0] != assigned_pairs[1]
+    assert len(render_script.legal_edge_color_combinations()) == 12
+    assert len(render_script.legal_corner_color_combinations()) == 8
+
+
+def test_corner_assignment_enforces_proper_color_chirality():
+    identities = [
+        identity
+        for identity in render_script.canonical_sticker_identities()
+        if identity.category == "corner" and identity.cubie_label == "UBL"
+    ]
+    identities.sort(key=lambda identity: {"U": 0, "L": 1, "B": 2}[identity.face])
+
+    # On the UBL corner, white-orange-blue is the clockwise standard order.
+    assert render_script.corner_color_assignment_is_chiral(
+        identities,
+        ("white", "orange", "blue"),
+    )
+    assert not render_script.corner_color_assignment_is_chiral(
+        identities,
+        ("white", "blue", "orange"),
+    )
+
+    # Exactly half of the permutations of a legal color triple are proper
+    # rotations; the other half are reflected/impossible corner assignments.
+    assignments = [
+        render_script.corner_color_assignment_is_chiral(
+            identities,
+            permutation,
+        )
+        for permutation in permutations(("white", "orange", "blue"))
+    ]
+    assert sum(assignments) == 3
+
+
+def test_corner_chirality_uses_rotated_center_color_scheme():
+    identities = [
+        identity
+        for identity in render_script.canonical_sticker_identities()
+        if identity.category == "corner" and identity.cubie_label == "UBL"
+    ]
+    identities.sort(key=lambda identity: {"U": 0, "L": 1, "B": 2}[identity.face])
+
+    # This is a valid cube rotation.  Chirality must follow the centers rather
+    # than assuming that a particular object face is always a fixed color.
+    rotated_face_colors = render_script.legal_center_color_assignments()[1]
+    rotated_color_face = {
+        color: face
+        for face, color in rotated_face_colors.items()
+    }
+    ordered_colors = tuple(rotated_face_colors[identity.face] for identity in identities)
+    assert render_script.corner_color_assignment_is_chiral(
+        identities,
+        ordered_colors,
+        rotated_color_face,
+    )
+
+
+def test_projected_center_color_overlay_only_draws_visible_classified_centers():
+    candidate = SimpleNamespace(
+        layer_rotations=(),
+        camera_matrix=render_script.default_camera_matrix((256, 256), 1.2),
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+    )
+    image = np.zeros((256, 256, 3), dtype=np.uint8)
+
+    drawn = render_script.draw_projected_center_colors(
+        image,
+        candidate,
+        {"C02 D": "yellow", "C01 U": "white"},
+        np.zeros((3, 1), dtype=np.float64),
+        np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64),
+    )
+
+    assert drawn == 1
+    assert np.any(image[:, :, 1] > 0)
+
+
+def test_classified_cube_diagnostic_panel_keeps_cube_stationary():
+    common = {
+        "layer_rotations": (),
+        "rvec": np.zeros((3, 1), dtype=np.float64),
+        "camera_matrix": render_script.default_camera_matrix((256, 256), 1.2),
+        "dist_coeffs": np.zeros((4, 1), dtype=np.float64),
+    }
+    first_candidate = SimpleNamespace(
+        **common,
+        tvec=np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64),
+    )
+    second_candidate = SimpleNamespace(
+        **common,
+        tvec=np.asarray([[40.0], [-25.0], [320.0]], dtype=np.float64),
+    )
+    image = np.zeros((256, 256, 3), dtype=np.uint8)
+    colors = {"C01 U": "white", "C02 D": "yellow"}
+
+    first = render_script.draw_classified_cube_diagnostic_panel(
+        image,
+        first_candidate,
+        colors,
+    )
+    second = render_script.draw_classified_cube_diagnostic_panel(
+        image,
+        second_candidate,
+        colors,
+    )
+
+    assert first.shape == (256, 512, 3)
+    np.testing.assert_array_equal(first[:, 256:], second[:, 256:])
+
+
+def test_projected_sticker_faces_match_cube_pose_geometry_after_symmetry():
+    symmetry = render_script.CUBE_SYMMETRY_MATRICES[7]
+    candidate = SimpleNamespace(
+        layer_rotations=(),
+        object_symmetry=symmetry,
+        camera_matrix=render_script.default_camera_matrix((256, 256), 1.2),
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+    )
+    rvec = render_script.transform_rvec_by_symmetry(
+        np.asarray([[0.12], [-0.18], [0.08]], dtype=np.float64),
+        symmetry,
+    )
+    tvec = np.asarray([[4.0], [-3.0], [180.0]], dtype=np.float64)
+
+    sticker_faces = render_script.projected_sticker_faces(candidate, rvec, tvec)
+    cube_faces = render_script.projected_cubelet_faces(candidate, rvec, tvec)
+
+    assert len(sticker_faces) == len(cube_faces)
+    for (_identity, sticker_depth, sticker_polygon), (
+        cube_depth,
+        cube_polygon,
+        _anchor,
+    ) in zip(sticker_faces, cube_faces, strict=True):
+        np.testing.assert_allclose(sticker_depth, cube_depth)
+        np.testing.assert_allclose(sticker_polygon, cube_polygon)
+
+
+def test_sticker_identity_overlay_draws_only_visible_stickers():
+    candidate = SimpleNamespace(
+        layer_rotations=(),
+        camera_matrix=render_script.default_camera_matrix((256, 256), 1.2),
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+    )
+    image = np.zeros((256, 256, 3), dtype=np.uint8)
+
+    drawn = render_script.draw_projected_sticker_identity_labels(
+        image,
+        candidate,
+        np.zeros((3, 1), dtype=np.float64),
+        np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64),
+    )
+
+    assert drawn == 9
+    assert np.any(image)
+
+
+def test_sticker_color_sampling_uses_projected_mask_and_cube_sticker_intersection():
+    image = np.full((256, 256, 3), (60, 80, 100), dtype=np.uint8)
+    camera_matrix = render_script.default_camera_matrix((256, 256), 1.2)
+    candidate = SimpleNamespace(
+        layer_rotations=(),
+        camera_matrix=camera_matrix,
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+        rvec=np.zeros((3, 1), dtype=np.float64),
+        tvec=np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64),
+    )
+    sticker_mask = np.ones((256, 256), dtype=bool)
+    cube_mask = np.ones((256, 256), dtype=bool)
+    predicted = ([sticker_mask], {0: "sticker"}, np.asarray([0], dtype=np.int32), cube_mask)
+
+    observations = render_script.sample_projected_sticker_colors(
+        image,
+        (0, 0, 256, 256),
+        predicted,
+        candidate,
+        max_samples_per_sticker=32,
+        min_samples_per_sticker=4,
+    )
+
+    assert observations
+    assert set(observations) == {
+        "C02 D",
+        "E09 DF/D",
+        "E11 DR/D",
+        "E13 DB/D",
+        "E15 DL/D",
+        "K13 DFR/D",
+        "K16 DFL/D",
+        "K19 DBL/D",
+        "K22 DBR/D",
+    }
+    assert all(np.array_equal(value, np.asarray((100, 80, 60), dtype=np.uint8)) for value in observations.values())
+
+    empty_cube = np.zeros_like(cube_mask)
+    empty_predicted = (predicted[0], predicted[1], predicted[2], empty_cube)
+    assert render_script.sample_projected_sticker_colors(
+        image,
+        (0, 0, 256, 256),
+        empty_predicted,
+        candidate,
+    ) == {}
+
+
+def test_sticker_rgb_html_plot_has_selectors_for_all_stickers(tmp_path):
+    pytest.importorskip("plotly.graph_objects")
+    trace = render_script.StickerColorTrace.create()
+    trace.observe(
+        7,
+        {trace.identities[0].label: np.asarray((10, 20, 30), dtype=np.uint8)},
+    )
+    output_path = tmp_path / "sticker_rgb.html"
+
+    render_script.save_sticker_rgb_html_plot(
+        trace,
+        output_path,
+        title="Sticker RGB",
+    )
+
+    html = output_path.read_text(encoding="utf-8")
+    assert "All stickers" in html
+    assert "Centers" in html
+    assert "Edges" in html
+    assert "Corners" in html
+    assert "fitted regression" in html
+    assert '"mode":"lines"' in html
+    assert '"groupclick":"toggleitem"' in html
+    assert all(
+        identity.label.replace("/", "\\u002f") in html
+        for identity in trace.identities
+    )
+
+
 def test_sticker_keypoint_matches_returns_a_consistent_circular_order():
     mask = np.zeros((32, 32), dtype=np.uint8)
     mask[8:24, 8:24] = 1
@@ -206,6 +672,31 @@ def test_render_sticker_masks_uses_inferred_sticker_type_colors():
     )
 
     assert np.all(output[12, 12] == render_script.STICKER_TYPE_COLORS_BGR["corner"])
+
+
+def test_sticker_mask_erosion_parser_and_roi_masks():
+    assert render_script.build_parser().parse_args(["--source", "frame.png"]).sticker_mask_erosion == 0
+    args = render_script.build_parser().parse_args(
+        ["--source", "frame.png", "--sticker-mask-erosion", "1"]
+    )
+    assert args.sticker_mask_erosion == 1
+
+    local_mask = np.zeros((9, 9), dtype=bool)
+    local_mask[2:7, 2:7] = True
+    predicted = (
+        [local_mask],
+        {0: "sticker"},
+        np.asarray([0], dtype=np.int32),
+        np.ones((9, 9), dtype=bool),
+    )
+    masks = render_script.sticker_segmentation_masks_in_roi(
+        predicted,
+        (9, 9),
+        sticker_mask_erosion=1,
+    )
+
+    assert len(masks) == 1
+    assert int(masks[0].sum()) == 9
 
 
 def test_sticker_mask_parser_preserves_the_model_cube_mask():

@@ -29,6 +29,31 @@ def test_masks_only_is_opt_in_parser_flag():
     assert build_parser().parse_args(["--source", "frame.png", "--masks-only"]).masks_only
 
 
+def test_sticker_mask_erosion_parser_flag():
+    assert build_parser().parse_args(["--source", "frame.png"]).sticker_mask_erosion == 0
+    assert build_parser().parse_args(
+        ["--source", "frame.png", "--sticker-mask-erosion", "2"]
+    ).sticker_mask_erosion == 2
+
+
+def test_sticker_mask_erosion_shrinks_sticker_and_combined_masks():
+    masks = np.zeros((2, 9, 9), dtype=np.float32)
+    masks[:, 2:7, 2:7] = 1.0
+    result = SimpleNamespace(
+        masks=SimpleNamespace(data=masks),
+        boxes=SimpleNamespace(cls=np.array([0, 1])),
+        names={0: "cube", 1: "sticker"},
+    )
+
+    sticker_mask = segmentation_union_mask(result, (9, 9), "sticker", sticker_mask_erosion=1)
+    combined_mask = segmentation_union_mask(result, (9, 9), "combined", sticker_mask_erosion=1)
+
+    assert sticker_mask is not None
+    assert combined_mask is not None
+    assert int(sticker_mask.sum()) == 9
+    assert int(combined_mask.sum()) == 9
+
+
 def test_predict_requests_high_resolution_masks():
     calls = {}
 
