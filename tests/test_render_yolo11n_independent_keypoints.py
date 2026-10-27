@@ -263,6 +263,10 @@ def test_piecewise_profiles_compare_trajectories_in_oklab():
 
     assert red_profile is not None
     assert blue_profile is not None
+    assert red_profile.polyline_rgb.shape == (3, 3)
+    assert blue_profile.polyline_rgb.shape == (3, 3)
+    assert np.isclose(np.max(red_profile.polyline_rgb[1]), 255.0)
+    assert np.isclose(np.max(blue_profile.polyline_rgb[1]), 255.0)
     assert render_script.sticker_color_profile_distance(red_profile, red_profile) < 1e-8
     assert render_script.sticker_color_profile_distance(red_profile, blue_profile) > 0.02
 

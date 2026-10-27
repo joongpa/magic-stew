@@ -378,10 +378,11 @@ with visible projected stickers colored, add `--show-classified-colors` (the
 older `--show-classified-stickers` and `--show-classified-centers` spellings
 remain supported). The standard
 color scheme is evaluated over its 24 legal cube rotations in OKLab, while
-sticker profiles are compared using piecewise OKLab trajectories and legal
-edge/corner constraints, including unique use of all 12 edge pieces and all 8
-corner pieces. Use `--save-colored-video OUTPUT.mp4` if the second pass should
-also be written to a separate video.
+sticker profiles use two-segment RGB regressions whose inflection reaches 255
+in at least one channel; those regressions are compared in OKLab subject to
+legal edge/corner constraints, including unique use of all 12 edge pieces and
+all 8 corner pieces. Use `--save-colored-video OUTPUT.mp4` if the second pass
+should also be written to a separate video.
 
 For ground-truth overlays on the prepared dataset, use
 `scripts/render_independent_keypoints.py`:

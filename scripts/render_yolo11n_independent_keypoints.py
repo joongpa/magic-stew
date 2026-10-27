@@ -351,8 +351,9 @@ class StickerColorTrace:
 
 @dataclass(frozen=True)
 class StickerColorProfile:
-    """A fitted black-to-color-to-white RGB trajectory in OKLab."""
+    """A fitted two-segment black-to-color-to-white RGB trajectory."""
 
+    polyline_rgb: np.ndarray
     polyline_oklab: np.ndarray
     residual: float
     sample_count: int
@@ -1462,52 +1463,84 @@ def _piecewise_profile_distances(
     )
 
 
+def _fit_rgb_inflection_point(rgb_points: np.ndarray) -> np.ndarray:
+    """Fit the RGB point where the first segment reaches one channel at 255."""
+
+    points = np.asarray(rgb_points, dtype=np.float64).reshape(-1, 3)
+    black = np.zeros(3, dtype=np.float64)
+    white = np.full(3, 255.0, dtype=np.float64)
+    candidates: list[tuple[int, np.ndarray]] = []
+    dominant_channels = np.argmax(points, axis=1)
+    for channel in range(3):
+        channel_points = points[dominant_channels == channel]
+        channel_points = channel_points[channel_points[:, channel] > 1e-6]
+        if len(channel_points) == 0:
+            continue
+        scaled = channel_points * (255.0 / channel_points[:, channel, None])
+        scaled = np.clip(scaled, 0.0, 255.0)
+        for pivot in scaled[:: max(1, len(scaled) // 8)]:
+            pivot = pivot.copy()
+            pivot[channel] = 255.0
+            candidates.append((channel, pivot))
+        median_pivot = np.median(scaled, axis=0)
+        median_pivot[channel] = 255.0
+        candidates.append((channel, median_pivot))
+    if not candidates:
+        return white
+
+    def score(pivot: np.ndarray) -> float:
+        polyline = np.asarray((black, pivot, white), dtype=np.float64)
+        return float(np.mean(_piecewise_profile_distances(points, polyline) ** 2))
+
+    best_channel, best_pivot = min(candidates, key=lambda item: score(item[1]))
+    best_score = score(best_pivot)
+    other_channels = tuple(index for index in range(3) if index != best_channel)
+    for step in (32.0, 16.0, 8.0, 4.0, 2.0, 1.0):
+        improved = True
+        while improved:
+            improved = False
+            for channel in other_channels:
+                for delta in (-step, step):
+                    candidate = best_pivot.copy()
+                    candidate[channel] = np.clip(candidate[channel] + delta, 0.0, 255.0)
+                    candidate[best_channel] = 255.0
+                    candidate_score = score(candidate)
+                    if candidate_score < best_score:
+                        best_pivot = candidate
+                        best_score = candidate_score
+                        improved = True
+    return best_pivot
+
+
 def fit_sticker_color_profile(
     trace: StickerColorTrace,
     sticker_label: str,
 ) -> StickerColorProfile | None:
-    """Fit a piecewise OKLab profile to one sticker's RGB observations."""
+    """Fit a two-segment RGB profile with a one-channel-255 inflection."""
 
     entries = trace.observations.get(sticker_label, ())
     if not entries:
         return None
-    points = rgb_to_oklab(
-        np.asarray([value for _frame, value in entries], dtype=np.float64)
-    ).astype(np.float32)
-    black = np.zeros(3, dtype=np.float32)
-    white = np.asarray((1.0, 0.0, 0.0), dtype=np.float32)
-    if len(points) == 1:
-        polyline = np.asarray((black, points[0], white), dtype=np.float32)
-        residual = float(_piecewise_profile_distances(points, polyline).mean())
-        return StickerColorProfile(polyline, residual, len(points))
-
-    ordered = points[np.argsort(points[:, 0])[::-1]]
-    candidate_indexes = np.unique(
-        np.linspace(0, len(ordered) - 1, min(24, len(ordered)), dtype=np.int32)
-    )
-    candidates = ordered[candidate_indexes]
-    best_pair = np.asarray((candidates[0], candidates[-1]), dtype=np.float32)
-    best_score = float("inf")
-    for first_index in range(len(candidates) - 1):
-        for second_index in range(first_index + 1, len(candidates)):
-            high_pivot = candidates[first_index]
-            low_pivot = candidates[second_index]
-            polyline = np.asarray(
-                (black, low_pivot, high_pivot, white),
-                dtype=np.float32,
-            )
-            score = float(
-                np.mean(_piecewise_profile_distances(points, polyline) ** 2)
-            )
-            if score < best_score:
-                best_score = score
-                best_pair = np.asarray((high_pivot, low_pivot), dtype=np.float32)
-    polyline = np.asarray(
-        (black, best_pair[1], best_pair[0], white),
+    rgb_points = np.asarray(
+        [value for _frame, value in entries],
+        dtype=np.float64,
+    ).reshape(-1, 3)
+    inflection = _fit_rgb_inflection_point(rgb_points)
+    polyline_rgb = np.asarray(
+        ((0.0, 0.0, 0.0), inflection, (255.0, 255.0, 255.0)),
         dtype=np.float32,
     )
-    residual = float(np.sqrt(np.mean(_piecewise_profile_distances(points, polyline) ** 2)))
-    return StickerColorProfile(polyline, residual, len(points))
+    points_oklab = rgb_to_oklab(rgb_points).astype(np.float32)
+    polyline_oklab = rgb_to_oklab(polyline_rgb).astype(np.float32)
+    residual = float(
+        np.sqrt(np.mean(_piecewise_profile_distances(points_oklab, polyline_oklab) ** 2))
+    )
+    return StickerColorProfile(
+        polyline_rgb,
+        polyline_oklab,
+        residual,
+        len(rgb_points),
+    )
 
 
 def sample_profile_polyline(polyline_oklab: np.ndarray, count: int = 48) -> np.ndarray:
@@ -4882,8 +4915,9 @@ def save_sticker_rgb_html_plot(
         if profile is None:
             regression_rgb = np.empty((0, 3), dtype=np.float32)
         else:
-            regression_oklab = sample_profile_polyline(profile.polyline_oklab, count=96)
-            regression_rgb = oklab_to_rgb(regression_oklab).astype(np.float32)
+            regression_rgb = sample_profile_polyline(profile.polyline_rgb, count=96).astype(
+                np.float32
+            )
             if normalize_rgb:
                 regression_rgb /= np.maximum(
                     np.linalg.norm(regression_rgb, axis=1, keepdims=True),
