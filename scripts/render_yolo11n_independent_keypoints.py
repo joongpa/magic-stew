@@ -6752,6 +6752,7 @@ def draw_classified_cube_diagnostic_panel(
     sticker_likelihoods: dict[str, dict[str, float]] | None = None,
     rvec: np.ndarray | None = None,
     orientation_axis_length: float = 24.0,
+    show_sticker_identities: bool = True,
 ) -> np.ndarray:
     """Append a classified projected cube beside the original diagnostic image."""
 
@@ -6820,13 +6821,14 @@ def draw_classified_cube_diagnostic_panel(
         outline=False,
         image_offset=image_offset,
     )
-    draw_projected_sticker_identity_labels(
-        output,
-        candidate,
-        display_rvec,
-        display_tvec,
-        image_offset=image_offset,
-    )
+    if show_sticker_identities:
+        draw_projected_sticker_identity_labels(
+            output,
+            candidate,
+            display_rvec,
+            display_tvec,
+            image_offset=image_offset,
+        )
     draw_orientation_axes(
         output,
         candidate,
@@ -7239,6 +7241,7 @@ def render_frame(
                 sticker_color_names,
                 sticker_likelihoods=sticker_likelihoods,
                 orientation_axis_length=args.orientation_axis_length,
+                show_sticker_identities=getattr(args, "show_sticker_identities", True),
             )
         return output, "none", 0
 
@@ -7273,6 +7276,7 @@ def render_frame(
                 sticker_color_names,
                 sticker_likelihoods=sticker_likelihoods,
                 orientation_axis_length=args.orientation_axis_length,
+                show_sticker_identities=getattr(args, "show_sticker_identities", True),
             )
         return output, roi_source, 0
 
@@ -7359,6 +7363,7 @@ def render_frame(
                 sticker_color_names,
                 sticker_likelihoods=sticker_likelihoods,
                 orientation_axis_length=args.orientation_axis_length,
+                show_sticker_identities=getattr(args, "show_sticker_identities", True),
             )
         return output, roi_source, point_count
     if len(local_points) == 0:
@@ -7383,6 +7388,7 @@ def render_frame(
                 None,
                 sticker_color_names,
                 orientation_axis_length=args.orientation_axis_length,
+                show_sticker_identities=getattr(args, "show_sticker_identities", True),
             )
         return output, roi_source, 0
 
@@ -7605,6 +7611,7 @@ def render_frame(
                 sticker_color_names,
                 sticker_likelihoods=sticker_likelihoods,
                 orientation_axis_length=args.orientation_axis_length,
+                show_sticker_identities=getattr(args, "show_sticker_identities", True),
             )
     elif args.show_pnp and neural_data is not None and neural_data.pose_ready:
         output = draw_sticker_pnp_candidate(
@@ -7627,6 +7634,7 @@ def render_frame(
                 sticker_color_names,
                 sticker_likelihoods=sticker_likelihoods,
                 orientation_axis_length=args.orientation_axis_length,
+                show_sticker_identities=getattr(args, "show_sticker_identities", True),
             )
     if neural_data is not None:
         neural_data.pose_candidate = pnp_candidate

@@ -735,6 +735,31 @@ def test_classified_cube_diagnostic_panel_keeps_cube_stationary():
     np.testing.assert_array_equal(first[:, 256:], second[:, 256:])
 
 
+def test_classified_cube_diagnostic_panel_can_hide_sticker_identities(monkeypatch):
+    candidate = SimpleNamespace(
+        layer_rotations=(),
+        rvec=np.zeros((3, 1), dtype=np.float64),
+        tvec=np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64),
+        camera_matrix=render_script.default_camera_matrix((256, 256), 1.2),
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+    )
+    calls = []
+    monkeypatch.setattr(
+        render_script,
+        "draw_projected_sticker_identity_labels",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or 0,
+    )
+
+    render_script.draw_classified_cube_diagnostic_panel(
+        np.zeros((256, 256, 3), dtype=np.uint8),
+        candidate,
+        {"C01 U": "white"},
+        show_sticker_identities=False,
+    )
+
+    assert calls == []
+
+
 def test_projected_sticker_faces_match_cube_pose_geometry_after_symmetry():
     symmetry = render_script.CUBE_SYMMETRY_MATRICES[7]
     candidate = SimpleNamespace(
