@@ -29,7 +29,6 @@ POSE_LABEL_FIELD_COUNT = 1 + 4 + (KPT_SHAPE[0] * KPT_SHAPE[1])
 BBOX_FIELD_COUNT = 4
 KEYPOINT_VISIBILITY_VALUES = {0, 1, 2}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
-DEFAULT_EXTRA_NEGATIVE_DIR = Path("data/youtube_solve_frames_hd/cropped-negatives")
 
 
 def label_lines(path: Path) -> list[str]:
@@ -243,10 +242,10 @@ def main() -> None:
     parser.add_argument(
         "--extra-negative-dir",
         type=Path,
-        default=DEFAULT_EXTRA_NEGATIVE_DIR,
+        default=None,
         help=(
             "Directory of cube-free images to include with empty pose labels "
-            f"(default: {DEFAULT_EXTRA_NEGATIVE_DIR})"
+            "(omitted by default)"
         ),
     )
     parser.add_argument("--workdir", type=Path, default=Path("runs/cube_piece_keypoint_pose_local"))

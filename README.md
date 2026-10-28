@@ -255,9 +255,9 @@ combine multiple datasets, provide multiple roots, for example:
   --source-dirs data/independent_keypoints_v2 data/another_dataset
 ```
 
-The trainer also includes cube-free images from
-`data/youtube_solve_frames_hd/cropped-negatives` by default, writing empty pose
-labels for them. Override the directory with `--extra-negative-dir`.
+The trainer does not include cube-free images unless requested. To add them,
+pass a directory with `--extra-negative-dir`; the images are written with empty
+pose labels.
 
 To prepare a fixed direct-correspondence target from the v3 independent
 dataset, use the 37-point three-face converter:
