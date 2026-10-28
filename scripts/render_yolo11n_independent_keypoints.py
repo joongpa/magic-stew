@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 """Render the independent cube-keypoint YOLO model with the live ROI flow.
 
-Per frame, this renderer:
+For video sources, this renderer uses a producer/consumer pipeline:
 
-1. Runs the cube bbox detector when no tracked ROI exists.
-2. Builds the padded square ROI using the shared live-pipeline helper.
-3. Runs the combined cube/sticker segmentation and independent three-class pose models inside that ROI.
-4. Maps the independent points and sticker masks back to the full frame.
-5. Updates the ROI tracker from the predicted point extent.
+1. The foreground pass runs the detector and neural models, displays their
+   output, and caches the raw frame/ROI/model data.
+2. A background worker consumes those cached records for initial pose solving
+   and color sampling while the neural producer continues.
+3. The final pass replays the cache for pose/classification presentation
+   without running neural inference again.
+
+Within the foreground pass, the neural work is:
+
+1. Run the cube bbox detector when no tracked ROI exists.
+2. Build the padded square ROI using the shared live-pipeline helper.
+3. Run the combined cube/sticker segmentation and independent three-class pose models inside that ROI.
+4. Map the independent points and sticker masks back to the full frame.
+5. Update the ROI tracker from the predicted point extent.
 
 Examples:
 
@@ -25,6 +34,8 @@ Examples:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 import json
 import sys
 from collections import deque
@@ -32,6 +43,8 @@ from dataclasses import dataclass, replace
 from itertools import combinations, permutations, product
 from pathlib import Path
 from time import perf_counter
+from queue import SimpleQueue
+from threading import Thread
 
 import cv2
 import numpy as np
@@ -68,6 +81,10 @@ CLASS_COLORS_BGR = (
 OCCLUDED_COLOR_BGR = (0, 0, 255)
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 WINDOW_NAME = "independent cube keypoints"
+CPU_NEURAL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="cpu-neural",
+)
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 DEFAULT_POSE_MODEL = (
     ROOT
@@ -293,6 +310,11 @@ PNP_LAYER_MISALIGNMENT_STEP_DEGREES = 3.0
 PNP_TURN_FACE_CANDIDATES = 2
 PNP_TURN_DEBUG_CANDIDATE_COUNT = 6
 PNP_TURN_OVERLAY_CANDIDATE_COUNT = 6
+# The final cached pass scores all 24 equivalent labelings using the complete
+# sticker-color history. The initial pose pass deliberately does not spend
+# time canonicalizing pose symmetry.
+POSE_SYMMETRY_RECOVERY_MIN_OBSERVATIONS = 4
+POSE_SYMMETRY_RECOVERY_LOW_PREDICTIVE_PROBABILITY = 0.10
 
 
 @dataclass(frozen=True)
@@ -325,6 +347,7 @@ class StickerColorTrace:
 
     identities: tuple[StickerIdentity, ...]
     observations: dict[str, list[tuple[int, np.ndarray]]]
+    observation_weights: dict[str, list[float]]
     frames_seen: int = 0
 
     @classmethod
@@ -333,12 +356,14 @@ class StickerColorTrace:
         return cls(
             identities=identities,
             observations={identity.label: [] for identity in identities},
+            observation_weights={identity.label: [] for identity in identities},
         )
 
     def observe(
         self,
         frame_index: int,
         observations: dict[str, np.ndarray],
+        observation_weights: dict[str, float] | None = None,
     ) -> None:
         self.frames_seen += 1
         for identity in self.identities:
@@ -347,6 +372,46 @@ class StickerColorTrace:
                 continue
             value = np.asarray(rgb, dtype=np.uint8).reshape(3).copy()
             self.observations[identity.label].append((int(frame_index), value))
+            weight = 1.0 if observation_weights is None else observation_weights.get(
+                identity.label,
+                1.0,
+            )
+            self.observation_weights[identity.label].append(
+                float(np.clip(weight, 0.0, 1.0))
+            )
+
+
+@dataclass
+class NeuralFrameData:
+    """All per-frame data produced by the detector and the two NN models."""
+
+    frame_index: int
+    frame: np.ndarray
+    roi_xyxy: tuple[int, int, int, int] | None
+    roi_source: str
+    sticker_masks: tuple[list[np.ndarray], object, np.ndarray, np.ndarray | None] | None
+    local_points: np.ndarray
+    point_confidences: np.ndarray
+    class_ids: np.ndarray
+    box_confidences: np.ndarray
+    pose_candidate: object | None = None
+    pose_ready: bool = False
+
+
+def copy_sticker_masks(
+    sticker_masks: tuple[list[np.ndarray], object, np.ndarray, np.ndarray | None] | None,
+) -> tuple[list[np.ndarray], object, np.ndarray, np.ndarray | None] | None:
+    """Detach segmentation arrays from Ultralytics result objects."""
+
+    if sticker_masks is None:
+        return None
+    masks, names, class_ids, cube_mask = sticker_masks
+    return (
+        [np.asarray(mask, dtype=bool).copy() for mask in masks],
+        names,
+        np.asarray(class_ids, dtype=np.int32).copy(),
+        None if cube_mask is None else np.asarray(cube_mask, dtype=bool).copy(),
+    )
 
 
 @dataclass(frozen=True)
@@ -356,6 +421,25 @@ class StickerColorProfile:
     polyline_rgb: np.ndarray
     polyline_oklab: np.ndarray
     residual: float
+    sample_count: int
+
+
+GLOBAL_COLOR_NAMES = tuple(PURE_COLOR_RGB)
+COLOR_LIKELIHOOD_SIGMA = 0.08
+STICKER_VIEW_WEIGHT_FLOOR = 0.0
+PAIRWISE_TRAJECTORY_DISTANCE_THRESHOLD = 0.035
+PAIRWISE_TRAJECTORY_MAX_POINTS = 64
+PAIRWISE_TRAJECTORY_SATURATION_FLOOR = 0.08
+PAIRWISE_TRAJECTORY_SATURATION_WEIGHT = 2.0
+
+
+@dataclass(frozen=True)
+class GlobalColorProfile:
+    """A diagnostic color group initialized from the pure-color priors."""
+
+    color_name: str
+    prior: StickerColorProfile | None
+    fitted: StickerColorProfile | None
     sample_count: int
 
 
@@ -1266,6 +1350,7 @@ def _ordered_cubie_label(face_names: tuple[str, ...]) -> str:
     return "".join(sorted(face_names, key=lambda name: FACE_NAME_ORDER[name]))
 
 
+@lru_cache(maxsize=1)
 def canonical_sticker_identities() -> tuple[StickerIdentity, ...]:
     """Return all 54 stickers in stable, human-readable order."""
 
@@ -1525,6 +1610,15 @@ def fit_sticker_color_profile(
         [value for _frame, value in entries],
         dtype=np.float64,
     ).reshape(-1, 3)
+    return fit_rgb_color_profile(rgb_points)
+
+
+def fit_rgb_color_profile(rgb_points: np.ndarray) -> StickerColorProfile | None:
+    """Fit the existing constrained two-segment model to RGB observations."""
+
+    rgb_points = np.asarray(rgb_points, dtype=np.float64).reshape(-1, 3)
+    if len(rgb_points) == 0:
+        return None
     inflection = _fit_rgb_inflection_point(rgb_points)
     polyline_rgb = np.asarray(
         ((0.0, 0.0, 0.0), inflection, (255.0, 255.0, 255.0)),
@@ -1541,6 +1635,626 @@ def fit_sticker_color_profile(
         residual,
         len(rgb_points),
     )
+
+
+def pure_rgb_color_profile(color_name: str) -> StickerColorProfile:
+    """Build a weak diagnostic prior from one pure RGB color."""
+
+    if color_name not in PURE_COLOR_RGB:
+        raise KeyError(color_name)
+    polyline_rgb = np.asarray(
+        (
+            (0.0, 0.0, 0.0),
+            PURE_COLOR_RGB[color_name],
+            (255.0, 255.0, 255.0),
+        ),
+        dtype=np.float32,
+    )
+    return StickerColorProfile(
+        polyline_rgb=polyline_rgb,
+        polyline_oklab=rgb_to_oklab(polyline_rgb).astype(np.float32),
+        residual=0.0,
+        sample_count=0,
+    )
+
+
+def classify_rgb_by_global_prior(
+    rgb: np.ndarray,
+    prior_profiles: dict[str, StickerColorProfile] | None = None,
+) -> tuple[str, float]:
+    """Assign one observation to its nearest pure-color prior."""
+
+    prior_profiles = (
+        {
+            color_name: pure_rgb_color_profile(color_name)
+            for color_name in PURE_COLOR_RGB
+        }
+        if prior_profiles is None
+        else prior_profiles
+    )
+    point_oklab = rgb_to_oklab(np.asarray(rgb, dtype=np.float64).reshape(1, 3))
+    distances = {
+        color_name: float(
+            _piecewise_profile_distances(
+                point_oklab,
+                profile.polyline_oklab,
+            )[0]
+        )
+        for color_name, profile in prior_profiles.items()
+    }
+    return min(distances.items(), key=lambda item: item[1])
+
+
+def build_global_color_profiles(
+    trace: StickerColorTrace,
+) -> tuple[
+    dict[str, GlobalColorProfile],
+    dict[str, list[tuple[str, int, np.ndarray]]],
+]:
+    """Build global profiles by grouping observations with weak pure priors."""
+
+    grouped: dict[str, list[tuple[str, int, np.ndarray]]] = {
+        color_name: [] for color_name in GLOBAL_COLOR_NAMES
+    }
+    prior_profiles = {
+        color_name: pure_rgb_color_profile(color_name)
+        for color_name in PURE_COLOR_RGB
+    }
+    for identity in trace.identities:
+        for frame_index, rgb in trace.observations.get(identity.label, ()):
+            color_name, _distance = classify_rgb_by_global_prior(rgb, prior_profiles)
+            grouped[color_name].append(
+                (identity.label, int(frame_index), np.asarray(rgb, dtype=np.uint8).copy())
+            )
+
+    profiles: dict[str, GlobalColorProfile] = {}
+    for color_name in GLOBAL_COLOR_NAMES:
+        entries = grouped[color_name]
+        values = np.asarray([entry[2] for entry in entries], dtype=np.float64)
+        profiles[color_name] = GlobalColorProfile(
+            color_name=color_name,
+            prior=prior_profiles.get(color_name),
+            fitted=fit_rgb_color_profile(values),
+            sample_count=len(entries),
+        )
+    return profiles, grouped
+
+
+def rgb_observation_color_likelihoods(
+    rgb: np.ndarray,
+    global_profiles: dict[str, GlobalColorProfile],
+) -> dict[str, float]:
+    """Return normalized soft likelihoods for one RGB observation."""
+
+    evidence = _rgb_observation_color_evidence(rgb, global_profiles)
+    evidence /= max(float(np.sum(evidence)), 1e-12)
+    return {
+        color_name: float(likelihood)
+        for color_name, likelihood in zip(GLOBAL_COLOR_NAMES, evidence, strict=True)
+    }
+
+
+def _rgb_observation_color_evidence(
+    rgb: np.ndarray,
+    global_profiles: dict[str, GlobalColorProfile],
+) -> np.ndarray:
+    """Return unnormalized p(observation|color) values for one RGB sample."""
+
+    point_oklab = rgb_to_oklab(np.asarray(rgb, dtype=np.float64).reshape(1, 3))
+    distances = np.asarray(
+        [
+            _piecewise_profile_distances(
+                point_oklab,
+                _global_profile_reference(global_profiles[color_name]).polyline_oklab,
+            )[0]
+            for color_name in GLOBAL_COLOR_NAMES
+        ],
+        dtype=np.float64,
+    )
+    return np.exp(-0.5 * (distances / COLOR_LIKELIHOOD_SIGMA) ** 2)
+
+
+def _apply_observation_weight(
+    evidence: np.ndarray,
+    weight: float,
+) -> np.ndarray:
+    """Temper one observation's likelihood without changing its color shape."""
+
+    clipped_weight = float(np.clip(weight, 0.0, 1.0))
+    safe_evidence = np.clip(np.asarray(evidence, dtype=np.float64), 1e-300, None)
+    return np.exp(clipped_weight * np.log(safe_evidence))
+
+
+def _trace_observation_weight(
+    trace: StickerColorTrace,
+    label: str,
+    observation_index: int,
+) -> float:
+    weights = trace.observation_weights.get(label, ())
+    if observation_index >= len(weights):
+        return 1.0
+    return float(np.clip(weights[observation_index], 0.0, 1.0))
+
+
+def build_sticker_observation_likelihoods(
+    trace: StickerColorTrace,
+    global_profiles: dict[str, GlobalColorProfile] | None = None,
+) -> dict[int, dict[str, dict[str, float]]]:
+    """Build normalized color posteriors for each sticker identity and frame."""
+
+    if global_profiles is None:
+        global_profiles, _global_observations = build_global_color_profiles(trace)
+    priors = {
+        identity.label: np.full(
+            len(GLOBAL_COLOR_NAMES),
+            1.0 / len(GLOBAL_COLOR_NAMES),
+            dtype=np.float64,
+        )
+        for identity in trace.identities
+    }
+    observations_by_frame: dict[int, list[tuple[str, np.ndarray, float]]] = {}
+    for identity in trace.identities:
+        for observation_index, (frame_index, rgb) in enumerate(
+            trace.observations.get(identity.label, ())
+        ):
+            observations_by_frame.setdefault(int(frame_index), []).append(
+                (
+                    identity.label,
+                    rgb,
+                    _trace_observation_weight(
+                        trace,
+                        identity.label,
+                        observation_index,
+                    ),
+                )
+            )
+    likelihoods_by_frame: dict[int, dict[str, dict[str, float]]] = {}
+    for frame_index in sorted(observations_by_frame):
+        for label, rgb, weight in observations_by_frame[frame_index]:
+            evidence = _rgb_observation_color_evidence(rgb, global_profiles)
+            prior = priors[label]
+            posterior = prior * _apply_observation_weight(evidence, weight)
+            posterior_sum = float(np.sum(posterior))
+            if posterior_sum > 1e-12:
+                posterior /= posterior_sum
+            else:
+                posterior = prior.copy()
+            likelihoods_by_frame.setdefault(frame_index, {})[label] = {
+                color_name: float(probability)
+                for color_name, probability in zip(
+                    GLOBAL_COLOR_NAMES,
+                    posterior,
+                    strict=True,
+                )
+            }
+            priors[label] = posterior
+    return likelihoods_by_frame
+
+
+def classify_sticker_colors_by_final_posterior(
+    likelihoods_by_frame: dict[int, dict[str, dict[str, float]]],
+) -> dict[str, str]:
+    """Assign each sticker its final independent-posterior argmax color."""
+
+    final_posteriors = final_sticker_posteriors(likelihoods_by_frame)
+    return {
+        label: max(probabilities.items(), key=lambda item: item[1])[0]
+        for label, probabilities in final_posteriors.items()
+        if probabilities
+    }
+
+
+def final_sticker_posteriors(
+    likelihoods_by_frame: dict[int, dict[str, dict[str, float]]],
+) -> dict[str, dict[str, float]]:
+    """Return the latest posterior recorded for each sticker identity."""
+
+    final_posteriors: dict[str, dict[str, float]] = {}
+    for frame_index in sorted(likelihoods_by_frame):
+        final_posteriors.update(
+            {
+                label: dict(probabilities)
+                for label, probabilities in likelihoods_by_frame[frame_index].items()
+            }
+        )
+    return final_posteriors
+
+
+def classify_sticker_colors_by_frame_posterior(
+    likelihoods_by_frame: dict[int, dict[str, dict[str, float]]],
+) -> dict[int, dict[str, str]]:
+    """Assign each observed sticker its posterior argmax at every frame."""
+
+    return {
+        frame_index: {
+            label: max(probabilities.items(), key=lambda item: item[1])[0]
+            for label, probabilities in frame_posteriors.items()
+            if probabilities
+        }
+        for frame_index, frame_posteriors in likelihoods_by_frame.items()
+    }
+
+
+def carry_forward_sticker_posteriors(
+    likelihoods_by_frame: dict[int, dict[str, dict[str, float]]],
+    frame_indices: list[int] | tuple[int, ...],
+) -> dict[int, dict[str, dict[str, float]]]:
+    """Carry each sticker's latest posterior through frames without a sample."""
+
+    current: dict[str, dict[str, float]] = {}
+    carried: dict[int, dict[str, dict[str, float]]] = {}
+    for frame_index in sorted(set(int(index) for index in frame_indices)):
+        for label, probabilities in likelihoods_by_frame.get(frame_index, {}).items():
+            current[label] = dict(probabilities)
+        carried[frame_index] = {
+            label: dict(probabilities)
+            for label, probabilities in current.items()
+        }
+    return carried
+
+
+def _trace_observations_by_frame(
+    trace: StickerColorTrace,
+) -> dict[int, dict[str, np.ndarray]]:
+    """Index the raw trace without changing its original sticker labels."""
+
+    observations_by_frame: dict[int, dict[str, np.ndarray]] = {}
+    for identity in trace.identities:
+        for frame_index, rgb in trace.observations.get(identity.label, ()):
+            observations_by_frame.setdefault(int(frame_index), {})[
+                identity.label
+            ] = np.asarray(rgb, dtype=np.uint8).reshape(3).copy()
+    return observations_by_frame
+
+
+def _trace_observation_weights_by_frame(
+    trace: StickerColorTrace,
+) -> dict[int, dict[str, float]]:
+    """Index per-observation reliability weights using the same frame keys."""
+
+    weights_by_frame: dict[int, dict[str, float]] = {}
+    for identity in trace.identities:
+        for observation_index, (frame_index, _rgb) in enumerate(
+            trace.observations.get(identity.label, ())
+        ):
+            weights_by_frame.setdefault(int(frame_index), {})[
+                identity.label
+            ] = _trace_observation_weight(
+                trace,
+                identity.label,
+                observation_index,
+            )
+    return weights_by_frame
+
+
+def sticker_identity_label_under_symmetry(
+    identity: StickerIdentity,
+    symmetry: np.ndarray,
+    identities_by_geometry: dict[tuple[tuple[int, int, int], int, int], StickerIdentity]
+    | None = None,
+) -> str:
+    """Return the source label that projects at ``identity`` after relabeling.
+
+    ``transform_candidate_by_symmetry`` uses ``R' = R S^T``.  Consequently,
+    target identity ``x`` in the transformed candidate occupies the old image
+    location of ``S^T x``.  This helper gives the corresponding raw-trace
+    label so color observations can be scored under a candidate symmetry.
+    """
+
+    if identities_by_geometry is None:
+        identities_by_geometry = {
+            (item.cubie_index, item.axis, item.side): item
+            for item in canonical_sticker_identities()
+        }
+    matrix = np.asarray(symmetry, dtype=np.float64).reshape(3, 3)
+    target_center = np.asarray(identity.cubie_index, dtype=np.float64) - 1.0
+    source_center = np.rint(matrix.T @ target_center).astype(np.int32) + 1
+    normal = np.zeros(3, dtype=np.float64)
+    normal[int(identity.axis)] = float(identity.side)
+    source_normal = matrix.T @ normal
+    source_axis = int(np.argmax(np.abs(source_normal)))
+    source_side = int(np.sign(source_normal[source_axis]))
+    source = identities_by_geometry.get(
+        (
+            tuple(int(value) for value in source_center),
+            source_axis,
+            source_side,
+        )
+    )
+    if source is None:
+        raise ValueError(
+            f"Symmetry did not map sticker {identity.label} to a valid sticker"
+        )
+    return source.label
+
+
+def _symmetry_observation_permutations(
+    identities: tuple[StickerIdentity, ...],
+) -> tuple[tuple[np.ndarray, dict[str, str]], ...]:
+    """Precompute target-label -> raw-label permutations for cube symmetries."""
+
+    identities_by_geometry = {
+        (identity.cubie_index, identity.axis, identity.side): identity
+        for identity in identities
+    }
+    return tuple(
+        (
+            symmetry,
+            {
+                identity.label: sticker_identity_label_under_symmetry(
+                    identity,
+                    symmetry,
+                    identities_by_geometry,
+                )
+                for identity in identities
+            },
+        )
+        for symmetry in CUBE_SYMMETRY_MATRICES
+    )
+
+
+def _update_sticker_color_posteriors(
+    priors: dict[str, np.ndarray],
+    observations: dict[str, np.ndarray],
+    global_profiles: dict[str, GlobalColorProfile],
+    observation_weights: dict[str, float] | None = None,
+) -> None:
+    """Update identity color posteriors from one corrected frame."""
+
+    for label, rgb in observations.items():
+        prior = priors.get(label)
+        if prior is None:
+            continue
+        evidence = _rgb_observation_color_evidence(rgb, global_profiles)
+        weight = 1.0 if observation_weights is None else observation_weights.get(label, 1.0)
+        posterior = prior * _apply_observation_weight(evidence, weight)
+        posterior_sum = float(np.sum(posterior))
+        if posterior_sum > 1e-12 and np.isfinite(posterior_sum):
+            priors[label] = posterior / posterior_sum
+
+
+def _score_symmetry_observations(
+    raw_observations: dict[str, np.ndarray],
+    permutation: dict[str, str],
+    priors: dict[str, np.ndarray],
+    global_profiles: dict[str, GlobalColorProfile],
+    raw_observation_weights: dict[str, float] | None = None,
+) -> tuple[float, int, int, dict[str, np.ndarray], dict[str, float]]:
+    """Return weighted likelihood scores, observations, and their weights."""
+
+    log_likelihoods: list[float] = []
+    low_probability_count = 0
+    remapped: dict[str, np.ndarray] = {}
+    remapped_weights: dict[str, float] = {}
+    for target_label, source_label in permutation.items():
+        rgb = raw_observations.get(source_label)
+        if rgb is None:
+            continue
+        prior = priors[target_label]
+        evidence = _rgb_observation_color_evidence(rgb, global_profiles)
+        weight = (
+            1.0
+            if raw_observation_weights is None
+            else raw_observation_weights.get(source_label, 1.0)
+        )
+        weighted_evidence = _apply_observation_weight(evidence, weight)
+        predictive_probability = float(np.dot(prior, weighted_evidence))
+        log_likelihoods.append(np.log(max(predictive_probability, 1e-12)))
+        if (
+            predictive_probability
+            < POSE_SYMMETRY_RECOVERY_LOW_PREDICTIVE_PROBABILITY
+        ):
+            low_probability_count += 1
+        remapped[target_label] = np.asarray(rgb, dtype=np.uint8).copy()
+        remapped_weights[target_label] = float(np.clip(weight, 0.0, 1.0))
+    if not log_likelihoods:
+        return float("-inf"), 0, 0, remapped, remapped_weights
+    return (
+        float(np.mean(log_likelihoods)),
+        len(log_likelihoods),
+        low_probability_count,
+        remapped,
+        remapped_weights,
+    )
+
+
+def recover_cached_pose_symmetries(
+    cache: list[NeuralFrameData],
+    trace: StickerColorTrace,
+    *,
+    debug: bool = False,
+    progress: bool = False,
+) -> StickerColorTrace:
+    """Recover whole-cube pose symmetries from the cached color observations.
+
+    The neural pass and its initial pose/color samples are already complete
+    when this runs.  Global color profiles are therefore fixed first, then a
+    sequential identity posterior scores all 24 cube symmetries for each cached
+    frame and chooses the best one.  Pose continuity is only a tie-breaker.
+    The returned trace is relabeled using those selected symmetries so the
+    existing classifier sees the recovered sticker identities.
+    """
+
+    global_profiles, _global_observations = build_global_color_profiles(trace)
+    identities = trace.identities
+    permutations = _symmetry_observation_permutations(identities)
+    identity_permutation = next(
+        permutation
+        for symmetry, permutation in permutations
+        if np.array_equal(symmetry, np.eye(3, dtype=np.float64))
+    )
+    identity_symmetry_index = next(
+        index
+        for index, (symmetry, _permutation) in enumerate(permutations)
+        if np.array_equal(symmetry, np.eye(3, dtype=np.float64))
+    )
+    priors = {
+        identity.label: np.full(
+            len(GLOBAL_COLOR_NAMES),
+            1.0 / len(GLOBAL_COLOR_NAMES),
+            dtype=np.float64,
+        )
+        for identity in identities
+    }
+    raw_by_frame = _trace_observations_by_frame(trace)
+    raw_weights_by_frame = _trace_observation_weights_by_frame(trace)
+    corrected_trace = StickerColorTrace.create()
+    previous_candidate: StickerPnPCandidate | None = None
+
+    total_records = len(cache)
+    for record_index, record in enumerate(cache, start=1):
+        if progress:
+            print_headless_progress(
+                "pose recovery",
+                record_index,
+                total_records,
+            )
+        raw_observations = raw_by_frame.get(record.frame_index, {})
+        raw_observation_weights = raw_weights_by_frame.get(record.frame_index, {})
+        candidate = record.pose_candidate
+        if not isinstance(candidate, StickerPnPCandidate):
+            corrected_trace.observe(record.frame_index, {})
+            continue
+
+        (
+            current_log_likelihood,
+            observation_count,
+            low_probability_count,
+            current_observations,
+            current_observation_weights,
+        ) = (
+            _score_symmetry_observations(
+                raw_observations,
+                identity_permutation,
+                priors,
+                global_profiles,
+                raw_observation_weights,
+            )
+        )
+        if debug and observation_count:
+            print(
+                "pose symmetry frame "
+                f"{record.frame_index}: obs={observation_count} "
+                f"current_logp={current_log_likelihood:.4f} "
+                f"low_probability_count={low_probability_count}",
+                flush=True,
+            )
+
+        selected_candidate = candidate
+        selected_observations = current_observations
+        selected_observation_weights = current_observation_weights
+        selected_log_likelihood = current_log_likelihood
+        if observation_count >= POSE_SYMMETRY_RECOVERY_MIN_OBSERVATIONS:
+            scored = []
+            for symmetry_index, (symmetry, permutation) in enumerate(permutations):
+                (
+                    log_likelihood,
+                    count,
+                    _low_count,
+                    remapped_observations,
+                    remapped_observation_weights,
+                ) = (
+                    _score_symmetry_observations(
+                        raw_observations,
+                        permutation,
+                        priors,
+                        global_profiles,
+                        raw_observation_weights,
+                    )
+                )
+                if count != observation_count:
+                    continue
+                transformed_candidate = transform_candidate_by_symmetry(
+                    candidate,
+                    symmetry,
+                )
+                continuity_distance = (
+                    pose_hypothesis_distance(
+                        transformed_candidate,
+                        (previous_candidate.rvec, previous_candidate.tvec),
+                    )
+                    if previous_candidate is not None
+                    else 0.0
+                )
+                scored.append(
+                    (
+                        symmetry_index,
+                        log_likelihood,
+                        -continuity_distance,
+                        transformed_candidate,
+                        remapped_observations,
+                        remapped_observation_weights,
+                    )
+                )
+            if scored:
+                best_log_likelihood = max(item[1] for item in scored)
+                likelihood_ties = [
+                    item
+                    for item in scored
+                    if best_log_likelihood - item[1] <= 1e-9
+                ]
+                (
+                    best_symmetry_index,
+                    _best_log_likelihood,
+                    _continuity,
+                    best_candidate,
+                    best_observations,
+                    best_observation_weights,
+                ) = max(
+                    likelihood_ties,
+                    key=lambda item: (
+                        item[2],
+                        int(item[0] == identity_symmetry_index),
+                    ),
+                )
+                if debug:
+                    print(
+                        "  tested orientations:"
+                        f" current_logp={selected_log_likelihood:.4f}",
+                        flush=True,
+                    )
+                    for (
+                        symmetry_index,
+                        log_likelihood,
+                        continuity_score,
+                        _tested_candidate,
+                        _tested_observations,
+                        _tested_observation_weights,
+                    ) in sorted(scored, key=lambda item: item[1], reverse=True):
+                        print(
+                            f"    symmetry={symmetry_index:02d} "
+                            f"logp={log_likelihood:.4f} "
+                            f"p={np.exp(log_likelihood):.4f} "
+                            f"continuity={-continuity_score:.4f}"
+                            f"{' *best' if symmetry_index == best_symmetry_index else ''}",
+                            flush=True,
+                        )
+                selected_candidate = best_candidate
+                selected_observations = best_observations
+                selected_observation_weights = best_observation_weights
+                selected_log_likelihood = best_log_likelihood
+
+        selected_candidate = replace(
+            selected_candidate,
+            orientation_anchor=orientation_anchor_for_candidate(selected_candidate),
+        )
+        record.pose_candidate = selected_candidate
+        previous_candidate = selected_candidate
+        corrected_trace.observe(
+            record.frame_index,
+            selected_observations,
+            observation_weights=selected_observation_weights,
+        )
+        _update_sticker_color_posteriors(
+            priors,
+            selected_observations,
+            global_profiles,
+            selected_observation_weights,
+        )
+    if progress:
+        print()
+
+    return corrected_trace
 
 
 def sample_profile_polyline(polyline_oklab: np.ndarray, count: int = 48) -> np.ndarray:
@@ -1581,42 +2295,235 @@ def sticker_color_profile_distance(
     return float(0.5 * (np.mean(first_to_second) + np.mean(second_to_first)))
 
 
-def classify_center_color_names(trace: StickerColorTrace) -> dict[str, str]:
-    """Assign observed centers to the lowest-cost legal standard color scheme."""
+def build_pairwise_sticker_color_posteriors(
+    trace: StickerColorTrace,
+    likelihoods_by_frame: dict[int, dict[str, dict[str, float]]],
 
-    center_observations: dict[str, np.ndarray] = {}
+) -> dict[str, dict[str, float]]:
+    """Build color evidence by grouping corrected sticker trajectories first.
+
+    The global posterior is used only to name each anonymous trajectory group.
+    Same-color relationships come from the raw corrected RGB trajectories,
+    after normalizing away brightness and retaining saturation as a separate
+    cue.  This prevents a bad global posterior for one sticker from being
+    propagated directly to its peers.
+    """
+
+    final_posteriors = final_sticker_posteriors(likelihoods_by_frame)
+    trajectory_by_label = {
+        identity.label: _sticker_chromatic_trajectory_points(
+            trace,
+            identity.label,
+        )
+        for identity in trace.identities
+        if identity.label in final_posteriors
+    }
+    trajectory_by_label = {
+        label: points
+        for label, points in trajectory_by_label.items()
+        if len(points) > 0
+    }
+    if len(trajectory_by_label) < 2:
+        return {
+            label: {
+                color_name: float(probability)
+                for color_name, probability in probabilities.items()
+            }
+            for label, probabilities in final_posteriors.items()
+        }
+
+    labels = tuple(trajectory_by_label)
+    parent = {label: label for label in labels}
+
+    def find(label: str) -> str:
+        while parent[label] != label:
+            parent[label] = parent[parent[label]]
+            label = parent[label]
+        return label
+
+    def union(first: str, second: str) -> None:
+        first_root = find(first)
+        second_root = find(second)
+        if first_root != second_root:
+            parent[second_root] = first_root
+
+    for first_index, first_label in enumerate(labels):
+        for second_label in labels[first_index + 1 :]:
+            distance = _sticker_trajectory_distance(
+                trajectory_by_label[first_label],
+                trajectory_by_label[second_label],
+            )
+            if distance <= PAIRWISE_TRAJECTORY_DISTANCE_THRESHOLD:
+                union(first_label, second_label)
+
+    groups: dict[str, list[str]] = {}
+    for label in labels:
+        groups.setdefault(find(label), []).append(label)
+
+    posteriors: dict[str, dict[str, float]] = {}
+    for group_labels in groups.values():
+        group_posterior = np.zeros(len(GLOBAL_COLOR_NAMES), dtype=np.float64)
+        posterior_count = 0
+        for label in group_labels:
+            probabilities = final_posteriors.get(label)
+            if not probabilities:
+                continue
+            group_posterior += np.asarray(
+                [
+                    probabilities.get(color_name, 0.0)
+                    for color_name in GLOBAL_COLOR_NAMES
+                ],
+                dtype=np.float64,
+            )
+            posterior_count += 1
+        if posterior_count == 0:
+            continue
+        group_posterior /= float(posterior_count)
+        group_sum = float(np.sum(group_posterior))
+        if group_sum > 1e-12:
+            group_posterior /= group_sum
+        group_probabilities = {
+            color_name: float(probability)
+            for color_name, probability in zip(
+                GLOBAL_COLOR_NAMES,
+                group_posterior,
+                strict=True,
+            )
+        }
+        posteriors.update({label: dict(group_probabilities) for label in group_labels})
+
+    posteriors.update(
+        {
+            label: {
+                color_name: float(probability)
+                for color_name, probability in probabilities.items()
+            }
+            for label, probabilities in final_posteriors.items()
+            if label not in posteriors and probabilities
+        }
+    )
+    return posteriors
+
+
+def classify_sticker_colors_by_pairwise_trajectory(
+    trace: StickerColorTrace,
+    likelihoods_by_frame: dict[int, dict[str, dict[str, float]]],
+) -> dict[str, str]:
+    """Assign final colors from pairwise trajectory-grouped posteriors."""
+
+    posteriors = build_pairwise_sticker_color_posteriors(
+        trace,
+        likelihoods_by_frame,
+    )
+    return {
+        label: max(probabilities.items(), key=lambda item: item[1])[0]
+        for label, probabilities in posteriors.items()
+        if probabilities
+    }
+
+
+def _sticker_chromatic_trajectory_points(
+    trace: StickerColorTrace,
+    sticker_label: str,
+) -> np.ndarray:
+    """Return brightness-normalized, saturation-aware trajectory samples."""
+
+    entries = trace.observations.get(sticker_label, ())
+    if not entries:
+        return np.empty((0, 4), dtype=np.float64)
+    rgb = np.asarray([value for _frame, value in entries], dtype=np.float64)
+    brightness = np.sum(rgb, axis=1)
+    saturation = (np.max(rgb, axis=1) - np.min(rgb, axis=1)) / np.maximum(
+        brightness,
+        1.0,
+    )
+    informative = (brightness > 1.0) & (
+        saturation >= PAIRWISE_TRAJECTORY_SATURATION_FLOOR
+    )
+    if not np.any(informative):
+        return np.empty((0, 4), dtype=np.float64)
+    chromatic = rgb[informative] / np.maximum(brightness[informative, None], 1.0)
+    points = np.column_stack((chromatic, saturation[informative]))
+    if len(points) <= PAIRWISE_TRAJECTORY_MAX_POINTS:
+        return points
+    indices = np.linspace(
+        0,
+        len(points) - 1,
+        PAIRWISE_TRAJECTORY_MAX_POINTS,
+        dtype=np.int32,
+    )
+    return points[indices]
+
+
+def _sticker_trajectory_distance(
+    first: np.ndarray,
+    second: np.ndarray,
+) -> float:
+    """Return a symmetric nearest-neighbor distance between trajectories."""
+
+    first = np.asarray(first, dtype=np.float64).reshape(-1, 4)
+    second = np.asarray(second, dtype=np.float64).reshape(-1, 4)
+    if len(first) == 0 or len(second) == 0:
+        return float("inf")
+    scaled_difference = np.asarray((1.0, 1.0, 1.0, PAIRWISE_TRAJECTORY_SATURATION_WEIGHT))
+    distances = np.linalg.norm(
+        (first[:, None, :] - second[None, :, :]) * scaled_difference,
+        axis=2,
+    )
+    return float(
+        0.5
+        * (
+            np.mean(np.min(distances, axis=1))
+            + np.mean(np.min(distances, axis=0))
+        )
+    )
+
+
+def _global_profile_reference(profile: GlobalColorProfile) -> StickerColorProfile | None:
+    """Return the fitted global profile, falling back to its pure-color prior."""
+
+    return profile.fitted if profile.fitted is not None else profile.prior
+
+
+def _sticker_to_global_profile_distance(
+    sticker_profile: StickerColorProfile,
+    global_profile: GlobalColorProfile,
+) -> float:
+    reference = _global_profile_reference(global_profile)
+    if reference is None:
+        return float("inf")
+    return sticker_color_profile_distance(sticker_profile, reference)
+
+
+def classify_center_color_names(
+    trace: StickerColorTrace,
+    global_profiles: dict[str, GlobalColorProfile] | None = None,
+) -> dict[str, str]:
+    """Assign centers using global profiles under the legal color scheme."""
+
+    if global_profiles is None:
+        global_profiles, _global_observations = build_global_color_profiles(trace)
+
+    center_profiles: dict[str, StickerColorProfile] = {}
     center_identities = (
         identity for identity in trace.identities if identity.category == "center"
     )
     for identity in center_identities:
-        entries = trace.observations.get(identity.label, ())
-        if not entries:
-            continue
-        values = np.asarray([value for _frame, value in entries], dtype=np.float64)
-        center_observations[identity.face] = np.median(values, axis=0)
-    if not center_observations:
+        profile = fit_sticker_color_profile(trace, identity.label)
+        if profile is not None:
+            center_profiles[identity.face] = profile
+    if not center_profiles:
         return {}
 
-    observed_faces = tuple(sorted(center_observations))
-    observed_oklab = rgb_to_oklab(
-        np.asarray([center_observations[face] for face in observed_faces])
-    )
-    target_names = tuple(PURE_COLOR_RGB)
-    target_oklab = rgb_to_oklab(
-        np.asarray([PURE_COLOR_RGB[name] for name in target_names])
-    )
     best_assignment = None
     best_cost = float("inf")
     for assignment in legal_center_color_assignments():
-        target_indices = [target_names.index(assignment[face]) for face in observed_faces]
-        cost = float(
-            np.sum(
-                np.linalg.norm(
-                    observed_oklab - target_oklab[target_indices],
-                    axis=1,
-                )
-                ** 2
+        cost = sum(
+            _sticker_to_global_profile_distance(
+                center_profiles[face],
+                global_profiles[assignment[face]],
             )
+            for face in center_profiles
         )
         if cost < best_cost:
             best_cost = cost
@@ -1626,7 +2533,7 @@ def classify_center_color_names(trace: StickerColorTrace) -> dict[str, str]:
     return {
         identity.label: best_assignment[identity.face]
         for identity in trace.identities
-        if identity.category == "center" and identity.face in center_observations
+        if identity.category == "center" and identity.face in center_profiles
     }
 
 
@@ -1681,12 +2588,15 @@ def corner_color_assignment_is_chiral(
     target_face_frame = np.column_stack(
         [FACE_VECTOR_BY_NAME[identity.face] for identity in identities]
     )
-    try:
-        source_color_frame = np.column_stack(
-            [FACE_VECTOR_BY_NAME[color_face_by_name[color_name]] for color_name in ordered_colors]
-        )
-    except KeyError:
-        return False
+    source_faces = [color_face_by_name.get(color_name) for color_name in ordered_colors]
+    if any(face is None for face in source_faces):
+        # The corner may include a color whose center has not been observed.
+        # The distinct/non-opposite check still applies, but chirality cannot
+        # be evaluated until all three color-to-face mappings are known.
+        return True
+    source_color_frame = np.column_stack(
+        [FACE_VECTOR_BY_NAME[face] for face in source_faces]
+    )
     # The assignment maps the source piece's face-color frame onto this
     # position's sticker-face frame.  A determinant of +1 is a proper cube
     # rotation; -1 is the reflected, impossible chirality.
@@ -1703,32 +2613,17 @@ def classify_sticker_color_names(
     trace: StickerColorTrace,
     center_color_names: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    """Classify observed edge/corner stickers with legal cubie constraints."""
+    """Classify all observed stickers from global profiles and legal cubies."""
+
+    global_profiles, _global_observations = build_global_color_profiles(trace)
 
     center_color_names = (
-        classify_center_color_names(trace)
+        classify_center_color_names(trace, global_profiles)
         if center_color_names is None
         else dict(center_color_names)
     )
     if not center_color_names:
         return {}
-    center_profiles: dict[str, StickerColorProfile] = {}
-    for identity in trace.identities:
-        if identity.category != "center":
-            continue
-        color_name = center_color_names.get(identity.label)
-        if color_name is None:
-            continue
-        profile = fit_sticker_color_profile(trace, identity.label)
-        if profile is not None:
-            center_profiles[color_name] = profile
-    if not center_profiles:
-        return dict(center_color_names)
-
-    if len(center_profiles) != len(PURE_COLOR_RGB):
-        # Without all six center references there is no reliable way to score
-        # a complete physical piece inventory.
-        return dict(center_color_names)
     color_face_by_name = {}
     for identity in trace.identities:
         if identity.category != "center":
@@ -1742,6 +2637,17 @@ def classify_sticker_color_names(
         for identity in trace.identities
         if identity.category != "center"
     }
+    profile_distance_by_label = {
+        label: {
+            color_name: _sticker_to_global_profile_distance(
+                profile,
+                global_profiles[color_name],
+            )
+            for color_name in color_names
+        }
+        for label, profile in profile_by_label.items()
+        if profile is not None
+    }
     groups_by_category: dict[str, dict[tuple[int, int, int], list[StickerIdentity]]] = {
         "edge": {},
         "corner": {},
@@ -1754,7 +2660,14 @@ def classify_sticker_color_names(
         category: str,
         piece_combinations: tuple[tuple[str, ...], ...],
     ) -> dict[str, str]:
-        groups = list(groups_by_category[category].values())
+        groups = [
+            identities
+            for identities in groups_by_category[category].values()
+            if any(
+                profile_by_label.get(identity.label) is not None
+                for identity in identities
+            )
+        ]
         for identities in groups:
             identities.sort(key=lambda identity: identity.face)
         states: dict[int, tuple[float, dict[str, str]]] = {0: (0.0, {})}
@@ -1782,10 +2695,126 @@ def classify_sticker_color_names(
                             profile = profile_by_label[identity.label]
                             if profile is None:
                                 continue
-                            option_cost += _sticker_profile_confidence(profile) * sticker_color_profile_distance(
-                                profile,
-                                center_profiles[color],
+                            option_cost += _sticker_profile_confidence(profile) * profile_distance_by_label[
+                                identity.label
+                            ][color]
+                            option_assignment[identity.label] = color
+                        total_cost = base_cost + option_cost
+                        next_mask = used_mask | piece_bit
+                        previous = next_states.get(next_mask)
+                        if previous is None or total_cost < previous[0]:
+                            next_states[next_mask] = (
+                                total_cost,
+                                {**base_assignment, **option_assignment},
                             )
+            states = next_states
+        if not states:
+            return {}
+        best_mask = max(states, key=lambda mask: mask.bit_count())
+        return states[best_mask][1]
+
+    edge_assignment = solve_inventory("edge", legal_edge_color_combinations(color_names))
+    corner_assignment = solve_inventory("corner", legal_corner_color_combinations(color_names))
+    return {**center_color_names, **edge_assignment, **corner_assignment}
+
+
+def classify_sticker_colors_by_pairwise_cube_rules(
+    trace: StickerColorTrace,
+    likelihoods_by_frame: dict[int, dict[str, dict[str, float]]],
+) -> dict[str, str]:
+    """Resolve pairwise trajectory evidence under legal cube constraints.
+
+    Global color profiles still provide the frame-by-frame evidence used for
+    pose correction.  Final identity colors come from the pairwise trajectory
+    evidence, with center rotations, unique physical pieces, and corner
+    chirality enforced only at this final assignment step.
+    """
+
+    pairwise_posteriors = build_pairwise_sticker_color_posteriors(
+        trace,
+        likelihoods_by_frame,
+    )
+    if not pairwise_posteriors:
+        return {}
+
+    color_names = tuple(PURE_COLOR_RGB)
+    color_cost_by_label = {
+        label: {
+            color_name: -float(np.log(max(probabilities.get(color_name, 0.0), 1e-12)))
+            for color_name in color_names
+        }
+        for label, probabilities in pairwise_posteriors.items()
+    }
+
+    center_identities = [
+        identity for identity in trace.identities if identity.category == "center"
+    ]
+    best_center_assignment: dict[str, str] | None = None
+    best_center_cost = float("inf")
+    for assignment in legal_center_color_assignments():
+        cost = sum(
+            color_cost_by_label[identity.label][assignment[identity.face]]
+            for identity in center_identities
+            if identity.label in color_cost_by_label
+        )
+        if cost < best_center_cost:
+            best_center_cost = cost
+            best_center_assignment = assignment
+    if best_center_assignment is None:
+        best_center_assignment = legal_center_color_assignments()[0]
+
+    center_color_names = {
+        identity.label: best_center_assignment[identity.face]
+        for identity in center_identities
+        if identity.label in color_cost_by_label
+    }
+    color_face_by_name = {
+        color_name: face
+        for face, color_name in best_center_assignment.items()
+    }
+
+    groups_by_category: dict[str, dict[tuple[int, int, int], list[StickerIdentity]]] = {
+        "edge": {},
+        "corner": {},
+    }
+    for identity in trace.identities:
+        if identity.category != "center":
+            groups_by_category[identity.category].setdefault(identity.cubie_index, []).append(identity)
+
+    def solve_inventory(
+        category: str,
+        piece_combinations: tuple[tuple[str, ...], ...],
+    ) -> dict[str, str]:
+        groups = [
+            identities
+            for identities in groups_by_category[category].values()
+            if any(identity.label in color_cost_by_label for identity in identities)
+        ]
+        for identities in groups:
+            identities.sort(key=lambda identity: identity.face)
+
+        states: dict[int, tuple[float, dict[str, str]]] = {0: (0.0, {})}
+        for identities in groups:
+            next_states: dict[int, tuple[float, dict[str, str]]] = {}
+            for used_mask, (base_cost, base_assignment) in states.items():
+                for piece_index, piece_colors in enumerate(piece_combinations):
+                    piece_bit = 1 << piece_index
+                    if used_mask & piece_bit:
+                        continue
+                    for ordered_colors in permutations(piece_colors):
+                        if category == "corner" and not corner_color_assignment_is_chiral(
+                            identities,
+                            ordered_colors,
+                            color_face_by_name,
+                        ):
+                            continue
+                        option_cost = 0.0
+                        option_assignment: dict[str, str] = {}
+                        for identity, color in zip(identities, ordered_colors, strict=True):
+                            costs = color_cost_by_label.get(identity.label)
+                            if costs is None:
+                                continue
+                            option_cost += costs[color]
                             option_assignment[identity.label] = color
                         total_cost = base_cost + option_cost
                         next_mask = used_mask | piece_bit
@@ -4271,6 +5300,31 @@ def predict_pose_result(
     return results[0] if results else None
 
 
+def is_cpu_device(device: object) -> bool:
+    """Return whether Ultralytics should run inference on the CPU."""
+
+    device_text = "" if device is None else str(device).lower()
+    return device is None or device_text == "cpu" or device_text.startswith("cpu:")
+
+
+def predict_models_parallel_cpu(
+    sticker_seg_model: object | None,
+    pose_model: object,
+    model_roi: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[tuple[list[np.ndarray], object, np.ndarray, np.ndarray | None] | None, object | None]:
+    """Run the independent CPU model calls concurrently."""
+
+    sticker_future = (
+        CPU_NEURAL_EXECUTOR.submit(predict_sticker_masks, sticker_seg_model, model_roi, args)
+        if sticker_seg_model is not None and args.run_sticker_segmentation
+        else None
+    )
+    pose_future = CPU_NEURAL_EXECUTOR.submit(predict_pose_result, pose_model, model_roi, args)
+    sticker_masks = sticker_future.result() if sticker_future is not None else None
+    return sticker_masks, pose_future.result()
+
+
 def cuda_stream_device(torch_module: object, device: object) -> object:
     device_text = str(device)
     if device_text.startswith("cuda"):
@@ -4740,6 +5794,46 @@ def sticker_segmentation_masks_in_roi(
     return masks
 
 
+def sticker_view_reliability_weight(
+    candidate: StickerPnPCandidate,
+    identity: StickerIdentity,
+    rotation: np.ndarray | None = None,
+) -> float:
+    """Return a lower evidence weight for nearly edge-on sticker views.
+
+    The reliability is the absolute cosine between the sticker normal and
+    the camera-facing direction.  It therefore tends to zero as the viewing
+    angle approaches 90 degrees, where projected sticker locations are most
+    sensitive to pose error.
+    """
+
+    if rotation is None:
+        rotation, _ = cv2.Rodrigues(
+            np.asarray(candidate.rvec, dtype=np.float64).reshape(3, 1)
+        )
+    center = cubelet_center_object_point(*identity.cubie_index)
+    face = cubelet_face_object_points(center, identity.axis, identity.side)
+    transformed_center, transformed_face = apply_cubelet_layer_rotations(
+        center,
+        face,
+        candidate.layer_rotations,
+    )
+    normal = np.cross(
+        transformed_face[1] - transformed_face[0],
+        transformed_face[2] - transformed_face[0],
+    )
+    center_camera = (
+        rotation @ np.asarray(transformed_center, dtype=np.float64)
+        + np.asarray(candidate.tvec, dtype=np.float64).reshape(3)
+    )
+    normal_camera = rotation @ normal
+    denominator = float(np.linalg.norm(normal_camera) * np.linalg.norm(center_camera))
+    if denominator <= 1e-12:
+        return STICKER_VIEW_WEIGHT_FLOOR
+    normal_alignment = abs(float(np.dot(normal_camera, center_camera))) / denominator
+    return float(max(STICKER_VIEW_WEIGHT_FLOOR, normal_alignment))
+
+
 def sample_projected_sticker_colors(
     frame_bgr: np.ndarray,
     roi_xyxy: tuple[int, int, int, int],
@@ -4868,10 +5962,13 @@ def save_sticker_rgb_html_plot(
     category_seen: set[str] = set()
     raw_trace_indexes: list[int] = []
     regression_trace_indexes: list[int] = []
+    global_raw_trace_indexes: dict[str, int] = {}
+    global_profile_trace_indexes: dict[str, int] = {}
     profiles = {
         identity.label: fit_sticker_color_profile(trace, identity.label)
         for identity in trace.identities
     }
+    global_profiles, global_observations = build_global_color_profiles(trace)
     for identity in trace.identities:
         entries = trace.observations.get(identity.label, ())
         frames = np.asarray([entry[0] for entry in entries], dtype=np.int32)
@@ -4942,8 +6039,103 @@ def save_sticker_rgb_html_plot(
         )
         category_seen.add(identity.category)
 
+    def global_plot_color(color_name: str) -> str:
+        red, green, blue = PURE_COLOR_RGB[color_name]
+        # A pure white line disappears on Plotly's white background.
+        if color_name == "white":
+            return "rgb(80,80,80)"
+        return f"rgb({red},{green},{blue})"
+
+    for color_name in GLOBAL_COLOR_NAMES:
+        entries = global_observations[color_name]
+        if entries:
+            rgb = np.asarray([entry[2] for entry in entries], dtype=np.uint8).reshape(-1, 3)
+            plot_rgb = rgb.astype(np.float32)
+            if normalize_rgb:
+                plot_rgb /= np.maximum(np.linalg.norm(plot_rgb, axis=1, keepdims=True), 1.0)
+            customdata = [
+                [entry[0], entry[1], int(red), int(green), int(blue)]
+                for entry, (red, green, blue) in zip(entries, rgb, strict=True)
+            ]
+        else:
+            rgb = np.empty((0, 3), dtype=np.uint8)
+            plot_rgb = np.empty((0, 3), dtype=np.float32)
+            customdata = []
+        global_raw_trace_indexes[color_name] = len(figure.data)
+        figure.add_trace(
+            go.Scatter3d(
+                x=plot_rgb[:, 0],
+                y=plot_rgb[:, 1],
+                z=plot_rgb[:, 2],
+                mode="markers",
+                marker={
+                    "size": point_size,
+                    "color": [
+                        f"rgb({int(red)},{int(green)},{int(blue)})"
+                        for red, green, blue in rgb
+                    ],
+                    "opacity": 0.88,
+                    "line": {"color": "black", "width": 1},
+                },
+                customdata=customdata,
+                hovertemplate=(
+                    f"{color_name} global group<br>"
+                    "sticker=%{customdata[0]}<br>"
+                    "frame=%{customdata[1]}<br>"
+                    "R=%{customdata[2]} G=%{customdata[3]} B=%{customdata[4]}"
+                    "<extra></extra>"
+                ),
+                name=f"{color_name} observations",
+                legendgroup="global-colors",
+            )
+        )
+        fitted = global_profiles[color_name].fitted
+        if fitted is None:
+            profile_rgb = np.empty((0, 3), dtype=np.float32)
+        else:
+            profile_rgb = sample_profile_polyline(fitted.polyline_rgb, count=96).astype(
+                np.float32
+            )
+            if normalize_rgb:
+                profile_rgb /= np.maximum(
+                    np.linalg.norm(profile_rgb, axis=1, keepdims=True),
+                    1.0,
+                )
+        global_profile_trace_indexes[color_name] = len(figure.data)
+        figure.add_trace(
+            go.Scatter3d(
+                x=profile_rgb[:, 0],
+                y=profile_rgb[:, 1],
+                z=profile_rgb[:, 2],
+                mode="lines",
+                line={
+                    "color": global_plot_color(color_name),
+                    "width": 7,
+                },
+                name=f"{color_name} global profile",
+                legendgroup="global-colors",
+                showlegend=False,
+                hovertemplate=(
+                    f"{color_name} global profile<br>"
+                    "R=%{x:.3f} G=%{y:.3f} B=%{z:.3f}<extra></extra>"
+                ),
+            )
+        )
+
     sticker_count = len(trace.identities)
     plot_trace_count = len(figure.data)
+
+    all_sticker_visibility = [False] * plot_trace_count
+    for index in range(len(trace.identities)):
+        all_sticker_visibility[raw_trace_indexes[index]] = True
+        all_sticker_visibility[regression_trace_indexes[index]] = True
+
+    def global_visibility(color_names: set[str]) -> list[bool]:
+        visibility = [False] * plot_trace_count
+        for color_name in color_names:
+            visibility[global_raw_trace_indexes[color_name]] = True
+            visibility[global_profile_trace_indexes[color_name]] = True
+        return visibility
 
     def visibility_for(predicate) -> list[bool]:
         visibility = [False] * plot_trace_count
@@ -4958,8 +6150,16 @@ def save_sticker_rgb_html_plot(
             "label": "All stickers",
             "method": "update",
             "args": [
-                {"visible": [True] * plot_trace_count},
+                {"visible": all_sticker_visibility},
                 {"title": f"{title} (all {sticker_count} stickers)"},
+            ],
+        },
+        {
+            "label": "All colors",
+            "method": "update",
+            "args": [
+                {"visible": global_visibility(set(GLOBAL_COLOR_NAMES))},
+                {"title": f"{title} — All colors"},
             ],
         },
         {
@@ -4999,6 +6199,17 @@ def save_sticker_rgb_html_plot(
             ],
         },
     ]
+    for color_name in GLOBAL_COLOR_NAMES:
+        selector_buttons.append(
+            {
+                "label": color_name,
+                "method": "update",
+                "args": [
+                    {"visible": global_visibility({color_name})},
+                    {"title": f"{title} — {color_name}"},
+                ],
+            }
+        )
     for trace_index, identity in enumerate(trace.identities):
         sticker_visibility = [False] * plot_trace_count
         sticker_visibility[raw_trace_indexes[trace_index]] = True
@@ -5312,6 +6523,7 @@ def draw_projected_sticker_identity_labels(
     candidate: StickerPnPCandidate,
     rvec: np.ndarray,
     tvec: np.ndarray,
+    image_offset: tuple[int, int] = (0, 0),
 ) -> int:
     """Draw the short identity number at the center of each visible sticker."""
 
@@ -5320,9 +6532,10 @@ def draw_projected_sticker_identity_labels(
     except cv2.error:
         return 0
     height, width = image.shape[:2]
+    image_offset_array = np.asarray(image_offset, dtype=np.float32).reshape(1, 2)
     drawn = 0
     for identity, _depth, polygon in projected_faces:
-        center = np.mean(polygon, axis=0)
+        center = np.mean(polygon, axis=0) + image_offset_array[0]
         if not np.isfinite(center).all():
             continue
         x, y = np.round(center).astype(np.int32)
@@ -5364,6 +6577,7 @@ def draw_projected_sticker_colors(
     tvec: np.ndarray,
     opacity: float = 0.72,
     image_offset: tuple[int, int] = (0, 0),
+    projected_faces: list[tuple[StickerIdentity, float, np.ndarray]] | None = None,
 ) -> int:
     """Fill classified, visible projected stickers with their colors."""
 
@@ -5372,22 +6586,37 @@ def draw_projected_sticker_colors(
     opacity = float(np.clip(opacity, 0.0, 1.0))
     image_offset_array = np.asarray(image_offset, dtype=np.float32).reshape(1, 2)
     drawn = 0
-    try:
-        projected_faces = projected_sticker_faces(candidate, rvec, tvec)
-    except cv2.error:
-        return 0
+    if projected_faces is None:
+        try:
+            projected_faces = projected_sticker_faces(candidate, rvec, tvec)
+        except cv2.error:
+            return 0
     for identity, _depth, polygon in projected_faces:
         color_name = sticker_color_names.get(identity.label)
         if color_name not in PURE_COLOR_RGB:
             continue
         polygon_int = np.round(polygon + image_offset_array).astype(np.int32)
-        mask = np.zeros(image.shape[:2], dtype=np.uint8)
-        cv2.fillConvexPoly(mask, polygon_int, 1)
+        height, width = image.shape[:2]
+        min_x = max(0, int(np.min(polygon_int[:, 0])))
+        max_x = min(width, int(np.max(polygon_int[:, 0])) + 1)
+        min_y = max(0, int(np.min(polygon_int[:, 1])))
+        max_y = min(height, int(np.max(polygon_int[:, 1])) + 1)
+        if min_x >= max_x or min_y >= max_y:
+            continue
+        local_polygon = polygon_int - np.asarray((min_x, min_y), dtype=np.int32)
+        mask = np.zeros((max_y - min_y, max_x - min_x), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, local_polygon, 1)
         color_bgr = tuple(int(value) for value in PURE_COLOR_RGB[color_name][::-1])
-        color_layer = np.empty_like(image)
-        color_layer[...] = color_bgr
-        blended = cv2.addWeighted(image, 1.0 - opacity, color_layer, opacity, 0.0)
-        image[mask > 0] = blended[mask > 0]
+        region = image[min_y:max_y, min_x:max_x]
+        selected = mask > 0
+        if np.any(selected):
+            pixels = region[selected].astype(np.float32)
+            color = np.asarray(color_bgr, dtype=np.float32)
+            region[selected] = np.clip(
+                pixels * (1.0 - opacity) + color * opacity,
+                0.0,
+                255.0,
+            ).astype(np.uint8)
         cv2.polylines(image, [polygon_int], True, (0, 0, 0), 2, cv2.LINE_AA)
         drawn += 1
     return drawn
@@ -5418,10 +6647,109 @@ def draw_projected_center_colors(
     )
 
 
+def draw_projected_sticker_likelihoods(
+    image: np.ndarray,
+    candidate: StickerPnPCandidate,
+    sticker_color_names: dict[str, str],
+    sticker_likelihoods: dict[str, dict[str, float]],
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    image_offset: tuple[int, int] = (0, 0),
+    projected_faces: list[tuple[StickerIdentity, float, np.ndarray]] | None = None,
+) -> int:
+    """Draw compact confidence values and a swatch for the strongest alternative."""
+
+    if not sticker_likelihoods:
+        return 0
+    if projected_faces is None:
+        try:
+            projected_faces = projected_sticker_faces(candidate, rvec, tvec)
+        except cv2.error:
+            return 0
+    drawn = 0
+    height, width = image.shape[:2]
+    offset = np.asarray(image_offset, dtype=np.float32)
+    for identity, _depth, polygon in projected_faces:
+        probabilities = sticker_likelihoods.get(identity.label)
+        assigned_color = sticker_color_names.get(identity.label)
+        if probabilities is None or assigned_color is None:
+            continue
+        confidence = float(probabilities.get(assigned_color, 0.0))
+        alternatives = [
+            (color_name, float(probability))
+            for color_name, probability in probabilities.items()
+            if color_name != assigned_color
+        ]
+        if not alternatives:
+            continue
+        second_color, second_probability = max(
+            alternatives,
+            key=lambda item: item[1],
+        )
+        center = np.mean(polygon, axis=0) + offset
+        if not np.isfinite(center).all():
+            continue
+        x, y = np.round(center).astype(np.int32)
+        if x < 0 or x >= width or y < 0 or y >= height:
+            continue
+        text = f"{confidence:.2f}, {second_probability:.2f}"
+        font_scale = 0.28
+        thickness = 1
+        text_size, baseline = cv2.getTextSize(
+            text,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            thickness,
+        )
+        swatch_size = max(5, int(round(text_size[1] * 0.75)))
+        swatch_gap = 3
+        block_width = text_size[0] + swatch_gap + swatch_size
+        block_height = max(text_size[1] + baseline, swatch_size)
+        origin_x = int(x - block_width / 2)
+        text_y = int(y - block_height / 2 + text_size[1])
+        top_left = (origin_x - 2, int(y - block_height / 2) - 2)
+        bottom_right = (origin_x + block_width + 2, int(y + block_height / 2) + 2)
+        cv2.rectangle(image, top_left, bottom_right, (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.putText(
+            image,
+            text,
+            (origin_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+        swatch_x = origin_x + text_size[0] + swatch_gap
+        swatch_y = int(y - swatch_size / 2)
+        swatch_color_bgr = tuple(
+            int(value) for value in PURE_COLOR_RGB[second_color][::-1]
+        )
+        cv2.rectangle(
+            image,
+            (swatch_x, swatch_y),
+            (swatch_x + swatch_size - 1, swatch_y + swatch_size - 1),
+            swatch_color_bgr,
+            -1,
+            cv2.LINE_AA,
+        )
+        cv2.rectangle(
+            image,
+            (swatch_x, swatch_y),
+            (swatch_x + swatch_size - 1, swatch_y + swatch_size - 1),
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        drawn += 1
+    return drawn
+
+
 def draw_classified_cube_diagnostic_panel(
     image: np.ndarray,
     candidate: StickerPnPCandidate | None,
     sticker_color_names: dict[str, str],
+    sticker_likelihoods: dict[str, dict[str, float]] | None = None,
     rvec: np.ndarray | None = None,
     orientation_axis_length: float = 24.0,
 ) -> np.ndarray:
@@ -5441,7 +6769,7 @@ def draw_classified_cube_diagnostic_panel(
     )
     cv2.putText(
         output,
-        "classified cube",
+        "classified cube | color confidence",
         (width + 10, 24),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
@@ -5458,6 +6786,10 @@ def draw_classified_cube_diagnostic_panel(
         [[0.0], [0.0], [CLASSIFIED_CUBE_DIAGNOSTIC_DEPTH_MM]],
         dtype=np.float64,
     )
+    try:
+        projected_faces = projected_sticker_faces(candidate, display_rvec, display_tvec)
+    except cv2.error:
+        projected_faces = []
     draw_projected_sticker_colors(
         output,
         candidate,
@@ -5465,15 +6797,34 @@ def draw_classified_cube_diagnostic_panel(
         display_rvec,
         display_tvec,
         image_offset=image_offset,
+        projected_faces=projected_faces,
     )
+    if sticker_likelihoods is not None:
+        draw_projected_sticker_likelihoods(
+            output,
+            candidate,
+            sticker_color_names,
+            sticker_likelihoods,
+            display_rvec,
+            display_tvec,
+            image_offset=image_offset,
+            projected_faces=projected_faces,
+        )
     draw_projected_cube_pose(
         output,
         candidate,
         display_rvec,
         display_tvec,
-        PNP_CUBE_COLOR_BGR,
+        (0, 0, 0),
         2,
-        outline=True,
+        outline=False,
+        image_offset=image_offset,
+    )
+    draw_projected_sticker_identity_labels(
+        output,
+        candidate,
+        display_rvec,
+        display_tvec,
         image_offset=image_offset,
     )
     draw_orientation_axes(
@@ -5574,7 +6925,7 @@ def draw_sticker_pnp_candidate(
             candidate,
             candidate.pre_final_rvec,
             candidate.pre_final_tvec,
-            PNP_CANDIDATE_CUBE_COLOR_BGR,
+            (0, 0, 0),
             1,
         )
     # The candidate stored in the buffer is always the current finalized
@@ -5588,7 +6939,7 @@ def draw_sticker_pnp_candidate(
         candidate,
         display_rvec,
         display_tvec,
-        PNP_CUBE_COLOR_BGR,
+        (0, 0, 0),
         2,
         outline=True,
     ):
@@ -5841,15 +7192,40 @@ def render_frame(
     pose_hypothesis_buffer: PoseHypothesisBuffer | None = None,
     sticker_color_trace: StickerColorTrace | None = None,
     sticker_color_names: dict[str, str] | None = None,
+    sticker_likelihoods: dict[str, dict[str, float]] | None = None,
+    cached_final_only: bool = False,
+    *,
+    neural_cache: list[NeuralFrameData] | None = None,
+    neural_data: NeuralFrameData | None = None,
+    neural_only: bool = False,
 ) -> tuple[np.ndarray, str, int]:
     height, width = frame.shape[:2]
-    roi_xyxy, candidate, roi_source = shared_roi_for_frame(
-        frame,
-        bbox_detector,
-        roi_tracker,
-        args.roi_padding,
-    )
+    if neural_data is not None:
+        roi_xyxy = neural_data.roi_xyxy
+        candidate = None
+        roi_source = neural_data.roi_source
+    else:
+        roi_xyxy, candidate, roi_source = shared_roi_for_frame(
+            frame,
+            bbox_detector,
+            roi_tracker,
+            args.roi_padding,
+        )
     if roi_xyxy is None:
+        if neural_cache is not None:
+            neural_cache.append(
+                NeuralFrameData(
+                    frame_index=0 if frame_index is None else frame_index,
+                    frame=frame.copy(),
+                    roi_xyxy=None,
+                    roi_source="none",
+                    sticker_masks=None,
+                    local_points=np.empty((0, 2), dtype=np.float32),
+                    point_confidences=np.empty((0,), dtype=np.float32),
+                    class_ids=np.empty((0,), dtype=np.int32),
+                    box_confidences=np.empty((0,), dtype=np.float32),
+                )
+            )
         reset_pose_temporal_state(
             pose_motion_filter,
             symmetry_tracker,
@@ -5861,6 +7237,7 @@ def render_frame(
                 output,
                 None,
                 sticker_color_names,
+                sticker_likelihoods=sticker_likelihoods,
                 orientation_axis_length=args.orientation_axis_length,
             )
         return output, "none", 0
@@ -5868,6 +7245,20 @@ def render_frame(
     x1, y1, x2, y2 = roi_xyxy
     roi = frame[y1:y2, x1:x2]
     if roi.size == 0:
+        if neural_cache is not None:
+            neural_cache.append(
+                NeuralFrameData(
+                    frame_index=0 if frame_index is None else frame_index,
+                    frame=frame.copy(),
+                    roi_xyxy=roi_xyxy,
+                    roi_source=roi_source,
+                    sticker_masks=None,
+                    local_points=np.empty((0, 2), dtype=np.float32),
+                    point_confidences=np.empty((0,), dtype=np.float32),
+                    class_ids=np.empty((0,), dtype=np.int32),
+                    box_confidences=np.empty((0,), dtype=np.float32),
+                )
+            )
         roi_tracker.reset()
         reset_pose_temporal_state(
             pose_motion_filter,
@@ -5880,51 +7271,96 @@ def render_frame(
                 output,
                 None,
                 sticker_color_names,
+                sticker_likelihoods=sticker_likelihoods,
                 orientation_axis_length=args.orientation_axis_length,
             )
         return output, roi_source, 0
 
-    model_roi = resize_to_square(roi, args.view_size)
-    if args.parallel_cuda:
-        sticker_masks, result = predict_models_parallel_cuda(
-            sticker_seg_model,
-            pose_model,
-            model_roi,
-            args,
-        )
+    if neural_data is None:
+        model_roi = resize_to_square(roi, args.view_size)
+        if args.parallel_cuda:
+            sticker_masks, result = predict_models_parallel_cuda(
+                sticker_seg_model,
+                pose_model,
+                model_roi,
+                args,
+            )
+        elif is_cpu_device(args.device):
+            sticker_masks, result = predict_models_parallel_cpu(
+                sticker_seg_model,
+                pose_model,
+                model_roi,
+                args,
+            )
+        else:
+            sticker_masks = (
+                predict_sticker_masks(sticker_seg_model, model_roi, args)
+                if sticker_seg_model is not None and args.run_sticker_segmentation
+                else None
+            )
+            result = predict_pose_result(pose_model, model_roi, args)
+        if result is None:
+            local_points = np.empty((0, 2), dtype=np.float32)
+            point_confidences = np.empty((0,), dtype=np.float32)
+            class_ids = np.empty((0,), dtype=np.int32)
+            box_confidences = np.empty((0,), dtype=np.float32)
+        else:
+            local_points, point_confidences, class_ids, box_confidences = pose_predictions(result)
+        if neural_cache is not None:
+            neural_cache.append(
+                NeuralFrameData(
+                    frame_index=0 if frame_index is None else frame_index,
+                    frame=frame.copy(),
+                    roi_xyxy=roi_xyxy,
+                    roi_source=roi_source,
+                    sticker_masks=copy_sticker_masks(sticker_masks),
+                    local_points=np.asarray(local_points, dtype=np.float32).copy(),
+                    point_confidences=np.asarray(point_confidences, dtype=np.float32).copy(),
+                    class_ids=np.asarray(class_ids, dtype=np.int32).copy(),
+                    box_confidences=np.asarray(box_confidences, dtype=np.float32).copy(),
+                )
+            )
     else:
-        sticker_masks = (
-            predict_sticker_masks(sticker_seg_model, model_roi, args)
-            if sticker_seg_model is not None and args.run_sticker_segmentation
-            else None
-        )
-        result = predict_pose_result(pose_model, model_roi, args)
-    if result is None:
-        roi_tracker.reset()
-        reset_pose_temporal_state(
-            pose_motion_filter,
-            symmetry_tracker,
-            pose_hypothesis_buffer,
-        )
-        output = render_sticker_masks(
-            frame,
+        sticker_masks = neural_data.sticker_masks
+        local_points = np.asarray(neural_data.local_points)
+        point_confidences = np.asarray(neural_data.point_confidences)
+        class_ids = np.asarray(neural_data.class_ids)
+        box_confidences = np.asarray(neural_data.box_confidences)
+    if cached_final_only and neural_data is not None and neural_data.pose_ready:
+        pnp_candidate = neural_data.pose_candidate
+        output = frame.copy()
+        point_count = int(len(local_points))
+        output = draw_context(
+            output,
             roi_xyxy,
-            sticker_masks if args.show_sticker_mask else None,
-            args.sticker_mask_opacity,
-            args.sticker_border_thickness,
-            sticker_mask_erosion=args.sticker_mask_erosion,
+            pnp_candidate,
+            roi_source,
+            point_count,
+            args.show_status,
         )
-        output = draw_context(output, roi_xyxy, candidate, roi_source, 0, args.show_status)
+        if args.show_pnp:
+            output = draw_sticker_pnp_candidate(
+                output,
+                pnp_candidate,
+                args.show_status,
+                getattr(args, "show_final_pnp_pose", False),
+                getattr(args, "show_orientation_axes", True),
+                getattr(args, "orientation_axis_length", 24.0),
+                turn_candidate_log if getattr(args, "recognize_moves", False) else None,
+                turn_candidate_image_dir if getattr(args, "recognize_moves", False) else None,
+                frame_index,
+                getattr(args, "show_sticker_identities", False),
+                None,
+            )
         if sticker_color_names is not None:
             output = draw_classified_cube_diagnostic_panel(
                 output,
-                None,
+                pnp_candidate,
                 sticker_color_names,
+                sticker_likelihoods=sticker_likelihoods,
                 orientation_axis_length=args.orientation_axis_length,
             )
-        return output, roi_source, 0
-
-    local_points, point_confidences, class_ids, box_confidences = pose_predictions(result)
+        return output, roi_source, point_count
     if len(local_points) == 0:
         roi_tracker.reset()
         reset_pose_temporal_state(
@@ -5951,17 +7387,21 @@ def render_frame(
         return output, roi_source, 0
 
     sticker_matches = (
-        sticker_keypoint_matches_for_masks(
-            sticker_masks[0],
-            local_points,
-            point_confidences,
-            class_ids,
-            box_confidences,
-            args.keypoint_conf,
-            args.pose_class_conf,
+        tuple()
+        if neural_only
+        else (
+            sticker_keypoint_matches_for_masks(
+                sticker_masks[0],
+                local_points,
+                point_confidences,
+                class_ids,
+                box_confidences,
+                args.keypoint_conf,
+                args.pose_class_conf,
+            )
+            if sticker_masks is not None
+            else tuple()
         )
-        if sticker_masks is not None
-        else tuple()
     )
     output = render_sticker_masks(
         frame,
@@ -5991,8 +7431,35 @@ def render_frame(
         copy_image=False,
     )
     output = draw_context(output, roi_xyxy, candidate, roi_source, point_count, args.show_status)
-    pnp_candidate = None
-    if args.show_pnp:
+    if neural_only:
+        # The first pass is deliberately limited to detector/model output.
+        # Pose solving and color sampling are handled by the asynchronous
+        # consumer so NN inference never waits for them.
+        roi_tracker.observe_tracking_bounds(
+            tracking_bounds(
+                local_roi_points,
+                point_confidences,
+                class_ids,
+                box_confidences,
+                args.pose_class_conf,
+                args.track_conf,
+                roi.shape[:2],
+            ),
+            width,
+            height,
+            tracking_gain=args.roi_tracking_gain,
+            tracking_padding=args.roi_tracking_padding,
+        )
+        return output, roi_source, point_count
+    pnp_candidate = (
+        neural_data.pose_candidate
+        if neural_data is not None and neural_data.pose_ready
+        else None
+    )
+    recognize_moves = bool(getattr(args, "recognize_moves", False))
+    if args.show_pnp and not (
+        neural_data is not None and neural_data.pose_ready
+    ):
         current_candidates = best_sticker_pnp_candidates(
             frame_points,
             class_ids,
@@ -6007,7 +7474,6 @@ def render_frame(
             current_candidates,
             symmetry_tracker,
         )
-        recognize_moves = bool(getattr(args, "recognize_moves", False))
         pose_graph_selection = None
         if recognize_moves:
             if pose_hypothesis_buffer is not None:
@@ -6092,19 +7558,32 @@ def render_frame(
         if (
             sticker_color_trace is not None
             and pnp_candidate is not None
-            and (frame_index is None or frame_index < args.color_plot_frames)
         ):
+            sticker_observations = sample_projected_sticker_colors(
+                frame,
+                roi_xyxy,
+                sticker_masks,
+                pnp_candidate,
+                max_samples_per_sticker=args.color_samples_per_sticker,
+                min_samples_per_sticker=args.color_min_samples_per_sticker,
+                sticker_mask_erosion=args.sticker_mask_erosion,
+            )
+            candidate_rotation, _ = cv2.Rodrigues(
+                np.asarray(pnp_candidate.rvec, dtype=np.float64).reshape(3, 1)
+            )
+            sticker_observation_weights = {
+                identity.label: sticker_view_reliability_weight(
+                    pnp_candidate,
+                    identity,
+                    candidate_rotation,
+                )
+                for identity in sticker_color_trace.identities
+                if identity.label in sticker_observations
+            }
             sticker_color_trace.observe(
                 0 if frame_index is None else frame_index,
-                sample_projected_sticker_colors(
-                    frame,
-                    roi_xyxy,
-                    sticker_masks,
-                    pnp_candidate,
-                    max_samples_per_sticker=args.color_samples_per_sticker,
-                    min_samples_per_sticker=args.color_min_samples_per_sticker,
-                    sticker_mask_erosion=args.sticker_mask_erosion,
-                ),
+                sticker_observations,
+                observation_weights=sticker_observation_weights,
             )
         output = draw_sticker_pnp_candidate(
             output,
@@ -6124,8 +7603,34 @@ def render_frame(
                 output,
                 pnp_candidate,
                 sticker_color_names,
+                sticker_likelihoods=sticker_likelihoods,
                 orientation_axis_length=args.orientation_axis_length,
             )
+    elif args.show_pnp and neural_data is not None and neural_data.pose_ready:
+        output = draw_sticker_pnp_candidate(
+            output,
+            pnp_candidate,
+            args.show_status,
+            getattr(args, "show_final_pnp_pose", False),
+            getattr(args, "show_orientation_axes", True),
+            getattr(args, "orientation_axis_length", 24.0),
+            turn_candidate_log if recognize_moves else None,
+            turn_candidate_image_dir if recognize_moves else None,
+            frame_index,
+            getattr(args, "show_sticker_identities", False),
+            None if sticker_color_names is not None else sticker_color_names,
+        )
+        if sticker_color_names is not None:
+            output = draw_classified_cube_diagnostic_panel(
+                output,
+                pnp_candidate,
+                sticker_color_names,
+                sticker_likelihoods=sticker_likelihoods,
+                orientation_axis_length=args.orientation_axis_length,
+            )
+    if neural_data is not None:
+        neural_data.pose_candidate = pnp_candidate
+        neural_data.pose_ready = True
     # Match the live pipeline: keep using this ROI until the independent pose
     # model fails, then fall back to the bbox detector on the next frame.
     roi_tracker.observe_tracking_bounds(
@@ -6162,6 +7667,42 @@ def create_video_writer(path: Path, frame: np.ndarray, fps: float) -> cv2.VideoW
     return writer
 
 
+def draw_fps_counter(
+    image: np.ndarray,
+    args: argparse.Namespace,
+    processing_fps: float,
+    loop_fps: float,
+) -> np.ndarray:
+    """Draw the processing/loop FPS indicator in the upper-left corner."""
+
+    if not args.show_fps:
+        return image
+    fps_y = 44 if args.show_status else 22
+    cv2.putText(
+        image,
+        f"PROC {processing_fps:.1f} | LOOP {loop_fps:.1f}",
+        (8, fps_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (40, 220, 40),
+        1,
+        cv2.LINE_AA,
+    )
+    return image
+
+
+def print_headless_progress(label: str, completed: int, total: int | None) -> None:
+    """Update one in-place console progress line for non-display runs."""
+
+    if total is not None and total > 0:
+        bounded_completed = min(max(int(completed), 0), int(total))
+        percent = 100.0 * bounded_completed / float(total)
+        message = f"{label}: {bounded_completed}/{total} ({percent:5.1f}%)"
+    else:
+        message = f"{label}: {int(completed)} frames"
+    print(f"\r{message:<52}", end="", flush=True)
+
+
 def make_pose_motion_filter(args: argparse.Namespace) -> PoseMotionFilter | None:
     if not args.pose_motion_filter:
         return None
@@ -6174,6 +7715,286 @@ def make_pose_motion_filter(args: argparse.Namespace) -> PoseMotionFilter | None
             max_angular_jerk_rad_s3=args.pose_motion_max_angular_jerk,
         )
     )
+
+
+def consume_neural_cache_for_pose(
+    records: SimpleQueue[NeuralFrameData | None],
+    bbox_detector: YOLOCubeDetector | None,
+    pose_model: object | None,
+    sticker_seg_model: object | None,
+    args: argparse.Namespace,
+    sticker_color_trace: StickerColorTrace | None,
+    turn_candidate_log: Path | None,
+    turn_candidate_image_dir: Path | None,
+) -> None:
+    """Run initial pose/color work without holding up neural inference."""
+
+    roi_tracker = RoiTracker()
+    pose_hypothesis_buffer = PoseHypothesisBuffer(max_frames=8)
+    pose_motion_filter = make_pose_motion_filter(args)
+    while True:
+        record = records.get()
+        if record is None:
+            return
+        render_frame(
+            record.frame,
+            bbox_detector,
+            pose_model,
+            roi_tracker,
+            args,
+            sticker_seg_model,
+            turn_candidate_log,
+            turn_candidate_image_dir,
+            record.frame_index,
+            pose_motion_filter,
+            None,
+            pose_hypothesis_buffer,
+            sticker_color_trace,
+            None,
+            neural_data=record,
+        )
+
+
+def run_neural_video_pass(
+    source: int | str,
+    bbox_detector: YOLOCubeDetector,
+    pose_model: object,
+    sticker_seg_model: object | None,
+    args: argparse.Namespace,
+    *,
+    sticker_color_trace: StickerColorTrace | None = None,
+    output_path: Path | None = None,
+    turn_candidate_log: Path | None = None,
+    turn_candidate_image_dir: Path | None = None,
+) -> tuple[list[NeuralFrameData], int, bool, float]:
+    """Collect/cache every NN result while a worker consumes pose results."""
+
+    capture = cv2.VideoCapture(source)
+    if not capture.isOpened():
+        raise SystemExit(f"Could not open source: {source}")
+    if isinstance(source, int):
+        configure_camera(capture, args)
+    source_fps = float(capture.get(cv2.CAP_PROP_FPS))
+    capture_frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    total_frames = capture_frame_count if capture_frame_count > 0 else None
+    cache: list[NeuralFrameData] = []
+    records: SimpleQueue[NeuralFrameData | None] = SimpleQueue()
+    worker = Thread(
+        target=consume_neural_cache_for_pose,
+        args=(
+            records,
+            None,
+            None,
+            None,
+            args,
+            sticker_color_trace,
+            turn_candidate_log,
+            turn_candidate_image_dir,
+        ),
+        name="initial-pose-consumer",
+        daemon=True,
+    )
+    worker.start()
+    writer = None
+    roi_tracker = RoiTracker()
+    previous_loop_end = None
+    smoothed_loop_fps = None
+    smoothed_processing_fps = None
+    frame_index = 0
+    completed = True
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            render_start = perf_counter()
+            now = render_start
+            loop_fps = (
+                None
+                if previous_loop_end is None
+                else 1.0 / max(now - previous_loop_end, 1e-6)
+            )
+            previous_loop_end = now
+            rendered, _roi_source, _point_count = render_frame(
+                frame,
+                bbox_detector,
+                pose_model,
+                roi_tracker,
+                args,
+                sticker_seg_model,
+                None,
+                None,
+                frame_index,
+                None,
+                None,
+                None,
+                None,
+                None,
+                neural_cache=cache,
+                neural_only=True,
+            )
+            render_end = perf_counter()
+            processing_fps = 1.0 / max(render_end - render_start, 1e-6)
+            if loop_fps is None:
+                loop_fps = processing_fps
+            smoothed_loop_fps = (
+                loop_fps
+                if smoothed_loop_fps is None
+                else 0.9 * smoothed_loop_fps + 0.1 * loop_fps
+            )
+            smoothed_processing_fps = (
+                processing_fps
+                if smoothed_processing_fps is None
+                else 0.9 * smoothed_processing_fps + 0.1 * processing_fps
+            )
+            rendered = draw_fps_counter(
+                rendered,
+                args,
+                smoothed_processing_fps,
+                smoothed_loop_fps,
+            )
+            records.put(cache[-1])
+            frame_index += 1
+            if not args.display:
+                print_headless_progress("neural pass", frame_index, total_frames)
+            if output_path is not None:
+                if writer is None:
+                    writer = create_video_writer(
+                        output_path,
+                        rendered,
+                        float(capture.get(cv2.CAP_PROP_FPS)),
+                    )
+                writer.write(rendered)
+            if args.display:
+                cv2.imshow(WINDOW_NAME, rendered)
+                key = cv2.waitKey(30 if args.once else 1) & 0xFF
+                if args.once or key in (ord("q"), 27, 13):
+                    completed = args.once
+                    break
+            elif args.once:
+                break
+    finally:
+        if writer is not None:
+            writer.release()
+        capture.release()
+        records.put(None)
+        worker.join()
+        if not args.display:
+            print()
+    if output_path is not None:
+        print(f"Saved neural output pass: {output_path}", flush=True)
+    return cache, frame_index, completed, source_fps
+
+
+def run_cached_video_pass(
+    cache: list[NeuralFrameData],
+    args: argparse.Namespace,
+    *,
+    sticker_color_names: dict[str, str] | None = None,
+    sticker_color_names_by_frame: dict[int, dict[str, str]] | None = None,
+    sticker_likelihoods_by_frame: dict[int, dict[str, dict[str, float]]] | None = None,
+    output_path: Path | None = None,
+    fps: float = 30.0,
+) -> bool:
+    """Replay cached frames through pose refinement and final rendering only."""
+
+    writer = None
+    roi_tracker = RoiTracker()
+    symmetry_tracker = CubeSymmetryTracker()
+    pose_hypothesis_buffer = PoseHypothesisBuffer(max_frames=8)
+    pose_motion_filter = make_pose_motion_filter(args)
+    previous_loop_end = None
+    smoothed_loop_fps = None
+    smoothed_processing_fps = None
+    completed = True
+    try:
+        total_frames = len(cache)
+        for record_index, record in enumerate(cache, start=1):
+            render_start = perf_counter()
+            now = render_start
+            loop_fps = (
+                None
+                if previous_loop_end is None
+                else 1.0 / max(now - previous_loop_end, 1e-6)
+            )
+            previous_loop_end = now
+            frame_sticker_color_names = (
+                sticker_color_names_by_frame.get(record.frame_index, {})
+                if sticker_color_names_by_frame is not None
+                else sticker_color_names
+            )
+            rendered, _roi_source, _point_count = render_frame(
+                record.frame,
+                None,
+                None,
+                roi_tracker,
+                args,
+                None,
+                None,
+                None,
+                record.frame_index,
+                pose_motion_filter,
+                symmetry_tracker,
+                pose_hypothesis_buffer,
+                None,
+                frame_sticker_color_names,
+                sticker_likelihoods=(
+                    sticker_likelihoods_by_frame.get(record.frame_index, {})
+                    if sticker_likelihoods_by_frame is not None
+                    else None
+                ),
+                # The background worker already completed pose solving for
+                # every cached record.  The final replay should only render
+                # those results, regardless of whether a window is visible.
+                cached_final_only=True,
+                neural_data=record,
+            )
+            render_end = perf_counter()
+            processing_fps = 1.0 / max(render_end - render_start, 1e-6)
+            if loop_fps is None:
+                loop_fps = processing_fps
+            smoothed_loop_fps = (
+                loop_fps
+                if smoothed_loop_fps is None
+                else 0.9 * smoothed_loop_fps + 0.1 * loop_fps
+            )
+            smoothed_processing_fps = (
+                processing_fps
+                if smoothed_processing_fps is None
+                else 0.9 * smoothed_processing_fps + 0.1 * processing_fps
+            )
+            rendered = draw_fps_counter(
+                rendered,
+                args,
+                smoothed_processing_fps,
+                smoothed_loop_fps,
+            )
+            if output_path is not None:
+                if writer is None:
+                    writer = create_video_writer(
+                        output_path,
+                        rendered,
+                        fps,
+                    )
+                writer.write(rendered)
+            if not args.display:
+                print_headless_progress("final pass", record_index, total_frames)
+            if args.display:
+                cv2.imshow(WINDOW_NAME, rendered)
+                key = cv2.waitKey(30 if args.once else 1) & 0xFF
+                if args.once or key in (ord("q"), 27, 13):
+                    completed = args.once
+                    break
+            elif args.once:
+                break
+    finally:
+        if writer is not None:
+            writer.release()
+        if not args.display:
+            print()
+    if output_path is not None:
+        print(f"Saved final output pass: {output_path}", flush=True)
+    return completed
 
 
 def run_video_pass(
@@ -6271,12 +8092,6 @@ def run_video_pass(
                     completed = args.once
                     break
             elif args.once:
-                break
-            if (
-                sticker_color_trace is not None
-                and frame_index >= args.color_plot_frames
-                and not args.display
-            ):
                 break
     finally:
         if writer is not None:
@@ -6397,7 +8212,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-pnp",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Draw the cube pose from sticker initialization and final refinement.",
+        help="Draw the cube pose during the final cached pass.",
     )
     parser.add_argument(
         "--show-final-pnp-pose",
@@ -6420,7 +8235,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--show-sticker-identities",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Draw stable C/E/K sticker identity numbers on visible stickers.",
     )
     parser.add_argument(
@@ -6431,6 +8246,21 @@ def build_parser() -> argparse.ArgumentParser:
             "Enable motion-graph and layer-turn recovery. By default the "
             "renderer stays on static sticker selection plus full-cube refinement."
         ),
+    )
+    parser.add_argument(
+        "--recover-pose-symmetry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Recover whole-cube symmetry changes from cached sticker colors "
+            "after the neural pass. This is independent of move recognition."
+        ),
+    )
+    parser.add_argument(
+        "--debug-pose-symmetry",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print per-frame pose-symmetry trigger and tested-orientation scores.",
     )
     parser.add_argument(
         "--pose-motion-filter",
@@ -6513,12 +8343,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--color-plot-frames",
-        type=int,
-        default=90,
-        help="Maximum video frames to collect for --rgb-html-plot (default: 90).",
-    )
-    parser.add_argument(
         "--color-samples-per-sticker",
         type=int,
         default=128,
@@ -6542,7 +8366,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Marker size in the grouped RGB HTML plot.",
     )
     parser.add_argument("--save", type=Path, help="Output image path, or one frame with --once.")
-    parser.add_argument("--save-video", type=Path, help="Output path for rendered video.")
+    parser.add_argument(
+        "--save-video",
+        type=Path,
+        help="Output path for the first pass containing neural outputs only.",
+    )
     parser.add_argument(
         "--show-classified-colors",
         "--show-classified-stickers",
@@ -6551,14 +8379,23 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Run a second pass and color visible projected stickers using the "
-            "legal standard cube color scheme."
+            "Run the final cached pass and color visible projected stickers "
+            "using the legal standard cube color scheme."
+        ),
+    )
+    parser.add_argument(
+        "--debug-independent-color-posteriors",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Color each sticker by its final independent posterior argmax; "
+            "disable legal cube color assignments while retaining pose recovery."
         ),
     )
     parser.add_argument(
         "--save-colored-video",
         type=Path,
-        help="Optional output path for the second, sticker-colored video pass.",
+        help="Optional output path for the final cached, sticker-colored video pass.",
     )
     parser.add_argument("--once", action="store_true", help="Process one video/camera frame and exit.")
     parser.add_argument("--no-display", dest="display", action="store_false")
@@ -6570,6 +8407,13 @@ def main() -> int:
     args = build_parser().parse_args()
     global PNP_ASSIGNMENT_MODE
     PNP_ASSIGNMENT_MODE = args.pnp_assignment_mode
+    if args.debug_independent_color_posteriors:
+        args.show_classified_colors = True
+        print(
+            "Debug color mode: independent final posteriors; "
+            "legal cube color assignments disabled; pose recovery retained",
+            flush=True,
+        )
     args.device = args.device or default_yolo_device()
     if args.turn_candidate_log is not None:
         turn_candidate_output_dir = args.turn_candidate_log
@@ -6603,8 +8447,6 @@ def main() -> int:
         raise SystemExit("--sticker-border-thickness must be non-negative")
     if args.sticker_mask_erosion < 0:
         raise SystemExit("--sticker-mask-erosion must be non-negative")
-    if args.color_plot_frames < 1:
-        raise SystemExit("--color-plot-frames must be positive")
     if args.color_samples_per_sticker < 1:
         raise SystemExit("--color-samples-per-sticker must be positive")
     if args.color_min_samples_per_sticker < 1:
@@ -6641,44 +8483,38 @@ def main() -> int:
         raise SystemExit("--show-classified-colors requires --run-sticker-segmentation")
     if args.show_classified_colors and not args.show_pnp:
         raise SystemExit("--show-classified-colors requires --show-pnp")
-    roi_tracker = RoiTracker()
-    symmetry_tracker = CubeSymmetryTracker()
-    pose_hypothesis_buffer = PoseHypothesisBuffer(max_frames=8)
     sticker_color_trace = (
         StickerColorTrace.create()
-        if args.rgb_html_plot is not None or args.show_classified_colors
+        if (
+            args.recover_pose_symmetry
+            or args.rgb_html_plot is not None
+            or args.show_classified_colors
+        )
         else None
     )
-    pose_motion_filter = None
-    if args.pose_motion_filter:
-        pose_motion_filter = PoseMotionFilter(
-            PoseMotionFilterConfig(
-                dt_seconds=args.pose_motion_dt,
-                max_acceleration_units_s2=args.pose_motion_max_acceleration,
-                max_jerk_units_s3=args.pose_motion_max_jerk,
-                max_angular_acceleration_rad_s2=args.pose_motion_max_angular_acceleration,
-                max_angular_jerk_rad_s3=args.pose_motion_max_angular_jerk,
-            )
-        )
 
     if is_image_source(source):
         frame = cv2.imread(str(source), cv2.IMREAD_COLOR)
         if frame is None:
             raise SystemExit(f"Could not read image: {source}")
+        image_cache: list[NeuralFrameData] = []
         rendered, roi_source, point_count = render_frame(
             frame,
             bbox_detector,
             pose_model,
-            roi_tracker,
+            RoiTracker(),
             args,
             sticker_seg_model,
-            args.turn_candidate_log,
-            args.turn_candidate_images,
+            None,
+            None,
             0,
-            pose_motion_filter,
-            symmetry_tracker,
-            pose_hypothesis_buffer,
-            sticker_color_trace,
+            None,
+            None,
+            None,
+            None,
+            None,
+            neural_cache=image_cache,
+            neural_only=True,
         )
         if args.save:
             args.save.parent.mkdir(parents=True, exist_ok=True)
@@ -6690,15 +8526,73 @@ def main() -> int:
             cv2.waitKey(0)
             cv2.destroyAllWindows()
         print(f"ROI source: {roi_source}; rendered points: {point_count}")
-        center_color_names = (
-            classify_center_color_names(sticker_color_trace)
+        # Complete the initial pose/color pass from cached NN data.  This is
+        # synchronous for one image, but follows the same data path as video.
+        render_frame(
+            frame,
+            None,
+            None,
+            RoiTracker(),
+            args,
+            None,
+            args.turn_candidate_log,
+            args.turn_candidate_images,
+            0,
+            make_pose_motion_filter(args),
+            None,
+            PoseHypothesisBuffer(max_frames=8),
+            sticker_color_trace,
+            None,
+            neural_data=image_cache[0],
+        )
+        if (
+            args.recover_pose_symmetry
+            and sticker_color_trace is not None
+        ):
+            sticker_color_trace = recover_cached_pose_symmetries(
+                image_cache,
+                sticker_color_trace,
+                debug=args.debug_pose_symmetry,
+                progress=not args.display,
+            )
+        sticker_likelihoods_by_frame = (
+            build_sticker_observation_likelihoods(sticker_color_trace)
             if args.show_classified_colors and sticker_color_trace is not None
             else {}
         )
-        sticker_color_names = classify_sticker_color_names(
-            sticker_color_trace,
-            center_color_names,
-        ) if sticker_color_trace is not None else {}
+        if args.debug_independent_color_posteriors:
+            sticker_likelihoods_by_frame = carry_forward_sticker_posteriors(
+                sticker_likelihoods_by_frame,
+                (0,),
+            )
+        sticker_color_names_by_frame = None
+        if args.show_classified_colors and sticker_color_trace is not None:
+            # Keep the independent debug view unconstrained; normal replay
+            # applies legal cube rules after pairwise trajectory grouping.
+            classifier = (
+                classify_sticker_colors_by_pairwise_trajectory
+                if args.debug_independent_color_posteriors
+                else classify_sticker_colors_by_pairwise_cube_rules
+            )
+            sticker_color_names = classifier(
+                sticker_color_trace,
+                sticker_likelihoods_by_frame,
+            )
+            center_color_names = {
+                identity.label: sticker_color_names[identity.label]
+                for identity in sticker_color_trace.identities
+                if identity.category == "center" and identity.label in sticker_color_names
+            }
+        else:
+            center_color_names = (
+                classify_center_color_names(sticker_color_trace)
+                if args.show_classified_colors and sticker_color_trace is not None
+                else {}
+            )
+            sticker_color_names = classify_sticker_color_names(
+                sticker_color_trace,
+                center_color_names,
+            ) if args.show_classified_colors and sticker_color_trace is not None else {}
         if center_color_names:
             print(
                 "Classified centers: "
@@ -6708,31 +8602,32 @@ def main() -> int:
                 ),
                 flush=True,
             )
-        if args.show_classified_colors and (args.display or sticker_color_names):
-            colored_roi_tracker = RoiTracker()
-            colored_symmetry_tracker = CubeSymmetryTracker()
-            colored_pose_hypothesis_buffer = PoseHypothesisBuffer(max_frames=8)
-            colored_pose_motion_filter = make_pose_motion_filter(args)
+        if (args.show_classified_colors or args.show_pnp) and args.display:
             colored_rendered, _colored_roi_source, _colored_point_count = render_frame(
                 frame,
-                bbox_detector,
-                pose_model,
-                colored_roi_tracker,
+                None,
+                None,
+                RoiTracker(),
                 args,
-                sticker_seg_model,
+                None,
                 None,
                 None,
                 0,
-                colored_pose_motion_filter,
-                colored_symmetry_tracker,
-                colored_pose_hypothesis_buffer,
+                make_pose_motion_filter(args),
+                CubeSymmetryTracker(),
+                PoseHypothesisBuffer(max_frames=8),
                 None,
-                sticker_color_names,
+                (
+                    sticker_color_names_by_frame.get(0, {})
+                    if sticker_color_names_by_frame is not None
+                    else sticker_color_names
+                ) if args.show_classified_colors else None,
+                sticker_likelihoods=sticker_likelihoods_by_frame.get(0, {}),
+                neural_data=image_cache[0],
             )
-            if args.display:
-                cv2.imshow(WINDOW_NAME, colored_rendered)
-                cv2.waitKey(0)
-                cv2.destroyAllWindows()
+            cv2.imshow(WINDOW_NAME, colored_rendered)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
         if sticker_color_trace is not None and args.rgb_html_plot is not None:
             save_sticker_color_plots(
                 sticker_color_trace,
@@ -6744,7 +8639,7 @@ def main() -> int:
             print(f"Saved sticker color plots: {args.rgb_html_plot}")
         return 0
 
-    frame_count, first_pass_completed = run_video_pass(
+    cache, frame_count, first_pass_completed, source_fps = run_neural_video_pass(
         source,
         bbox_detector,
         pose_model,
@@ -6755,15 +8650,54 @@ def main() -> int:
         turn_candidate_log=args.turn_candidate_log,
         turn_candidate_image_dir=args.turn_candidate_images,
     )
-    center_color_names = (
-        classify_center_color_names(sticker_color_trace)
+    if (
+        args.recover_pose_symmetry
+        and sticker_color_trace is not None
+    ):
+        sticker_color_trace = recover_cached_pose_symmetries(
+            cache,
+            sticker_color_trace,
+            debug=args.debug_pose_symmetry,
+            progress=not args.display,
+        )
+    sticker_likelihoods_by_frame = (
+        build_sticker_observation_likelihoods(sticker_color_trace)
         if args.show_classified_colors and sticker_color_trace is not None
         else {}
     )
-    sticker_color_names = classify_sticker_color_names(
-        sticker_color_trace,
-        center_color_names,
-    ) if sticker_color_trace is not None else {}
+    if args.debug_independent_color_posteriors:
+        sticker_likelihoods_by_frame = carry_forward_sticker_posteriors(
+            sticker_likelihoods_by_frame,
+            tuple(record.frame_index for record in cache),
+        )
+    sticker_color_names_by_frame = None
+    if args.show_classified_colors and sticker_color_trace is not None:
+        # Keep the independent debug view unconstrained; normal replay
+        # applies legal cube rules after pairwise trajectory grouping.
+        classifier = (
+            classify_sticker_colors_by_pairwise_trajectory
+            if args.debug_independent_color_posteriors
+            else classify_sticker_colors_by_pairwise_cube_rules
+        )
+        sticker_color_names = classifier(
+            sticker_color_trace,
+            sticker_likelihoods_by_frame,
+        )
+        center_color_names = {
+            identity.label: sticker_color_names[identity.label]
+            for identity in sticker_color_trace.identities
+            if identity.category == "center" and identity.label in sticker_color_names
+        }
+    else:
+        center_color_names = (
+            classify_center_color_names(sticker_color_trace)
+            if args.show_classified_colors and sticker_color_trace is not None
+            else {}
+        )
+        sticker_color_names = classify_sticker_color_names(
+            sticker_color_trace,
+            center_color_names,
+        ) if args.show_classified_colors and sticker_color_trace is not None else {}
     if center_color_names:
         print(
             "Classified centers: "
@@ -6774,18 +8708,18 @@ def main() -> int:
             flush=True,
         )
     if (
-        args.show_classified_colors
+        (args.show_classified_colors or args.show_pnp)
         and first_pass_completed
         and (args.display or args.save_colored_video is not None)
     ):
-        run_video_pass(
-            source,
-            bbox_detector,
-            pose_model,
-            sticker_seg_model,
+        run_cached_video_pass(
+            cache,
             args,
-        sticker_color_names=sticker_color_names,
+            sticker_color_names=sticker_color_names if args.show_classified_colors else None,
+            sticker_color_names_by_frame=sticker_color_names_by_frame,
+            sticker_likelihoods_by_frame=sticker_likelihoods_by_frame,
             output_path=args.save_colored_video,
+            fps=source_fps,
         )
     if sticker_color_trace is not None and args.rgb_html_plot is not None:
         save_sticker_color_plots(
@@ -6793,7 +8727,7 @@ def main() -> int:
             args.rgb_html_plot,
             title=(
                 "Independent-keypoint sticker RGB observations "
-                f"across {min(frame_count, args.color_plot_frames)} frames"
+                f"across {frame_count} frames"
             ),
             primary_normalized=args.normalize_rgb_plot,
             point_size=args.plotly_point_size,

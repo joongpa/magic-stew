@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-
 INDEPENDENT_POSE_CLASS_NAMES = ("corner", "corner-edge", "corner-edge-center")
 
 # Chosen from the 100% learning-curve threshold sweep. The edge class needs a
@@ -12,7 +11,7 @@ INDEPENDENT_POSE_CLASS_NAMES = ("corner", "corner-edge", "corner-edge-center")
 # positives.
 DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES = {
     "corner": 0.25,
-    "corner-edge": 0.30,
+    "corner-edge": 0.4,
     "corner-edge-center": 0.25,
 }
 

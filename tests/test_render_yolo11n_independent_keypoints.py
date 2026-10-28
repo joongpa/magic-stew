@@ -271,6 +271,275 @@ def test_piecewise_profiles_compare_trajectories_in_oklab():
     assert render_script.sticker_color_profile_distance(red_profile, blue_profile) > 0.02
 
 
+def test_color_observation_likelihoods_are_soft_and_normalized():
+    profiles = {
+        color_name: render_script.GlobalColorProfile(
+            color_name=color_name,
+            prior=render_script.pure_rgb_color_profile(color_name),
+            fitted=None,
+            sample_count=0,
+        )
+        for color_name in render_script.PURE_COLOR_RGB
+    }
+
+    likelihoods = render_script.rgb_observation_color_likelihoods(
+        np.asarray((128, 20, 20), dtype=np.uint8),
+        profiles,
+    )
+
+    assert np.isclose(sum(likelihoods.values()), 1.0)
+    assert likelihoods["red"] > likelihoods["orange"]
+    assert likelihoods["orange"] > likelihoods["blue"]
+
+
+def test_sticker_observation_likelihood_uses_previous_observations_as_prior():
+    trace = render_script.StickerColorTrace.create()
+    label = trace.identities[0].label
+    trace.observe(0, {label: np.asarray((128, 20, 20), dtype=np.uint8)})
+    trace.observe(1, {label: np.asarray((10, 10, 180), dtype=np.uint8)})
+    profiles = {
+        color_name: render_script.GlobalColorProfile(
+            color_name=color_name,
+            prior=render_script.pure_rgb_color_profile(color_name),
+            fitted=None,
+            sample_count=0,
+        )
+        for color_name in render_script.PURE_COLOR_RGB
+    }
+
+    likelihoods = render_script.build_sticker_observation_likelihoods(trace, profiles)
+
+    assert set(likelihoods) == {0, 1}
+    first = likelihoods[0][label]
+    second = likelihoods[1][label]
+    assert np.isclose(sum(first.values()), 1.0)
+    assert np.isclose(sum(second.values()), 1.0)
+    assert first["red"] > first["orange"]
+    assert second["red"] < first["red"]
+
+
+def test_low_reliability_observation_has_tempered_color_effect():
+    profiles = {
+        color_name: render_script.GlobalColorProfile(
+            color_name=color_name,
+            prior=render_script.pure_rgb_color_profile(color_name),
+            fitted=None,
+            sample_count=0,
+        )
+        for color_name in render_script.PURE_COLOR_RGB
+    }
+    label = render_script.StickerColorTrace.create().identities[0].label
+    trace = render_script.StickerColorTrace.create()
+    trace.observe(
+        0,
+        {label: np.asarray((180, 10, 10), dtype=np.uint8)},
+        observation_weights={label: 0.0},
+    )
+
+    posterior = render_script.build_sticker_observation_likelihoods(trace, profiles)[0][label]
+
+    assert all(np.isclose(value, 1.0 / len(render_script.PURE_COLOR_RGB)) for value in posterior.values())
+
+
+def test_final_posterior_color_assignment_is_independent_per_sticker():
+    label = render_script.StickerColorTrace.create().identities[0].label
+    another_label = render_script.StickerColorTrace.create().identities[1].label
+
+    assigned = render_script.classify_sticker_colors_by_final_posterior(
+        {
+            0: {
+                label: {"red": 0.40, "orange": 0.60},
+                another_label: {"blue": 0.75, "green": 0.25},
+            },
+            1: {
+                label: {"red": 0.80, "orange": 0.20},
+            },
+        }
+    )
+
+    assert assigned == {label: "red", another_label: "blue"}
+
+
+def test_pairwise_trajectory_support_reinforces_a_shared_color():
+    trace = render_script.StickerColorTrace.create()
+    orange_label = trace.identities[0].label
+    red_label = trace.identities[1].label
+    another_orange_label = trace.identities[2].label
+    white_label = trace.identities[3].label
+    orange_rgb = np.asarray((255, 165, 0), dtype=np.uint8)
+    red_rgb = np.asarray((255, 0, 0), dtype=np.uint8)
+    white_rgb = np.asarray((255, 148, 149), dtype=np.uint8)
+    for frame_index in range(4):
+        trace.observe(
+            frame_index,
+            {
+                orange_label: orange_rgb,
+                red_label: red_rgb,
+                another_orange_label: orange_rgb,
+                white_label: white_rgb,
+            },
+        )
+
+    assigned = render_script.classify_sticker_colors_by_pairwise_trajectory(
+        trace,
+        {
+            3: {
+                orange_label: {"red": 0.80, "orange": 0.20},
+                red_label: {"red": 0.95, "orange": 0.05},
+                another_orange_label: {"red": 0.10, "orange": 0.90},
+                white_label: {"white": 0.99, "orange": 0.01},
+            }
+        },
+    )
+
+    assert assigned[orange_label] == "orange"
+    assert assigned[another_orange_label] == "orange"
+    assert assigned[red_label] == "red"
+    assert assigned[white_label] == "white"
+
+
+def test_frame_posterior_color_assignment_can_change_by_frame():
+    label = render_script.StickerColorTrace.create().identities[0].label
+
+    assigned = render_script.classify_sticker_colors_by_frame_posterior(
+        {
+            0: {label: {"red": 0.70, "orange": 0.30}},
+            1: {label: {"red": 0.35, "orange": 0.65}},
+        }
+    )
+
+    assert assigned[0][label] == "red"
+    assert assigned[1][label] == "orange"
+
+
+def test_frame_posteriors_carry_forward_when_a_sticker_is_not_observed():
+    label = render_script.StickerColorTrace.create().identities[0].label
+    other_label = render_script.StickerColorTrace.create().identities[1].label
+    posteriors = render_script.carry_forward_sticker_posteriors(
+        {
+            0: {label: {"red": 0.70, "orange": 0.30}},
+            2: {other_label: {"blue": 0.80, "green": 0.20}},
+        },
+        (0, 1, 2),
+    )
+
+    assert posteriors[1][label] == {"red": 0.70, "orange": 0.30}
+    assert posteriors[2][label] == {"red": 0.70, "orange": 0.30}
+    assert posteriors[1].get(other_label) is None
+    assert posteriors[2][other_label] == {"blue": 0.80, "green": 0.20}
+
+
+def test_face_on_sticker_views_receive_lower_reliability_weight():
+    identity = next(
+        item
+        for item in render_script.canonical_sticker_identities()
+        if item.face == "U" and item.category == "center"
+    )
+    face_on_candidate = SimpleNamespace(
+        rvec=np.zeros((3, 1), dtype=np.float64),
+        tvec=np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64),
+        layer_rotations=(),
+    )
+    angled_candidate = SimpleNamespace(
+        rvec=np.asarray([[np.deg2rad(70.0)], [0.0], [0.0]], dtype=np.float64),
+        tvec=np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64),
+        layer_rotations=(),
+    )
+
+    face_on_weight = render_script.sticker_view_reliability_weight(
+        face_on_candidate,
+        identity,
+    )
+    angled_weight = render_script.sticker_view_reliability_weight(
+        angled_candidate,
+        identity,
+    )
+
+    assert np.isclose(face_on_weight, 1.0)
+    assert render_script.STICKER_VIEW_WEIGHT_FLOOR == 0.0
+    assert 0.0 < angled_weight < face_on_weight
+
+
+def test_cached_pose_symmetry_recovery_uses_color_identity_history(capsys):
+    image_size = (256, 256)
+    camera_matrix = render_script.default_camera_matrix(image_size, 1.2)
+    rvec = np.asarray([[0.12], [-0.18], [0.08]], dtype=np.float64)
+    tvec = np.asarray([[4.0], [-3.0], [180.0]], dtype=np.float64)
+    object_points = render_script.canonical_sticker_object_points("corner")
+    image_points, _ = cv2.projectPoints(
+        object_points,
+        rvec,
+        tvec,
+        camera_matrix,
+        np.zeros((4, 1), dtype=np.float64),
+    )
+    match = render_script.StickerKeypointMatch(
+        mask_index=0,
+        keypoint_indices=(0, 1, 2, 3),
+        sticker_type="corner",
+        average_confidence=0.95,
+    )
+    candidate = render_script.solve_sticker_pnp(
+        image_points.reshape(-1, 2),
+        np.asarray([0, 1, 2, 1], dtype=np.int32),
+        match,
+        image_size,
+        1.2,
+    )
+    assert candidate is not None
+
+    trace = render_script.StickerColorTrace.create()
+    color_by_label = {
+        identity.label: np.asarray(
+            render_script.PURE_COLOR_RGB[
+                render_script.STANDARD_FACE_COLOR_NAMES[identity.face]
+            ],
+            dtype=np.uint8,
+        )
+        for identity in trace.identities
+    }
+    symmetry = render_script.CUBE_SYMMETRY_MATRICES[7]
+    identities_by_geometry = {
+        (identity.cubie_index, identity.axis, identity.side): identity
+        for identity in trace.identities
+    }
+    permutation = {
+        identity.label: render_script.sticker_identity_label_under_symmetry(
+            identity,
+            symmetry,
+            identities_by_geometry,
+        )
+        for identity in trace.identities
+    }
+    frame_one = {
+        source_label: color_by_label[target_label]
+        for target_label, source_label in permutation.items()
+    }
+    trace.observe(0, color_by_label)
+    trace.observe(1, frame_one)
+
+    records = [
+        SimpleNamespace(frame_index=0, pose_candidate=candidate),
+        SimpleNamespace(frame_index=1, pose_candidate=candidate),
+    ]
+    corrected_trace = render_script.recover_cached_pose_symmetries(
+        records,
+        trace,
+        debug=True,
+    )
+    debug_output = capsys.readouterr().out
+    assert "pose symmetry frame 1" in debug_output
+    assert "tested orientations" in debug_output
+    assert "symmetry=07" in debug_output
+
+    recovered = records[1].pose_candidate
+    expected_rvec = render_script.transform_rvec_by_symmetry(candidate.rvec, symmetry)
+    assert render_script.rotation_symmetry_distance(recovered.rvec, expected_rvec) < 1e-6
+    assert corrected_trace.observations[trace.identities[0].label][1][1].tolist() == list(
+        color_by_label[trace.identities[0].label]
+    )
+
+
 def test_sticker_assignment_rejects_opposite_colors_on_one_edge():
     trace = render_script.StickerColorTrace.create()
     center_labels = {
@@ -512,6 +781,58 @@ def test_sticker_identity_overlay_draws_only_visible_stickers():
     assert np.any(image)
 
 
+def test_sticker_likelihood_overlay_is_compact_and_draws_second_color_swatch(monkeypatch):
+    identity = render_script.canonical_sticker_identities()[0]
+    candidate = SimpleNamespace()
+    polygon = np.asarray(
+        ((20.0, 20.0), (44.0, 20.0), (44.0, 44.0), (20.0, 44.0)),
+        dtype=np.float32,
+    )
+    monkeypatch.setattr(
+        render_script,
+        "projected_sticker_faces",
+        lambda *_args, **_kwargs: [(identity, 1.0, polygon)],
+    )
+    drawn_text: list[str] = []
+    rectangles: list[tuple[int, int, int]] = []
+    real_rectangle = cv2.rectangle
+
+    def record_text(image, text, *args, **kwargs):
+        drawn_text.append(text)
+        return image
+
+    def record_rectangle(image, _first, _second, color, *args, **kwargs):
+        rectangles.append(tuple(int(value) for value in color))
+        return real_rectangle(image, _first, _second, color, *args, **kwargs)
+
+    monkeypatch.setattr(render_script.cv2, "putText", record_text)
+    monkeypatch.setattr(render_script.cv2, "rectangle", record_rectangle)
+
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    drawn = render_script.draw_projected_sticker_likelihoods(
+        image,
+        candidate,
+        {identity.label: "red"},
+        {
+            identity.label: {
+                "red": 0.87,
+                "orange": 0.10,
+                "yellow": 0.01,
+                "white": 0.01,
+                "blue": 0.005,
+                "green": 0.005,
+            }
+        },
+        np.zeros((3, 1), dtype=np.float64),
+        np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64),
+        projected_faces=[(identity, 1.0, polygon)],
+    )
+
+    assert drawn == 1
+    assert drawn_text == ["0.87, 0.10"]
+    assert (0, 165, 255) in rectangles
+
+
 def test_sticker_color_sampling_uses_projected_mask_and_cube_sticker_intersection():
     image = np.full((256, 256, 3), (60, 80, 100), dtype=np.uint8)
     camera_matrix = render_script.default_camera_matrix((256, 256), 1.2)
@@ -576,6 +897,9 @@ def test_sticker_rgb_html_plot_has_selectors_for_all_stickers(tmp_path):
 
     html = output_path.read_text(encoding="utf-8")
     assert "All stickers" in html
+    assert "All colors" in html
+    assert "unknown observations" not in html
+    assert "global profile" in html
     assert "Centers" in html
     assert "Edges" in html
     assert "Corners" in html
