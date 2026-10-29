@@ -1,6 +1,9 @@
 import importlib.util
+import json
+from dataclasses import replace
 from itertools import permutations
 from pathlib import Path
+from queue import SimpleQueue
 import sys
 from types import SimpleNamespace
 
@@ -22,6 +25,383 @@ render_script = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 sys.modules[SPEC.name] = render_script
 SPEC.loader.exec_module(render_script)
+
+
+def test_final_video_parser_option_is_not_color_specific():
+    args = render_script.build_parser().parse_args(
+        [
+            "--source",
+            "input.mp4",
+            "--save-final-video",
+            "runs/final.mp4",
+        ]
+    )
+
+    assert args.save_final_video == Path("runs/final.mp4")
+
+
+def test_legacy_colored_video_parser_option_remains_an_alias():
+    args = render_script.build_parser().parse_args(
+        [
+            "--source",
+            "input.mp4",
+            "--save-colored-video",
+            "runs/final.mp4",
+        ]
+    )
+
+    assert args.save_final_video == Path("runs/final.mp4")
+
+
+def test_turn_candidate_log_appends_one_complete_record_per_frame(tmp_path):
+    path = tmp_path / "turn_candidate_scores.jsonl"
+    candidate = SimpleNamespace(
+        turn_candidate_scores=(("R+3", 0.12, 7, 0.08, 0.04),),
+        turn_candidate_diagnostics=(
+            {
+                "label": "R+3",
+                "global_mean_error": 0.12,
+                "global_robust_error": 0.16,
+                "layer_rotations": [],
+            },
+        ),
+        turn_fit_evaluated=True,
+        turn_fit_unexplained_keypoints=2,
+        turn_fit_sticker_score=0.03,
+        turn_fit_static_scores=(0.04, 0.02, 0.06),
+        turn_fit_articulated_scores=(0.03, 0.01, 0.04),
+        layer_rotations=(),
+    )
+
+    render_script.append_turn_candidate_log(path, candidate, 12)
+    render_script.append_turn_candidate_log(path, None, 13)
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [record["frame_index"] for record in records] == [12, 13]
+    assert records[0]["candidate_count"] == 1
+    assert records[0]["candidates"][0]["global_robust_error"] == 0.16
+    assert records[1]["has_pose"] is False
+    assert records[1]["candidate_count"] == 0
+
+
+def test_quicktime_frame_counter_adds_timecode_track_without_reencoding(
+    tmp_path,
+    monkeypatch,
+):
+    output_path = tmp_path / "render.mp4"
+    output_path.write_bytes(b"opencv movie")
+    commands = []
+
+    monkeypatch.setattr(render_script.shutil, "which", lambda name: "/opt/bin/ffmpeg")
+
+    def fake_run(command, **kwargs):
+        commands.append((command, kwargs))
+        Path(command[-1]).write_bytes(b"movie with tmcd track")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(render_script.subprocess, "run", fake_run)
+
+    assert render_script.add_quicktime_frame_counter(output_path)
+    assert output_path.read_bytes() == b"movie with tmcd track"
+    assert len(commands) == 1
+    command, kwargs = commands[0]
+    assert command[command.index("-c") + 1] == "copy"
+    assert command[command.index("-timecode") + 1] == "00:00:00:00"
+    assert kwargs["check"] is False
+
+
+def test_quicktime_frame_counter_skips_non_quicktime_video_extensions(
+    tmp_path,
+    monkeypatch,
+):
+    output_path = tmp_path / "render.avi"
+    output_path.write_bytes(b"opencv movie")
+    monkeypatch.setattr(
+        render_script.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("ffmpeg should not run for AVI"),
+    )
+
+    assert not render_script.add_quicktime_frame_counter(output_path)
+    assert output_path.read_bytes() == b"opencv movie"
+
+
+def test_turn_search_defaults_to_all_six_layer_sides():
+    args = render_script.build_parser().parse_args(["--source", "input.mp4"])
+
+    assert args.pnp_turn_face_candidates == 6
+    assert render_script.PNP_LAYER_MISALIGNMENT_MIN_DEGREES == -45.0
+    assert render_script.PNP_LAYER_MISALIGNMENT_MAX_DEGREES == 45.0
+
+
+def test_turn_overlay_colors_single_and_double_layers_by_role():
+    candidate = SimpleNamespace(
+        layer_rotations=(
+            render_script.CubeLayerRotation(axis=2, side=1, angle_degrees=30.0),
+        )
+    )
+    assert render_script.projected_cube_layer_color(candidate, False, (1, 2, 3)) == (
+        0,
+        0,
+        255,
+    )
+    assert render_script.projected_cube_layer_color(candidate, True, (1, 2, 3)) == (
+        0,
+        0,
+        0,
+    )
+
+    candidate.layer_rotations = (
+        render_script.CubeLayerRotation(
+            axis=2,
+            side=1,
+            angle_degrees=30.0,
+            layer_count=2,
+        ),
+    )
+    assert render_script.projected_cube_layer_color(candidate, False, (1, 2, 3)) == (
+        0,
+        0,
+        0,
+    )
+    assert render_script.projected_cube_layer_color(candidate, True, (1, 2, 3)) == (
+        0,
+        0,
+        255,
+    )
+
+
+def test_combined_headless_progress_keeps_neural_and_pose_counts_together(capsys):
+    progress = render_script.CombinedHeadlessProgress(("neural pass", "pose pass"))
+
+    progress.update("neural pass", 3, 10)
+    progress.update("pose pass", 2, 10)
+    progress.finish()
+
+    output = capsys.readouterr().out
+    assert "neural pass: 3/10" in output
+    assert "pose pass: 2/10" in output
+
+
+def test_async_pose_consumer_only_selects_candidates(monkeypatch):
+    records = SimpleQueue()
+    record = SimpleNamespace(frame="frame", frame_index=4)
+    records.put(record)
+    records.put(None)
+    calls = []
+
+    monkeypatch.setattr(
+        render_script,
+        "make_pose_motion_filter",
+        lambda _args: None,
+    )
+
+    def fake_render_frame(*_args, **kwargs):
+        calls.append(kwargs)
+        return None, "cached", 0
+
+    monkeypatch.setattr(render_script, "render_frame", fake_render_frame)
+    render_script.consume_neural_cache_for_pose(
+        records,
+        None,
+        None,
+        None,
+        SimpleNamespace(),
+        None,
+        None,
+        None,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["neural_data"] is record
+    assert calls[0]["candidate_only"] is True
+
+
+def test_cached_final_replay_draws_all_observed_keypoints(monkeypatch):
+    observed = {}
+
+    def fake_draw_pose(image, frame_points, *args, **kwargs):
+        observed["frame_points"] = frame_points.copy()
+        return image, len(frame_points)
+
+    monkeypatch.setattr(render_script, "draw_pose", fake_draw_pose)
+    monkeypatch.setattr(render_script, "draw_context", lambda image, *args: image)
+
+    neural_data = render_script.NeuralFrameData(
+        frame_index=0,
+        frame=np.zeros((32, 32, 3), dtype=np.uint8),
+        roi_xyxy=(4, 8, 20, 24),
+        roi_source="tracker",
+        sticker_masks=None,
+        local_points=np.asarray([[0.0, 0.0], [8.0, 12.0]], dtype=np.float32),
+        point_confidences=np.asarray([0.9, 0.8], dtype=np.float32),
+        class_ids=np.asarray([0, 1], dtype=np.int32),
+        box_confidences=np.asarray([0.9, 0.8], dtype=np.float32),
+        pose_ready=True,
+    )
+    args = SimpleNamespace(
+        view_size=16,
+        show_sticker_mask=False,
+        show_status=False,
+        show_pnp=False,
+        keypoint_conf=0.25,
+        pose_class_conf={},
+        show_labels=False,
+        show_confidences=False,
+    )
+
+    render_script.render_frame(
+        neural_data.frame,
+        None,
+        None,
+        None,
+        args,
+        neural_data=neural_data,
+        cached_final_only=True,
+    )
+
+    np.testing.assert_allclose(
+        observed["frame_points"],
+        np.asarray([[4.0, 8.0], [12.0, 20.0]], dtype=np.float32),
+    )
+
+
+def test_draw_sticker_boundaries_uses_retained_segmentation_contours():
+    image = np.zeros((32, 32, 3), dtype=np.uint8)
+    candidate = SimpleNamespace(
+        sticker_contours=(
+            np.asarray(
+                [[4.0, 4.0], [20.0, 4.0], [20.0, 20.0], [4.0, 20.0]],
+                dtype=np.float32,
+            ),
+        )
+    )
+
+    rendered = render_script.draw_sticker_boundaries(image, candidate)
+
+    assert np.count_nonzero(rendered) > 0
+
+
+def test_reprojection_error_is_drawn_on_frame_without_console_output():
+    image = np.zeros((80, 240, 3), dtype=np.uint8)
+    candidate = SimpleNamespace(
+        overall_reprojection_error=7.25,
+        reprojection_error=1.5,
+    )
+
+    rendered = render_script.draw_reprojection_error_overlay(image, candidate)
+
+    assert np.count_nonzero(rendered) > 0
+
+
+def test_pose_reprojection_fit_metric_uses_normalized_median_and_p90(monkeypatch):
+    monkeypatch.setattr(
+        render_script,
+        "projected_cube_diameter",
+        lambda *_args, **_kwargs: 100.0,
+    )
+    candidate = SimpleNamespace(
+        camera_matrix=np.eye(3),
+        assignment_image_points=np.asarray(
+            [(1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (4.0, 0.0)],
+        ),
+        assignment_projected_points=np.zeros((4, 2), dtype=np.float64),
+    )
+
+    metric = render_script.pose_reprojection_fit_metric(candidate)
+
+    expected = (2.5 + 0.5 * np.percentile([1.0, 2.0, 3.0, 4.0], 90)) / 100.0
+    assert metric == pytest.approx(expected)
+
+
+def test_sticker_mask_centroids_are_rendered_independently_of_mask_fill():
+    image = np.zeros((32, 32, 3), dtype=np.uint8)
+    sticker_mask = np.zeros((32, 32), dtype=np.uint8)
+    sticker_mask[4:28, 4:28] = 1
+    predicted = (
+        [sticker_mask],
+        None,
+        np.asarray([0], dtype=np.int32),
+        None,
+    )
+    rendered = render_script.draw_sticker_mask_centroids(
+        image,
+        (0, 0, 32, 32),
+        predicted,
+    )
+
+    assert np.all(
+        rendered[16, 16] == render_script.STICKER_MASK_CENTROID_COLOR_BGR
+    )
+
+    without_ids = render_script.draw_sticker_mask_centroids(
+        image,
+        (0, 0, 32, 32),
+        predicted,
+        show_sticker_identities=False,
+    )
+    with_ids = render_script.draw_sticker_mask_centroids(
+        image,
+        (0, 0, 32, 32),
+        predicted,
+        show_sticker_identities=True,
+    )
+    assert np.count_nonzero(with_ids[6:14, 22:32]) > np.count_nonzero(
+        without_ids[6:14, 22:32]
+    )
+
+
+def test_move_search_runs_only_after_static_pose_selection(monkeypatch):
+    candidate = render_script.StickerPnPCandidate(
+        sticker_type="corner",
+        sticker_average_confidence=0.9,
+        image_points=np.zeros((4, 2), dtype=np.float32),
+        object_points=np.zeros((4, 3), dtype=np.float32),
+        projected_sticker_points=np.zeros((4, 2), dtype=np.float32),
+        camera_matrix=np.eye(3, dtype=np.float64),
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+        rvec=np.zeros((3, 1), dtype=np.float64),
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+        reprojection_error=0.0,
+        assignment_image_points=np.zeros((4, 2), dtype=np.float32),
+        assignment_projected_points=np.zeros((4, 2), dtype=np.float32),
+        assignment_object_points=np.zeros((4, 3), dtype=np.float32),
+    )
+    record = render_script.NeuralFrameData(
+        frame_index=0,
+        frame=np.zeros((8, 8, 3), dtype=np.uint8),
+        roi_xyxy=None,
+        roi_source="none",
+        sticker_masks=None,
+        local_points=np.empty((0, 2), dtype=np.float32),
+        point_confidences=np.empty((0,), dtype=np.float32),
+        class_ids=np.empty((0,), dtype=np.int32),
+        box_confidences=np.empty((0,), dtype=np.float32),
+        pose_candidate=candidate,
+        pose_candidates=(candidate,),
+        pose_ready=True,
+    )
+    calls = []
+
+    def fake_refine(value, **kwargs):
+        calls.append(kwargs["recover_layer_turns"])
+        return value
+
+    monkeypatch.setattr(
+        render_script,
+        "solve_pnp_from_low_error_assignments",
+        fake_refine,
+    )
+
+    render_script.recover_cached_pose_symmetries(
+        [record],
+        render_script.StickerColorTrace.create(),
+        refine_pose=True,
+        recover_orientation=False,
+        recognize_moves=True,
+    )
+
+    assert calls == [False, True]
 
 
 def test_sticker_type_patterns_and_three_point_fallbacks():
@@ -1001,7 +1381,7 @@ def test_sticker_selection_prefers_parallelogram_like_geometry():
     assert render_script.sticker_match_priority_key(good_match) < render_script.sticker_match_priority_key(bad_match)
 
 
-def test_render_sticker_masks_uses_inferred_sticker_type_colors():
+def test_render_sticker_masks_uses_neutral_class_independent_color():
     image = np.zeros((32, 32, 3), dtype=np.uint8)
     local_mask = np.zeros((32, 32), dtype=bool)
     local_mask[8:24, 8:24] = True
@@ -1024,7 +1404,7 @@ def test_render_sticker_masks_uses_inferred_sticker_type_colors():
         class_confidences=dict(render_script.DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES),
     )
 
-    assert np.all(output[12, 12] == render_script.STICKER_TYPE_COLORS_BGR["corner"])
+    assert np.all(output[12, 12] == render_script.STICKER_MASK_NEUTRAL_COLOR_BGR)
 
 
 def test_sticker_mask_erosion_parser_and_roi_masks():
@@ -1107,6 +1487,127 @@ def test_solve_sticker_pnp_uses_canonical_corner_correspondence():
     assert candidate.assignment_projected_points is not None
     assert len(candidate.assignment_image_points) == 4
     assert len(candidate.assignment_projected_points) == 4
+
+
+def test_final_assignment_refinement_is_keypoint_only(monkeypatch):
+    object_points = render_script.canonical_sticker_object_points("corner")
+    camera_matrix = render_script.default_camera_matrix((256, 256), 1.2)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    rvec = np.asarray([[0.12], [-0.18], [0.08]], dtype=np.float64)
+    tvec = np.asarray([[4.0], [-3.0], [180.0]], dtype=np.float64)
+    image_points, _ = cv2.projectPoints(
+        object_points,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    match = render_script.StickerKeypointMatch(
+        mask_index=0,
+        keypoint_indices=(0, 1, 2, 3),
+        sticker_type="corner",
+        average_confidence=0.95,
+    )
+    candidate = render_script.solve_sticker_pnp(
+        image_points.reshape(-1, 2),
+        np.asarray([0, 1, 2, 1], dtype=np.int32),
+        match,
+        (256, 256),
+        1.2,
+    )
+    assert candidate is not None
+    candidate = replace(
+        candidate,
+        mask_fit_error=12.0,
+        mask_boundary_sample_count=7,
+    )
+    mask_refinement_calls = []
+    monkeypatch.setattr(
+        render_script,
+        "refine_pose_with_sticker_boundaries",
+        lambda value: mask_refinement_calls.append(value) or value,
+    )
+
+    refined = render_script.solve_pnp_from_low_error_assignments(
+        candidate,
+    )
+
+    assert mask_refinement_calls == []
+    assert not np.isfinite(refined.mask_fit_error)
+    assert refined.mask_boundary_sample_count == 0
+
+    assert len(mask_refinement_calls) == 0
+
+
+def test_initial_sticker_hypotheses_defer_full_refinement(monkeypatch):
+    object_points = render_script.canonical_sticker_object_points("corner")
+    camera_matrix = render_script.default_camera_matrix((256, 256), 1.2)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    rvec = np.asarray([[0.12], [-0.18], [0.08]], dtype=np.float64)
+    tvec = np.asarray([[4.0], [-3.0], [180.0]], dtype=np.float64)
+    image_points, _ = cv2.projectPoints(
+        object_points,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    base_match = render_script.StickerKeypointMatch(
+        mask_index=0,
+        keypoint_indices=(0, 1, 2, 3),
+        sticker_type="corner",
+        average_confidence=0.95,
+    )
+    base_candidate = render_script.solve_sticker_pnp(
+        image_points.reshape(-1, 2),
+        np.asarray([0, 1, 2, 1], dtype=np.int32),
+        base_match,
+        (256, 256),
+        1.2,
+    )
+    assert base_candidate is not None
+    matches = tuple(
+        render_script.StickerKeypointMatch(
+            index,
+            (0, 1, 2, 3),
+            "corner",
+            0.9,
+        )
+        for index in range(3)
+    )
+    refinement_flags = []
+
+    def fake_sticker_solve(*_args, **_kwargs):
+        match = _args[2]
+        return replace(
+            base_candidate,
+            sticker_type=match.sticker_type,
+            sticker_average_confidence=match.average_confidence,
+            mask_fit_error=float(match.mask_index),
+        )
+
+    def fake_assignment_solve(candidate, **kwargs):
+        refinement_flags.append(kwargs)
+        return candidate
+
+    monkeypatch.setattr(render_script, "solve_sticker_pnp", fake_sticker_solve)
+    monkeypatch.setattr(
+        render_script,
+        "solve_pnp_from_low_error_assignments",
+        fake_assignment_solve,
+    )
+
+    candidates = render_script.best_sticker_pnp_candidates(
+        np.zeros((12, 2), dtype=np.float32),
+        np.zeros((12,), dtype=np.int32),
+        matches,
+        (128, 128),
+        1.2,
+    )
+
+    assert len(candidates) == 3
+    assert refinement_flags == []
+    assert [candidate.mask_fit_error for candidate in candidates] == [0.0, 1.0, 2.0]
 
 
 def test_projected_cube_diameter_uses_the_initial_pose_scale():
@@ -1345,7 +1846,7 @@ def test_transformed_visibility_rejects_occluded_lattice_points():
     assert len(visible_points) < len(turned_points)
 
 
-def test_recover_misaligned_layer_updates_assignment_geometry():
+def test_recover_misaligned_layer_updates_assignment_geometry(monkeypatch):
     image_size = (256, 256)
     camera_matrix = render_script.default_camera_matrix(image_size, 1.2)
     dist_coeffs = np.zeros((4, 1), dtype=np.float64)
@@ -1430,6 +1931,23 @@ def test_recover_misaligned_layer_updates_assignment_geometry():
         scoring_points=all_points,
     )
     assert candidate is not None
+    candidate = replace(
+        candidate,
+        sticker_contours=(np.zeros((4, 2), dtype=np.float32),),
+    )
+    def fail_sticker_score(*_args, **_kwargs):
+        raise AssertionError("sticker scoring must not run during pose-only turn fitting")
+
+    monkeypatch.setattr(
+        render_script,
+        "sticker_mask_wireframe_score",
+        fail_sticker_score,
+    )
+    monkeypatch.setattr(
+        render_script,
+        "sticker_mask_layer_wireframe_score",
+        fail_sticker_score,
+    )
     limit = (
         render_script.PNP_FINAL_ASSIGNMENT_ERROR_FRACTION
         * render_script.projected_cube_diameter(candidate)
@@ -1466,6 +1984,22 @@ def test_recover_misaligned_layer_updates_assignment_geometry():
         shortlisted.assignment_projected_points,
         exhaustive.assignment_projected_points,
     )
+    searched_rotations = [
+        rotation
+        for debug_candidate in logged.turn_candidate_debug
+        for rotation in debug_candidate.layer_rotations
+    ]
+    assert len({
+        (rotation.axis, rotation.side)
+        for rotation in searched_rotations
+    }) == 6
+    assert {rotation.layer_count for rotation in searched_rotations} == {1, 2}
+    assert min(rotation.angle_degrees for rotation in searched_rotations) == -45.0
+    assert max(rotation.angle_degrees for rotation in searched_rotations) == 45.0
+    assert all(
+        rotation.angle_degrees % 3.0 == 0.0
+        for rotation in searched_rotations
+    )
     assert len(logged.turn_candidate_scores) > render_script.PNP_TURN_DEBUG_CANDIDATE_COUNT
     assert len(logged.turn_candidate_debug) == len(logged.turn_candidate_scores)
 
@@ -1489,7 +2023,7 @@ def test_three_point_edge_uses_image_gap_to_preserve_cyclic_correspondence():
     np.testing.assert_allclose(object_points[list(sequences[0])], object_points[:3])
 
 
-def test_three_point_pnp_uses_segmentation_to_choose_the_matching_pose_branch():
+def test_three_point_pnp_defers_segmentation_until_after_pose_refinement():
     object_points = render_script.canonical_sticker_object_points("corner")
     camera_matrix = render_script.default_camera_matrix((256, 256), 1.2)
     dist_coeffs = np.zeros((4, 1), dtype=np.float64)
@@ -1518,14 +2052,181 @@ def test_three_point_pnp_uses_segmentation_to_choose_the_matching_pose_branch():
         1.2,
         sticker_contour=full_image_points,
     )
+    candidate_without_mask = render_script.solve_sticker_pnp(
+        full_image_points[[2, 3, 0]],
+        np.asarray([2, 1, 0], dtype=np.int32),
+        match,
+        (256, 256),
+        1.2,
+    )
 
     assert candidate is not None
-    np.testing.assert_allclose(
-        candidate.projected_sticker_points,
-        full_image_points[[2, 3, 0]],
-        atol=1e-3,
+    assert candidate_without_mask is not None
+    np.testing.assert_allclose(candidate.tvec, candidate_without_mask.tvec)
+    np.testing.assert_allclose(candidate.rvec, candidate_without_mask.rvec)
+    assert not np.isfinite(candidate.mask_fit_error)
+
+
+def test_sticker_mask_center_uncertainty_increases_for_asymmetric_mask():
+    clean = np.zeros((64, 64), dtype=np.uint8)
+    clean[20:40, 20:40] = 1
+    asymmetric = clean.copy()
+    asymmetric[20:40, 40:54] = 1
+    barely_visible = np.zeros((64, 64), dtype=np.uint8)
+    barely_visible[30:34, 30:45] = 1
+
+    centers, uncertainties = (
+        render_script.sticker_mask_center_observations_to_frame(
+            [clean, asymmetric, barely_visible],
+            (0, 0, 64, 64),
+        )
     )
-    np.testing.assert_allclose(candidate.tvec, tvec, atol=1e-2)
+
+    assert len(centers) == 3
+    assert uncertainties[1] > uncertainties[0]
+    assert uncertainties[2] > uncertainties[0]
+
+
+def test_sticker_mask_center_hypothesis_score_uses_uncertainty(monkeypatch):
+    monkeypatch.setattr(
+        render_script,
+        "projected_cube_diameter",
+        lambda _candidate: 100.0,
+    )
+
+    def fake_matches(candidate, _rvec, _tvec, _max_error):
+        uncertainty = candidate.sticker_mask_center_uncertainties[0]
+        return (
+            np.zeros((1, 2), dtype=np.float64),
+            np.zeros((1, 3), dtype=np.float64),
+            np.asarray([8.0], dtype=np.float64),
+            np.asarray([uncertainty], dtype=np.float64),
+        )
+
+    monkeypatch.setattr(
+        render_script,
+        "matched_sticker_mask_center_correspondences",
+        fake_matches,
+    )
+    common = dict(
+        overall_reprojection_error=1.0,
+        reprojection_error=1.0,
+        sticker_mask_centers=(np.asarray((20.0, 20.0)),),
+        rvec=np.zeros((3, 1), dtype=np.float64),
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    clean = SimpleNamespace(
+        **common,
+        sticker_mask_center_uncertainties=(1.0,),
+    )
+    uncertain = SimpleNamespace(
+        **common,
+        sticker_mask_center_uncertainties=(8.0,),
+    )
+
+    assert (
+        render_script.sticker_mask_center_hypothesis_score(uncertain)
+        < render_script.sticker_mask_center_hypothesis_score(clean)
+    )
+
+
+def test_sticker_wireframe_score_prefers_the_pose_matching_mask_boundaries():
+    object_points = render_script.canonical_sticker_object_points("corner")
+    image_size = (256, 256)
+    camera_matrix = render_script.default_camera_matrix(image_size, 1.2)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    rvec = np.asarray([[0.12], [-0.18], [0.08]], dtype=np.float64)
+    tvec = np.asarray([[4.0], [-3.0], [180.0]], dtype=np.float64)
+    image_points, _ = cv2.projectPoints(
+        object_points,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    match = render_script.StickerKeypointMatch(
+        mask_index=0,
+        keypoint_indices=(0, 1, 2, 3),
+        sticker_type="corner",
+        average_confidence=0.95,
+    )
+    candidate = render_script.solve_sticker_pnp(
+        image_points.reshape(-1, 2),
+        np.asarray([0, 1, 2, 1], dtype=np.int32),
+        match,
+        image_size,
+        1.2,
+    )
+    assert candidate is not None
+    contours = tuple(
+        polygon
+        for _identity, _depth, polygon in render_script.projected_sticker_faces(
+            candidate,
+            rvec,
+            tvec,
+        )
+    )
+    candidate = replace(candidate, sticker_contours=contours)
+
+    matching_score, matching_count = render_script.sticker_mask_wireframe_score(
+        candidate,
+        rvec,
+        tvec,
+    )
+    shifted_score, shifted_count = render_script.sticker_mask_wireframe_score(
+        candidate,
+        rvec + np.asarray([[0.02], [0.0], [0.0]]),
+        tvec,
+    )
+
+    assert matching_count > 0
+    assert shifted_count > 0
+    assert matching_score < shifted_score
+
+
+def test_sticker_wireframe_score_tolerates_a_merged_mask_boundary():
+    object_points = render_script.canonical_sticker_object_points("corner")
+    image_size = (256, 256)
+    camera_matrix = render_script.default_camera_matrix(image_size, 1.2)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    rvec = np.asarray([[0.12], [-0.18], [0.08]], dtype=np.float64)
+    tvec = np.asarray([[4.0], [-3.0], [180.0]], dtype=np.float64)
+    image_points, _ = cv2.projectPoints(
+        object_points,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    match = render_script.StickerKeypointMatch(0, (0, 1, 2, 3), "corner", 0.95)
+    candidate = render_script.solve_sticker_pnp(
+        image_points.reshape(-1, 2),
+        np.asarray([0, 1, 2, 1], dtype=np.int32),
+        match,
+        image_size,
+        1.2,
+    )
+    assert candidate is not None
+    polygons = [
+        polygon
+        for _identity, _depth, polygon in render_script.projected_sticker_faces(
+            candidate,
+            rvec,
+            tvec,
+        )
+    ]
+    merged = np.concatenate(polygons[:2], axis=0).astype(np.float32)
+    merged_hull = cv2.convexHull(merged.reshape(-1, 1, 2)).reshape(-1, 2)
+    candidate = replace(candidate, sticker_contours=(merged_hull,))
+
+    score, sample_count = render_script.sticker_mask_wireframe_score(
+        candidate,
+        rvec,
+        tvec,
+    )
+
+    assert np.isfinite(score)
+    assert sample_count > 0
 
 
 def test_best_sticker_prefers_four_points_over_higher_confidence_three_points(monkeypatch):
@@ -1808,6 +2509,25 @@ def test_naive_assignment_allows_multiple_observations_to_choose_one_target():
     np.testing.assert_array_equal(columns, np.asarray([0, 0, 2], dtype=np.int32))
 
 
+def test_class_aware_assignment_rejects_known_class_mismatches():
+    observed = np.asarray([(10.0, 10.0)])
+    projected = np.asarray([(10.0, 10.0)])
+
+    score, rows, columns = (
+        render_script.observed_keypoint_reprojection_nearest_assignment(
+            observed,
+            projected,
+            image_size=(100, 100),
+            observed_class_ids=np.asarray([0], dtype=np.int32),
+            projected_class_ids=np.asarray([1], dtype=np.int32),
+        )
+    )
+
+    assert np.isinf(score)
+    assert len(rows) == 0
+    assert len(columns) == 0
+
+
 def test_pivot_consistency_penalizes_a_swapped_free_assignment():
     image_size = (640, 480)
     camera_matrix = render_script.default_camera_matrix(image_size, 1.2)
@@ -1883,7 +2603,7 @@ def test_pivot_consistency_penalizes_a_swapped_free_assignment():
     )
 
     assert swapped_score > correct_score
-    assert class_aware_swapped_score > swapped_score
+    assert np.isinf(class_aware_swapped_score)
 
 
 def test_assignment_residual_direction_statistics_detects_common_direction():

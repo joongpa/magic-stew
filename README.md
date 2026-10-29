@@ -367,8 +367,20 @@ cube symmetry continuous across video frames. A projected red/green/blue XYZ
 gizmo is shown at the cube center; use `--no-show-orientation-axes` to hide it
 or `--orientation-axis-length MM` to resize it. Layer-turn recovery and the
 motion graph are disabled until explicitly enabled with `--recognize-moves`.
-When move recognition is enabled, `--turn-candidate-log OUTPUT_DIR` records
-the evaluated turn permutations and saves annotated candidate images.
+When move recognition is enabled, `--turn-candidate-log OUTPUT_DIR` writes one
+JSONL record per video frame. Each record includes the complete set of tested
+turn configurations, their global mean and robust scores, keypoint/heatmap
+components, inlier counts, trigger diagnostics, and the selected result. It
+also saves annotated candidate images unless `--turn-candidate-images` points
+elsewhere.
+With `--recognize-moves`, pose refinement and geometric turn search run on
+every pose frame.
+During the initial pose-hypothesis pass, sticker segmentation adds a second
+refinement step after the keypoint assignment/PnP refinement. Its objective
+compares that pose against the collective projected sticker wireframe and mask boundaries:
+both directions use robust soft distance, and transverse crossings add a
+finite penalty. Missing internal boundaries, including masks that merge
+same-color stickers, are tolerated rather than treated as a hard failure.
 For a debugging overlay that labels only the currently visible projected
 stickers, add `--show-sticker-identities`; the labels use the stable `C##`,
 `E##`, and `K##` identity numbers used by the HTML plot.
@@ -381,8 +393,13 @@ color scheme is evaluated over its 24 legal cube rotations in OKLab, while
 sticker profiles use two-segment RGB regressions whose inflection reaches 255
 in at least one channel; those regressions are compared in OKLab subject to
 legal edge/corner constraints, including unique use of all 12 edge pieces and
-all 8 corner pieces. Use `--save-colored-video OUTPUT.mp4` if the second pass
-should also be written to a separate video.
+all 8 corner pieces. Use `--save-final-video OUTPUT.mp4` if the final cached
+pass should also be written to a separate video. This saves the pose output
+even when color classification is disabled; the older
+`--save-colored-video OUTPUT.mp4` spelling remains accepted as an alias.
+For `.mp4`, `.m4v`, and `.mov` outputs, the script adds a QuickTime timecode
+track after rendering so QuickTime Player can enable its frame-counter display.
+This requires `ffmpeg` to be available on `PATH`.
 
 For ground-truth overlays on the prepared dataset, use
 `scripts/render_independent_keypoints.py`:
