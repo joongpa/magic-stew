@@ -195,13 +195,18 @@ def face_points(center: np.ndarray, axis: int, side: int) -> np.ndarray:
 def projected_visible_sticker_faces(
     pose: dict[str, object],
     rotations: list[dict[str, object]],
+    selected_layer: dict[str, object] | None = None,
 ) -> list[tuple[np.ndarray, bool]]:
-    return [(item["polygon"], item["moving"]) for item in projected_face_regions(pose, rotations)]
+    return [
+        (item["polygon"], item["moving"])
+        for item in projected_face_regions(pose, rotations, selected_layer)
+    ]
 
 
 def projected_face_regions(
     pose: dict[str, object],
     rotations: list[dict[str, object]],
+    selected_layer: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
     """Project visible cubie faces together with their clickable outer edges."""
 
@@ -245,6 +250,8 @@ def projected_face_regions(
                         projected = projected.reshape(-1, 2)
                         if np.isfinite(projected).all():
                             moving = any(cubie_in_layer(center, rotation) for rotation in rotations)
+                            if not moving and selected_layer is not None:
+                                moving = cubie_in_layer(center, selected_layer)
                             edges = []
                             for other_axis in range(3):
                                 if other_axis == axis or indices[other_axis] == 1:
@@ -295,8 +302,19 @@ def draw_candidate(
     rotations = candidate.get("layer_rotations", [])
     if not isinstance(rotations, list):
         rotations = []
+    selected_layer = None
+    if rotations and all(
+        isinstance(rotation, dict)
+        and abs(float(rotation.get("angle_degrees", 0.0))) <= 1e-6
+        for rotation in rotations
+    ):
+        selected_layer = rotations[0]
+    if selected_layer is None and not rotations:
+        record_selected_layer = record.get("selected_layer")
+        if isinstance(record_selected_layer, dict):
+            selected_layer = record_selected_layer
     try:
-        faces = projected_visible_sticker_faces(pose, rotations)
+        faces = projected_visible_sticker_faces(pose, rotations, selected_layer)
     except (cv2.error, KeyError, TypeError, ValueError):
         return output
     overlay = output.copy()
@@ -507,6 +525,18 @@ function groupTitle(key) {
   const sideName=side>0?'+':'−';
   return `${axisName}${sideName} · ${width===1?'single':'double'} layer`;
 }
+function groupSortKey(items) {
+  const remainderScores=items.map(item=>Number(item.candidate.remainder_score)).filter(Number.isFinite);
+  if(remainderScores.length) {
+    return [-Math.max(...remainderScores), Math.min(...items.map(item=>Number(item.candidate.global_mean_error)).filter(Number.isFinite))];
+  }
+  const meanScores=items.map(item=>Number(item.candidate.global_mean_error)).filter(Number.isFinite);
+  return [meanScores.length ? Math.min(...meanScores) : Infinity, 0];
+}
+function compareGroups(first, second, groupsForSort) {
+  const a=groupSortKey(groupsForSort.get(first)||[]), b=groupSortKey(groupsForSort.get(second)||[]);
+  return a[0]-b[0] || a[1]-b[1] || first.localeCompare(second);
+}
 function candidateAngle(candidate) {
   if(candidate.is_baseline) return 0;
   const rotations=candidate.layer_rotations||[];
@@ -588,8 +618,7 @@ async function loadFrame() {
     if(!groups.has(key)) groups.set(key,[]);
     groups.get(key).push({candidate,index});
   });
-  const orderedKeys=groups.has('static-only') ? ['static-only'] : [];
-  for(let axis=0;axis<3;axis++) for(const side of [-1,1]) for(const width of [1,2]) orderedKeys.push(`${axis}:${side}:${width}`);
+  const orderedKeys=[...groups.keys()].sort((first, second)=>compareGroups(first, second, groups));
   orderedKeys.forEach((key)=>{
     const details=document.createElement('details'); details.className='group';
     details.open=(groups.get(key)||[]).some(item=>item.index===candidateIndex);

@@ -531,6 +531,10 @@ class StickerPnPCandidate:
     mask_center_match_count: int = 0
     image_size: tuple[int, int] | None = None
     layer_rotations: tuple["CubeLayerRotation", ...] = ()
+    # Layer selected by the fast removal-based move-recognition mode.  This is
+    # deliberately separate from ``layer_rotations``: the selected layer is
+    # highlighted, but the displayed cube is not turned.
+    turn_selected_layer: "CubeLayerRotation | None" = None
     # Per-candidate diagnostics: (label, global mean score, inliers,
     # keypoint p90, keypoint mean).
     turn_candidate_scores: tuple[tuple[str, float, int, float, float], ...] = ()
@@ -948,6 +952,19 @@ def layer_rotation_debug_label(
         width = int(rotation.layer_count)
         parts.append(f"{axis}{side}{angle:+.0f}w{width}")
     return "/".join(parts)
+
+
+def candidate_turn_debug_label(candidate: StickerPnPCandidate | None) -> str:
+    """Return the displayed label for either turn-recovery mode."""
+
+    selected_layer = (
+        None if candidate is None else getattr(candidate, "turn_selected_layer", None)
+    )
+    if selected_layer is not None:
+        return f"remove {layer_rotation_debug_label((selected_layer,))}"
+    return layer_rotation_debug_label(
+        tuple() if candidate is None else candidate.layer_rotations
+    )
 
 
 def parse_source(source: str) -> int | str:
@@ -2178,6 +2195,7 @@ def recover_cached_pose_symmetries(
     refine_pose: bool = False,
     recover_orientation: bool = True,
     recognize_moves: bool = False,
+    turn_recovery_mode: str = "angle-search",
     max_turn_face_candidates: int = PNP_TURN_FACE_CANDIDATES,
     record_all_turn_candidates: bool = False,
     pose_motion_filter: PoseMotionFilter | None = None,
@@ -2400,6 +2418,7 @@ def recover_cached_pose_symmetries(
             selected_candidate = solve_pnp_from_low_error_assignments(
                 selected_candidate,
                 recover_layer_turns=True,
+                turn_recovery_mode=turn_recovery_mode,
                 max_turn_face_candidates=max_turn_face_candidates,
                 record_all_turn_candidates=record_all_turn_candidates,
             )
@@ -5341,6 +5360,14 @@ def transform_candidate_by_symmetry(
         transform_layer_rotation_by_symmetry(rotation, symmetry)
         for rotation in candidate.layer_rotations
     )
+    transformed_selected_layer = (
+        None
+        if candidate.turn_selected_layer is None
+        else transform_layer_rotation_by_symmetry(
+            candidate.turn_selected_layer,
+            symmetry,
+        )
+    )
     transformed_debug = tuple(
         replace(
             debug_candidate,
@@ -5400,6 +5427,7 @@ def transform_candidate_by_symmetry(
             )
         ),
         layer_rotations=transformed_layer_rotations,
+        turn_selected_layer=transformed_selected_layer,
         turn_candidate_scores=transformed_scores,
         turn_candidate_debug=transformed_debug,
         rvec=transformed_rvec,
@@ -6167,6 +6195,272 @@ def _legacy_recover_misaligned_cube_layers(
     )
 
 
+def layer_removal_mask_for_assigned_points(
+    assigned_object_points: np.ndarray,
+    axis: int,
+    side: int,
+    layer_count: int,
+) -> np.ndarray:
+    """Return points that are safe to remove for one layer hypothesis.
+
+    The selected slab follows ``cube_layer_mask``: a single layer owns its
+    complete outer 4x4 face (4 corners, 8 corner-edges, and 4
+    corner-edge-centers). A double layer also owns the seam between its two
+    moving cubie layers, while the seam to the stationary layer remains out of
+    the mask.
+    """
+
+    points = np.asarray(assigned_object_points, dtype=np.float64).reshape(-1, 3)
+    if len(points) == 0 or axis not in (0, 1, 2) or side not in (-1, 1):
+        return np.zeros(len(points), dtype=bool)
+    base = np.asarray(CUBE_LATTICE_OBJECT_POINTS_MM, dtype=np.float64).reshape(-1, 3)
+    if len(base) == 0 or not np.isfinite(points).all():
+        return np.zeros(len(points), dtype=bool)
+    nearest = np.argmin(
+        np.linalg.norm(points[:, None, :] - base[None, :, :], axis=2),
+        axis=1,
+    )
+    nearest_error = np.linalg.norm(points - base[nearest], axis=1)
+    valid = nearest_error <= 1e-3
+    layer_count = int(np.clip(layer_count, 1, 2))
+    selected_axis_positions = (
+        set(range(layer_count))
+        if int(side) < 0
+        else set(range(CUBE_GRID_MAX_INDEX - layer_count + 1, CUBE_GRID_MAX_INDEX + 1))
+    )
+    removal = np.zeros(len(points), dtype=bool)
+    for point_index, lattice_index in enumerate(nearest):
+        if not valid[point_index]:
+            continue
+        coord = CUBE_LATTICE_COORDS[int(lattice_index)]
+        if coord[int(axis)] not in selected_axis_positions:
+            continue
+        # Shared seam points remain for a single-layer hypothesis because they
+        # may belong to the adjacent stationary layer. With two layers
+        # selected, that seam is internal to the moving slab and is removed.
+        removal[point_index] = True
+    return removal
+
+
+def recover_misaligned_cube_layers_by_removal(
+    candidate: StickerPnPCandidate,
+    assignment_error_limit: float,
+    *,
+    record_all_turn_candidates: bool = False,
+) -> StickerPnPCandidate:
+    """Select a layer by scoring the complete assignment after removing it.
+
+    This fast move-recognition mode evaluates the twelve single/double layer
+    options once each. It scores the retained keypoints together with gated
+    sticker-centroid matches, never rotates the geometry, and stores the
+    selected layer only as display metadata.
+    """
+
+    image_points = candidate.assignment_image_points
+    projected_points = candidate.assignment_projected_points
+    object_points = candidate.assignment_object_points
+    if image_points is None or projected_points is None or object_points is None:
+        return candidate
+    image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
+    projected_points = np.asarray(projected_points, dtype=np.float32).reshape(-1, 2)
+    object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
+    if (
+        len(image_points) < 3
+        or len(image_points) != len(projected_points)
+        or len(image_points) != len(object_points)
+        or not np.isfinite(assignment_error_limit)
+    ):
+        return candidate
+
+    distances = np.linalg.norm(image_points - projected_points, axis=1)
+    finite = (
+        np.isfinite(image_points).all(axis=1)
+        & np.isfinite(projected_points).all(axis=1)
+        & np.isfinite(object_points).all(axis=1)
+        & np.isfinite(distances)
+    )
+    cube_scale = projected_cube_diameter(candidate)
+    if not np.isfinite(cube_scale) or cube_scale <= 0.0:
+        return candidate
+
+    static_fit = pose_reprojection_fit_metric(candidate)
+    static_unexplained = int(np.count_nonzero(
+        finite & (distances > assignment_error_limit)
+    ))
+    options: list[dict[str, object]] = []
+    for axis in range(3):
+        for side in (-1, 1):
+            for layer_count in (1, 2):
+                removed = layer_removal_mask_for_assigned_points(
+                    object_points,
+                    axis,
+                    side,
+                    layer_count,
+                )
+                retained = finite & ~removed
+                retained_distances = distances[retained]
+                heatmap_mean_error, heatmap_robust_error, heatmap_match_count = (
+                    sticker_mask_center_remainder_fit_metrics(
+                        candidate,
+                        axis,
+                        side,
+                        layer_count,
+                        assignment_error_limit,
+                    )
+                )
+                if len(retained_distances) == 0:
+                    mean_error = float("inf")
+                    robust_error = float("inf")
+                    p90_error = float("inf")
+                    inlier_count = 0
+                else:
+                    normalized = retained_distances / cube_scale
+                    mean_error = float(np.mean(normalized))
+                    robust_error = float(
+                        np.median(normalized)
+                        + 0.5 * np.percentile(normalized, 90)
+                    )
+                    p90_error = float(np.percentile(normalized, 90))
+                    inlier_count = int(
+                        np.count_nonzero(
+                            retained_distances <= assignment_error_limit
+                        )
+                    )
+                combined_mean_error = mean_error + (
+                    PNP_TURN_MASK_CENTER_WEIGHT * heatmap_mean_error
+                    if np.isfinite(heatmap_mean_error)
+                    else float("inf")
+                )
+                combined_robust_error = robust_error + (
+                    PNP_TURN_MASK_CENTER_WEIGHT * heatmap_robust_error
+                    if np.isfinite(heatmap_robust_error)
+                    else float("inf")
+                )
+                # Convert the error metric to a bounded fit score so the
+                # selection follows the requested highest-score convention.
+                remainder_score = (
+                    0.0
+                    if not np.isfinite(combined_robust_error)
+                    else 1.0 / (1.0 + combined_robust_error)
+                )
+                selected_layer = CubeLayerRotation(
+                    axis=axis,
+                    side=side,
+                    angle_degrees=0.0,
+                    layer_count=layer_count,
+                )
+                options.append(
+                    {
+                        "axis": axis,
+                        "side": side,
+                        "layer_count": layer_count,
+                        "label": f"remove {layer_rotation_debug_label((selected_layer,))}",
+                        "selected_layer": selected_layer,
+                        "mean_error": combined_mean_error,
+                        "robust_error": combined_robust_error,
+                        "p90_error": p90_error,
+                        "heatmap_mean_error": heatmap_mean_error,
+                        "heatmap_robust_error": heatmap_robust_error,
+                        "heatmap_match_count": heatmap_match_count,
+                        "remainder_score": remainder_score,
+                        "inlier_count": inlier_count,
+                        "removed_count": int(np.count_nonzero(removed)),
+                        "retained_count": int(np.count_nonzero(retained)),
+                    }
+                )
+
+    ordered_options = sorted(
+        options,
+        key=lambda option: (
+            -float(option["remainder_score"]),
+            float(option["mean_error"]),
+            -int(option["inlier_count"]),
+            int(option["axis"]),
+            int(option["side"]),
+            int(option["layer_count"]),
+        ),
+    )
+    if not ordered_options:
+        return candidate
+    selected = ordered_options[0]
+    recorded_options = (
+        ordered_options
+        if record_all_turn_candidates
+        else ordered_options[:PNP_TURN_DEBUG_CANDIDATE_COUNT]
+    )
+    diagnostics = tuple(
+        {
+            "label": str(option["label"]),
+            "is_baseline": False,
+            "is_layer_removal": True,
+            "layer_axis": int(option["axis"]),
+            "layer_side": int(option["side"]),
+            "layer_count": int(option["layer_count"]),
+            "layer_rotations": [
+                {
+                    "axis": int(option["axis"]),
+                    "side": int(option["side"]),
+                    "angle_degrees": 0.0,
+                    "layer_count": int(option["layer_count"]),
+                }
+            ],
+            "global_mean_error": float(option["mean_error"]),
+            "global_robust_error": float(option["robust_error"]),
+            "remainder_score": float(option["remainder_score"]),
+            "keypoint_mean_error": float(option["mean_error"]),
+            "keypoint_robust_error": float(option["robust_error"]),
+            "keypoint_p90_error": float(option["p90_error"]),
+            "heatmap_mean_error": float(option["heatmap_mean_error"]),
+            "heatmap_robust_error": float(option["heatmap_robust_error"]),
+            "heatmap_match_count": int(option["heatmap_match_count"]),
+            "inlier_count": int(option["inlier_count"]),
+            "layer_inlier_count": int(option["inlier_count"]),
+            "removed_point_count": int(option["removed_count"]),
+            "retained_point_count": int(option["retained_count"]),
+        }
+        for option in recorded_options
+    )
+    scores = tuple(
+        (
+            str(option["label"]),
+            float(option["robust_error"]),
+            int(option["inlier_count"]),
+            float(option["p90_error"]),
+            float(option["mean_error"]),
+        )
+        for option in recorded_options
+    )
+    selected_layer = selected["selected_layer"]
+    return replace(
+        candidate,
+        layer_rotations=(),
+        turn_selected_layer=selected_layer,
+        turn_layer_scores=tuple(
+            (
+                str(option["label"]),
+                float(option["mean_error"]),
+                0.0,
+                float(option["mean_error"]),
+            )
+            for option in recorded_options
+        ),
+        turn_candidate_scores=scores,
+        turn_candidate_diagnostics=diagnostics,
+        turn_candidate_debug=(),
+        turn_fit_sticker_score=0.0,
+        turn_fit_unexplained_keypoints=static_unexplained,
+        turn_fit_evaluated=True,
+        turn_fit_static_scores=(static_fit, 0.0, static_fit),
+        turn_fit_articulated_scores=(
+            float(selected["mean_error"]),
+            0.0,
+            float(selected["robust_error"]),
+        ),
+        turn_fit_search_rvec=np.asarray(candidate.rvec, dtype=np.float64).copy(),
+        turn_fit_search_tvec=np.asarray(candidate.tvec, dtype=np.float64).copy(),
+    )
+
+
 def recover_misaligned_cube_layers(
     candidate: StickerPnPCandidate,
     assignment_error_limit: float,
@@ -6899,6 +7193,101 @@ def sticker_mask_center_fit_metric(
     return metric, len(distances)
 
 
+def sticker_mask_center_remainder_fit_metrics(
+    candidate: StickerPnPCandidate,
+    axis: int,
+    side: int,
+    layer_count: int,
+    max_error: float,
+) -> tuple[float, float, int]:
+    """Score gated sticker centers after removing one static layer slab."""
+
+    observed = np.asarray(
+        getattr(candidate, "sticker_mask_centers", ()),
+        dtype=np.float64,
+    ).reshape(-1, 2)
+    if len(observed) == 0:
+        return 0.0, 0.0, 0
+    if (
+        not np.isfinite(observed).all()
+        or not np.isfinite(max_error)
+        or max_error <= 0.0
+    ):
+        return float("inf"), float("inf"), 0
+    trial_candidate = candidate
+    if getattr(candidate, "layer_rotations", ()):
+        trial_candidate = replace(candidate, layer_rotations=())
+    try:
+        projected_faces = projected_sticker_faces(
+            trial_candidate,
+            candidate.rvec,
+            candidate.tvec,
+        )
+    except (cv2.error, ValueError, FloatingPointError):
+        return float("inf"), float("inf"), 0
+    if not projected_faces:
+        return float("inf"), float("inf"), 0
+
+    projected = np.asarray(
+        [
+            np.mean(np.asarray(face[2], dtype=np.float64), axis=0)
+            for face in projected_faces
+        ],
+        dtype=np.float64,
+    )
+    if not np.isfinite(projected).all():
+        return float("inf"), float("inf"), 0
+    distances = np.linalg.norm(observed[:, None, :] - projected[None, :, :], axis=2)
+    pairs = sorted(
+        (
+            float(distances[observation_index, face_index]),
+            observation_index,
+            face_index,
+        )
+        for observation_index in range(len(observed))
+        for face_index in range(len(projected_faces))
+    )
+    uncertainties = np.asarray(
+        getattr(candidate, "sticker_mask_center_uncertainties", ()),
+        dtype=np.float64,
+    ).reshape(-1)
+    if len(uncertainties) != len(observed):
+        uncertainties = np.ones(len(observed), dtype=np.float64)
+    uncertainties = np.where(
+        np.isfinite(uncertainties), np.maximum(uncertainties, 1.0), np.inf
+    )
+    layer_count = int(np.clip(layer_count, 1, 2))
+    selected_positions = (
+        set(range(layer_count))
+        if int(side) < 0
+        else set(range(3 - layer_count, 3))
+    )
+    used_observations: set[int] = set()
+    used_faces: set[int] = set()
+    retained_distances: list[float] = []
+    retained_uncertainties: list[float] = []
+    for distance, observation_index, face_index in pairs:
+        if distance > max_error:
+            break
+        if observation_index in used_observations or face_index in used_faces:
+            continue
+        used_observations.add(observation_index)
+        used_faces.add(face_index)
+        identity = projected_faces[face_index][0]
+        if identity.cubie_index[int(axis)] in selected_positions:
+            continue
+        retained_distances.append(distance)
+        retained_uncertainties.append(float(uncertainties[observation_index]))
+    if not retained_distances:
+        return float("inf"), float("inf"), 0
+    mean, robust = uncertainty_weighted_center_fit_metrics(
+        np.asarray(retained_distances, dtype=np.float64),
+        np.asarray(retained_uncertainties, dtype=np.float64),
+        projected_cube_diameter(candidate),
+    )
+    return mean, robust, len(retained_distances)
+
+
 def sticker_mask_center_turn_fit_metrics(
     candidate: StickerPnPCandidate,
     rvec: np.ndarray,
@@ -7401,6 +7790,7 @@ def solve_pnp_from_low_error_assignments(
     max_turn_face_candidates: int = PNP_TURN_FACE_CANDIDATES,
     record_all_turn_candidates: bool = False,
     recover_layer_turns: bool = False,
+    turn_recovery_mode: str = "angle-search",
 ) -> StickerPnPCandidate:
     """Run one final PnP solve using the candidate's full assignment.
 
@@ -7440,18 +7830,26 @@ def solve_pnp_from_low_error_assignments(
         PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * cube_diameter
     )
     if recover_layer_turns:
-        candidate = recover_misaligned_cube_layers(
-            candidate,
-            assignment_error_limit,
-            max_face_candidates=max_turn_face_candidates,
-            record_all_turn_candidates=record_all_turn_candidates,
-        )
+        if turn_recovery_mode == "layer-removal":
+            candidate = recover_misaligned_cube_layers_by_removal(
+                candidate,
+                assignment_error_limit,
+                record_all_turn_candidates=record_all_turn_candidates,
+            )
+        else:
+            candidate = recover_misaligned_cube_layers(
+                candidate,
+                assignment_error_limit,
+                max_face_candidates=max_turn_face_candidates,
+                record_all_turn_candidates=record_all_turn_candidates,
+            )
     else:
         # Make the static-pose contract explicit even if a caller passes a
         # candidate that was previously used by the turn-recovery path.
         candidate = replace(
             candidate,
             layer_rotations=(),
+            turn_selected_layer=None,
             turn_candidate_scores=(),
             turn_candidate_debug=(),
         )
@@ -9015,10 +9413,27 @@ def projected_cubelet_faces(
                         candidate.camera_matrix,
                         candidate.dist_coeffs,
                     )
-                    anchor = orientation_anchor.axis is None or (
-                        _cubelet_layer_index(center, orientation_anchor.axis)
-                        in orientation_anchor.layers
+                    selected_layer = getattr(candidate, "turn_selected_layer", None)
+                    active_rotations = tuple(
+                        rotation
+                        for rotation in getattr(candidate, "layer_rotations", ())
+                        if abs(float(rotation.angle_degrees)) > 1e-6
                     )
+                    if selected_layer is not None and not active_rotations:
+                        selected_axis = int(selected_layer.axis)
+                        selected_side = int(selected_layer.side)
+                        selected_count = int(np.clip(selected_layer.layer_count, 1, 3))
+                        selected_layers = (
+                            range(3 - selected_count, 3)
+                            if selected_side > 0
+                            else range(selected_count)
+                        )
+                        anchor = _cubelet_layer_index(center, selected_axis) in selected_layers
+                    else:
+                        anchor = orientation_anchor.axis is None or (
+                            _cubelet_layer_index(center, orientation_anchor.axis)
+                            in orientation_anchor.layers
+                        )
                     projected_faces.append(
                         (
                             float(center_camera[2]),
@@ -9052,6 +9467,12 @@ def projected_cube_layer_color(
             and abs(float(rotation.angle_degrees)) > 1e-6
         )
     )
+    selected_layer = getattr(candidate, "turn_selected_layer", None)
+    if selected_layer is not None and not rotations:
+        # In removal mode ``anchor`` identifies the selected layer.  The
+        # geometry remains static, while the selected layer keeps the normal
+        # red diagnostic color.
+        return PNP_TURN_MOVING_COLOR_BGR if anchor else PNP_TURN_STATIC_COLOR_BGR
     if not rotations:
         return fallback_color
     double_layer = max(int(rotation.layer_count) for rotation in rotations) >= 2
@@ -9235,6 +9656,14 @@ def append_turn_candidate_log(
         and getattr(candidate, "turn_fit_articulated_scores", None) is not None
         else None
     )
+    selected_layer_value = (
+        None if candidate is None else getattr(candidate, "turn_selected_layer", None)
+    )
+    rotations_for_log = (
+        tuple(candidate.layer_rotations)
+        if candidate is not None and candidate.layer_rotations
+        else (() if selected_layer_value is None else (selected_layer_value,))
+    )
     selected_rotations = (
         [
             {
@@ -9243,10 +9672,20 @@ def append_turn_candidate_log(
                 "angle_degrees": float(rotation.angle_degrees),
                 "layer_count": int(rotation.layer_count),
             }
-            for rotation in candidate.layer_rotations
+            for rotation in rotations_for_log
         ]
         if candidate is not None
         else []
+    )
+    selected_layer = (
+        {
+            "axis": int(selected_layer_value.axis),
+            "side": int(selected_layer_value.side),
+            "angle_degrees": float(selected_layer_value.angle_degrees),
+            "layer_count": int(selected_layer_value.layer_count),
+        }
+        if selected_layer_value is not None
+        else None
     )
     search_rvec = (
         getattr(candidate, "turn_fit_search_rvec", None)
@@ -9316,10 +9755,16 @@ def append_turn_candidate_log(
         "static_fit_scores": static_scores,
         "selected_fit_scores": articulated_scores,
         "selected": (
-            layer_rotation_debug_label(candidate.layer_rotations)
+            candidate_turn_debug_label(candidate)
             if candidate is not None
             else None
         ),
+        "turn_recovery_mode": (
+            "layer-removal"
+            if selected_layer_value is not None
+            else "angle-search"
+        ),
+        "selected_layer": selected_layer,
         "selected_layer_rotations": selected_rotations,
         "search_pose": search_pose,
         "candidate_count": len(candidates),
@@ -9902,7 +10347,7 @@ def draw_sticker_pnp_candidate(
     # latter is off by default, but the turn ranking is useful while debugging
     # PnP behavior and should remain visible whenever a turn search ran.
     if turn_candidate_scores:
-        selected_turn_label = layer_rotation_debug_label(candidate.layer_rotations)
+        selected_turn_label = candidate_turn_debug_label(candidate)
         turn_y = 110 if show_status else 66
         turn_diagnostics = getattr(candidate, "turn_candidate_diagnostics", ())
         if turn_diagnostics:
@@ -10632,6 +11077,11 @@ def render_frame(
                 selected_candidate = solve_pnp_from_low_error_assignments(
                     selected_candidate,
                     recover_layer_turns=True,
+                    turn_recovery_mode=getattr(
+                        args,
+                        "pnp_turn_recovery_mode",
+                        "angle-search",
+                    ),
                     max_turn_face_candidates=args.pnp_turn_face_candidates,
                     record_all_turn_candidates=turn_candidate_log is not None,
                 )
@@ -11462,6 +11912,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--pnp-turn-recovery-mode",
+        choices=("layer-removal", "angle-search"),
+        default="layer-removal",
+        help=(
+            "Move-recognition strategy. layer-removal ranks all 12 single/double "
+            "layers by the fit of the remaining points without rotating the cube; "
+            "angle-search retains the exhaustive -45..45 degree search."
+        ),
+    )
+    parser.add_argument(
         "--recover-pose-symmetry",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -11790,6 +12250,7 @@ def main() -> int:
                     and sticker_color_trace is not None
                 ),
                 recognize_moves=args.recognize_moves,
+                turn_recovery_mode=args.pnp_turn_recovery_mode,
                 max_turn_face_candidates=args.pnp_turn_face_candidates,
                 record_all_turn_candidates=args.turn_candidate_log is not None,
                 pose_motion_filter=make_pose_motion_filter(args),
@@ -11907,6 +12368,7 @@ def main() -> int:
                 and sticker_color_trace is not None
             ),
             recognize_moves=args.recognize_moves,
+            turn_recovery_mode=args.pnp_turn_recovery_mode,
             max_turn_face_candidates=args.pnp_turn_face_candidates,
             record_all_turn_candidates=args.turn_candidate_log is not None,
             pose_motion_filter=make_pose_motion_filter(args),

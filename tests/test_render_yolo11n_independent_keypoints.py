@@ -53,6 +53,76 @@ def test_legacy_colored_video_parser_option_remains_an_alias():
     assert args.save_final_video == Path("runs/final.mp4")
 
 
+def test_layer_removal_is_the_default_move_recovery_mode():
+    args = render_script.build_parser().parse_args(["--source", "input.mp4"])
+
+    assert args.pnp_turn_recovery_mode == "layer-removal"
+
+
+def test_single_layer_removal_includes_its_complete_outer_face():
+    points = render_script.CUBE_LATTICE_OBJECT_POINTS_MM
+
+    removed = render_script.layer_removal_mask_for_assigned_points(
+        points,
+        axis=2,
+        side=-1,
+        layer_count=1,
+    )
+
+    assert int(removed.sum()) == 16
+    for point_index, coord in enumerate(render_script.CUBE_LATTICE_COORDS):
+        assert bool(removed[point_index]) == (coord[2] == 0)
+
+
+def test_double_layer_removal_includes_the_inner_seam_plane():
+    points = render_script.CUBE_LATTICE_OBJECT_POINTS_MM
+
+    single = render_script.layer_removal_mask_for_assigned_points(
+        points,
+        axis=2,
+        side=1,
+        layer_count=1,
+    )
+    double = render_script.layer_removal_mask_for_assigned_points(
+        points,
+        axis=2,
+        side=1,
+        layer_count=2,
+    )
+
+    assert int(single.sum()) == 16
+    assert int(double.sum()) == 28
+    assert np.all(double[single])
+    assert np.count_nonzero(double & ~single) == 12
+    assert not np.any(single[
+        [coord[2] == 2 for coord in render_script.CUBE_LATTICE_COORDS]
+    ])
+
+
+def test_layer_removal_selection_colors_selected_layer_without_rotation():
+    selected = render_script.CubeLayerRotation(
+        axis=2,
+        side=1,
+        angle_degrees=0.0,
+        layer_count=2,
+    )
+    candidate = SimpleNamespace(
+        layer_rotations=(),
+        turn_selected_layer=selected,
+    )
+
+    assert render_script.projected_cube_layer_color(candidate, True, (1, 2, 3)) == (
+        0,
+        0,
+        255,
+    )
+    assert render_script.projected_cube_layer_color(candidate, False, (1, 2, 3)) == (
+        0,
+        0,
+        0,
+    )
+
+
 def test_turn_candidate_log_appends_one_complete_record_per_frame(tmp_path):
     path = tmp_path / "turn_candidate_scores.jsonl"
     candidate = SimpleNamespace(
@@ -149,6 +219,68 @@ def test_turn_center_scoring_uses_optimal_one_to_one_assignment(monkeypatch):
 
     assert match_count == 2
     assert ranking < 0.025
+
+
+def test_layer_removal_center_score_keeps_only_centers_outside_removed_layer(monkeypatch):
+    top_identity = render_script.StickerIdentity(
+        label="U-center",
+        category="center",
+        cubie_label="U",
+        face="U",
+        cubie_index=(1, 1, 2),
+        axis=2,
+        side=1,
+    )
+    bottom_identity = render_script.StickerIdentity(
+        label="D-center",
+        category="center",
+        cubie_label="D",
+        face="D",
+        cubie_index=(1, 1, 0),
+        axis=2,
+        side=-1,
+    )
+
+    def polygon(center):
+        x, y = center
+        return np.asarray(
+            ((x - 1, y - 1), (x + 1, y - 1), (x + 1, y + 1), (x - 1, y + 1)),
+            dtype=np.float64,
+        )
+
+    candidate = SimpleNamespace(
+        sticker_mask_centers=(
+            np.asarray((0.0, 0.0)),
+            np.asarray((20.0, 0.0)),
+        ),
+        sticker_mask_center_uncertainties=(1.0, 1.0),
+        layer_rotations=(),
+        rvec=np.zeros((3, 1), dtype=np.float64),
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+        camera_matrix=np.eye(3, dtype=np.float64),
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+    )
+    monkeypatch.setattr(render_script, "projected_cube_diameter", lambda *_args: 100.0)
+    monkeypatch.setattr(
+        render_script,
+        "projected_sticker_faces",
+        lambda *_args: [
+            (top_identity, 1.0, polygon((0.0, 0.0))),
+            (bottom_identity, 1.0, polygon((20.0, 0.0))),
+        ],
+    )
+
+    mean, robust, match_count = render_script.sticker_mask_center_remainder_fit_metrics(
+        candidate,
+        axis=2,
+        side=1,
+        layer_count=1,
+        max_error=5.0,
+    )
+
+    assert mean == pytest.approx(0.0)
+    assert robust == pytest.approx(0.0)
+    assert match_count == 1
 
 
 def test_quicktime_frame_counter_adds_timecode_track_without_reencoding(

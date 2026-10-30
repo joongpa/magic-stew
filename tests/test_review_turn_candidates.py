@@ -92,6 +92,24 @@ def test_static_front_view_does_not_project_opposite_cubie_faces():
     assert len(review_script.projected_visible_sticker_faces(pose, [])) == 9
 
 
+def test_static_layer_removal_candidate_still_marks_selected_layer_red():
+    pose = {
+        "camera_matrix": [[200.0, 0.0, 80.0], [0.0, 200.0, 60.0], [0.0, 0.0, 1.0]],
+        "dist_coeffs": [0.0, 0.0, 0.0, 0.0],
+        "rvec": [0.0, 0.0, 0.0],
+        "tvec": [0.0, 0.0, 300.0],
+    }
+
+    faces = review_script.projected_visible_sticker_faces(
+        pose,
+        [],
+        {"axis": 2, "side": -1, "angle_degrees": 0.0, "layer_count": 1},
+    )
+
+    assert len(faces) == 9
+    assert all(moving for _polygon, moving in faces)
+
+
 def test_renderer_selection_is_found_even_when_not_top_ranked():
     turn = {"axis": 0, "side": 1, "angle_degrees": 12.0, "layer_count": 1}
     record = {
