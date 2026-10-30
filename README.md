@@ -361,6 +361,16 @@ control the per-frame averaging and the minimum reliable mask area. Use
 `--sticker-mask-erosion N` to shrink each predicted sticker mask by `N` ROI
 pixels before rendering and color sampling, which avoids sampling near sticker
 boundaries.
+When `--show-sticker-mask` is enabled, the final output displays the
+transparent red distance-transform heatmap used to visualize sticker-mask
+peaks instead of the binary mask fill and boundary overlay.
+That same peak-to-centroid confidence tempers mask-center influence during pose
+refinement, so irregular or merged masks cannot pull the solve as strongly as
+clean, centered masks.
+Before pose fitting and display, sticker detections are filtered so a mask
+with at least 90% of its area covered by the union of larger retained sticker
+masks is removed; identical masks keep the first detection. This check uses
+the raw predicted masks before `--sticker-mask-erosion`.
 By default the renderer is in static-pose mode: it selects a sticker, refines
 the full-cube pose from the independent keypoint assignment, and keeps the
 cube symmetry continuous across video frames. A projected red/green/blue XYZ
@@ -371,10 +381,31 @@ When move recognition is enabled, `--turn-candidate-log OUTPUT_DIR` writes one
 JSONL record per video frame. Each record includes the complete set of tested
 turn configurations, their global mean and robust scores, keypoint/heatmap
 components, inlier counts, trigger diagnostics, and the selected result. It
-also saves annotated candidate images unless `--turn-candidate-images` points
+also includes the search-time camera/pose inputs, observed keypoints/classes,
+fixed assignments, and heatmap centers needed to reproject every logged pose.
+Annotated candidate images are saved unless `--turn-candidate-images` points
 elsewhere.
 With `--recognize-moves`, pose refinement and geometric turn search run on
 every pose frame.
+
+To review the logged alternatives interactively, run the standalone browser
+reviewer against the same source video and log directory:
+
+```bash
+.venv/bin/python scripts/review_turn_candidates.py \
+  --video /path/to/solve.mp4 \
+  --log /path/to/turn-candidate-log
+```
+
+Open the printed local URL. Step through frames, click a candidate to inspect
+its reprojected pose, and save `Correct`, `Uncertain`, or `No valid pose`. The
+labels are written to `turn_candidate_scores.labels.json` beside the JSONL and
+do not modify the inference log. Tested options are grouped into collapsible
+single-layer and double-layer sections for each of the six layer sides.
+Click a visible projected layer to select it, double-click for a double-layer
+turn, then use `,` and `.` to step through the logged angles. Click the center
+sticker for that face's layer or an outer row for an adjacent layer.
+
 During the initial pose-hypothesis pass, sticker segmentation adds a second
 refinement step after the keypoint assignment/PnP refinement. Its objective
 compares that pose against the collective projected sticker wireframe and mask boundaries:

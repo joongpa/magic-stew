@@ -1,6 +1,6 @@
 import importlib.util
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from itertools import permutations
 from pathlib import Path
 from queue import SimpleQueue
@@ -70,6 +70,15 @@ def test_turn_candidate_log_appends_one_complete_record_per_frame(tmp_path):
         turn_fit_sticker_score=0.03,
         turn_fit_static_scores=(0.04, 0.02, 0.06),
         turn_fit_articulated_scores=(0.03, 0.01, 0.04),
+        turn_fit_search_rvec=np.zeros((3, 1), dtype=np.float64),
+        turn_fit_search_tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+        camera_matrix=np.eye(3, dtype=np.float64),
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+        assignment_image_points=np.asarray(((1.0, 2.0),), dtype=np.float32),
+        assignment_observed_class_ids=np.asarray((2,), dtype=np.int32),
+        assignment_fixed_mask=np.asarray((True,)),
+        sticker_mask_centers=(np.asarray((3.0, 4.0)),),
+        sticker_mask_center_uncertainties=(1.5,),
         layer_rotations=(),
     )
 
@@ -80,8 +89,66 @@ def test_turn_candidate_log_appends_one_complete_record_per_frame(tmp_path):
     assert [record["frame_index"] for record in records] == [12, 13]
     assert records[0]["candidate_count"] == 1
     assert records[0]["candidates"][0]["global_robust_error"] == 0.16
+    assert records[0]["search_pose"]["tvec"] == [[0.0], [0.0], [200.0]]
+    assert records[0]["search_pose"]["assignment_image_points"] == [[1.0, 2.0]]
     assert records[1]["has_pose"] is False
     assert records[1]["candidate_count"] == 0
+
+
+def test_turn_center_scoring_rewards_coverage_and_discounts_uncertain_false_detection(monkeypatch):
+    @dataclass
+    class CenterCandidate:
+        sticker_mask_centers: tuple
+        sticker_mask_center_uncertainties: tuple
+        layer_rotations: tuple = ()
+
+    monkeypatch.setattr(render_script, "projected_cube_diameter", lambda *_args: 100.0)
+    monkeypatch.setattr(
+        render_script,
+        "projected_sticker_faces",
+        lambda *_args: [(None, 0, np.tile([0.0, 0.0], (4, 1)))],
+    )
+    pose = np.zeros((3, 1))
+
+    def score(centers, uncertainties):
+        candidate = CenterCandidate(tuple(centers), tuple(uncertainties))
+        return render_script.sticker_mask_center_turn_fit_metrics(candidate, pose, pose, (), 5.0)
+
+    close, _, close_count = score(((0.0, 0.0),), (1.0,))
+    within_tolerance, _, _ = score(((2.0, 0.0),), (1.0,))
+    reliable_false, _, reliable_count = score(((0.0, 0.0), (30.0, 0.0)), (1.0, 1.0))
+    uncertain_false, _, uncertain_count = score(((0.0, 0.0), (30.0, 0.0)), (1.0, 4.0))
+    assert close == within_tolerance == 0.0
+    assert close_count == reliable_count == uncertain_count == 1
+    assert 0.0 < uncertain_false < reliable_false
+    assert reliable_false == pytest.approx(0.025)
+
+
+def test_turn_center_scoring_uses_optimal_one_to_one_assignment(monkeypatch):
+    @dataclass
+    class CenterCandidate:
+        sticker_mask_centers: tuple
+        sticker_mask_center_uncertainties: tuple
+        layer_rotations: tuple = ()
+
+    monkeypatch.setattr(render_script, "projected_cube_diameter", lambda *_args: 100.0)
+    monkeypatch.setattr(
+        render_script,
+        "projected_sticker_faces",
+        lambda *_args: [
+            (None, 0, np.tile([0.0, 0.0], (4, 1))),
+            (None, 0, np.tile([6.0, 0.0], (4, 1))),
+        ],
+    )
+    candidate = CenterCandidate(((2.0, 0.0), (0.0, 0.0)), (1.0, 1.0))
+    pose = np.zeros((3, 1))
+
+    ranking, _, match_count = render_script.sticker_mask_center_turn_fit_metrics(
+        candidate, pose, pose, (), 5.0
+    )
+
+    assert match_count == 2
+    assert ranking < 0.025
 
 
 def test_quicktime_frame_counter_adds_timecode_track_without_reencoding(
@@ -349,6 +416,96 @@ def test_sticker_mask_centroids_are_rendered_independently_of_mask_fill():
     assert np.count_nonzero(with_ids[6:14, 22:32]) > np.count_nonzero(
         without_ids[6:14, 22:32]
     )
+
+
+def test_sticker_mask_heatmap_is_transparent_and_redder_at_mask_peak():
+    image = np.full((32, 32, 3), 10, dtype=np.uint8)
+    sticker_mask = np.zeros((32, 32), dtype=bool)
+    sticker_mask[8:24, 8:24] = True
+    predicted = (
+        [sticker_mask],
+        None,
+        np.asarray([0], dtype=np.int32),
+        None,
+    )
+
+    rendered = render_script.draw_sticker_mask_heatmap(
+        image,
+        (0, 0, 32, 32),
+        predicted,
+        show_sticker_identities=False,
+    )
+
+    np.testing.assert_array_equal(rendered[0, 0], image[0, 0])
+    assert rendered[16, 16, 2] > rendered[16, 8, 2] > image[16, 8, 2]
+
+
+def test_sticker_mask_containment_preserves_neighbors_and_first_duplicate():
+    large = np.zeros((30, 40), dtype=bool)
+    large[2:12, 2:14] = True
+    contained = np.zeros_like(large)
+    contained[3:8, 3:8] = True
+    neighbor = np.zeros_like(large)
+    neighbor[2:12, 13:23] = True
+    duplicate = large.copy()
+    empty = np.zeros_like(large)
+
+    keep = render_script.retained_sticker_mask_indices(
+        np.asarray([contained, neighbor, large, duplicate, empty])
+    )
+
+    assert keep == [1, 2]
+
+
+def test_sticker_mask_containment_uses_fraction_of_smaller_mask():
+    large = np.zeros((20, 30), dtype=bool)
+    large[0:10, 0:12] = True
+    mostly_inside = np.zeros_like(large)
+    mostly_inside[0:10, 3:13] = True  # 90 of 100 pixels overlap.
+    partly_inside = np.zeros_like(large)
+    partly_inside[0:10, 4:14] = True  # 80 of 100 pixels overlap.
+
+    assert render_script.retained_sticker_mask_indices(np.asarray([mostly_inside, large])) == [1]
+    assert render_script.retained_sticker_mask_indices(np.asarray([partly_inside, large])) == [0, 1]
+
+
+def test_sticker_mask_containment_uses_union_of_other_masks():
+    target = np.zeros((30, 30), dtype=bool)
+    target[10:20, 10:20] = True
+
+    first_cover = np.zeros_like(target)
+    first_cover[10:20, 10:15] = True  # 50% of the target.
+    first_cover[0:10, 0:10] = True  # Make this a larger retained mask.
+
+    second_cover = np.zeros_like(target)
+    second_cover[10:20, 16:20] = True  # 40% of the target.
+    second_cover[0:10, 20:30] = True  # Make this a larger retained mask.
+
+    # Neither cover reaches the threshold alone, but their union covers 90%
+    # of the target, so the target is filtered out.
+    assert render_script.retained_sticker_mask_indices(
+        np.asarray([target, first_cover, second_cover])
+    ) == [1, 2]
+
+
+def test_sticker_mask_filter_preserves_class_ids_and_separate_cube_mask():
+    small = np.zeros((16, 16), dtype=np.float32)
+    small[4:7, 4:7] = 1
+    large = np.zeros_like(small)
+    large[2:10, 2:10] = 1
+    cube = np.ones_like(small)
+    result = SimpleNamespace(
+        masks=SimpleNamespace(data=np.asarray([small, cube, large])),
+        boxes=SimpleNamespace(cls=np.asarray([0, 2, 1])),
+        names={0: "red", 1: "blue", 2: "cube"},
+    )
+
+    masks, _names, classes, cube_mask = render_script.sticker_masks_from_result(result)
+
+    assert len(masks) == 1
+    np.testing.assert_array_equal(masks[0], large.astype(bool))
+    np.testing.assert_array_equal(classes, [1])
+    np.testing.assert_array_equal(cube_mask, cube.astype(bool))
 
 
 def test_move_search_runs_only_after_static_pose_selection(monkeypatch):

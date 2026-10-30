@@ -54,6 +54,7 @@ from time import perf_counter
 
 import cv2
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -323,10 +324,21 @@ PNP_MASK_CENTER_HYPOTHESIS_HUBER_DELTA = 2.0
 PNP_MASK_CENTER_UNMATCHED_PENALTY = 1.0
 PNP_MASK_CENTER_SHAPE_PENALTY = 4.0
 PNP_MASK_CENTER_MIN_VISIBLE_AREA = 64.0
-# Turn fitting uses the same segmentation-derived center observations as
-# static fitting, but only for the layer being tested. Boundary/contour
-# scoring remains disabled.
+# A centroid at the distance-transform peak is a stronger center observation
+# than one sitting in a low-heat region. Keep a floor so weak masks remain
+# usable as soft evidence instead of becoming hard rejects.
+PNP_MASK_CENTER_HEATMAP_CONFIDENCE_FLOOR = 0.20
+PNP_MASK_CENTER_SOLVE_WEIGHT = 0.50
+# Suppress duplicate/partial sticker detections mostly covered by a larger
+# sticker mask, before erosion and before the masks are used by any pass.
+STICKER_MASK_CONTAINMENT_THRESHOLD = 0.90
+# Turn ranking uses all segmentation-derived center observations. Its bounded
+# coverage penalty is converted to cube-normalized distance units before it is
+# combined with keypoint reprojection error.
 PNP_TURN_MASK_CENTER_WEIGHT = 1.0
+PNP_TURN_CENTER_TOLERANCE_FRACTION = 0.02
+PNP_TURN_CENTER_UNCERTAINTY_TOLERANCE_CAP = 0.01
+PNP_TURN_CENTER_PENALTY_SCALE = 0.05
 # Final-solve observations must be close relative to the displayed cube size.
 # This is deliberately expressed as a fraction of the projected cube diameter
 # so the same setting works at different distances from the camera.
@@ -525,6 +537,11 @@ class StickerPnPCandidate:
     # Full JSON-safe diagnostics for every tested turn configuration when
     # candidate logging is enabled.
     turn_candidate_diagnostics: tuple[dict[str, object], ...] = ()
+    # Exact static pose inputs used while evaluating the turn configurations.
+    # These are kept separate because temporal filtering may change the pose
+    # after the search has completed.
+    turn_fit_search_rvec: np.ndarray | None = None
+    turn_fit_search_tvec: np.ndarray | None = None
     turn_candidate_debug: tuple["TurnCandidateDebug", ...] = ()
     # Per-layer pre-search diagnostics: (layer, keypoint, sticker, combined).
     turn_layer_scores: tuple[tuple[str, float, float, float], ...] = ()
@@ -1085,6 +1102,34 @@ def predict_sticker_result(
     return results[0] if results else None
 
 
+def retained_sticker_mask_indices(masks: np.ndarray) -> list[int]:
+    """Keep nonempty masks unless larger retained masks cover most of them.
+
+    Coverage is measured against the union of all larger masks already
+    retained, so several partial detections can collectively suppress a
+    duplicate. Process largest first and break equal-area ties by original
+    detection order. Return surviving indices in original order to preserve
+    alignment with segmentation class IDs and downstream sticker references.
+    """
+
+    binary = np.asarray(masks, dtype=bool)
+    if binary.ndim != 3 or not len(binary):
+        return []
+    areas = np.count_nonzero(binary, axis=(1, 2))
+    retained: list[int] = []
+    retained_union = np.zeros(binary.shape[1:], dtype=bool)
+    for index in sorted(range(len(binary)), key=lambda item: (-int(areas[item]), item)):
+        area = int(areas[index])
+        if area == 0:
+            continue
+        covered_area = np.count_nonzero(binary[index] & retained_union)
+        if covered_area >= STICKER_MASK_CONTAINMENT_THRESHOLD * area:
+            continue
+        retained.append(index)
+        retained_union |= binary[index]
+    return sorted(retained)
+
+
 def sticker_masks_from_result(
     result: object | None,
 ) -> tuple[list[np.ndarray], object, np.ndarray, np.ndarray | None] | None:
@@ -1127,6 +1172,8 @@ def sticker_masks_from_result(
         ]
     else:
         keep = list(range(min(len(mask_data), len(class_ids))))
+    selected_masks = np.asarray(mask_data[keep]) >= 0.5
+    keep = [keep[index] for index in retained_sticker_mask_indices(selected_masks)]
     return (
         [np.asarray(mask_data[index]) >= 0.5 for index in keep],
         names,
@@ -3928,6 +3975,23 @@ def sticker_mask_center_observations_to_frame(
                 local_center - np.asarray((peak_x, peak_y), dtype=np.float64)
             )
         )
+        peak_distance = float(distance[peak_y, peak_x])
+        centroid_distance = float(
+            distance[
+                int(np.clip(round(local_center[1]), 0, distance.shape[0] - 1)),
+                int(np.clip(round(local_center[0]), 0, distance.shape[1] - 1)),
+            ]
+        )
+        heatmap_confidence = (
+            centroid_distance / peak_distance if peak_distance > 0.0 else 0.0
+        )
+        heatmap_confidence = float(
+            np.clip(
+                heatmap_confidence,
+                PNP_MASK_CENTER_HEATMAP_CONFIDENCE_FLOOR,
+                1.0,
+            )
+        )
         pixel_spread = float(
             np.sqrt(
                 np.var(xs.astype(np.float64))
@@ -3965,6 +4029,10 @@ def sticker_mask_center_observations_to_frame(
             1.0,
             (base_uncertainty + size_penalty) * shape_penalty,
         )
+        # A centroid in a low-intensity heatmap region is less trustworthy
+        # even when its overall mask area is large. This directly reduces its
+        # inverse-variance weight in center scoring and turn ranking.
+        uncertainty /= np.sqrt(heatmap_confidence)
         centers.append(center)
         uncertainties.append(uncertainty)
     return tuple(centers), tuple(uncertainties)
@@ -6156,6 +6224,8 @@ def recover_misaligned_cube_layers(
 
     unexplained_count = int(np.count_nonzero(finite & ~accepted & ~fixed_mask))
     static_fit = pose_reprojection_fit_metric(candidate)
+    search_rvec = np.asarray(candidate.rvec, dtype=np.float64).copy()
+    search_tvec = np.asarray(candidate.tvec, dtype=np.float64).copy()
     static_sticker_fit, static_sticker_matches = sticker_mask_center_fit_metric(
         candidate,
         candidate.rvec,
@@ -6183,6 +6253,8 @@ def recover_misaligned_cube_layers(
             static_fit + PNP_TURN_MASK_CENTER_WEIGHT * static_sticker_fit,
         ),
         turn_fit_articulated_scores=None,
+        turn_fit_search_rvec=search_rvec,
+        turn_fit_search_tvec=search_tvec,
     )
     if (not unexplained_count and not sticker_error) or max_face_candidates <= 0:
         return diagnostic_candidate
@@ -6834,7 +6906,13 @@ def sticker_mask_center_turn_fit_metrics(
     layer_rotations: tuple[CubeLayerRotation, ...],
     max_error: float,
 ) -> tuple[float, float, int]:
-    """Return global mean/robust heatmap fit for one turn configuration."""
+    """Return coverage-aware ranking and legacy robust acceptance metrics.
+
+    Every observed center contributes to ranking, including unmatched ones.
+    The bounded dimensionless coverage penalty is scaled into the same
+    cube-normalized units as keypoint error. Acceptance retains the previous
+    median-plus-p90 metric so its threshold is not silently redefined.
+    """
 
     observed = np.asarray(
         getattr(candidate, "sticker_mask_centers", ()),
@@ -6845,26 +6923,78 @@ def sticker_mask_center_turn_fit_metrics(
     if not np.isfinite(max_error) or max_error <= 0.0:
         return float("inf"), float("inf"), 0
     trial_candidate = replace(candidate, layer_rotations=layer_rotations)
-    (
-        _image_points,
-        _object_points,
-        distances,
-        uncertainties,
-    ) = matched_sticker_mask_center_correspondences(
-        trial_candidate,
-        rvec,
-        tvec,
-        max_error,
-    )
-    if len(distances) == 0:
-        return float("inf"), float("inf"), 0
     scale = projected_cube_diameter(candidate, rvec, tvec)
-    mean, robust = uncertainty_weighted_center_fit_metrics(
-        distances,
-        uncertainties,
-        scale,
+    if not np.isfinite(scale) or scale <= 0.0 or not np.isfinite(observed).all():
+        return float("inf"), float("inf"), 0
+    try:
+        faces = projected_sticker_faces(trial_candidate, rvec, tvec)
+    except (cv2.error, ValueError, FloatingPointError):
+        return float("inf"), float("inf"), 0
+    projected = np.asarray(
+        [np.mean(np.asarray(face[2], dtype=np.float64), axis=0) for face in faces],
+        dtype=np.float64,
+    ).reshape(-1, 2)
+    uncertainties = np.asarray(
+        getattr(candidate, "sticker_mask_center_uncertainties", ()), dtype=np.float64
+    ).reshape(-1)
+    if len(uncertainties) != len(observed):
+        uncertainties = np.ones(len(observed), dtype=np.float64)
+    uncertainties = np.where(
+        np.isfinite(uncertainties), np.maximum(uncertainties, 1.0), np.inf
     )
-    return mean, robust, len(distances)
+    weights = 1.0 / np.square(uncertainties)
+    if not np.any(weights > 0.0):
+        return float("inf"), float("inf"), 0
+    distances = np.linalg.norm(observed[:, None, :] - projected[None, :, :], axis=2)
+    gate = max_error / scale
+    tolerance = np.minimum(
+        PNP_TURN_CENTER_TOLERANCE_FRACTION
+        + np.minimum(uncertainties / scale, PNP_TURN_CENTER_UNCERTAINTY_TOLERANCE_CAP),
+        gate - 1e-9,
+    )
+    fraction = np.clip(
+        (distances / scale - tolerance[:, None]) / (gate - tolerance[:, None]),
+        0.0,
+        1.0,
+    )
+    penalties = fraction * fraction * (3.0 - 2.0 * fraction)
+    # One dummy per detection permits any number of unmatched observations.
+    costs = np.concatenate(
+        (penalties * weights[:, None], np.broadcast_to(weights[:, None], (len(observed), len(observed)))),
+        axis=1,
+    )
+    rows, columns = linear_sum_assignment(costs)
+    mean = PNP_TURN_CENTER_PENALTY_SCALE * float(
+        np.sum(costs[rows, columns]) / np.sum(weights)
+    )
+    match_count = int(np.count_nonzero(
+        (columns < len(projected))
+        & (costs[rows, columns] < weights[rows])
+    ))
+
+    # Preserve the previous greedy correspondence and acceptance score.
+    pairs = sorted(
+        (float(distances[i, j]), i, j)
+        for i in range(len(observed))
+        for j in range(len(projected))
+    )
+    used_observations: set[int] = set()
+    used_faces: set[int] = set()
+    old_distances: list[float] = []
+    old_uncertainties: list[float] = []
+    for distance, observation_index, face_index in pairs:
+        if distance > max_error:
+            break
+        if observation_index in used_observations or face_index in used_faces:
+            continue
+        used_observations.add(observation_index)
+        used_faces.add(face_index)
+        old_distances.append(distance)
+        old_uncertainties.append(float(uncertainties[observation_index]))
+    _, robust = uncertainty_weighted_center_fit_metrics(
+        np.asarray(old_distances), np.asarray(old_uncertainties), scale
+    )
+    return mean, robust, match_count
 
 
 def sticker_mask_center_layer_fit_metric(
@@ -6971,7 +7101,7 @@ def sticker_mask_center_layer_fit_metric(
     return metric, len(matched)
 
 
-def draw_sticker_mask_centroids(
+def draw_sticker_mask_heatmap(
     image: np.ndarray,
     roi_xyxy: tuple[int, int, int, int],
     predicted: tuple[list[np.ndarray], object, np.ndarray, np.ndarray | None]
@@ -6979,16 +7109,49 @@ def draw_sticker_mask_centroids(
     | None,
     sticker_mask_erosion: int = 0,
     show_sticker_identities: bool = True,
+    show_sticker_mask: bool = True,
 ) -> np.ndarray:
-    """Draw segmentation-derived sticker centers and optional IDs."""
+    """Draw a transparent red heatmap centered on each sticker-mask peak."""
 
     output = image.copy()
-    if predicted is None:
+    if not show_sticker_mask or predicted is None:
         return output
-    if len(predicted) == 4:
-        local_masks = predicted[0]
-    else:
-        local_masks = predicted[0]
+    local_masks = predicted[0]
+    x1, y1, x2, y2 = (int(value) for value in roi_xyxy)
+    roi_height = y2 - y1
+    roi_width = x2 - x1
+    if roi_height <= 0 or roi_width <= 0:
+        return output
+
+    heatmap = np.zeros((roi_height, roi_width), dtype=np.float32)
+    for mask in sticker_segmentation_masks_in_roi(
+        predicted,
+        (roi_height, roi_width),
+        sticker_mask_erosion,
+    ):
+        distance = cv2.distanceTransform(
+            np.asarray(mask, dtype=np.uint8),
+            cv2.DIST_L2,
+            5,
+        )
+        peak = float(distance.max())
+        if peak > 0.0:
+            heatmap = np.maximum(heatmap, distance / peak)
+
+    if bool(np.any(heatmap > 0.0)):
+        # Keep the boundary nearly transparent and make the deepest interior
+        # pixels visibly red. The power curve concentrates color near the
+        # distance-transform peak instead of tinting the whole mask uniformly.
+        alpha = np.square(heatmap) * 0.82
+        roi = output[y1:y2, x1:x2]
+        red = np.zeros_like(roi, dtype=np.float32)
+        red[..., 2] = 255.0
+        blended = (
+            roi.astype(np.float32) * (1.0 - alpha[..., None])
+            + red * alpha[..., None]
+        )
+        output[y1:y2, x1:x2] = np.clip(blended, 0.0, 255.0).astype(np.uint8)
+
     centers = sticker_mask_centers_to_frame(
         local_masks,
         roi_xyxy,
@@ -7019,6 +7182,26 @@ def draw_sticker_mask_centroids(
                 cv2.LINE_AA,
             )
     return output
+
+
+def draw_sticker_mask_centroids(
+    image: np.ndarray,
+    roi_xyxy: tuple[int, int, int, int],
+    predicted: tuple[list[np.ndarray], object, np.ndarray, np.ndarray | None]
+    | tuple[list[np.ndarray], object, np.ndarray]
+    | None,
+    sticker_mask_erosion: int = 0,
+    show_sticker_identities: bool = True,
+) -> np.ndarray:
+    """Backward-compatible alias for the segmentation heatmap overlay."""
+
+    return draw_sticker_mask_heatmap(
+        image,
+        roi_xyxy,
+        predicted,
+        sticker_mask_erosion=sticker_mask_erosion,
+        show_sticker_identities=show_sticker_identities,
+    )
 
 
 def refine_pose_with_sticker_centers(
@@ -7058,6 +7241,38 @@ def refine_pose_with_sticker_centers(
             mask_center_fit_error=float("inf"),
             mask_center_match_count=0,
         )
+    observed_center_image_points = np.asarray(
+        center_image_points,
+        dtype=np.float64,
+    ).copy()
+    try:
+        projected_center_points, _ = cv2.projectPoints(
+            center_object_points,
+            candidate.rvec,
+            candidate.tvec,
+            candidate.camera_matrix,
+            candidate.dist_coeffs,
+        )
+    except cv2.error:
+        return candidate
+    projected_center_points = projected_center_points.reshape(-1, 2)
+    center_uncertainties = np.maximum(
+        np.asarray(_center_uncertainties, dtype=np.float64).reshape(-1),
+        1.0,
+    )
+    if len(center_uncertainties) != len(center_image_points):
+        center_uncertainties = np.ones(len(center_image_points), dtype=np.float64)
+    center_weights = np.clip(
+        PNP_MASK_CENTER_SOLVE_WEIGHT / np.square(center_uncertainties),
+        0.0,
+        PNP_MASK_CENTER_SOLVE_WEIGHT,
+    )
+    # Feed solvePnP a tempered observation: a clean heatmap center retains
+    # useful pull, while an unreliable centroid is moved toward the current
+    # pose prediction and cannot drag the solve as strongly.
+    center_image_points = projected_center_points + center_weights[:, None] * (
+        center_image_points - projected_center_points
+    )
     try:
         ok, center_rvec, center_tvec = cv2.solvePnP(
             np.concatenate((solve_object_points, center_object_points), axis=0),
@@ -7129,7 +7344,7 @@ def refine_pose_with_sticker_centers(
     ):
         return candidate
     post_center_distances = np.linalg.norm(
-        projected_centers - center_image_points,
+        projected_centers - observed_center_image_points,
         axis=1,
     )
     diameter = projected_cube_diameter(candidate, center_rvec, center_tvec)
@@ -8985,6 +9200,8 @@ def append_turn_candidate_log(
         if isinstance(value, (float, np.floating)):
             numeric = float(value)
             return numeric if np.isfinite(numeric) else None
+        if isinstance(value, np.ndarray):
+            return value.tolist()
         if isinstance(value, (int, np.integer, str, bool)) or value is None:
             return value
         return str(value)
@@ -9031,6 +9248,53 @@ def append_turn_candidate_log(
         if candidate is not None
         else []
     )
+    search_rvec = (
+        getattr(candidate, "turn_fit_search_rvec", None)
+        if candidate is not None
+        else None
+    )
+    search_tvec = (
+        getattr(candidate, "turn_fit_search_tvec", None)
+        if candidate is not None
+        else None
+    )
+    search_pose = (
+        {
+            "rvec": search_rvec,
+            "tvec": search_tvec,
+            "camera_matrix": getattr(candidate, "camera_matrix", None),
+            "dist_coeffs": getattr(candidate, "dist_coeffs", None),
+            "image_size": getattr(candidate, "image_size", None),
+            "sticker_type": getattr(candidate, "sticker_type", None),
+            "assignment_image_points": getattr(
+                candidate,
+                "assignment_image_points",
+                None,
+            ),
+            "assignment_observed_class_ids": getattr(
+                candidate,
+                "assignment_observed_class_ids",
+                None,
+            ),
+            "assignment_fixed_mask": getattr(
+                candidate,
+                "assignment_fixed_mask",
+                None,
+            ),
+            "sticker_mask_centers": getattr(
+                candidate,
+                "sticker_mask_centers",
+                (),
+            ),
+            "sticker_mask_center_uncertainties": getattr(
+                candidate,
+                "sticker_mask_center_uncertainties",
+                (),
+            ),
+        }
+        if candidate is not None
+        else None
+    )
     record = {
         "frame_index": frame_index,
         "has_pose": candidate is not None,
@@ -9057,6 +9321,7 @@ def append_turn_candidate_log(
             else None
         ),
         "selected_layer_rotations": selected_rotations,
+        "search_pose": search_pose,
         "candidate_count": len(candidates),
         "candidates": candidates,
     }
@@ -9639,25 +9904,54 @@ def draw_sticker_pnp_candidate(
     if turn_candidate_scores:
         selected_turn_label = layer_rotation_debug_label(candidate.layer_rotations)
         turn_y = 110 if show_status else 66
-        for index, (label, mean_score, inlier_count, p90_error, mean_error) in enumerate(
-            turn_candidate_scores[:PNP_TURN_OVERLAY_CANDIDATE_COUNT]
-        ):
-            selected_marker = "*" if label == selected_turn_label else " "
-            turn_label = (
-                f"turn {selected_marker}{label} | in {inlier_count} | "
-                f"mean {mean_score:.3f} | kp p90 {p90_error:.3f} | "
-                f"kp mean {mean_error:.3f}"
-            )
-            cv2.putText(
-                output,
-                turn_label,
-                (8, turn_y + 16 * index),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.40,
-                PNP_ASSIGNMENT_COLOR_BGR,
-                1,
-                cv2.LINE_AA,
-            )
+        turn_diagnostics = getattr(candidate, "turn_candidate_diagnostics", ())
+        if turn_diagnostics:
+            displayed_trials = turn_diagnostics[:PNP_TURN_OVERLAY_CANDIDATE_COUNT]
+            for index, trial in enumerate(displayed_trials):
+                label = str(trial.get("label", index))
+                selected_marker = "*" if label == selected_turn_label else " "
+                rank_score = float(trial.get("global_mean_error", float("inf")))
+                accept_score = float(trial.get("global_robust_error", float("inf")))
+                inlier_count = int(trial.get("inlier_count", 0))
+                rank_text = f"{rank_score:.3f}" if np.isfinite(rank_score) else "inf"
+                accept_text = (
+                    f"{accept_score:.3f}" if np.isfinite(accept_score) else "inf"
+                )
+                turn_label = (
+                    f"turn {selected_marker}{label} | in {inlier_count} | "
+                    f"rank {rank_text} | accept {accept_text}"
+                )
+                cv2.putText(
+                    output,
+                    turn_label,
+                    (8, turn_y + 16 * index),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.40,
+                    PNP_ASSIGNMENT_COLOR_BGR,
+                    1,
+                    cv2.LINE_AA,
+                )
+        else:
+            displayed_trials = turn_candidate_scores[:PNP_TURN_OVERLAY_CANDIDATE_COUNT]
+            for index, (label, mean_score, inlier_count, p90_error, mean_error) in enumerate(
+                displayed_trials
+            ):
+                selected_marker = "*" if label == selected_turn_label else " "
+                turn_label = (
+                    f"turn {selected_marker}{label} | in {inlier_count} | "
+                    f"accept {mean_score:.3f} | kp p90 {p90_error:.3f} | "
+                    f"kp mean {mean_error:.3f}"
+                )
+                cv2.putText(
+                    output,
+                    turn_label,
+                    (8, turn_y + 16 * index),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.40,
+                    PNP_ASSIGNMENT_COLOR_BGR,
+                    1,
+                    cv2.LINE_AA,
+                )
     if getattr(candidate, "turn_fit_evaluated", False):
         def score_text(scores: tuple[float, float, float] | None) -> str:
             if scores is None:
@@ -10037,34 +10331,6 @@ def render_frame(
         )
         output = frame.copy()
         point_count = int(len(local_points))
-        if args.show_sticker_mask and sticker_masks is not None and roi_xyxy is not None:
-            sticker_matches = sticker_keypoint_matches_for_masks(
-                sticker_masks[0],
-                local_points,
-                point_confidences,
-                class_ids,
-                box_confidences,
-                args.keypoint_conf,
-                args.pose_class_conf,
-            )
-            output = render_sticker_masks(
-                output,
-                roi_xyxy,
-                sticker_masks,
-                args.sticker_mask_opacity,
-                args.sticker_border_thickness,
-                pose_predictions=(
-                    local_points,
-                    point_confidences,
-                    class_ids,
-                    box_confidences,
-                ),
-                point_threshold=args.keypoint_conf,
-                class_confidences=args.pose_class_conf,
-                show_class_labels=args.show_labels,
-                sticker_matches=sticker_matches,
-                sticker_mask_erosion=args.sticker_mask_erosion,
-            )
         if roi_xyxy is not None:
             frame_points, _ = local_to_frame_points(
                 local_points,
@@ -10115,12 +10381,13 @@ def render_frame(
                     output,
                     diagnostic_candidate,
                 )
-        output = draw_sticker_mask_centroids(
+        output = draw_sticker_mask_heatmap(
             output,
             roi_xyxy,
             sticker_masks,
             sticker_mask_erosion=getattr(args, "sticker_mask_erosion", 0),
             show_sticker_identities=getattr(args, "show_sticker_identities", True),
+            show_sticker_mask=getattr(args, "show_sticker_mask", False),
         )
         if sticker_color_names is not None:
             output = draw_classified_cube_diagnostic_panel(
@@ -10140,21 +10407,15 @@ def render_frame(
             symmetry_tracker,
             pose_hypothesis_buffer,
         )
-        output = render_sticker_masks(
-            frame,
-            roi_xyxy,
-            sticker_masks if args.show_sticker_mask else None,
-            args.sticker_mask_opacity,
-            args.sticker_border_thickness,
-            sticker_mask_erosion=args.sticker_mask_erosion,
-        )
+        output = frame.copy()
         output = draw_context(output, roi_xyxy, candidate, roi_source, 0, args.show_status)
-        output = draw_sticker_mask_centroids(
+        output = draw_sticker_mask_heatmap(
             output,
             roi_xyxy,
             sticker_masks,
             sticker_mask_erosion=getattr(args, "sticker_mask_erosion", 0),
             show_sticker_identities=getattr(args, "show_sticker_identities", True),
+            show_sticker_mask=getattr(args, "show_sticker_mask", False),
         )
         if sticker_color_names is not None:
             output = draw_classified_cube_diagnostic_panel(
@@ -10184,19 +10445,7 @@ def render_frame(
             else tuple()
         )
     )
-    output = render_sticker_masks(
-        frame,
-        roi_xyxy,
-        sticker_masks if args.show_sticker_mask else None,
-        args.sticker_mask_opacity,
-        args.sticker_border_thickness,
-        pose_predictions=(local_points, point_confidences, class_ids, box_confidences),
-        point_threshold=args.keypoint_conf,
-        class_confidences=args.pose_class_conf,
-        show_class_labels=args.show_labels,
-        sticker_matches=sticker_matches,
-        sticker_mask_erosion=args.sticker_mask_erosion,
-    )
+    output = frame.copy()
 
     frame_points, local_roi_points = local_to_frame_points(local_points, roi_xyxy, args.view_size)
     output, point_count = draw_pose(
@@ -10215,12 +10464,13 @@ def render_frame(
     if neural_only:
         # The foreground pass is deliberately limited to detector/model
         # output. Pose candidates are selected by the asynchronous consumer.
-        output = draw_sticker_mask_centroids(
+        output = draw_sticker_mask_heatmap(
             output,
             roi_xyxy,
             sticker_masks,
             sticker_mask_erosion=getattr(args, "sticker_mask_erosion", 0),
             show_sticker_identities=getattr(args, "show_sticker_identities", True),
+            show_sticker_mask=getattr(args, "show_sticker_mask", False),
         )
         roi_tracker.observe_tracking_bounds(
             tracking_bounds(
@@ -10315,12 +10565,13 @@ def render_frame(
             # Keep the inexpensive color history used by pose symmetry and
             # later turn scoring; defer only the expensive pose refinement.
             record_color_observations(pnp_candidate)
-        output = draw_sticker_mask_centroids(
+        output = draw_sticker_mask_heatmap(
             output,
             roi_xyxy,
             sticker_masks,
             sticker_mask_erosion=getattr(args, "sticker_mask_erosion", 0),
             show_sticker_identities=getattr(args, "show_sticker_identities", True),
+            show_sticker_mask=getattr(args, "show_sticker_mask", False),
         )
         roi_tracker.observe_tracking_bounds(
             tracking_bounds(
@@ -10458,12 +10709,13 @@ def render_frame(
                 orientation_axis_length=args.orientation_axis_length,
                 show_sticker_identities=getattr(args, "show_sticker_identities", True),
             )
-    output = draw_sticker_mask_centroids(
+    output = draw_sticker_mask_heatmap(
         output,
         roi_xyxy,
         sticker_masks,
         sticker_mask_erosion=getattr(args, "sticker_mask_erosion", 0),
         show_sticker_identities=getattr(args, "show_sticker_identities", True),
+        show_sticker_mask=getattr(args, "show_sticker_mask", False),
     )
     if neural_data is not None:
         neural_data.pose_candidate = pnp_candidate
@@ -11151,7 +11403,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Run the combined segmentation model even when its mask is not displayed.",
     )
-    parser.add_argument("--show-sticker-mask", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--show-sticker-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show a transparent red sticker heatmap in final output.",
+    )
     parser.add_argument(
         "--parallel-cuda",
         action=argparse.BooleanOptionalAction,
