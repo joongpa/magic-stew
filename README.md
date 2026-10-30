@@ -375,9 +375,10 @@ By default the renderer is in static-pose mode: it selects a sticker, refines
 the full-cube pose from the independent keypoint assignment, and keeps the
 cube symmetry continuous across video frames. A projected red/green/blue XYZ
 gizmo is shown at the cube center; use `--no-show-orientation-axes` to hide it
-or `--orientation-axis-length MM` to resize it. Layer-turn recovery and the
-motion graph are disabled until explicitly enabled with `--recognize-moves`.
-When move recognition is enabled, `--turn-candidate-log OUTPUT_DIR` writes one
+or `--orientation-axis-length MM` to resize it. Pose recovery can use the
+color-profile symmetry recovery for whole-cube orientation, followed by the
+layer-turn search when move recognition is enabled.
+When recovery is enabled, `--turn-candidate-log OUTPUT_DIR` writes one
 JSONL record per video frame. Each record includes the complete set of tested
 turn configurations, their global mean and robust scores, keypoint/heatmap
 components, inlier counts, trigger diagnostics, and the selected result. It
@@ -386,14 +387,29 @@ fixed assignments, and heatmap centers needed to reproject every logged pose.
 Annotated candidate images are saved unless `--turn-candidate-images` points
 elsewhere.
 With `--recognize-moves`, pose refinement and geometric turn search run on
-every pose frame.
+every processed frame with a usable pose. The turn search is not throttled by
+frame interval, and it remains enabled even when pose drawing is disabled.
+Without `--recognize-moves`, the default pose-symmetry option uses the same
+closest-color-profile orientation recovery as the original pose pipeline. It
+evaluates the 24 proper cube symmetries and uses profile likelihood plus pose
+continuity to select the closest orientation before rendering.
+The optional `--pose-motion-filter` is intentionally simpler: it compares
+only the cube-core translation between accepted poses and rejects changes over
+30 mm; rotation, velocity, acceleration, and jerk are not used.
 
 Move recognition defaults to the exhaustive angle-search mode. It tests every
-single/double layer configuration over the -45° to 45° range in 3° increments,
-ranking each configuration with a regularized mean of normalized keypoint
-reprojection and sticker-mask-centroid fit. Use
+single/double layer configuration over the `-180°` through `174°` range in 6°
+increments (with `180°` omitted as the duplicate of `-180°`), ranking each
+configuration with a regularized mean of normalized keypoint reprojection,
+sticker-mask-centroid fit, and—when global color profiles and sticker priors
+are available—a `p(observation|prior)` color fit weighted at twice the
+combined keypoint-plus-centroid terms. Mask centroids use closest
+projected sticker faces so the accelerator can score the complete batch without
+Hungarian matching. Use
 `--pnp-turn-recovery-mode layer-removal` to opt into the faster subtractive
 alternative, which ranks the 12 layer options without rotating the geometry.
+The live output also shows the accumulated standard moves in the fixed
+white-top/U and green-front/F frame.
 When `--device` selects CUDA or Apple MPS, the exhaustive geometry and scoring
 pass is batched on that accelerator; unsupported accelerator setups fall back
 to the CPU implementation.
@@ -407,14 +423,19 @@ reviewer against the same source video and log directory:
   --log /path/to/turn-candidate-log
 ```
 
-Open the printed local URL. Step through frames, click a candidate to inspect
-its reprojected pose, and save `Correct`, `Uncertain`, or `No valid pose`. The
+Open the printed local URL. Step through frames in either direction, click a
+candidate to inspect its reprojected pose and geometry-plus-color score, and
+save `Correct`, `Uncertain`, or `No valid pose`. The
 labels are written to `turn_candidate_scores.labels.json` beside the JSONL and
 do not modify the inference log. Tested options are grouped into collapsible
 single-layer and double-layer sections for each of the six layer sides.
 Click a visible projected layer to select it, double-click for a double-layer
 turn, then use `,` and `.` to step through the logged angles. Click the center
-sticker for that face's layer or an outer row for an adjacent layer.
+sticker for that face's layer or an outer row for an adjacent layer. New logs
+also include a per-identity `p(observation | prior)` table for inspecting the
+individual color evidence behind the aggregate score. The rendered cube also
+shows the matched likelihood beside each visible sticker identity when those
+values are available.
 
 During the initial pose-hypothesis pass, sticker segmentation adds a second
 refinement step after the keypoint assignment/PnP refinement. Its objective

@@ -59,6 +59,43 @@ def test_angle_search_is_the_default_move_recovery_mode():
     assert args.pnp_turn_recovery_mode == "angle-search"
 
 
+def test_move_accumulator_does_not_reemit_same_state_after_neutral_frame():
+    rotation = render_script.CubeLayerRotation(0, 1, 90.0, 1)
+    candidate = SimpleNamespace(
+        layer_rotations=(rotation,),
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    accumulator = render_script.MoveAccumulator()
+
+    accumulator.observe(candidate)
+    first_move_count = len(accumulator.moves)
+    accumulator.observe(None)
+    accumulator.observe(candidate)
+
+    assert first_move_count == 1
+    assert len(accumulator.moves) == 1
+    assert accumulator.displacement_mm == 0.0
+
+
+def test_move_accumulator_displays_core_displacement_between_good_poses():
+    rotation = render_script.CubeLayerRotation(0, 1, 90.0, 1)
+    first = SimpleNamespace(
+        layer_rotations=(rotation,),
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    second = SimpleNamespace(
+        layer_rotations=(rotation,),
+        tvec=np.asarray([[12.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    accumulator = render_script.MoveAccumulator()
+
+    accumulator.observe(first)
+    accumulator.observe(second)
+
+    assert len(accumulator.moves) == 1
+    assert accumulator.displacement_mm == 12.0
+
+
 def test_initial_scramble_parser_accepts_standard_notation_and_alias():
     args = render_script.build_parser().parse_args(
         ["--source", "input.mp4", "--known-scramble", "R U2 F' Rw2 r'"]
@@ -176,6 +213,8 @@ def test_layer_removal_selection_colors_selected_layer_without_rotation():
 
 def test_turn_candidate_log_appends_one_complete_record_per_frame(tmp_path):
     path = tmp_path / "turn_candidate_scores.jsonl"
+    color_likelihoods = np.zeros((54, 1), dtype=np.float64)
+    color_likelihoods[:2, 0] = (0.8, 0.2)
     candidate = SimpleNamespace(
         turn_candidate_scores=(("R+3", 0.12, 7, 0.08, 0.04),),
         turn_candidate_diagnostics=(
@@ -183,12 +222,16 @@ def test_turn_candidate_log_appends_one_complete_record_per_frame(tmp_path):
                 "label": "R+3",
                 "global_mean_error": 0.12,
                 "global_robust_error": 0.16,
+                "color_error": 0.04,
+                "color_match_count": 1,
                 "layer_rotations": [],
             },
         ),
         turn_fit_evaluated=True,
         turn_fit_unexplained_keypoints=2,
         turn_fit_sticker_score=0.03,
+        turn_fit_color_score=0.05,
+        turn_color_likelihoods=color_likelihoods,
         turn_fit_static_scores=(0.04, 0.02, 0.06),
         turn_fit_articulated_scores=(0.03, 0.01, 0.04),
         turn_fit_search_rvec=np.zeros((3, 1), dtype=np.float64),
@@ -210,6 +253,9 @@ def test_turn_candidate_log_appends_one_complete_record_per_frame(tmp_path):
     assert [record["frame_index"] for record in records] == [12, 13]
     assert records[0]["candidate_count"] == 1
     assert records[0]["candidates"][0]["global_robust_error"] == 0.16
+    assert records[0]["candidates"][0]["color_error"] == 0.04
+    assert len(records[0]["turn_color_identity_labels"]) == 54
+    assert records[0]["turn_color_likelihoods"][:2] == [[0.8], [0.2]]
     assert records[0]["search_pose"]["tvec"] == [[0.0], [0.0], [200.0]]
     assert records[0]["search_pose"]["assignment_image_points"] == [[1.0, 2.0]]
     assert records[1]["has_pose"] is False
@@ -376,12 +422,23 @@ def test_quicktime_frame_counter_skips_non_quicktime_video_extensions(
     assert output_path.read_bytes() == b"opencv movie"
 
 
-def test_turn_search_defaults_to_all_six_layer_sides():
+def test_turn_search_defaults_to_all_six_layer_sides_and_full_period():
     args = render_script.build_parser().parse_args(["--source", "input.mp4"])
 
     assert args.pnp_turn_face_candidates == 6
-    assert render_script.PNP_LAYER_MISALIGNMENT_MIN_DEGREES == -45.0
-    assert render_script.PNP_LAYER_MISALIGNMENT_MAX_DEGREES == 45.0
+    assert render_script.PNP_LAYER_MISALIGNMENT_MIN_DEGREES == -180.0
+    assert render_script.PNP_LAYER_MISALIGNMENT_MAX_DEGREES == 180.0
+    assert render_script.PNP_LAYER_MISALIGNMENT_STEP_DEGREES == 6.0
+    angles = render_script.turn_search_angles()
+    assert len(angles) == 60
+    assert angles[0] == -180.0
+    assert angles[-1] == 174.0
+
+
+def test_turn_color_weight_matches_combined_geometry_weight():
+    assert render_script.PNP_TURN_COLOR_WEIGHT == pytest.approx(
+        2.0 * (1.0 + render_script.PNP_TURN_MASK_CENTER_WEIGHT)
+    )
 
 
 def test_turn_overlay_colors_single_and_double_layers_by_role():
@@ -484,6 +541,99 @@ def test_gpu_sticker_center_scoring_uses_nearest_faces_without_hungarian(monkeyp
     assert robust.shape == (1,)
     assert np.isfinite(means[0])
     assert np.isfinite(robust[0])
+
+
+def test_turn_color_likelihood_uses_global_profile_and_identity_prior():
+    profiles, _grouped = render_script.build_global_color_profiles_from_samples([])
+    identities = render_script.canonical_sticker_identities()
+    red_index = render_script.GLOBAL_COLOR_NAMES.index("red")
+    blue_index = render_script.GLOBAL_COLOR_NAMES.index("blue")
+    red_prior = np.zeros(len(render_script.GLOBAL_COLOR_NAMES), dtype=np.float64)
+    red_prior[red_index] = 1.0
+    blue_prior = np.zeros(len(render_script.GLOBAL_COLOR_NAMES), dtype=np.float64)
+    blue_prior[blue_index] = 1.0
+    candidate = SimpleNamespace(
+        sticker_mask_centers=(np.asarray((128.0, 128.0)),),
+        sticker_mask_colors=(
+            np.asarray(render_script.PURE_COLOR_RGB["red"], dtype=np.uint8),
+        ),
+    )
+
+    likelihoods = render_script.turn_color_predictive_likelihoods(
+        candidate,
+        {
+            identities[0].label: red_prior,
+            identities[1].label: blue_prior,
+        },
+        profiles,
+    )
+
+    assert likelihoods is not None
+    assert likelihoods.shape == (54, 1)
+    assert likelihoods[0, 0] > likelihoods[1, 0]
+
+
+def test_projected_sticker_identity_moves_with_layer_geometry():
+    common = dict(
+        camera_matrix=render_script.default_camera_matrix((256, 256), 1.2),
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+    )
+    rvec = np.asarray([[0.12], [-0.18], [0.08]], dtype=np.float64)
+    tvec = np.asarray([[4.0], [-3.0], [180.0]], dtype=np.float64)
+    static = SimpleNamespace(layer_rotations=(), **common)
+    turned = SimpleNamespace(
+        layer_rotations=(
+            render_script.CubeLayerRotation(axis=0, side=-1, angle_degrees=90.0),
+        ),
+        **common,
+    )
+    static_faces = {
+        identity.label: polygon
+        for identity, _depth, polygon in render_script.projected_sticker_faces(
+            static,
+            rvec,
+            tvec,
+        )
+    }
+    turned_faces = {
+        identity.label: polygon
+        for identity, _depth, polygon in render_script.projected_sticker_faces(
+            turned,
+            rvec,
+            tvec,
+        )
+    }
+    moved_labels = set(static_faces) & set(turned_faces)
+
+    assert moved_labels
+    assert any(
+        not np.allclose(static_faces[label], turned_faces[label])
+        for label in moved_labels
+    )
+
+
+def test_gpu_turn_color_score_uses_identity_likelihoods_without_cpu_matching():
+    torch = pytest.importorskip("torch")
+    candidate = SimpleNamespace(
+        sticker_mask_centers=(np.asarray((0.0, 0.0)),),
+        sticker_mask_colors=(np.asarray((255, 0, 0), dtype=np.uint8),),
+        sticker_mask_center_uncertainties=(1.0,),
+    )
+    likelihoods = np.full((54, 1), 0.01, dtype=np.float64)
+    likelihoods[7, 0] = 0.90
+    color_error, match_count = render_script._gpu_sticker_color_fit_metrics(
+        candidate,
+        torch,
+        torch.as_tensor([[[0.0, 0.0], [20.0, 0.0]]], dtype=torch.float64),
+        torch.ones((1, 2), dtype=torch.bool),
+        np.asarray((7, 8), dtype=np.int64),
+        scale=100.0,
+        max_error=10.0,
+        color_likelihoods=likelihoods,
+    )
+
+    np.testing.assert_allclose(color_error, (-np.log(0.90),))
+    assert match_count.tolist() == [1]
 
 
 def test_combined_headless_progress_keeps_neural_and_pose_counts_together(capsys):
@@ -824,29 +974,15 @@ def test_move_search_runs_only_after_static_pose_selection(monkeypatch):
         fake_refine,
     )
 
-    def fail_color_work(*_args, **_kwargs):
-        raise AssertionError("geometry-only pose recovery must not classify colors")
-
-    monkeypatch.setattr(
-        render_script,
-        "build_global_color_profiles",
-        fail_color_work,
-    )
-    monkeypatch.setattr(
-        render_script,
-        "_score_symmetry_observations",
-        fail_color_work,
-    )
-
     render_script.recover_cached_pose_symmetries(
-        [record],
+        [record, replace(record, frame_index=1)],
         render_script.StickerColorTrace.create(),
         refine_pose=True,
         recover_orientation=False,
         recognize_moves=True,
     )
 
-    assert calls == [False, True]
+    assert calls == [False, True, False, True]
 
 
 def test_sticker_type_patterns_and_three_point_fallbacks():
@@ -869,6 +1005,18 @@ def test_cube_symmetries_are_the_24_proper_rotations():
     assert len({tuple(matrix.reshape(-1)) for matrix in matrices}) == 24
     assert all(np.isclose(np.linalg.det(matrix), 1.0) for matrix in matrices)
     np.testing.assert_array_equal(matrices[0], np.eye(3))
+
+
+def test_fitted_rotation_notation_uses_white_top_green_front_frame():
+    assert render_script.cube_rotation_to_notation(
+        render_script.CubeLayerRotation(0, 1, -90.0, 1)
+    ) == "R"
+    assert render_script.cube_rotation_to_notation(
+        render_script.CubeLayerRotation(1, -1, -90.0, 1)
+    ) == "F"
+    assert render_script.cube_rotation_to_notation(
+        render_script.CubeLayerRotation(2, 1, -90.0, 3)
+    ) == "y"
 
 
 def test_symmetry_transformation_preserves_projected_cube_geometry():
@@ -1471,7 +1619,7 @@ def test_face_on_sticker_views_receive_lower_reliability_weight():
     assert 0.0 < angled_weight < face_on_weight
 
 
-def test_cached_pose_symmetry_recovery_uses_color_identity_history(capsys):
+def test_cached_pose_symmetry_recovery_prioritizes_pose_continuity(capsys):
     image_size = (256, 256)
     camera_matrix = render_script.default_camera_matrix(image_size, 1.2)
     rvec = np.asarray([[0.12], [-0.18], [0.08]], dtype=np.float64)
@@ -1533,7 +1681,7 @@ def test_cached_pose_symmetry_recovery_uses_color_identity_history(capsys):
         SimpleNamespace(frame_index=0, pose_candidate=candidate),
         SimpleNamespace(frame_index=1, pose_candidate=candidate),
     ]
-    corrected_trace = render_script.recover_cached_pose_symmetries(
+    render_script.recover_cached_pose_symmetries(
         records,
         trace,
         debug=True,
@@ -1544,11 +1692,11 @@ def test_cached_pose_symmetry_recovery_uses_color_identity_history(capsys):
     assert "symmetry=07" in debug_output
 
     recovered = records[1].pose_candidate
-    expected_rvec = render_script.transform_rvec_by_symmetry(candidate.rvec, symmetry)
-    assert render_script.rotation_symmetry_distance(recovered.rvec, expected_rvec) < 1e-6
-    assert corrected_trace.observations[trace.identities[0].label][1][1].tolist() == list(
-        color_by_label[trace.identities[0].label]
-    )
+    previous_pose = records[0].pose_candidate
+    assert render_script.rotation_symmetry_distance(
+        recovered.rvec,
+        previous_pose.rvec,
+    ) < 1e-6
 
 
 def test_sticker_assignment_rejects_opposite_colors_on_one_edge():
@@ -1815,6 +1963,31 @@ def test_sticker_identity_overlay_draws_only_visible_stickers():
 
     assert drawn == 9
     assert np.any(image)
+
+
+def test_sticker_identity_overlay_maps_predictive_likelihood_to_identity():
+    candidate = SimpleNamespace(
+        layer_rotations=(),
+        camera_matrix=render_script.default_camera_matrix((256, 256), 1.2),
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+    )
+    rvec = np.zeros((3, 1), dtype=np.float64)
+    tvec = np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64)
+    faces = render_script.projected_sticker_faces(candidate, rvec, tvec)
+    identity, _depth, polygon = faces[0]
+    likelihoods = np.zeros((54, 1), dtype=np.float64)
+    identity_index = render_script.canonical_sticker_identities().index(identity)
+    likelihoods[identity_index, 0] = 0.91
+    candidate.sticker_mask_centers = (np.mean(polygon, axis=0),)
+    candidate.turn_color_likelihoods = likelihoods
+
+    values = render_script.projected_turn_color_likelihoods_by_identity(
+        candidate,
+        rvec,
+        tvec,
+    )
+
+    assert values[identity.label] == pytest.approx(0.91)
 
 
 def test_sticker_likelihood_overlay_is_compact_and_draws_second_color_swatch(monkeypatch):
@@ -2671,10 +2844,10 @@ def test_recover_misaligned_layer_updates_assignment_geometry(monkeypatch):
         for rotation in searched_rotations
     }) == 6
     assert {rotation.layer_count for rotation in searched_rotations} == {1, 2}
-    assert min(rotation.angle_degrees for rotation in searched_rotations) == -45.0
-    assert max(rotation.angle_degrees for rotation in searched_rotations) == 45.0
+    assert min(rotation.angle_degrees for rotation in searched_rotations) == -180.0
+    assert max(rotation.angle_degrees for rotation in searched_rotations) == 174.0
     assert all(
-        rotation.angle_degrees % 3.0 == 0.0
+        rotation.angle_degrees % 6.0 == 0.0
         for rotation in searched_rotations
     )
     assert len(logged.turn_candidate_scores) > render_script.PNP_TURN_DEBUG_CANDIDATE_COUNT
@@ -3073,6 +3246,27 @@ def test_hypothesis_selection_keeps_much_better_visual_candidate_on_turn():
     )
 
     assert selected is good_turn
+
+
+def test_hypothesis_selection_rejects_core_displacement_over_30mm():
+    def candidate(position, error):
+        return SimpleNamespace(
+            overall_reprojection_error=error,
+            reprojection_error=0.0,
+            rvec=np.zeros((3, 1), dtype=np.float64),
+            tvec=np.asarray([[position], [0.0], [200.0]], dtype=np.float64),
+        )
+
+    selected = render_script.select_pose_hypothesis(
+        (candidate(31.0, 0.1), candidate(20.0, 1.0)),
+        (np.zeros((3, 1)), np.asarray([[0.0], [0.0], [200.0]])),
+    )
+
+    assert selected.tvec[0, 0] == 20.0
+    assert render_script.select_pose_hypothesis(
+        (candidate(31.0, 0.1),),
+        (np.zeros((3, 1)), np.asarray([[0.0], [0.0], [200.0]])),
+    ) is None
 
 
 def test_pose_graph_prefers_path_with_bounded_derivatives():

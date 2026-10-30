@@ -50,6 +50,7 @@ def test_review_candidates_marks_static_pose_when_turn_search_was_not_tested():
             "has_pose": True,
             "search_pose": {"rvec": [0.0, 0.0, 0.0]},
             "static_fit_scores": [0.1, 0.0, 0.1],
+            "turn_fit_color_score": 0.7,
             "candidates": [],
         }
     )
@@ -57,6 +58,23 @@ def test_review_candidates_marks_static_pose_when_turn_search_was_not_tested():
     assert len(candidates) == 1
     assert candidates[0]["label"] == "static pose (turn search not tested)"
     assert candidates[0]["global_mean_error"] == 0.1
+    assert candidates[0]["color_error"] == 0.7
+
+
+def test_color_likelihood_payload_exposes_each_identity_and_observation():
+    payload = review_script.color_likelihood_payload(
+        {
+            "turn_color_identity_labels": ["C01 U"],
+            "turn_color_observation_centers": [[12.0, 34.0]],
+            "turn_color_likelihoods": [[0.875]],
+        }
+    )
+
+    assert payload == {
+        "color_identity_labels": ["C01 U"],
+        "color_observation_centers": [[12.0, 34.0]],
+        "color_likelihoods": [[0.875]],
+    }
 
 
 def test_rotation_matrix_matches_opencv_rodrigues_convention():
@@ -141,9 +159,12 @@ def test_projected_click_regions_identify_face_and_adjacent_layer_edges():
 
 
 def test_frame_navigation_decodes_by_index_without_random_seeking(monkeypatch, tmp_path):
+    captures = []
+
     class FakeCapture:
         def __init__(self, _path):
             self.index = 0
+            captures.append(self)
 
         def isOpened(self):
             return True
@@ -166,3 +187,4 @@ def test_frame_navigation_decodes_by_index_without_random_seeking(monkeypatch, t
 
     for index in (0, 1, 4, 4, 2, 5):
         assert np.all(state.frame(index) == index)
+    assert len(captures) == 1

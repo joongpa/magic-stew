@@ -13,6 +13,7 @@ import argparse
 import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections import OrderedDict
 from pathlib import Path
 from threading import Lock
 from urllib.parse import parse_qs, urlparse
@@ -30,6 +31,7 @@ HEATMAP_COLOR_BGR = (180, 105, 255)
 OBSERVED_COLOR_BGR = (255, 0, 255)
 TEXT_COLOR_BGR = (255, 255, 255)
 OUTLINE_COLOR_BGR = (0, 0, 0)
+FRAME_CACHE_SIZE = 32
 
 
 def json_safe(value: object) -> object:
@@ -97,9 +99,33 @@ def review_candidates(record: dict[str, object]) -> list[dict[str, object]]:
             "global_robust_error": None,
             "keypoint_mean_error": keypoint_score,
             "heatmap_mean_error": heatmap_score,
+            "color_error": record.get("turn_fit_color_score"),
             "inlier_count": None,
         }
     ]
+
+
+def color_likelihood_payload(record: dict[str, object]) -> dict[str, object]:
+    """Return the logged per-identity color likelihood table, if present."""
+
+    likelihoods = record.get("turn_color_likelihoods")
+    labels = record.get("turn_color_identity_labels")
+    centers = record.get("turn_color_observation_centers")
+    if not isinstance(likelihoods, list) or not likelihoods:
+        return {
+            "color_identity_labels": [],
+            "color_observation_centers": [],
+            "color_likelihoods": [],
+        }
+    if not isinstance(labels, list):
+        labels = [f"identity {index}" for index in range(len(likelihoods))]
+    if not isinstance(centers, list):
+        centers = []
+    return {
+        "color_identity_labels": labels,
+        "color_observation_centers": centers,
+        "color_likelihoods": likelihoods,
+    }
 
 
 def selected_candidate_index(record: dict[str, object]) -> int | None:
@@ -115,6 +141,21 @@ def selected_candidate_index(record: dict[str, object]) -> int | None:
     return None
 
 
+def pose_for_candidate(
+    record: dict[str, object],
+    candidate_index: int,
+) -> dict[str, object] | None:
+    """Use the finalized renderer pose for the selected configuration."""
+
+    selected_index = selected_candidate_index(record)
+    if selected_index == candidate_index:
+        selected_pose = record.get("selected_pose")
+        if isinstance(selected_pose, dict):
+            return selected_pose
+    search_pose = record.get("search_pose")
+    return search_pose if isinstance(search_pose, dict) else None
+
+
 def rotation_matrix_for_layer(rotation: dict[str, object]) -> tuple[np.ndarray, np.ndarray]:
     axis = int(rotation["axis"])
     side = int(rotation["side"])
@@ -123,7 +164,8 @@ def rotation_matrix_for_layer(rotation: dict[str, object]) -> tuple[np.ndarray, 
     vector[axis, 0] = angle
     matrix, _ = cv2.Rodrigues(vector)
     pivot = np.zeros(3, dtype=np.float64)
-    pivot[axis] = side * CUBE_HALF_SIZE_MM
+    if int(rotation.get("layer_count", 1)) < 3:
+        pivot[axis] = side * CUBE_HALF_SIZE_MM
     return matrix, pivot
 
 
@@ -292,8 +334,8 @@ def draw_candidate(
     candidates = review_candidates(record)
     if not 0 <= candidate_index < len(candidates):
         return output
-    pose = record.get("search_pose")
-    if not isinstance(pose, dict) or any(
+    pose = pose_for_candidate(record, candidate_index)
+    if pose is None or any(
         pose.get(name) is None
         for name in ("camera_matrix", "dist_coeffs", "rvec", "tvec")
     ):
@@ -352,7 +394,8 @@ def draw_candidate(
     text = (
         f"{candidate_index}: {label} | "
         f"mean {format_score(candidate.get('global_mean_error'))} | "
-        f"robust {format_score(candidate.get('global_robust_error'))}"
+        f"robust {format_score(candidate.get('global_robust_error'))} | "
+        f"color {format_score(candidate.get('color_error', candidate.get('color_mean_error')))}"
     )
     cv2.rectangle(output, (6, 6), (min(output.shape[1] - 6, 900), 36), (0, 0, 0), -1)
     cv2.putText(
@@ -380,6 +423,7 @@ class ReviewState:
             raise SystemExit(f"Could not open video: {video_path}")
         self.next_video_frame = 0
         self.last_video_frame: np.ndarray | None = None
+        self.frame_cache: OrderedDict[int, np.ndarray] = OrderedDict()
         self.labels = self._read_labels()
 
     def _read_labels(self) -> dict[str, dict[str, object]]:
@@ -401,8 +445,11 @@ class ReviewState:
         if frame_index < 0:
             raise ValueError(f"Invalid video frame {frame_index}")
         with self.video_lock:
-            if frame_index == self.next_video_frame - 1 and self.last_video_frame is not None:
-                return self.last_video_frame.copy()
+            cached = self.frame_cache.get(frame_index)
+            if cached is not None:
+                self.frame_cache.move_to_end(frame_index)
+                self.last_video_frame = cached
+                return cached.copy()
             if frame_index < self.next_video_frame:
                 self.capture.release()
                 self.capture = cv2.VideoCapture(str(self.video_path))
@@ -417,9 +464,17 @@ class ReviewState:
                         f"Could not read video frame {frame_index}; "
                         f"video ended at decoded frame {self.next_video_frame - 1}"
                     )
+                self.frame_cache[self.next_video_frame] = frame.copy()
+                self.frame_cache.move_to_end(self.next_video_frame)
+                while len(self.frame_cache) > FRAME_CACHE_SIZE:
+                    self.frame_cache.popitem(last=False)
                 self.next_video_frame += 1
                 self.last_video_frame = frame
-            return self.last_video_frame.copy()
+            cached = self.frame_cache.get(frame_index)
+            if cached is None:
+                raise ValueError(f"Could not cache video frame {frame_index}")
+            self.last_video_frame = cached
+            return cached.copy()
 
     def save_label(self, payload: dict[str, object]) -> dict[str, object]:
         if not isinstance(payload, dict):
@@ -475,6 +530,11 @@ details.group summary:hover { color:#fff; }
 .candidate.selected { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
 .candidate.correct { border-color:#57d38c; } .candidate.baseline { background:#292d33; }
 .candidate .title { font-weight:600; } .candidate .metrics { color:#aeb8c4; font-size:12px; margin-top:3px; }
+.color-panel { border-top:1px solid var(--line); padding:8px; max-height:38vh; overflow:auto; }
+.color-panel summary { cursor:pointer; color:#cbd5e0; font-weight:600; }
+.color-panel table { border-collapse:collapse; font-size:11px; white-space:nowrap; margin-top:7px; }
+.color-panel th, .color-panel td { border:1px solid var(--line); padding:3px 5px; text-align:right; }
+.color-panel th:first-child, .color-panel td:first-child { position:sticky; left:0; background:var(--panel); text-align:left; }
 .muted { color:#aeb8c4; } .status { margin-left:auto; }
 #note { width:100%; min-height:56px; resize:vertical; margin-top:8px; }
 .actions { display:flex; gap:6px; margin-top:8px; flex-wrap:wrap; }
@@ -501,6 +561,7 @@ label { display:flex; gap:5px; align-items:center; }
       <textarea id="note" placeholder="Optional note about the scoring failure..."></textarea>
     </div>
     <div id="candidates"></div>
+    <details id="colorPanel" class="color-panel"><summary>p(observation | prior) by sticker identity</summary><div id="colorTable" class="muted">No color likelihoods recorded for this frame.</div></details>
   </aside>
 </main>
 <script>
@@ -543,6 +604,15 @@ function candidateAngle(candidate) {
   return rotations.length ? Number(rotations[rotations.length-1].angle_degrees) : null;
 }
 function selectCandidate(index) { candidateIndex=index; loadFrame(); }
+function framePosition() { return meta.frames.findIndex(item => item.frame_index === frameIndex); }
+function setFrameFromInput(value) {
+  if(!meta.frames.length) return;
+  const requested=Number(value);
+  const exact=Number.isFinite(requested) ? meta.frames.findIndex(item => item.frame_index === requested) : -1;
+  const position=exact>=0 ? exact : meta.frames.reduce((best,item,index)=>
+    Math.abs(item.frame_index-requested)<Math.abs(meta.frames[best].frame_index-requested) ? index : best, 0);
+  frameIndex=meta.frames[position].frame_index; candidateIndex=null; activeLayer=null; loadFrame();
+}
 function chooseLayer(axis,side,width) {
   const key=`${axis}:${side}:${width}`;
   const available=candidates.map((candidate,index)=>({candidate,index,angle:candidateAngle(candidate)}))
@@ -576,6 +646,37 @@ function segmentDistance(point,a,b) {
   const t=length ? Math.max(0,Math.min(1,((point[0]-a[0])*dx+(point[1]-a[1])*dy)/length)) : 0;
   return Math.hypot(point[0]-a[0]-t*dx,point[1]-a[1]-t*dy);
 }
+function formatProbability(value) {
+  const number=Number(value);
+  return Number.isFinite(number) ? number.toExponential(3) : '—';
+}
+function renderColorLikelihoods(data) {
+  const root=$('colorTable'); root.innerHTML='';
+  const labels=data.color_identity_labels||[], matrix=data.color_likelihoods||[];
+  if(!labels.length || !matrix.length) { root.textContent='No color likelihoods recorded for this frame.'; return; }
+  const centers=data.color_observation_centers||[];
+  const columnCount=Math.max(0,...matrix.map(row=>Array.isArray(row)?row.length:0));
+  if(!columnCount) { root.textContent='No observed sticker colors recorded for this frame.'; return; }
+  const table=document.createElement('table');
+  const head=document.createElement('tr');
+  const identityHead=document.createElement('th'); identityHead.textContent='identity'; head.appendChild(identityHead);
+  for(let column=0; column<columnCount; column++) {
+    const cell=document.createElement('th');
+    const center=centers[column];
+    cell.textContent=Array.isArray(center) ? `o${column} (${center.map(value=>Math.round(Number(value))).join(',')})` : `o${column}`;
+    head.appendChild(cell);
+  }
+  table.appendChild(head);
+  labels.forEach((label,rowIndex)=>{
+    const row=document.createElement('tr');
+    const identity=document.createElement('td'); identity.textContent=String(label); row.appendChild(identity);
+    for(let column=0; column<columnCount; column++) {
+      const cell=document.createElement('td'); cell.textContent=formatProbability(matrix[rowIndex]?.[column]); row.appendChild(cell);
+    }
+    table.appendChild(row);
+  });
+  root.appendChild(table);
+}
 function layerAt(event,width) {
   const img=$('candidateImage'), rect=img.getBoundingClientRect();
   const scale=Math.min(rect.width/img.naturalWidth,rect.height/img.naturalHeight);
@@ -592,6 +693,7 @@ async function loadFrame() {
   const data=await getJson(`/api/candidates?frame=${frameIndex}`);
   if(version!==loadVersion) return;
   candidates=data.candidates;
+  renderColorLikelihoods(data);
   const count=data.candidates.length;
   if(candidateIndex===null) candidateIndex=current.selected_index ?? 0;
   candidateIndex=Math.max(0, Math.min(candidateIndex, Math.max(0,count-1)));
@@ -606,7 +708,7 @@ async function loadFrame() {
   const staticOnly=count===1 && data.candidates[0].label.includes('turn search not tested');
   $('frameInfo').textContent=staticOnly
     ? `frame ${frameIndex} · turn search not tested · showing static pose`
-    : `frame ${frameIndex} · ${count} tested configurations · ranked by combined mean · selected: ${current.selected || 'none'}`;
+    : `frame ${frameIndex} · ${count} tested configurations · ranked by geometry + color · selected: ${current.selected || 'none'}`;
   $('candidateTitle').textContent=staticOnly ? 'Static pose (turn search not tested)' : (count ? `Candidate ${candidateIndex+1}/${count}` : 'No tested candidate');
   $('layerInfo').textContent=activeLayer ? `${groupTitle(`${activeLayer.axis}:${activeLayer.side}:${activeLayer.width}`)} · angle ${candidateAngle(candidates[candidateIndex])}° · , / . to adjust` : 'Click a layer; double-click for two layers. Use , / . to turn.';
   $('correct').disabled=!count; $('selectNext').disabled=!count;
@@ -628,13 +730,23 @@ async function loadFrame() {
     if(!items.length){ const empty=document.createElement('div'); empty.className='muted'; empty.style.padding='5px 0 9px'; empty.textContent='No configuration tested'; itemContainer.appendChild(empty); }
     items.forEach(({candidate:c,index:i})=>{
       const el=document.createElement('div'); el.className='candidate'+(i===candidateIndex?' selected':'')+(c.is_baseline?' baseline':'');
-      el.innerHTML=`<div class="title">${i}: ${c.label}${i===current.selected_index?' · renderer selection':''}</div><div class="metrics">rank ${(c.global_mean_error??NaN).toFixed(4)} · accept ${(c.global_robust_error??NaN).toFixed(4)} · kp ${(c.keypoint_mean_error??NaN).toFixed(4)} · heat ${(c.heatmap_mean_error??NaN).toFixed(4)} · inliers ${c.inlier_count??0}</div>`;
+      const colorError=Number(c.color_error ?? c.color_mean_error);
+      const colorMatches=Number(c.color_match_count);
+      const colorText=Number.isFinite(colorError) ? ` · color ${colorError.toFixed(4)}` : '';
+      const colorMatchText=Number.isFinite(colorMatches) ? `/${colorMatches} color matches` : '';
+      el.innerHTML=`<div class="title">${i}: ${c.label}${i===current.selected_index?' · renderer selection':''}</div><div class="metrics">rank ${(c.global_mean_error??NaN).toFixed(4)} · accept ${(c.global_robust_error??NaN).toFixed(4)} · kp ${(c.keypoint_mean_error??NaN).toFixed(4)} · heat ${(c.heatmap_mean_error??NaN).toFixed(4)}${colorText}${colorMatchText} · inliers ${c.inlier_count??0}</div>`;
       el.onclick=()=>{ const parts=key.split(':').map(Number); activeLayer=parts.length===3 && parts.every(Number.isFinite) ? {axis:parts[0],side:parts[1],width:parts[2]} : null; selectCandidate(i); }; itemContainer.appendChild(el);
     });
     details.appendChild(itemContainer); list.appendChild(details);
   });
 }
-function moveFrame(delta) { frameIndex=Math.max(0,Math.min(meta.frames.length-1,frameIndex+delta)); candidateIndex=null; activeLayer=null; loadFrame(); }
+function moveFrame(delta) {
+  if(!meta.frames.length) return;
+  const currentPosition=framePosition();
+  const position=Math.max(0,Math.min(meta.frames.length-1,(currentPosition<0?0:currentPosition)+delta));
+  if(position===currentPosition) return;
+  frameIndex=meta.frames[position].frame_index; candidateIndex=null; activeLayer=null; loadFrame();
+}
 async function label(kind, advance=false) {
   const payload={frame_index:frameIndex,candidate_index:kind==='correct'&&current.candidate_count?candidateIndex:null,label:kind,note:$('note').value};
   const saved=await getJson('/api/label',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -642,7 +754,7 @@ async function label(kind, advance=false) {
 }
 $('prev').onclick=()=>moveFrame(-1); $('next').onclick=()=>moveFrame(1); $('source').onclick=()=>{$('candidateImage').src=imageUrl(-1);};
 $('correct').onclick=()=>label('correct'); $('uncertain').onclick=()=>label('uncertain'); $('invalid').onclick=()=>label('no_valid_pose'); $('selectNext').onclick=()=>label('correct',true);
-$('frame').onchange=e=>{ frameIndex=Math.max(0,Math.min(meta.frames.length-1,Number(e.target.value)||0)); candidateIndex=null; activeLayer=null; loadFrame(); };
+$('frame').onchange=e=>setFrameFromInput(e.target.value);
 $('candidateImage').addEventListener('click',e=>{ if(e.detail!==1)return; clearTimeout(clickTimer); clickTimer=setTimeout(()=>layerAt(e,1),250); });
 $('candidateImage').addEventListener('dblclick',e=>{ e.preventDefault(); clearTimeout(clickTimer); layerAt(e,2); });
 document.addEventListener('keydown',e=>{ if(['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return; if(e.key===','){e.preventDefault();stepAngle(-1);} if(e.key==='.'){e.preventDefault();stepAngle(1);} if(e.key==='ArrowLeft')moveFrame(-1); if(e.key==='ArrowRight')moveFrame(1); if(e.key==='ArrowUp'){candidateIndex=Math.max(0,candidateIndex-1);activeLayer=null;loadFrame();} if(e.key==='ArrowDown'){candidateIndex++;activeLayer=null;loadFrame();} if(e.key.toLowerCase()==='c')label('correct'); if(e.key.toLowerCase()==='u')label('uncertain'); if(e.key.toLowerCase()==='n')label('no_valid_pose'); });
@@ -703,8 +815,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/candidates":
             frame_index = int(query.get("frame", [0])[0])
             record = self.state.record_for_frame(frame_index)
+            payload = color_likelihood_payload(record) if record is not None else {
+                "color_identity_labels": [],
+                "color_observation_centers": [],
+                "color_likelihoods": [],
+            }
+            payload["candidates"] = [] if record is None else review_candidates(record)
             self._send_json(
-                {"candidates": [] if record is None else review_candidates(record)}
+                payload
             )
             return
         if parsed.path == "/api/face-regions":
@@ -712,7 +830,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
             candidate_index = int(query.get("candidate", [0])[0])
             record = self.state.record_for_frame(frame_index)
             candidates = review_candidates(record) if record is not None else []
-            pose = record.get("search_pose") if record is not None else None
+            pose = (
+                pose_for_candidate(record, candidate_index)
+                if record is not None
+                else None
+            )
             if not isinstance(pose, dict) or not 0 <= candidate_index < len(candidates):
                 self._send_json({"faces": []})
                 return

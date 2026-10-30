@@ -99,4 +99,5 @@ def test_accept_measurement_returns_current_pose_without_blending():
     np.testing.assert_allclose(accepted_tvec, measured_tvec)
     predicted = motion_filter.predict_pose()
     assert predicted is not None
-    assert not np.allclose(predicted[0], measured_rvec)
+    np.testing.assert_allclose(predicted[0], measured_rvec)
+    np.testing.assert_allclose(predicted[1], measured_tvec)
