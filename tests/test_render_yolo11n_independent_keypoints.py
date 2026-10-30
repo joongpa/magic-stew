@@ -59,6 +59,57 @@ def test_layer_removal_is_the_default_move_recovery_mode():
     assert args.pnp_turn_recovery_mode == "layer-removal"
 
 
+def test_initial_scramble_parser_accepts_standard_notation_and_alias():
+    args = render_script.build_parser().parse_args(
+        ["--source", "input.mp4", "--known-scramble", "R U2 F' Rw2 r'"]
+    )
+
+    assert args.initial_scramble == ("R", "U2", "F'", "Rw2", "r'")
+
+
+def test_scramble_recognition_can_be_disabled():
+    args = render_script.build_parser().parse_args(
+        ["--source", "input.mp4", "--no-recognize-scramble"]
+    )
+
+    assert args.recognize_scramble is False
+
+    enabled = render_script.build_parser().parse_args(
+        ["--source", "input.mp4", "--recognize-scramble"]
+    )
+    assert enabled.recognize_scramble is True
+
+
+def test_classified_colors_are_reported_as_a_solved_to_state_scramble():
+    state = render_script.CubeState.from_scramble(("R", "U2", "F'"))
+    trace = render_script.StickerColorTrace.create()
+    color_names = {
+        identity.label: state.color_at(
+            (identity.cubie_index, identity.axis, identity.side)
+        )
+        for identity in trace.identities
+    }
+    seen_facelets = []
+
+    def fake_solve(facelets: str) -> str:
+        seen_facelets.append(facelets)
+        return "R U2 F'"
+
+    assert render_script.scramble_from_classified_sticker_colors(
+        trace,
+        color_names,
+        solve=fake_solve,
+    ) == "F U2 R'"
+    assert len(seen_facelets) == 1
+
+
+def test_classified_colors_do_not_report_a_scramble_for_an_incomplete_state():
+    trace = render_script.StickerColorTrace.create()
+    color_names = {trace.identities[0].label: "white"}
+
+    assert render_script.scramble_from_classified_sticker_colors(trace, color_names) is None
+
+
 def test_single_layer_removal_includes_its_complete_outer_face():
     points = render_script.CUBE_LATTICE_OBJECT_POINTS_MM
 
@@ -572,6 +623,32 @@ def test_sticker_mask_heatmap_is_transparent_and_redder_at_mask_peak():
     assert rendered[16, 16, 2] > rendered[16, 8, 2] > image[16, 8, 2]
 
 
+def test_sticker_mask_heatmap_can_hide_centroid_markers():
+    image = np.full((32, 32, 3), 10, dtype=np.uint8)
+    sticker_mask = np.zeros((32, 32), dtype=bool)
+    sticker_mask[8:24, 8:24] = True
+    predicted = (
+        [sticker_mask],
+        None,
+        np.asarray([0], dtype=np.int32),
+        None,
+    )
+
+    with_centroid = render_script.draw_sticker_mask_heatmap(
+        image,
+        (0, 0, 32, 32),
+        predicted,
+    )
+    without_centroid = render_script.draw_sticker_mask_heatmap(
+        image,
+        (0, 0, 32, 32),
+        predicted,
+        show_sticker_centroids=False,
+    )
+
+    assert np.any(with_centroid != without_centroid)
+
+
 def test_sticker_mask_containment_preserves_neighbors_and_first_duplicate():
     large = np.zeros((30, 40), dtype=bool)
     large[2:12, 2:14] = True
@@ -1028,6 +1105,23 @@ def test_global_profiles_use_soft_responsibilities_for_ambiguous_red_orange_samp
     assert responsibilities[orange_index] > 0.01
 
 
+def test_global_profiles_can_use_pose_free_mask_samples():
+    samples = []
+    for frame_index in range(8):
+        samples.extend(
+            (
+                ("M0", frame_index, np.asarray((220, 25, 15), dtype=np.uint8)),
+                ("M1", frame_index, np.asarray((240, 125, 20), dtype=np.uint8)),
+            )
+        )
+
+    profiles, grouped = render_script.build_global_color_profiles_from_samples(samples)
+
+    assert sum(len(entries) for entries in grouped.values()) == len(samples)
+    assert profiles["red"].fitted is not None
+    assert profiles["orange"].fitted is not None
+
+
 def test_sticker_observation_likelihood_uses_previous_observations_as_prior():
     trace = render_script.StickerColorTrace.create()
     label = trace.identities[0].label
@@ -1138,6 +1232,52 @@ def test_cube_rules_do_not_assign_weakly_observed_sticker():
     )
 
     assert label not in assigned
+
+
+def test_cube_rules_infer_the_last_corner_color_from_two_known_stickers():
+    trace = render_script.StickerColorTrace.create()
+    face_colors = render_script.STANDARD_FACE_COLOR_NAMES
+    center_identities = [
+        identity for identity in trace.identities if identity.category == "center"
+    ]
+    corner_identities = [
+        identity
+        for identity in trace.identities
+        if identity.category == "corner" and identity.cubie_label == "UBL"
+    ]
+    corner_identities.sort(key=lambda identity: identity.face)
+    missing_identity = corner_identities[2]
+    all_corner_identities = [
+        identity for identity in trace.identities if identity.category == "corner"
+    ]
+    observed = {
+        identity.label: face_colors[identity.face]
+        for identity in center_identities + [
+            identity
+            for identity in all_corner_identities
+            if identity.label != missing_identity.label
+        ]
+    }
+    for frame_index in range(3):
+        trace.observe(
+            frame_index,
+            {
+                label: np.asarray(render_script.PURE_COLOR_RGB[color], dtype=np.uint8)
+                for label, color in observed.items()
+            },
+        )
+
+    posterior_by_label = {
+        label: {color_name: (0.98 if color_name == color else 0.02 / 5.0)
+                for color_name in render_script.PURE_COLOR_RGB}
+        for label, color in observed.items()
+    }
+    assigned = render_script.classify_sticker_colors_by_cube_rules(
+        trace,
+        posterior_by_label,
+    )
+
+    assert assigned[missing_identity.label] == face_colors[missing_identity.face]
 
 
 def test_pairwise_trajectory_support_reinforces_a_shared_color():
@@ -1833,12 +1973,58 @@ def test_render_sticker_masks_uses_neutral_class_independent_color():
     assert np.all(output[12, 12] == render_script.STICKER_MASK_NEUTRAL_COLOR_BGR)
 
 
+def test_debug_color_masks_classifies_mask_pixels_without_sticker_identity():
+    image = np.zeros((32, 32, 3), dtype=np.uint8)
+    image[:, :] = (255, 0, 0)  # BGR blue
+    local_mask = np.zeros((32, 32), dtype=bool)
+    local_mask[8:24, 8:24] = True
+    predicted = (
+        [local_mask],
+        {0: "sticker"},
+        np.asarray([0], dtype=np.int32),
+        None,
+    )
+    profiles = {
+        color_name: render_script.GlobalColorProfile(
+            color_name=color_name,
+            prior=render_script.pure_rgb_color_profile(color_name),
+            fitted=None,
+            sample_count=0,
+        )
+        for color_name in render_script.GLOBAL_COLOR_NAMES
+    }
+
+    output = render_script.draw_classified_sticker_masks(
+        image,
+        (0, 0, 32, 32),
+        predicted,
+        global_profiles=profiles,
+        opacity=1.0,
+        show_sticker_identities=False,
+    )
+
+    assert np.all(output[12, 12] == (255, 0, 0))
+    assert np.all(output[0, 0] == image[0, 0])
+
+
 def test_sticker_mask_erosion_parser_and_roi_masks():
     assert render_script.build_parser().parse_args(["--source", "frame.png"]).sticker_mask_erosion == 0
     args = render_script.build_parser().parse_args(
         ["--source", "frame.png", "--sticker-mask-erosion", "1"]
     )
     assert args.sticker_mask_erosion == 1
+    debug_args = render_script.build_parser().parse_args(
+        ["--source", "frame.png", "--debug-color-masks"]
+    )
+    assert debug_args.debug_color_masks is True
+    hidden_args = render_script.build_parser().parse_args(
+        [
+            "--source",
+            "frame.png",
+            "--no-show-keypoints",
+        ]
+    )
+    assert hidden_args.show_keypoints is False
 
     local_mask = np.zeros((9, 9), dtype=bool)
     local_mask[2:7, 2:7] = True

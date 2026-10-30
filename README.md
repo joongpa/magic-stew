@@ -442,6 +442,24 @@ For `.mp4`, `.m4v`, and `.mov` outputs, the script adds a QuickTime timecode
 track after rendering so QuickTime Player can enable its frame-counter display.
 This requires `ffmpeg` to be available on `PATH`.
 
+If the video starts from a known scramble, provide it so the color matcher
+uses the known sticker state and only solves the whole-cube orientation:
+
+```bash
+.venv/bin/python scripts/render_yolo11n_independent_keypoints.py \
+  --source /path/to/solve.mp4 \
+  --model runs/pose/runs/independent_keypoints_v3_weights.pt \
+  --combined-seg-model runs/segment/runs/combinedSegmentWeights.pt \
+  --initial-scramble "R U2 F'"
+```
+
+Scrambles use standard face-turn notation (`R`, `U2`, `F'`), wide-turn
+notation (`Rw`, `Uw2`, `Fw'`, or lowercase aliases such as `r`), and whole-
+cube rotations (`x/y/z`). They are interpreted in the fixed frame
+white-on-top/U and green-on-front/F. When supplied, measured color posteriors
+do not change the displayed sticker colors.
+`--known-scramble` is an alias for `--initial-scramble`.
+
 For ground-truth overlays on the prepared dataset, use
 `scripts/render_independent_keypoints.py`:
 
