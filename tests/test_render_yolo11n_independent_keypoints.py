@@ -682,6 +682,20 @@ def test_move_search_runs_only_after_static_pose_selection(monkeypatch):
         fake_refine,
     )
 
+    def fail_color_work(*_args, **_kwargs):
+        raise AssertionError("geometry-only pose recovery must not classify colors")
+
+    monkeypatch.setattr(
+        render_script,
+        "build_global_color_profiles",
+        fail_color_work,
+    )
+    monkeypatch.setattr(
+        render_script,
+        "_score_symmetry_observations",
+        fail_color_work,
+    )
+
     render_script.recover_cached_pose_symmetries(
         [record],
         render_script.StickerColorTrace.create(),
@@ -961,6 +975,59 @@ def test_color_observation_likelihoods_are_soft_and_normalized():
     assert likelihoods["orange"] > likelihoods["blue"]
 
 
+def test_global_profiles_use_soft_responsibilities_for_ambiguous_red_orange_samples():
+    trace = render_script.StickerColorTrace.create()
+    labels = [identity.label for identity in trace.identities]
+    red_values = np.asarray(
+        [[40, 2, 2], [90, 5, 4], [150, 15, 10], [220, 30, 20], [255, 60, 40]],
+        dtype=np.uint8,
+    )
+    orange_values = np.asarray(
+        [[50, 25, 2], [110, 55, 4], [170, 90, 8], [220, 130, 30], [255, 165, 0]],
+        dtype=np.uint8,
+    )
+    ambiguous_orange = np.asarray((255, 100, 0), dtype=np.uint8)
+    for frame_index in range(20):
+        trace.observe(
+            frame_index,
+            {
+                labels[0]: red_values[frame_index % len(red_values)],
+                labels[1]: orange_values[frame_index % len(orange_values)],
+                # This sample is closer to the red pure prior, but is still
+                # allowed to contribute to the orange profile softly.
+                labels[2]: ambiguous_orange,
+            },
+        )
+
+    profiles, _grouped = render_script.build_global_color_profiles(trace)
+    red_pivot = profiles["red"].fitted.polyline_rgb[1]
+    orange_pivot = profiles["orange"].fitted.polyline_rgb[1]
+
+    assert orange_pivot[1] > red_pivot[1] + 40.0
+    likelihoods = render_script.rgb_observation_color_likelihoods(
+        np.asarray((255, 165, 0), dtype=np.uint8),
+        profiles,
+    )
+    assert likelihoods["orange"] > likelihoods["red"]
+
+    prior_distances = np.asarray(
+        [
+            render_script._piecewise_profile_distances(
+                render_script.rgb_to_oklab(ambiguous_orange.reshape(1, 3)),
+                render_script.pure_rgb_color_profile(color_name).polyline_oklab,
+            )[0]
+            for color_name in render_script.GLOBAL_COLOR_NAMES
+        ]
+    )
+    responsibilities = render_script._global_profile_soft_responsibilities(
+        prior_distances.reshape(1, -1)
+    )[0]
+    red_index = render_script.GLOBAL_COLOR_NAMES.index("red")
+    orange_index = render_script.GLOBAL_COLOR_NAMES.index("orange")
+    assert responsibilities[red_index] > responsibilities[orange_index]
+    assert responsibilities[orange_index] > 0.01
+
+
 def test_sticker_observation_likelihood_uses_previous_observations_as_prior():
     trace = render_script.StickerColorTrace.create()
     label = trace.identities[0].label
@@ -985,6 +1052,37 @@ def test_sticker_observation_likelihood_uses_previous_observations_as_prior():
     assert np.isclose(sum(second.values()), 1.0)
     assert first["red"] > first["orange"]
     assert second["red"] < first["red"]
+
+
+def test_debug_global_profile_likelihoods_are_independent_per_frame():
+    trace = render_script.StickerColorTrace.create()
+    label = trace.identities[0].label
+    trace.observe(0, {label: np.asarray((128, 20, 20), dtype=np.uint8)})
+    trace.observe(1, {label: np.asarray((10, 10, 180), dtype=np.uint8)})
+    profiles = {
+        color_name: render_script.GlobalColorProfile(
+            color_name=color_name,
+            prior=render_script.pure_rgb_color_profile(color_name),
+            fitted=None,
+            sample_count=0,
+        )
+        for color_name in render_script.PURE_COLOR_RGB
+    }
+
+    likelihoods = render_script.build_sticker_global_profile_likelihoods(
+        trace,
+        profiles,
+    )
+
+    assert set(likelihoods) == {0, 1}
+    for frame_index, rgb in (
+        (0, np.asarray((128, 20, 20), dtype=np.uint8)),
+        (1, np.asarray((10, 10, 180), dtype=np.uint8)),
+    ):
+        expected = render_script.rgb_observation_color_likelihoods(rgb, profiles)
+        actual = likelihoods[frame_index][label]
+        assert np.isclose(sum(actual.values()), 1.0)
+        assert actual == expected
 
 
 def test_low_reliability_observation_has_tempered_color_effect():
@@ -1027,6 +1125,19 @@ def test_final_posterior_color_assignment_is_independent_per_sticker():
     )
 
     assert assigned == {label: "red", another_label: "blue"}
+
+
+def test_cube_rules_do_not_assign_weakly_observed_sticker():
+    trace = render_script.StickerColorTrace.create()
+    label = trace.identities[0].label
+    trace.observe(0, {label: np.asarray((255, 0, 0), dtype=np.uint8)})
+
+    assigned = render_script.classify_sticker_colors_by_cube_rules(
+        trace,
+        {label: {"red": 0.95, "orange": 0.05}},
+    )
+
+    assert label not in assigned
 
 
 def test_pairwise_trajectory_support_reinforces_a_shared_color():
@@ -1079,6 +1190,32 @@ def test_frame_posterior_color_assignment_can_change_by_frame():
 
     assert assigned[0][label] == "red"
     assert assigned[1][label] == "orange"
+
+
+def test_frame_global_profile_color_assignment_is_independent_per_sample():
+    trace = render_script.StickerColorTrace.create()
+    label = trace.identities[0].label
+    trace.observe(0, {label: np.asarray((128, 20, 20), dtype=np.uint8)})
+    trace.observe(1, {label: np.asarray((10, 10, 180), dtype=np.uint8)})
+    profiles = {
+        color_name: render_script.GlobalColorProfile(
+            color_name=color_name,
+            prior=render_script.pure_rgb_color_profile(color_name),
+            fitted=None,
+            sample_count=0,
+        )
+        for color_name in render_script.GLOBAL_COLOR_NAMES
+    }
+
+    assigned = render_script.classify_sticker_colors_by_frame_global_profile(
+        trace,
+        profiles,
+    )
+
+    assert assigned == {
+        0: {label: "red"},
+        1: {label: "blue"},
+    }
 
 
 def test_frame_posteriors_carry_forward_when_a_sticker_is_not_observed():
