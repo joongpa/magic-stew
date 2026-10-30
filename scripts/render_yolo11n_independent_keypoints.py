@@ -2529,6 +2529,7 @@ def recover_cached_pose_symmetries(
     recover_orientation: bool = True,
     recognize_moves: bool = False,
     turn_recovery_mode: str = "angle-search",
+    turn_scoring_device: object | None = None,
     max_turn_face_candidates: int = PNP_TURN_FACE_CANDIDATES,
     record_all_turn_candidates: bool = False,
     pose_motion_filter: PoseMotionFilter | None = None,
@@ -2643,6 +2644,7 @@ def recover_cached_pose_symmetries(
                         # search is applied only after the final static
                         # candidate has been selected below.
                         recover_layer_turns=False,
+                        turn_scoring_device=turn_scoring_device,
                         max_turn_face_candidates=max_turn_face_candidates,
                         record_all_turn_candidates=record_all_turn_candidates,
                     )
@@ -2805,6 +2807,7 @@ def recover_cached_pose_symmetries(
                 selected_candidate,
                 recover_layer_turns=True,
                 turn_recovery_mode=turn_recovery_mode,
+                turn_scoring_device=turn_scoring_device,
                 max_turn_face_candidates=max_turn_face_candidates,
                 record_all_turn_candidates=record_all_turn_candidates,
             )
@@ -7145,11 +7148,662 @@ def recover_misaligned_cube_layers_by_removal(
     )
 
 
+def _turn_torch_scoring_device(device: object | None) -> object | None:
+    """Return a CUDA/MPS Torch device when turn scoring is requested and usable."""
+
+    if device is None:
+        return None
+    try:
+        import torch
+    except ImportError:
+        return None
+    device_text = str(device).lower()
+    if device_text.startswith("cuda"):
+        return torch.device(device_text) if torch.cuda.is_available() else None
+    if device_text.isdigit():
+        return torch.device(f"cuda:{device_text}") if torch.cuda.is_available() else None
+    if device_text.startswith("mps"):
+        mps_backend = getattr(torch.backends, "mps", None)
+        return torch.device("mps") if mps_backend is not None and mps_backend.is_available() else None
+    return None
+
+
+@lru_cache(maxsize=1)
+def _turn_gpu_static_geometry() -> tuple[np.ndarray, ...]:
+    """Build the fixed cube geometry used by the batched turn scorer."""
+
+    triangles: list[np.ndarray] = []
+    triangle_centers: list[np.ndarray] = []
+    sticker_faces: list[np.ndarray] = []
+    sticker_centers: list[np.ndarray] = []
+    sticker_cubie_centers: list[np.ndarray] = []
+    sticker_normals: list[np.ndarray] = []
+    for x_index in range(3):
+        for y_index in range(3):
+            for z_index in range(3):
+                center = cubelet_center_object_point(x_index, y_index, z_index)
+                outer_faces = tuple(
+                    (axis, side)
+                    for axis in range(3)
+                    for side in (-1, 1)
+                    if (
+                        (axis == 0 and ((side == -1 and x_index == 0) or (side == 1 and x_index == 2)))
+                        or (axis == 1 and ((side == -1 and y_index == 0) or (side == 1 and y_index == 2)))
+                        or (axis == 2 and ((side == -1 and z_index == 0) or (side == 1 and z_index == 2)))
+                    )
+                )
+                for axis, side in outer_faces:
+                    face = cubelet_face_object_points(center, axis, side).astype(np.float64)
+                    sticker_faces.append(face)
+                    sticker_centers.append(np.mean(face, axis=0))
+                    sticker_cubie_centers.append(np.asarray(center, dtype=np.float64))
+                    sticker_normals.append(np.cross(face[1] - face[0], face[2] - face[0]))
+                    triangles.append(np.asarray((face[0], face[1], face[2]), dtype=np.float64))
+                    triangles.append(np.asarray((face[0], face[2], face[3]), dtype=np.float64))
+                    triangle_centers.extend((center, center))
+    return (
+        np.asarray(triangles, dtype=np.float64),
+        np.asarray(triangle_centers, dtype=np.float64),
+        np.asarray(sticker_faces, dtype=np.float64),
+        np.asarray(sticker_centers, dtype=np.float64),
+        np.asarray(sticker_cubie_centers, dtype=np.float64),
+        np.asarray(sticker_normals, dtype=np.float64),
+    )
+
+
+def _torch_axis_rotation_matrices(torch_module: object, axes: object, angles: object) -> object:
+    """Return one Rodrigues matrix per axis/angle pair."""
+
+    torch = torch_module
+    count = int(axes.shape[0])
+    zeros = torch.zeros(count, dtype=angles.dtype, device=angles.device)
+    ones = torch.ones(count, dtype=angles.dtype, device=angles.device)
+    cosine = torch.cos(angles)
+    sine = torch.sin(angles)
+    rotation_x = torch.stack(
+        (
+            torch.stack((ones, zeros, zeros), dim=1),
+            torch.stack((zeros, cosine, -sine), dim=1),
+            torch.stack((zeros, sine, cosine), dim=1),
+        ),
+        dim=1,
+    )
+    rotation_y = torch.stack(
+        (
+            torch.stack((cosine, zeros, sine), dim=1),
+            torch.stack((zeros, ones, zeros), dim=1),
+            torch.stack((-sine, zeros, cosine), dim=1),
+        ),
+        dim=1,
+    )
+    rotation_z = torch.stack(
+        (
+            torch.stack((cosine, -sine, zeros), dim=1),
+            torch.stack((sine, cosine, zeros), dim=1),
+            torch.stack((zeros, zeros, ones), dim=1),
+        ),
+        dim=1,
+    )
+    rotations = torch.stack((rotation_x, rotation_y, rotation_z), dim=1)
+    return rotations[torch.arange(count, device=axes.device), axes]
+
+
+def _torch_project_turn_points(
+    torch_module: object,
+    points: object,
+    camera_rotation: object,
+    tvec: object,
+    camera_matrix: object,
+    dist_coeffs: object,
+) -> object:
+    """Project batched 3-D points with the OpenCV pinhole distortion model."""
+
+    torch = torch_module
+    camera_points = torch.einsum("ij,b...j->b...i", camera_rotation, points) + tvec
+    z = camera_points[..., 2]
+    safe_z = torch.where(torch.abs(z) > 1e-12, z, torch.ones_like(z))
+    x = camera_points[..., 0] / safe_z
+    y = camera_points[..., 1] / safe_z
+    coefficients = torch.zeros(5, dtype=points.dtype, device=points.device)
+    flattened_coefficients = dist_coeffs.reshape(-1)
+    coefficient_count = min(5, int(flattened_coefficients.shape[0]))
+    if coefficient_count:
+        coefficients[:coefficient_count] = flattened_coefficients[:coefficient_count]
+    k1, k2, p1, p2, k3 = coefficients
+    radius_squared = x * x + y * y
+    radial = 1.0 + radius_squared * (
+        k1 + radius_squared * (k2 + radius_squared * k3)
+    )
+    distorted_x = x * radial + 2.0 * p1 * x * y + p2 * (
+        radius_squared + 2.0 * x * x
+    )
+    distorted_y = y * radial + p1 * (radius_squared + 2.0 * y * y) + 2.0 * p2 * x * y
+    return torch.stack(
+        (
+            camera_matrix[0, 0] * distorted_x + camera_matrix[0, 2],
+            camera_matrix[1, 1] * distorted_y + camera_matrix[1, 2],
+        ),
+        dim=-1,
+    )
+
+
+def _gpu_sticker_center_fit_metrics(
+    candidate: StickerPnPCandidate,
+    torch_module: object,
+    projected_face_centers: object,
+    visible_faces: object,
+    scale: float,
+    max_error: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Score batched sticker centers with accelerator-resident nearest matching.
+
+    The mask centroids are intentionally allowed to share a projected face.
+    This avoids the CPU-only Hungarian assignment while retaining the same
+    uncertainty-weighted, gated center penalty for every configuration.
+    """
+
+    torch = torch_module
+    observed = np.asarray(getattr(candidate, "sticker_mask_centers", ()), dtype=np.float64).reshape(-1, 2)
+    if len(observed) == 0:
+        count = int(projected_face_centers.shape[0])
+        return np.zeros(count), np.zeros(count), np.zeros(count, dtype=np.int32)
+    uncertainties = np.asarray(
+        getattr(candidate, "sticker_mask_center_uncertainties", ()),
+        dtype=np.float64,
+    ).reshape(-1)
+    if len(uncertainties) != len(observed):
+        uncertainties = np.ones(len(observed), dtype=np.float64)
+    uncertainties = np.where(
+        np.isfinite(uncertainties), np.maximum(uncertainties, 1.0), np.inf
+    )
+    weights = 1.0 / np.square(uncertainties)
+    observed_t = torch.as_tensor(observed, dtype=projected_face_centers.dtype, device=projected_face_centers.device)
+    uncertainty_t = torch.as_tensor(uncertainties, dtype=projected_face_centers.dtype, device=projected_face_centers.device)
+    weight_t = torch.as_tensor(weights, dtype=projected_face_centers.dtype, device=projected_face_centers.device)
+    distances = torch.linalg.vector_norm(
+        observed_t[None, :, None, :] - projected_face_centers[:, None, :, :],
+        dim=-1,
+    )
+    distances = torch.where(visible_faces[:, None, :], distances, torch.full_like(distances, float("inf")))
+    gate = max_error / scale
+    tolerance = torch.minimum(
+        0.02 + torch.minimum(uncertainty_t / scale, torch.as_tensor(0.01, dtype=uncertainty_t.dtype, device=uncertainty_t.device)),
+        torch.as_tensor(gate - 1e-9, dtype=uncertainty_t.dtype, device=uncertainty_t.device),
+    )
+    fraction = torch.clamp(
+        (distances / scale - tolerance[None, :, None])
+        / torch.clamp(gate - tolerance[None, :, None], min=1e-12),
+        0.0,
+        1.0,
+    )
+    penalties = fraction * fraction * (3.0 - 2.0 * fraction)
+    nearest_distances, nearest_faces = torch.min(distances, dim=2)
+    nearest_penalties = torch.gather(
+        penalties,
+        2,
+        nearest_faces[:, :, None],
+    ).squeeze(2)
+    finite = torch.isfinite(nearest_distances) & (weight_t[None, :] > 0.0)
+    safe_weights = torch.where(
+        finite,
+        weight_t[None, :].expand_as(nearest_distances),
+        torch.zeros_like(nearest_distances),
+    )
+    total_weight_t = torch.sum(safe_weights, dim=1)
+    means_t = torch.where(
+        total_weight_t > 0.0,
+        PNP_TURN_CENTER_PENALTY_SCALE
+        * torch.sum(nearest_penalties * safe_weights, dim=1)
+        / torch.clamp(total_weight_t, min=1e-12),
+        torch.full_like(total_weight_t, float("inf")),
+    )
+
+    # Compute weighted median and p90 on the accelerator.  Invalid matches
+    # have zero weight and sort to the end, so no per-configuration Python
+    # loop or host-side assignment is needed.
+    normalized = torch.where(
+        finite,
+        nearest_distances / scale,
+        torch.full_like(nearest_distances, float("inf")),
+    )
+    sorted_values, order = torch.sort(normalized, dim=1)
+    sorted_weights = torch.gather(safe_weights, 1, order)
+    cumulative = torch.cumsum(sorted_weights, dim=1)
+    median_targets = 0.50 * total_weight_t[:, None]
+    p90_targets = 0.90 * total_weight_t[:, None]
+    median_reached = cumulative >= median_targets
+    p90_reached = cumulative >= p90_targets
+    median_indices = torch.argmax(median_reached.to(torch.int32), dim=1)
+    p90_indices = torch.argmax(p90_reached.to(torch.int32), dim=1)
+    median_values = torch.gather(sorted_values, 1, median_indices[:, None]).squeeze(1)
+    p90_values = torch.gather(sorted_values, 1, p90_indices[:, None]).squeeze(1)
+    robust_t = torch.where(
+        total_weight_t > 0.0,
+        median_values + 0.5 * p90_values,
+        torch.full_like(total_weight_t, float("inf")),
+    )
+    match_counts_t = torch.count_nonzero(
+        finite & (nearest_distances < max_error),
+        dim=1,
+    )
+    return (
+        means_t.detach().cpu().numpy().astype(np.float64, copy=False),
+        robust_t.detach().cpu().numpy().astype(np.float64, copy=False),
+        match_counts_t.detach().cpu().numpy().astype(np.int32, copy=False),
+    )
+
+
+def _score_turn_configurations_on_gpu(
+    candidate: StickerPnPCandidate,
+    assignment_error_limit: float,
+    scoring_device: object,
+) -> list[dict[str, object]] | None:
+    """Batch exhaustive turn projection and scoring on CUDA or Apple MPS.
+
+    Mask centroids use nearest visible projected centers, so the complete
+    numeric configuration score stays on the accelerator. All configuration
+    geometry, projection, class-aware nearest assignment, and residual
+    calculation are batched on the GPU. Returning ``None`` lets callers use the established CPU path for
+    unsupported Torch accelerator environments or malformed candidates.
+    """
+
+    try:
+        import torch
+
+        base_rotations = tuple(candidate.layer_rotations)
+        if base_rotations:
+            return None
+        image_points = np.asarray(candidate.assignment_image_points, dtype=np.float64).reshape(-1, 2)
+        projected_points = np.asarray(candidate.assignment_projected_points, dtype=np.float64).reshape(-1, 2)
+        object_points = np.asarray(candidate.assignment_object_points, dtype=np.float64).reshape(-1, 3)
+        if (
+            len(image_points) < 3
+            or len(image_points) != len(projected_points)
+            or len(image_points) != len(object_points)
+            or not np.isfinite(assignment_error_limit)
+        ):
+            return None
+        scale = projected_cube_diameter(candidate)
+        if not np.isfinite(scale) or scale <= 0.0:
+            return None
+        base_object_points = np.asarray(CUBE_LATTICE_OBJECT_POINTS_MM, dtype=np.float64)
+        base_normals = np.asarray(CUBE_LATTICE_BOUNDARY_NORMALS, dtype=np.float64)
+        base_face_mask = np.asarray(CUBE_LATTICE_BOUNDARY_FACE_MASK, dtype=bool)
+        (
+            triangles,
+            triangle_centers,
+            sticker_faces,
+            _sticker_centers,
+            sticker_cubie_centers,
+            sticker_normals,
+        ) = _turn_gpu_static_geometry()
+        angles = np.arange(
+            PNP_LAYER_MISALIGNMENT_MIN_DEGREES,
+            PNP_LAYER_MISALIGNMENT_MAX_DEGREES
+            + 0.5 * PNP_LAYER_MISALIGNMENT_STEP_DEGREES,
+            PNP_LAYER_MISALIGNMENT_STEP_DEGREES,
+            dtype=np.float64,
+        )
+        configurations: list[tuple[int, int, int, float, bool, tuple[CubeLayerRotation, ...], str]] = []
+        for axis in range(3):
+            for side in (-1, 1):
+                for layer_count in (1, 2):
+                    configurations.append(
+                        (
+                            axis,
+                            side,
+                            layer_count,
+                            0.0,
+                            True,
+                            (),
+                            f"static {layer_face_debug_label(axis, side)}",
+                        )
+                    )
+                    if int(cube_layer_mask(base_object_points, axis, side, layer_count).sum()) < 3:
+                        continue
+                    for angle in angles:
+                        if abs(float(angle)) < 1e-6:
+                            continue
+                        rotation = CubeLayerRotation(axis, side, float(angle), layer_count)
+                        configurations.append(
+                            (
+                                axis,
+                                side,
+                                layer_count,
+                                float(angle),
+                                False,
+                                (rotation,),
+                                layer_rotation_debug_label((rotation,)),
+                            )
+                        )
+        if not configurations:
+            return []
+
+        device = scoring_device
+        dtype = torch.float32 if str(device).startswith("mps") else torch.float64
+        count = len(configurations)
+        axes = torch.as_tensor([item[0] for item in configurations], dtype=torch.long, device=device)
+        sides = torch.as_tensor([item[1] for item in configurations], dtype=dtype, device=device)
+        layer_counts = torch.as_tensor([item[2] for item in configurations], dtype=dtype, device=device)
+        angles_t = torch.as_tensor([item[3] for item in configurations], dtype=dtype, device=device)
+        active = torch.as_tensor([not item[4] for item in configurations], dtype=torch.bool, device=device)
+        base_points_t = torch.as_tensor(base_object_points, dtype=dtype, device=device)
+        base_normals_t = torch.as_tensor(base_normals, dtype=dtype, device=device)
+        camera_rotation_np, _ = cv2.Rodrigues(np.asarray(candidate.rvec, dtype=np.float64).reshape(3, 1))
+        camera_rotation = torch.as_tensor(camera_rotation_np, dtype=dtype, device=device)
+        tvec = torch.as_tensor(np.asarray(candidate.tvec, dtype=np.float64).reshape(1, 1, 3), dtype=dtype, device=device)
+        camera_matrix = torch.as_tensor(np.asarray(candidate.camera_matrix, dtype=np.float64), dtype=dtype, device=device)
+        dist_coeffs = torch.as_tensor(np.asarray(candidate.dist_coeffs, dtype=np.float64), dtype=dtype, device=device)
+        rotation = _torch_axis_rotation_matrices(torch, axes, sides * angles_t * (np.pi / 180.0))
+        point_coordinates = base_points_t[:, axes].T
+        layer_boundary = CUBE_HALF_SIZE_MM - (layer_counts - 1.0) * CUBE_LAYER_SIZE_MM
+        point_layer_mask = torch.where(
+            sides[:, None] > 0.0,
+            point_coordinates >= layer_boundary[:, None] - 1e-4,
+            point_coordinates <= -layer_boundary[:, None] + 1e-4,
+        ) & active[:, None]
+        point_center = torch.zeros((count, 3), dtype=dtype, device=device)
+        point_center[torch.arange(count, device=device), axes] = sides * CUBE_HALF_SIZE_MM
+        expanded_points = base_points_t[None, :, :].expand(count, -1, -1)
+        rotated_points = torch.matmul(expanded_points - point_center[:, None, :], rotation.transpose(1, 2)) + point_center[:, None, :]
+        transformed_points = torch.where(point_layer_mask[:, :, None], rotated_points, expanded_points)
+
+        expanded_normals = base_normals_t[None, :, :, :].expand(count, -1, -1, -1)
+        rotated_normals = torch.einsum("bij,bnfj->bnfi", rotation, expanded_normals)
+        transformed_normals = torch.where(point_layer_mask[:, :, None, None], rotated_normals, expanded_normals)
+        front_facing = (
+            torch.as_tensor(base_face_mask, dtype=torch.bool, device=device)[None, :, :, None]
+            & (torch.einsum("ij,bnfj->bnfi", camera_rotation, transformed_normals)[..., 2:3] < 0.0)
+        ).any(dim=2).squeeze(-1)
+
+        triangle_centers_t = torch.as_tensor(triangle_centers, dtype=dtype, device=device)
+        triangle_coordinates = triangle_centers_t[:, axes].T
+        triangle_boundary = CUBE_HALF_SIZE_MM - layer_counts * CUBE_LAYER_SIZE_MM + CUBE_LAYER_SIZE_MM / 2.0
+        triangle_layer_mask = torch.where(
+            sides[:, None] > 0.0,
+            triangle_coordinates >= triangle_boundary[:, None] - 1e-4,
+            triangle_coordinates <= -triangle_boundary[:, None] + 1e-4,
+        ) & active[:, None]
+        triangles_t = torch.as_tensor(triangles, dtype=dtype, device=device)
+        expanded_triangles = triangles_t[None, :, :, :].expand(count, -1, -1, -1)
+        triangle_center_points = point_center[:, None, :]
+        rotated_triangles = torch.matmul(
+            expanded_triangles - triangle_center_points[:, :, None, :],
+            rotation[:, None, :, :].transpose(2, 3),
+        ) + triangle_center_points[:, :, None, :]
+        transformed_triangles = torch.where(
+            triangle_layer_mask[:, :, None, None],
+            rotated_triangles,
+            expanded_triangles,
+        )
+        camera_origin = -camera_rotation.transpose(0, 1) @ tvec.reshape(3, 1)
+        camera_origin = camera_origin.reshape(1, 1, 3)
+        directions = transformed_points - camera_origin
+        safe_directions = torch.where(torch.abs(directions) <= 1e-12, 1.0, directions)
+        bounds_min = -CUBE_HALF_SIZE_MM
+        bounds_max = CUBE_HALF_SIZE_MM
+        near = (bounds_min - camera_origin) / safe_directions
+        far = (bounds_max - camera_origin) / safe_directions
+        slab_near = torch.minimum(near, far)
+        slab_far = torch.maximum(near, far)
+        parallel_inside = (torch.abs(directions) > 1e-12) | (
+            (camera_origin >= bounds_min) & (camera_origin <= bounds_max)
+        )
+        t_enter = torch.maximum(torch.zeros_like(slab_near[..., 0]), torch.amax(slab_near, dim=2))
+        t_exit = torch.minimum(torch.ones_like(slab_far[..., 0]), torch.amin(slab_far, dim=2))
+        ray_intersects_cube = torch.all(parallel_inside, dim=2) & (t_enter <= t_exit)
+        direction_is_zero = torch.linalg.vector_norm(directions, dim=2) <= 1e-9
+        hidden_by_cube = ray_intersects_cube & ~direction_is_zero & (t_enter > 1e-5) & (t_enter < 1.0 - 1e-4)
+
+        edge_1 = transformed_triangles[:, :, 1] - transformed_triangles[:, :, 0]
+        edge_2 = transformed_triangles[:, :, 2] - transformed_triangles[:, :, 0]
+        ray_cross_edge_2 = torch.cross(directions[:, :, None, :], edge_2[:, None, :, :], dim=3)
+        determinant = torch.sum(edge_1[:, None, :, :] * ray_cross_edge_2, dim=3)
+        valid_determinant = torch.abs(determinant) > 1e-9
+        inverse_determinant = torch.where(valid_determinant, 1.0 / determinant, torch.zeros_like(determinant))
+        origin_to_vertex = -transformed_triangles[:, None, :, 0, :] + camera_origin[:, :, None, :]
+        barycentric_u = inverse_determinant * torch.sum(origin_to_vertex * ray_cross_edge_2, dim=3)
+        cross_q = torch.cross(origin_to_vertex, edge_1[:, None, :, :], dim=3)
+        barycentric_v = inverse_determinant * torch.sum(directions[:, :, None, :] * cross_q, dim=3)
+        distance = inverse_determinant * torch.sum(edge_2[:, None, :, :] * cross_q, dim=3)
+        triangle_hits = (
+            valid_determinant
+            & (barycentric_u >= -1e-6)
+            & (barycentric_v >= -1e-6)
+            & (barycentric_u + barycentric_v <= 1.0 + 1e-6)
+            & (distance > 1e-5)
+            & (distance < 1.0 - 1e-4)
+        )
+        hidden_by_surface = torch.any(triangle_hits, dim=2)
+        visible_points = front_facing & torch.where(active[:, None], ~hidden_by_surface, ~hidden_by_cube)
+        projected = _torch_project_turn_points(
+            torch,
+            transformed_points,
+            camera_rotation,
+            tvec,
+            camera_matrix,
+            dist_coeffs,
+        )
+        observed = torch.as_tensor(image_points, dtype=dtype, device=device)
+        distances = torch.linalg.vector_norm(observed[None, :, None, :] - projected[:, None, :, :], dim=3)
+        distances = torch.where(visible_points[:, None, :], distances, torch.full_like(distances, float("inf")))
+
+        fixed_mask = candidate.assignment_fixed_mask
+        if fixed_mask is not None:
+            fixed_mask = np.asarray(fixed_mask, dtype=bool).reshape(-1)
+        if fixed_mask is None or len(fixed_mask) != len(image_points):
+            fixed_mask = np.zeros(len(image_points), dtype=bool)
+            fixed_mask[: min(len(candidate.image_points), len(image_points))] = True
+        fixed_positions = np.flatnonzero(fixed_mask).astype(np.int32)
+        if len(fixed_positions) != len(candidate.object_points):
+            fixed_positions = np.empty((0,), dtype=np.int32)
+        fixed_object_points = np.asarray(candidate.object_points, dtype=np.float64).reshape(-1, 3)
+        fixed_projected_points = projected_points[fixed_positions].copy()
+        existing_projected_classes = candidate.assignment_projected_class_ids
+        if existing_projected_classes is not None:
+            existing_projected_classes = np.asarray(existing_projected_classes, dtype=np.int32).reshape(-1)
+            if len(existing_projected_classes) != len(image_points):
+                existing_projected_classes = None
+        fixed_projected_classes = (
+            existing_projected_classes[fixed_positions].copy()
+            if existing_projected_classes is not None
+            else np.full(len(fixed_positions), -1, dtype=np.int32)
+        )
+        observed_classes = candidate.assignment_observed_class_ids
+        if observed_classes is not None:
+            observed_classes = np.asarray(observed_classes, dtype=np.int32).reshape(-1)
+            if len(observed_classes) != len(image_points):
+                observed_classes = None
+        use_class_aware_assignment = PNP_ASSIGNMENT_MODE == "class-aware"
+        trial_classes = torch.as_tensor(CUBE_LATTICE_CLASS_IDS, dtype=torch.long, device=device)
+        if use_class_aware_assignment and observed_classes is not None:
+            observed_class_t = torch.as_tensor(observed_classes, dtype=torch.long, device=device)
+            mismatch = (
+                (observed_class_t[None, :, None] >= 0)
+                & (trial_classes[None, None, :] >= 0)
+                & (observed_class_t[None, :, None] != trial_classes[None, None, :])
+            )
+            distances = torch.where(mismatch, torch.full_like(distances, float("inf")), distances)
+
+        fixed_object_t = torch.as_tensor(fixed_object_points, dtype=dtype, device=device)
+        fixed_layer_coordinates = fixed_object_t[:, axes].T if len(fixed_object_points) else torch.empty((count, 0), dtype=dtype, device=device)
+        fixed_layer_mask = torch.where(
+            sides[:, None] > 0.0,
+            fixed_layer_coordinates >= layer_boundary[:, None] - 1e-4,
+            fixed_layer_coordinates <= -layer_boundary[:, None] + 1e-4,
+        ) & active[:, None] if len(fixed_object_points) else torch.empty((count, 0), dtype=torch.bool, device=device)
+        preserve_fixed = torch.zeros((count, len(image_points)), dtype=torch.bool, device=device)
+        if len(fixed_positions):
+            preserve_fixed[:, fixed_positions] = ~fixed_layer_mask
+        min_distances, columns = torch.min(distances, dim=2)
+        selected_projected = torch.gather(projected, 1, columns[:, :, None].expand(-1, -1, 2))
+        selected_objects = torch.gather(transformed_points, 1, columns[:, :, None].expand(-1, -1, 3))
+        selected_classes = trial_classes[columns]
+        if len(fixed_positions):
+            fixed_row_mask = np.full(len(image_points), -1, dtype=np.int32)
+            fixed_row_mask[fixed_positions] = np.arange(len(fixed_positions), dtype=np.int32)
+            fixed_row_t = torch.as_tensor(np.maximum(fixed_row_mask, 0), dtype=torch.long, device=device)
+            fixed_objects_by_row = fixed_object_t[fixed_row_t]
+            fixed_projected_by_row_np = np.zeros((len(image_points), 2), dtype=np.float64)
+            fixed_projected_by_row_np[fixed_positions] = fixed_projected_points
+            fixed_projected_by_row = torch.as_tensor(
+                fixed_projected_by_row_np,
+                dtype=dtype,
+                device=device,
+            )
+            fixed_classes_by_row_np = np.full(len(image_points), -1, dtype=np.int32)
+            fixed_classes_by_row_np[fixed_positions] = fixed_projected_classes
+            fixed_classes_by_row = torch.as_tensor(
+                fixed_classes_by_row_np,
+                dtype=torch.long,
+                device=device,
+            )
+            fixed_distances_by_row = torch.linalg.vector_norm(
+                observed - fixed_projected_by_row,
+                dim=1,
+            )
+            assigned_objects = torch.where(preserve_fixed[:, :, None], fixed_objects_by_row[None, :, :], selected_objects)
+            assigned_projected = torch.where(preserve_fixed[:, :, None], fixed_projected_by_row[None, :, :], selected_projected)
+            assigned_classes = torch.where(preserve_fixed, fixed_classes_by_row[None, :], selected_classes)
+            assigned_distances = torch.where(preserve_fixed, fixed_distances_by_row[None, :], min_distances)
+        else:
+            assigned_objects = selected_objects
+            assigned_projected = selected_projected
+            assigned_classes = selected_classes
+            assigned_distances = min_distances
+
+        sticker_face_centers_t = torch.as_tensor(sticker_cubie_centers, dtype=dtype, device=device)
+        sticker_normals_t = torch.as_tensor(sticker_normals, dtype=dtype, device=device)
+        sticker_coordinates = sticker_face_centers_t[:, axes].T
+        sticker_boundary = CUBE_HALF_SIZE_MM - layer_counts * CUBE_LAYER_SIZE_MM + CUBE_LAYER_SIZE_MM / 2.0
+        sticker_layer_mask = torch.where(
+            sides[:, None] > 0.0,
+            sticker_coordinates >= sticker_boundary[:, None] - 1e-4,
+            sticker_coordinates <= -sticker_boundary[:, None] + 1e-4,
+        ) & active[:, None]
+        expanded_faces = torch.as_tensor(sticker_faces, dtype=dtype, device=device)[None, :, :, :].expand(count, -1, -1, -1)
+        rotated_faces = torch.matmul(
+            expanded_faces - point_center[:, None, None, :],
+            rotation[:, None, :, :].transpose(2, 3),
+        ) + point_center[:, None, None, :]
+        transformed_faces = torch.where(sticker_layer_mask[:, :, None, None], rotated_faces, expanded_faces)
+        projected_face_centers = _torch_project_turn_points(
+            torch,
+            transformed_faces,
+            camera_rotation,
+            tvec,
+            camera_matrix,
+            dist_coeffs,
+        ).mean(dim=2)
+        transformed_face_normals = torch.einsum(
+            "bij,bfj->bfi",
+            rotation,
+            sticker_normals_t[None, :, :].expand(count, -1, -1),
+        )
+        transformed_face_normals = torch.where(
+            sticker_layer_mask[:, :, None],
+            transformed_face_normals,
+            sticker_normals_t[None, :, :].expand(count, -1, -1),
+        )
+        face_centers_camera = torch.einsum("ij,bfj->bfi", camera_rotation, transformed_faces.mean(dim=2)) + tvec
+        face_normals_camera = torch.einsum("ij,bfj->bfi", camera_rotation, transformed_face_normals)
+        visible_faces = torch.sum(face_normals_camera * -face_centers_camera, dim=2) > 0.0
+        sticker_mean, sticker_robust, sticker_matches = _gpu_sticker_center_fit_metrics(
+            candidate,
+            torch,
+            projected_face_centers,
+            visible_faces,
+            float(scale),
+            float(assignment_error_limit),
+        )
+
+        assigned_distances_cpu = assigned_distances.detach().cpu().numpy()
+        assigned_objects_cpu = assigned_objects.detach().cpu().numpy()
+        assigned_projected_cpu = assigned_projected.detach().cpu().numpy()
+        assigned_classes_cpu = assigned_classes.detach().cpu().numpy()
+        results: list[dict[str, object]] = []
+        for trial_index, configuration in enumerate(configurations):
+            axis, side, layer_count, _angle, is_baseline, rotations, label = configuration
+            distances_i = assigned_distances_cpu[trial_index]
+            finite_distances = np.isfinite(distances_i)
+            layer_mask = cube_layer_mask(assigned_objects_cpu[trial_index], axis, side, layer_count)
+            layer_finite = finite_distances & layer_mask
+            if not np.any(layer_finite):
+                keypoint_error = robust_error = mean_error = p90_error = float("inf")
+                inlier_count = layer_inlier_count = 0
+            else:
+                if use_class_aware_assignment and observed_classes is not None:
+                    known = (
+                        (observed_classes >= 0)
+                        & (assigned_classes_cpu[trial_index] >= 0)
+                        & layer_finite
+                    )
+                    if np.any(known) and np.any(observed_classes[known] != assigned_classes_cpu[trial_index][known]):
+                        keypoint_error = robust_error = mean_error = p90_error = float("inf")
+                        inlier_count = layer_inlier_count = 0
+                        finite_distances = np.zeros_like(finite_distances)
+                    else:
+                        normalized = distances_i[finite_distances] / scale
+                        mean_error = float(np.mean(normalized))
+                        robust_error = float(np.median(normalized) + 0.5 * np.percentile(normalized, 90))
+                        p90_error = float(np.percentile(normalized, 90))
+                        keypoint_error = mean_error
+                        inlier_count = int(np.count_nonzero(finite_distances & (distances_i <= assignment_error_limit)))
+                        layer_inlier_count = int(np.count_nonzero(layer_finite & (distances_i <= assignment_error_limit)))
+                else:
+                    normalized = distances_i[finite_distances] / scale
+                    mean_error = float(np.mean(normalized))
+                    robust_error = float(np.median(normalized) + 0.5 * np.percentile(normalized, 90))
+                    p90_error = float(np.percentile(normalized, 90))
+                    keypoint_error = mean_error
+                    inlier_count = int(np.count_nonzero(finite_distances & (distances_i <= assignment_error_limit)))
+                    layer_inlier_count = int(np.count_nonzero(layer_finite & (distances_i <= assignment_error_limit)))
+            combined_mean_error = keypoint_error + (
+                PNP_TURN_MASK_CENTER_WEIGHT * float(sticker_mean[trial_index])
+                if np.isfinite(sticker_mean[trial_index])
+                else float("inf")
+            )
+            combined_robust_error = robust_error + (
+                PNP_TURN_MASK_CENTER_WEIGHT * float(sticker_robust[trial_index])
+                if np.isfinite(sticker_robust[trial_index])
+                else float("inf")
+            )
+            results.append(
+                {
+                    "is_baseline": is_baseline,
+                    "rank": (combined_mean_error, -float(inlier_count), p90_error, -float(layer_inlier_count)),
+                    "label": label,
+                    "robust_error": combined_robust_error,
+                    "keypoint_error": keypoint_error,
+                    "sticker_error": float(sticker_mean[trial_index]),
+                    "combined_mean_error": combined_mean_error,
+                    "keypoint_robust_error": robust_error,
+                    "sticker_robust_error": float(sticker_robust[trial_index]),
+                    "sticker_match_count": int(sticker_matches[trial_index]),
+                    "inlier_count": inlier_count,
+                    "layer_inlier_count": layer_inlier_count,
+                    "p90_error": p90_error,
+                    "mean_error": mean_error,
+                    "layer_axis": axis,
+                    "layer_side": side,
+                    "layer_count": layer_count,
+                    "layer_rotations": rotations,
+                    "assignment_projected_points": assigned_projected_cpu[trial_index].copy(),
+                    "assignment_object_points": assigned_objects_cpu[trial_index].copy(),
+                    "assignment_projected_class_ids": assigned_classes_cpu[trial_index].copy(),
+                }
+            )
+        return results
+    except (RuntimeError, ValueError, TypeError, IndexError, cv2.error):
+        return None
+
+
 def recover_misaligned_cube_layers(
     candidate: StickerPnPCandidate,
     assignment_error_limit: float,
     max_face_candidates: int = PNP_TURN_FACE_CANDIDATES,
     record_all_turn_candidates: bool = False,
+    scoring_device: object | None = None,
 ) -> StickerPnPCandidate:
     """Search every single/double layer turn using combined local fit.
 
@@ -7534,39 +8188,48 @@ def recover_misaligned_cube_layers(
         PNP_LAYER_MISALIGNMENT_STEP_DEGREES,
         dtype=np.float64,
     )
-    ranked_trials: list[dict[str, object]] = []
-    for axis in range(3):
-        for side in (-1, 1):
-            for layer_count in (1, 2):
-                baseline = evaluate_trial(
-                    base_rotations,
-                    axis,
-                    side,
-                    layer_count,
-                    True,
-                )
-                if baseline is not None:
-                    ranked_trials.append(baseline)
-                if int(cube_layer_mask(base_object_points, axis, side, layer_count).sum()) < 3:
-                    continue
-                for angle in angles:
-                    if abs(float(angle)) < 1e-6:
+    ranked_trials = None
+    torch_device = _turn_torch_scoring_device(scoring_device)
+    if torch_device is not None:
+        ranked_trials = _score_turn_configurations_on_gpu(
+            candidate,
+            assignment_error_limit,
+            torch_device,
+        )
+    if ranked_trials is None:
+        ranked_trials = []
+        for axis in range(3):
+            for side in (-1, 1):
+                for layer_count in (1, 2):
+                    baseline = evaluate_trial(
+                        base_rotations,
+                        axis,
+                        side,
+                        layer_count,
+                        True,
+                    )
+                    if baseline is not None:
+                        ranked_trials.append(baseline)
+                    if int(cube_layer_mask(base_object_points, axis, side, layer_count).sum()) < 3:
                         continue
-                    rotation = CubeLayerRotation(
-                        axis,
-                        side,
-                        float(angle),
-                        layer_count,
-                    )
-                    trial = evaluate_trial(
-                        base_rotations + (rotation,),
-                        axis,
-                        side,
-                        layer_count,
-                        False,
-                    )
-                    if trial is not None:
-                        ranked_trials.append(trial)
+                    for angle in angles:
+                        if abs(float(angle)) < 1e-6:
+                            continue
+                        rotation = CubeLayerRotation(
+                            axis,
+                            side,
+                            float(angle),
+                            layer_count,
+                        )
+                        trial = evaluate_trial(
+                            base_rotations + (rotation,),
+                            axis,
+                            side,
+                            layer_count,
+                            False,
+                        )
+                        if trial is not None:
+                            ranked_trials.append(trial)
 
     ordered_trials = sorted(ranked_trials, key=lambda trial: trial["rank"])
     static_inlier_count = int(np.count_nonzero(accepted))
@@ -8651,6 +9314,7 @@ def solve_pnp_from_low_error_assignments(
     record_all_turn_candidates: bool = False,
     recover_layer_turns: bool = False,
     turn_recovery_mode: str = "angle-search",
+    turn_scoring_device: object | None = None,
 ) -> StickerPnPCandidate:
     """Run one final PnP solve using the candidate's full assignment.
 
@@ -8702,6 +9366,7 @@ def solve_pnp_from_low_error_assignments(
                 assignment_error_limit,
                 max_face_candidates=max_turn_face_candidates,
                 record_all_turn_candidates=record_all_turn_candidates,
+                scoring_device=turn_scoring_device,
             )
     else:
         # Make the static-pose contract explicit even if a caller passes a
@@ -12049,6 +12714,7 @@ def render_frame(
                         "pnp_turn_recovery_mode",
                         "angle-search",
                     ),
+                    turn_scoring_device=getattr(args, "device", None),
                     max_turn_face_candidates=args.pnp_turn_face_candidates,
                     record_all_turn_candidates=turn_candidate_log is not None,
                 )
@@ -12892,11 +13558,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pnp-turn-recovery-mode",
         choices=("layer-removal", "angle-search"),
-        default="layer-removal",
+        default="angle-search",
         help=(
-            "Move-recognition strategy. layer-removal ranks all 12 single/double "
-            "layers by the fit of the remaining points without rotating the cube; "
-            "angle-search retains the exhaustive -45..45 degree search."
+            "Move-recognition strategy. angle-search tests every single/double "
+            "layer configuration using keypoint and sticker-centroid fit over "
+            "the exhaustive -45..45 degree search; layer-removal is the faster "
+            "subtractive alternative."
         ),
     )
     parser.add_argument(
@@ -13310,6 +13977,7 @@ def main() -> int:
                 recover_orientation=False,
                 recognize_moves=args.recognize_moves,
                 turn_recovery_mode=args.pnp_turn_recovery_mode,
+                turn_scoring_device=args.device,
                 max_turn_face_candidates=args.pnp_turn_face_candidates,
                 record_all_turn_candidates=args.turn_candidate_log is not None,
                 pose_motion_filter=make_pose_motion_filter(args),
@@ -13484,6 +14152,7 @@ def main() -> int:
             recover_orientation=False,
             recognize_moves=args.recognize_moves,
             turn_recovery_mode=args.pnp_turn_recovery_mode,
+            turn_scoring_device=args.device,
             max_turn_face_candidates=args.pnp_turn_face_candidates,
             record_all_turn_candidates=args.turn_candidate_log is not None,
             pose_motion_filter=make_pose_motion_filter(args),

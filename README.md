@@ -388,15 +388,15 @@ elsewhere.
 With `--recognize-moves`, pose refinement and geometric turn search run on
 every pose frame.
 
-Move recognition defaults to the fast layer-removal mode. It ranks all 12
-single/double layer options by the normalized fit of the remaining keypoints
-and the retained sticker-centroid matches within the 5% cube-diameter gate.
-A single layer removes its full 4x4 face (4 corners, 8 corner-edges, and 4
-corner-edge-centers); a double layer also removes the seam internal to its two
-moving cubie layers, while the seam against the stationary layer remains. The
-selected layer is highlighted red while the displayed cube remains unrotated.
-Use `--pnp-turn-recovery-mode angle-search` to restore the older -45° to 45°
-search in 3° increments.
+Move recognition defaults to the exhaustive angle-search mode. It tests every
+single/double layer configuration over the -45° to 45° range in 3° increments,
+ranking each configuration with a regularized mean of normalized keypoint
+reprojection and sticker-mask-centroid fit. Use
+`--pnp-turn-recovery-mode layer-removal` to opt into the faster subtractive
+alternative, which ranks the 12 layer options without rotating the geometry.
+When `--device` selects CUDA or Apple MPS, the exhaustive geometry and scoring
+pass is batched on that accelerator; unsupported accelerator setups fall back
+to the CPU implementation.
 
 To review the logged alternatives interactively, run the standalone browser
 reviewer against the same source video and log directory:

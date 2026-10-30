@@ -53,10 +53,10 @@ def test_legacy_colored_video_parser_option_remains_an_alias():
     assert args.save_final_video == Path("runs/final.mp4")
 
 
-def test_layer_removal_is_the_default_move_recovery_mode():
+def test_angle_search_is_the_default_move_recovery_mode():
     args = render_script.build_parser().parse_args(["--source", "input.mp4"])
 
-    assert args.pnp_turn_recovery_mode == "layer-removal"
+    assert args.pnp_turn_recovery_mode == "angle-search"
 
 
 def test_initial_scramble_parser_accepts_standard_notation_and_alias():
@@ -419,6 +419,71 @@ def test_turn_overlay_colors_single_and_double_layers_by_role():
         0,
         255,
     )
+
+
+def test_turn_overlay_renders_selected_single_layer_in_red():
+    image_size = (256, 256)
+    rotation = render_script.CubeLayerRotation(
+        axis=2,
+        side=1,
+        angle_degrees=30.0,
+        layer_count=1,
+    )
+    candidate = SimpleNamespace(
+        layer_rotations=(rotation,),
+        orientation_anchor=render_script.orientation_anchor_for_candidate(
+            SimpleNamespace(layer_rotations=(rotation,))
+        ),
+        camera_matrix=render_script.default_camera_matrix(image_size, 1.2),
+        dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+    )
+    image = np.zeros((image_size[1], image_size[0], 3), dtype=np.uint8)
+
+    assert render_script.draw_projected_cube_pose(
+        image,
+        candidate,
+        np.asarray([[0.12], [-0.18], [0.08]], dtype=np.float64),
+        np.asarray([[4.0], [-3.0], [180.0]], dtype=np.float64),
+        (0, 0, 0),
+        2,
+    )
+    assert np.any(np.all(image == np.asarray((0, 0, 255), dtype=np.uint8), axis=2))
+
+
+def test_gpu_sticker_center_scoring_uses_nearest_faces_without_hungarian(monkeypatch):
+    torch = pytest.importorskip("torch")
+    candidate = SimpleNamespace(
+        sticker_mask_centers=(
+            np.asarray((0.0, 0.0), dtype=np.float64),
+            np.asarray((1.0, 0.0), dtype=np.float64),
+        ),
+        sticker_mask_center_uncertainties=(1.0, 1.0),
+    )
+    projected_face_centers = torch.as_tensor(
+        [[[0.0, 0.0]]],
+        dtype=torch.float64,
+    )
+    visible_faces = torch.ones((1, 1), dtype=torch.bool)
+
+    monkeypatch.setattr(
+        render_script,
+        "linear_sum_assignment",
+        lambda *_args, **_kwargs: pytest.fail("GPU center scoring should not use Hungarian matching"),
+    )
+    means, robust, match_counts = render_script._gpu_sticker_center_fit_metrics(
+        candidate,
+        torch,
+        projected_face_centers,
+        visible_faces,
+        scale=100.0,
+        max_error=10.0,
+    )
+
+    assert match_counts.tolist() == [2]
+    assert means.shape == (1,)
+    assert robust.shape == (1,)
+    assert np.isfinite(means[0])
+    assert np.isfinite(robust[0])
 
 
 def test_combined_headless_progress_keeps_neural_and_pose_counts_together(capsys):
