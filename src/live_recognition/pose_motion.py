@@ -28,7 +28,7 @@ class PoseMotionFilterConfig:
     """
 
     dt_seconds: float = 1.0 / 30.0
-    max_displacement_mm: float = 30.0
+    max_displacement_mm: float = 40.0
     position_alpha: float = 0.35
     position_beta: float = 0.08
     position_gamma: float = 0.02

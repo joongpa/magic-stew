@@ -257,71 +257,93 @@ def projected_face_regions(
     rvec = np.asarray(pose["rvec"], dtype=np.float64).reshape(3, 1)
     tvec = np.asarray(pose["tvec"], dtype=np.float64).reshape(3, 1)
     camera_rotation, _ = cv2.Rodrigues(rvec)
+    geometry_state = pose.get("cube_geometry_state")
+    if isinstance(geometry_state, dict) and geometry_state:
+        geometry_faces = []
+        for value in geometry_state.values():
+            try:
+                position, axis, side = value
+                position = tuple(int(item) for item in position)
+                axis = int(axis)
+                side = int(side)
+            except (TypeError, ValueError):
+                continue
+            if (
+                len(position) == 3
+                and axis in (0, 1, 2)
+                and side in (-1, 1)
+                and position[axis] in (0, 2)
+            ):
+                geometry_faces.append((position, axis, side))
+    else:
+        geometry_faces = [
+            ((x_index, y_index, z_index), axis, side)
+            for x_index in range(3)
+            for y_index in range(3)
+            for z_index in range(3)
+            for axis in range(3)
+            for side in (-1, 1)
+            if (x_index, y_index, z_index)[axis] == (0 if side < 0 else 2)
+        ]
     faces: list[dict[str, object]] = []
-    for x_index in range(3):
-        for y_index in range(3):
-            for z_index in range(3):
-                center = cubie_center(x_index, y_index, z_index)
-                for axis in range(3):
-                    for side in (-1, 1):
-                        indices = (x_index, y_index, z_index)
-                        if indices[axis] != (0 if side < 0 else 2):
-                            continue
-                        base_polygon = face_points(center, axis, side)
-                        polygon = apply_rotations(base_polygon, center, rotations)
-                        transformed_center = apply_rotations(
-                            center.reshape(1, 3),
-                            center,
-                            rotations,
-                        )[0]
-                        normal = np.cross(
-                            polygon[1] - polygon[0],
-                            polygon[2] - polygon[0],
-                        )
-                        center_camera = camera_rotation @ transformed_center + tvec.reshape(3)
-                        normal_camera = camera_rotation @ normal
-                        if float(np.dot(normal_camera, -center_camera)) <= 0.0:
-                            continue
-                        projected, _ = cv2.projectPoints(
-                            polygon,
-                            rvec,
-                            tvec,
-                            camera_matrix,
-                            dist_coeffs,
-                        )
-                        projected = projected.reshape(-1, 2)
-                        if np.isfinite(projected).all():
-                            moving = any(cubie_in_layer(center, rotation) for rotation in rotations)
-                            if not moving and selected_layer is not None:
-                                moving = cubie_in_layer(center, selected_layer)
-                            edges = []
-                            for other_axis in range(3):
-                                if other_axis == axis or indices[other_axis] == 1:
-                                    continue
-                                edge_side = -1 if indices[other_axis] == 0 else 1
-                                for vertex in range(4):
-                                    next_vertex = (vertex + 1) % 4
-                                    if np.isclose(
-                                        base_polygon[vertex, other_axis],
-                                        edge_side * CUBE_HALF_SIZE_MM,
-                                    ) and np.isclose(
-                                        base_polygon[next_vertex, other_axis],
-                                        edge_side * CUBE_HALF_SIZE_MM,
-                                    ):
-                                        edges.append({
-                                            "axis": other_axis,
-                                            "side": edge_side,
-                                            "start": vertex,
-                                            "end": next_vertex,
-                                        })
-                            faces.append({
-                                "polygon": projected,
-                                "moving": moving,
-                                "axis": axis,
-                                "side": side,
-                                "depth": float(center_camera[2]),
-                                "edges": edges,
-                            })
+    for indices, axis, side in geometry_faces:
+        center = cubie_center(*indices)
+        base_polygon = face_points(center, axis, side)
+        polygon = apply_rotations(base_polygon, center, rotations)
+        transformed_center = apply_rotations(
+            center.reshape(1, 3),
+            center,
+            rotations,
+        )[0]
+        normal = np.cross(
+            polygon[1] - polygon[0],
+            polygon[2] - polygon[0],
+        )
+        center_camera = camera_rotation @ transformed_center + tvec.reshape(3)
+        normal_camera = camera_rotation @ normal
+        if float(np.dot(normal_camera, -center_camera)) <= 0.0:
+            continue
+        projected, _ = cv2.projectPoints(
+            polygon,
+            rvec,
+            tvec,
+            camera_matrix,
+            dist_coeffs,
+        )
+        projected = projected.reshape(-1, 2)
+        if np.isfinite(projected).all():
+            moving = any(cubie_in_layer(center, rotation) for rotation in rotations)
+            if not moving and selected_layer is not None:
+                moving = cubie_in_layer(center, selected_layer)
+            edges = []
+            for other_axis in range(3):
+                if other_axis == axis or indices[other_axis] == 1:
+                    continue
+                edge_side = -1 if indices[other_axis] == 0 else 1
+                for vertex in range(4):
+                    next_vertex = (vertex + 1) % 4
+                    if np.isclose(
+                        base_polygon[vertex, other_axis],
+                        edge_side * CUBE_HALF_SIZE_MM,
+                    ) and np.isclose(
+                        base_polygon[next_vertex, other_axis],
+                        edge_side * CUBE_HALF_SIZE_MM,
+                    ):
+                        edges.append({
+                            "axis": other_axis,
+                            "side": edge_side,
+                            "start": vertex,
+                            "end": next_vertex,
+                        })
+            faces.append({
+                "polygon": projected,
+                "moving": moving,
+                "cubie_index": list(indices),
+                "axis": axis,
+                "side": side,
+                "depth": float(center_camera[2]),
+                "edges": edges,
+            })
     return faces
 
 
@@ -356,7 +378,11 @@ def draw_candidate(
         if isinstance(record_selected_layer, dict):
             selected_layer = record_selected_layer
     try:
-        faces = projected_visible_sticker_faces(pose, rotations, selected_layer)
+        face_regions = projected_face_regions(pose, rotations, selected_layer)
+        faces = [
+            (item["polygon"], item["moving"])
+            for item in face_regions
+        ]
     except (cv2.error, KeyError, TypeError, ValueError):
         return output
     overlay = output.copy()
@@ -389,6 +415,76 @@ def draw_candidate(
             point = tuple(np.round(center).astype(int))
             cv2.circle(output, point, 7, (0, 0, 0), -1, cv2.LINE_AA)
             cv2.circle(output, point, 5, HEATMAP_COLOR_BGR, -1, cv2.LINE_AA)
+
+    identity_geometry = record.get("turn_color_identity_geometry", [])
+    geometry_by_key = {}
+    if isinstance(identity_geometry, list):
+        for item in identity_geometry:
+            if not isinstance(item, dict):
+                continue
+            cubie_index = item.get("cubie_index")
+            if not isinstance(cubie_index, list) or len(cubie_index) != 3:
+                continue
+            try:
+                key = (
+                    tuple(int(value) for value in cubie_index),
+                    int(item["axis"]),
+                    int(item["side"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            geometry_by_key[key] = str(item.get("label", ""))
+    candidate_likelihoods = candidate.get("color_likelihoods_by_identity", {})
+    if isinstance(candidate_likelihoods, dict) and geometry_by_key:
+        for region in face_regions:
+            key = (
+                tuple(int(value) for value in region["cubie_index"]),
+                int(region["axis"]),
+                int(region["side"]),
+            )
+            full_label = geometry_by_key.get(key)
+            probability = candidate_likelihoods.get(full_label)
+            if full_label is None or probability is None:
+                continue
+            try:
+                probability = float(probability)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(probability):
+                continue
+            label = full_label.split(" ", 1)[0]
+            polygon = np.asarray(region["polygon"], dtype=np.float64).reshape(-1, 2)
+            center = np.mean(polygon, axis=0)
+            text = f"{label} {probability:.2f}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = 0.42
+            thickness = 1
+            (text_width, text_height), baseline = cv2.getTextSize(
+                text,
+                font,
+                scale,
+                thickness,
+            )
+            x = int(round(float(center[0]) - text_width / 2.0))
+            y = int(round(float(center[1]) + (text_height - baseline) / 2.0))
+            cv2.rectangle(
+                output,
+                (x - 3, y - text_height - 3),
+                (x + text_width + 3, y + baseline + 3),
+                (0, 0, 0),
+                -1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                output,
+                text,
+                (x, y),
+                font,
+                scale,
+                TEXT_COLOR_BGR,
+                thickness,
+                cv2.LINE_AA,
+            )
 
     label = str(candidate.get("label", f"candidate {candidate_index}"))
     text = (
@@ -650,8 +746,24 @@ function formatProbability(value) {
   const number=Number(value);
   return Number.isFinite(number) ? number.toExponential(3) : '—';
 }
-function renderColorLikelihoods(data) {
+function renderColorLikelihoods(data, candidate) {
   const root=$('colorTable'); root.innerHTML='';
+  const perCandidate=candidate?.color_likelihoods_by_identity;
+  if(perCandidate && typeof perCandidate==='object' && !Array.isArray(perCandidate) && Object.keys(perCandidate).length) {
+    const table=document.createElement('table');
+    const head=document.createElement('tr');
+    const identityHead=document.createElement('th'); identityHead.textContent='identity'; head.appendChild(identityHead);
+    const probabilityHead=document.createElement('th'); probabilityHead.textContent='p(observation | prior)'; head.appendChild(probabilityHead);
+    table.appendChild(head);
+    Object.entries(perCandidate).sort(([first],[second])=>first.localeCompare(second)).forEach(([label,value])=>{
+      const row=document.createElement('tr');
+      const identity=document.createElement('td'); identity.textContent=String(label); row.appendChild(identity);
+      const probability=document.createElement('td'); probability.textContent=formatProbability(value); row.appendChild(probability);
+      table.appendChild(row);
+    });
+    root.appendChild(table);
+    return;
+  }
   const labels=data.color_identity_labels||[], matrix=data.color_likelihoods||[];
   if(!labels.length || !matrix.length) { root.textContent='No color likelihoods recorded for this frame.'; return; }
   const centers=data.color_observation_centers||[];
@@ -693,10 +805,10 @@ async function loadFrame() {
   const data=await getJson(`/api/candidates?frame=${frameIndex}`);
   if(version!==loadVersion) return;
   candidates=data.candidates;
-  renderColorLikelihoods(data);
   const count=data.candidates.length;
   if(candidateIndex===null) candidateIndex=current.selected_index ?? 0;
   candidateIndex=Math.max(0, Math.min(candidateIndex, Math.max(0,count-1)));
+  renderColorLikelihoods(data, candidates[candidateIndex]);
   $('frame').value=frameIndex;
   $('sourceImage').onerror=()=>$('status').textContent=`Could not decode video frame ${frameIndex}; check the source video.`;
   $('candidateImage').onerror=()=>$('status').textContent=`Could not decode video frame ${frameIndex}; check the source video.`;

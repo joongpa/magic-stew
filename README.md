@@ -395,7 +395,7 @@ evaluates the 24 proper cube symmetries and uses profile likelihood plus pose
 continuity to select the closest orientation before rendering.
 The optional `--pose-motion-filter` is intentionally simpler: it compares
 only the cube-core translation between accepted poses and rejects changes over
-30 mm; rotation, velocity, acceleration, and jerk are not used.
+40 mm; rotation, velocity, acceleration, and jerk are not used.
 
 Move recognition defaults to the exhaustive angle-search mode. It tests every
 single/double layer configuration over the `-180°` through `174°` range in 6°

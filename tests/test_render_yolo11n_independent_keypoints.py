@@ -96,6 +96,138 @@ def test_move_accumulator_displays_core_displacement_between_good_poses():
     assert accumulator.displacement_mm == 12.0
 
 
+def test_move_accumulator_displays_rejected_pose_displacement_without_accepting_it():
+    rotation = render_script.CubeLayerRotation(0, 1, 90.0, 1)
+    first = SimpleNamespace(
+        layer_rotations=(rotation,),
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    rejected = SimpleNamespace(
+        layer_rotations=(rotation,),
+        tvec=np.asarray([[35.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    accumulator = render_script.MoveAccumulator()
+
+    accumulator.observe(first)
+    accumulator.observe(None, displacement_candidate=rejected)
+
+    assert accumulator.current_fit == "rejected"
+    assert accumulator.displacement_mm == 35.0
+    assert len(accumulator.moves) == 1
+
+
+def test_move_accumulator_ignores_whole_cube_rotations_as_state_changes():
+    face_rotation = render_script.CubeLayerRotation(0, 1, 90.0, 1)
+    whole_cube_rotation = render_script.CubeLayerRotation(0, 1, 90.0, 3)
+    face_candidate = SimpleNamespace(
+        layer_rotations=(face_rotation,),
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    whole_cube_candidate = SimpleNamespace(
+        layer_rotations=(whole_cube_rotation,),
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    accumulator = render_script.MoveAccumulator()
+
+    accumulator.observe(face_candidate)
+    accumulator.observe(whole_cube_candidate)
+    accumulator.observe(face_candidate)
+
+    assert len(accumulator.moves) == 1
+
+
+def test_move_accumulator_snaps_layer_turn_past_45_degrees():
+    partial_rotation = render_script.CubeLayerRotation(0, 1, 84.0, 1)
+    partial_candidate = SimpleNamespace(
+        layer_rotations=(partial_rotation,),
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    accumulator = render_script.MoveAccumulator()
+
+    accumulator.observe(partial_candidate)
+
+    assert accumulator.moves == ["R'"]
+
+
+def test_move_accumulator_keeps_turn_at_or_below_45_degrees_uncommitted():
+    partial_rotation = render_script.CubeLayerRotation(0, 1, 45.0, 1)
+    partial_candidate = SimpleNamespace(
+        layer_rotations=(partial_rotation,),
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    accumulator = render_script.MoveAccumulator()
+
+    accumulator.observe(partial_candidate)
+
+    assert accumulator.moves == []
+
+
+def test_move_accumulator_applies_completed_moves_to_displayed_state():
+    initial_state = render_script.CubeState.solved()
+    identities = render_script.canonical_sticker_identities()
+    initial_colors = {
+        identity.label: initial_state.color_at(
+            (identity.cubie_index, identity.axis, identity.side)
+        )
+        for identity in identities
+    }
+    rotation = render_script.CubeLayerRotation(0, 1, 90.0, 1)
+    candidate = SimpleNamespace(
+        layer_rotations=(rotation,),
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    accumulator = render_script.MoveAccumulator()
+
+    accumulator.observe(candidate, sticker_color_names=initial_colors)
+
+    # Colors are keyed by persistent physical identity, so applying a move
+    # changes the identity's projected location, not its color.
+    assert accumulator.current_color_names() == initial_colors
+
+
+def test_stateful_move_accumulator_commits_repeated_moves_from_matching_models():
+    rotation = render_script.CubeLayerRotation(0, 1, 90.0, 1)
+    first_state = render_script.CubeGeometryState.identity()
+    second_state = first_state.apply_move("R'")
+    first = SimpleNamespace(
+        layer_rotations=(rotation,),
+        cube_geometry_state=first_state,
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    second = SimpleNamespace(
+        layer_rotations=(rotation,),
+        cube_geometry_state=second_state,
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    accumulator = render_script.MoveAccumulator()
+
+    accumulator.observe(first)
+    accumulator.observe(second)
+
+    assert accumulator.moves == ["R'", "R'"]
+    assert accumulator._geometry_state.signature() == second_state.apply_move("R'").signature()
+
+
+def test_stateful_move_accumulator_rejects_a_stale_model_update():
+    rotation = render_script.CubeLayerRotation(0, 1, 90.0, 1)
+    identity_state = render_script.CubeGeometryState.identity()
+    candidate = SimpleNamespace(
+        layer_rotations=(rotation,),
+        cube_geometry_state=identity_state,
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+    accumulator = render_script.MoveAccumulator()
+
+    accumulator.observe(candidate)
+    moves_before = list(accumulator.moves)
+    state_before = accumulator._geometry_state.signature()
+    accumulator.observe(candidate)
+
+    assert accumulator.current_fit == "state-mismatch"
+    assert accumulator.moves == moves_before
+    assert accumulator._geometry_state.signature() == state_before
+
+
 def test_initial_scramble_parser_accepts_standard_notation_and_alias():
     args = render_script.build_parser().parse_args(
         ["--source", "input.mp4", "--known-scramble", "R U2 F' Rw2 r'"]
@@ -625,6 +757,13 @@ def test_gpu_turn_color_score_uses_identity_likelihoods_without_cpu_matching():
         candidate,
         torch,
         torch.as_tensor([[[0.0, 0.0], [20.0, 0.0]]], dtype=torch.float64),
+        torch.as_tensor(
+            [[
+                [[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]],
+                [[15.0, -5.0], [25.0, -5.0], [25.0, 5.0], [15.0, 5.0]],
+            ]],
+            dtype=torch.float64,
+        ),
         torch.ones((1, 2), dtype=torch.bool),
         np.asarray((7, 8), dtype=np.int64),
         scale=100.0,
@@ -862,6 +1001,30 @@ def test_sticker_mask_heatmap_can_hide_centroid_markers():
     )
 
     assert np.any(with_centroid != without_centroid)
+
+
+def test_sticker_mask_heatmap_can_hide_fill_without_hiding_centroid():
+    image = np.zeros((32, 32, 3), dtype=np.uint8)
+    sticker_mask = np.zeros((32, 32), dtype=bool)
+    sticker_mask[8:24, 8:24] = True
+    predicted = (
+        [sticker_mask],
+        None,
+        np.asarray([0], dtype=np.int32),
+        None,
+    )
+
+    rendered = render_script.draw_sticker_mask_heatmap(
+        image,
+        (0, 0, 32, 32),
+        predicted,
+        show_sticker_mask=False,
+    )
+
+    assert np.all(
+        rendered[16, 16] == render_script.STICKER_MASK_CENTROID_COLOR_BGR
+    )
+    assert np.all(rendered[10, 10] == image[10, 10])
 
 
 def test_sticker_mask_containment_preserves_neighbors_and_first_duplicate():
@@ -1697,6 +1860,89 @@ def test_cached_pose_symmetry_recovery_prioritizes_pose_continuity(capsys):
         recovered.rvec,
         previous_pose.rvec,
     ) < 1e-6
+
+
+def test_cached_pose_recovery_rejects_core_displacement_with_motion_filter():
+    def make_candidate(x_position):
+        return render_script.StickerPnPCandidate(
+            sticker_type="corner",
+            sticker_average_confidence=0.9,
+            image_points=np.zeros((4, 2), dtype=np.float32),
+            object_points=np.zeros((4, 3), dtype=np.float32),
+            projected_sticker_points=np.zeros((4, 2), dtype=np.float32),
+            camera_matrix=np.eye(3, dtype=np.float64),
+            dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+            rvec=np.zeros((3, 1), dtype=np.float64),
+            tvec=np.asarray([[x_position], [0.0], [200.0]], dtype=np.float64),
+            reprojection_error=0.0,
+            overall_reprojection_error=0.0,
+        )
+
+    first = make_candidate(0.0)
+    second = make_candidate(41.0)
+    third = make_candidate(82.0)
+    records = [
+        SimpleNamespace(frame_index=0, pose_candidate=first, pose_candidates=(first,)),
+        SimpleNamespace(frame_index=1, pose_candidate=second, pose_candidates=(second,)),
+        SimpleNamespace(frame_index=2, pose_candidate=third, pose_candidates=(third,)),
+    ]
+    motion_filter = render_script.PoseMotionFilter(
+        render_script.PoseMotionFilterConfig(max_displacement_mm=40.0)
+    )
+
+    render_script.recover_cached_pose_symmetries(
+        records,
+        render_script.StickerColorTrace.create(),
+        recover_orientation=False,
+        pose_motion_filter=motion_filter,
+    )
+
+    assert records[0].pose_candidate is not None
+    assert records[1].pose_candidate is None
+    assert records[1].pose_diagnostic_candidate is not None
+    current_pose = motion_filter.current_pose()
+    assert current_pose is not None
+    np.testing.assert_allclose(current_pose[1], third.tvec)
+
+
+def test_cached_pose_recovery_accepts_large_jump_with_close_next_frame():
+    def make_candidate(x_position):
+        return render_script.StickerPnPCandidate(
+            sticker_type="corner",
+            sticker_average_confidence=0.9,
+            image_points=np.zeros((4, 2), dtype=np.float32),
+            object_points=np.zeros((4, 3), dtype=np.float32),
+            projected_sticker_points=np.zeros((4, 2), dtype=np.float32),
+            camera_matrix=np.eye(3, dtype=np.float64),
+            dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+            rvec=np.zeros((3, 1), dtype=np.float64),
+            tvec=np.asarray([[x_position], [0.0], [200.0]], dtype=np.float64),
+            reprojection_error=0.0,
+            overall_reprojection_error=0.0,
+        )
+
+    first = make_candidate(0.0)
+    second = make_candidate(41.0)
+    third = make_candidate(61.0)
+    records = [
+        SimpleNamespace(frame_index=0, pose_candidate=first, pose_candidates=(first,)),
+        SimpleNamespace(frame_index=1, pose_candidate=second, pose_candidates=(second,)),
+        SimpleNamespace(frame_index=2, pose_candidate=third, pose_candidates=(third,)),
+    ]
+    motion_filter = render_script.PoseMotionFilter(
+        render_script.PoseMotionFilterConfig(max_displacement_mm=40.0)
+    )
+
+    render_script.recover_cached_pose_symmetries(
+        records,
+        render_script.StickerColorTrace.create(),
+        recover_orientation=False,
+        pose_motion_filter=motion_filter,
+    )
+
+    assert records[0].pose_candidate is not None
+    assert records[1].pose_candidate is not None
+    assert records[2].pose_candidate is not None
 
 
 def test_sticker_assignment_rejects_opposite_colors_on_one_edge():
@@ -2742,28 +2988,23 @@ def test_recover_misaligned_layer_updates_assignment_geometry(monkeypatch):
         (rotation,),
     )
     layer_indices = np.flatnonzero(layer_mask)
-    source_index = int(
-        layer_indices[
-            np.argmax(
-                np.linalg.norm(
-                    rotated_objects[layer_indices] - visible_objects[layer_indices],
-                    axis=1,
-                )
-            )
-        ]
+    displacements = np.linalg.norm(
+        rotated_objects[layer_indices] - visible_objects[layer_indices],
+        axis=1,
     )
-    extra_point, _ = cv2.projectPoints(
-        rotated_objects[source_index : source_index + 1],
+    source_indices = layer_indices[np.argsort(displacements)[-3:]]
+    extra_points, _ = cv2.projectPoints(
+        rotated_objects[source_indices],
         rvec,
         tvec,
         camera_matrix,
         dist_coeffs,
     )
-    all_points = np.concatenate((sticker_image_points, extra_point.reshape(-1, 2)))
+    all_points = np.concatenate((sticker_image_points, extra_points.reshape(-1, 2)))
     all_classes = np.concatenate(
         (
             np.asarray([0, 1, 2, 1], dtype=np.int32),
-            np.asarray([visible_classes[source_index]], dtype=np.int32),
+            visible_classes[source_indices].astype(np.int32),
         )
     )
     match = render_script.StickerKeypointMatch(
@@ -2839,10 +3080,11 @@ def test_recover_misaligned_layer_updates_assignment_geometry(monkeypatch):
         for debug_candidate in logged.turn_candidate_debug
         for rotation in debug_candidate.layer_rotations
     ]
-    assert len({
+    searched_layer_sides = {
         (rotation.axis, rotation.side)
         for rotation in searched_rotations
-    }) == 6
+    }
+    assert 0 < len(searched_layer_sides) < 6
     assert {rotation.layer_count for rotation in searched_rotations} == {1, 2}
     assert min(rotation.angle_degrees for rotation in searched_rotations) == -180.0
     assert max(rotation.angle_degrees for rotation in searched_rotations) == 174.0
@@ -2852,6 +3094,82 @@ def test_recover_misaligned_layer_updates_assignment_geometry(monkeypatch):
     )
     assert len(logged.turn_candidate_scores) > render_script.PNP_TURN_DEBUG_CANDIDATE_COUNT
     assert len(logged.turn_candidate_debug) == len(logged.turn_candidate_scores)
+
+
+def test_turn_acceptance_compares_against_matching_static_baseline():
+    static_inliers = {
+        (0, 1, 1): 19,
+        (0, 1, 2): 19,
+    }
+    tied_turn = {
+        "is_baseline": False,
+        "layer_axis": 0,
+        "layer_side": 1,
+        "layer_count": 1,
+        "inlier_count": 19,
+    }
+    improving_turn = {
+        **tied_turn,
+        "inlier_count": 20,
+    }
+
+    assert not render_script.turn_trial_exceeds_static_baseline(
+        tied_turn,
+        static_inliers,
+    )
+    assert render_script.turn_trial_exceeds_static_baseline(
+        improving_turn,
+        static_inliers,
+    )
+
+
+def test_completed_turn_can_win_tied_geometry_with_combined_rank():
+    static = {
+        "is_baseline": True,
+        "layer_axis": 0,
+        "layer_side": 1,
+        "layer_count": 1,
+        "inlier_count": 19,
+        "rank": (1.0, -19.0, 4.0, -19.0),
+    }
+    completed_turn = {
+        "is_baseline": False,
+        "layer_axis": 0,
+        "layer_side": 1,
+        "layer_count": 1,
+        "inlier_count": 19,
+        "layer_inlier_count": 3,
+        "rank": (0.9, -19.0, 4.0, -19.0),
+        "layer_rotations": (
+            render_script.CubeLayerRotation(0, 1, 90.0, 1),
+        ),
+    }
+    partial_turn = {
+        **completed_turn,
+        "rank": (0.8, -19.0, 4.0, -19.0),
+        "layer_rotations": (
+            render_script.CubeLayerRotation(0, 1, 44.0, 1),
+        ),
+    }
+
+    baseline = {(0, 1, 1): static}
+    assert render_script.turn_trial_exceeds_static_baseline(
+        completed_turn,
+        baseline,
+    )
+    assert not render_script.turn_trial_exceeds_static_baseline(
+        partial_turn,
+        baseline,
+    )
+
+    insufficient_layer_evidence = {
+        **completed_turn,
+        "layer_inlier_count": 1,
+    }
+    assert not render_script.turn_trial_exceeds_static_baseline(
+        insufficient_layer_evidence,
+        baseline,
+    )
 
 
 def test_three_point_edge_uses_image_gap_to_preserve_cyclic_correspondence():
@@ -3248,7 +3566,7 @@ def test_hypothesis_selection_keeps_much_better_visual_candidate_on_turn():
     assert selected is good_turn
 
 
-def test_hypothesis_selection_rejects_core_displacement_over_30mm():
+def test_hypothesis_selection_rejects_core_displacement_over_40mm():
     def candidate(position, error):
         return SimpleNamespace(
             overall_reprojection_error=error,
@@ -3258,13 +3576,13 @@ def test_hypothesis_selection_rejects_core_displacement_over_30mm():
         )
 
     selected = render_script.select_pose_hypothesis(
-        (candidate(31.0, 0.1), candidate(20.0, 1.0)),
+        (candidate(41.0, 0.1), candidate(20.0, 1.0)),
         (np.zeros((3, 1)), np.asarray([[0.0], [0.0], [200.0]])),
     )
 
     assert selected.tvec[0, 0] == 20.0
     assert render_script.select_pose_hypothesis(
-        (candidate(31.0, 0.1),),
+        (candidate(41.0, 0.1),),
         (np.zeros((3, 1)), np.asarray([[0.0], [0.0], [200.0]])),
     ) is None
 
