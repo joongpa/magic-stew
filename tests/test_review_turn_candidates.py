@@ -143,6 +143,26 @@ def test_renderer_selection_is_found_even_when_not_top_ranked():
     assert review_script.selected_candidate_index(record) == 0
 
 
+def test_renderer_selection_distinguishes_color_offsets_with_identical_geometry():
+    record = dict(selected_layer_rotations=[], selected_committed_moves=["R"],
+                  selected_color_offset_degrees=-90.0, selected_trial_id="0:-90",
+                  candidates=[dict(trial_id="0:+0", layer_rotations=[], color_offset=0.0, state_moves=[]),
+                              dict(trial_id="0:-90", layer_rotations=[], color_offset=-90.0, state_moves=["R"])])
+    assert review_script.selected_candidate_index(record) == 1
+    # Older offset logs have no explicit ID, but still carry enough evidence.
+    del record["selected_trial_id"]
+    assert review_script.selected_candidate_index(record) == 1
+    record["selected_trial_id"] = "not-recorded"
+    assert review_script.selected_candidate_index(record) is None
+
+
+def test_search_debug_payload_preserves_forecasts_and_handles_legacy_logs():
+    search = dict(status="searched", previous_move="R", selected_path=dict(total_score=None))
+    assert review_script.search_debug_payload({"search": search}) == search
+    assert review_script.search_debug_payload({}) is None
+    assert review_script.search_debug_payload(None) is None
+
+
 def test_projected_click_regions_identify_face_and_adjacent_layer_edges():
     pose = {
         "camera_matrix": [[200.0, 0.0, 80.0], [0.0, 200.0, 60.0], [0.0, 0.0, 1.0]],

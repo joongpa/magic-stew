@@ -37,6 +37,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import os
 import shutil
@@ -52,6 +53,7 @@ from pathlib import Path
 from queue import SimpleQueue
 from threading import Lock, Thread
 from time import perf_counter
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -295,10 +297,23 @@ PNP_TURN_MASK_CENTER_WEIGHT = 1.0
 # color is the negative log predictive likelihood p(observation | prior).
 PNP_TURN_COLOR_WEIGHT = 1.0
 MIN_TURN_LAYER_OBSERVATIONS = 3
-# A turn may bypass the strict global-inlier comparison when its predictive
-# color error is at least 2x better than the matching static baseline.
+# A turn is eligible against static when it has more unified inliers or its
+# predictive color error is at least 2x better than the matching baseline.
 PNP_TURN_COLOR_RESCUE_MAX_RATIO = 0.5
 PNP_TURN_CENTER_PENALTY_SCALE = 0.05
+# Search multiple state sequences over the next ten frames. Scores use two
+# uniform blocks: the front half gets 30% and the back half gets 70%.
+PNP_TURN_LOOKAHEAD_FRAMES = 10
+# Scheduling batch size, not a limit on retained states or branching.
+PNP_TURN_LOOKAHEAD_STATE_BATCH_SIZE = 32
+# Keep the best hold plus the top color-ranked changes at every parent.
+PNP_TURN_LOOKAHEAD_STATE_CHANGE_LIMIT = 10
+# Bound total frame/state evaluations per decision, including complete-path seeds.
+PNP_TURN_LOOKAHEAD_STATE_BUDGET = 1024
+# Minimum whole-window fit improvement needed per additional turn. Charge
+# this outside temporal weights so later moves do not become cheaper and
+# future evidence can outweigh a weak current-frame fit without a hard gate.
+PNP_TURN_LOOKAHEAD_MOVE_COST = 0.01
 # Final-solve observations must be close relative to the displayed cube size.
 # This is deliberately expressed as a fraction of the projected cube diameter
 # so the same setting works at different distances from the camera. Keep this
@@ -307,12 +322,14 @@ PNP_FINAL_ASSIGNMENT_ERROR_FRACTION = 0.05
 # This is the normalized fit threshold used for temporal candidate
 # tie-breaking. Outright acceptance rejection remains disabled while this
 # threshold is being evaluated on live footage.
-PNP_POSE_REPROJECTION_ERROR_THRESHOLD = 0.05
+PNP_POSE_REPROJECTION_ERROR_THRESHOLD = 0.12
 PNP_POSE_REPROJECTION_ERROR_REJECTION_ENABLED = False
 PNP_LAYER_MISALIGNMENT_MIN_DEGREES = -90.0
 PNP_LAYER_MISALIGNMENT_MAX_DEGREES = 90.0
 PNP_LAYER_MISALIGNMENT_STEP_DEGREES = 6.0
 POSE_MOTION_DISPLACEMENT_TOLERANCE_MM = 40.0
+# Temporarily keep isolated translation jumps instead of rejecting the frame.
+POSE_TWO_SIDED_MOTION_REJECTION_ENABLED = False
 # Retained for CLI/API compatibility. Move fitting currently evaluates all six
 # layer faces; the value no longer limits the face search.
 PNP_TURN_DEBUG_CANDIDATE_COUNT = 6
@@ -509,6 +526,10 @@ class StickerPnPCandidate:
     mask_center_match_count: int = 0
     image_size: tuple[int, int] | None = None
     layer_rotations: tuple["CubeLayerRotation", ...] = ()
+    # Physical stickers include the selected color offset. Keypoint geometry
+    # retains only the partial angle because quarter turns permute its lattice.
+    # None preserves the legacy shared geometry/sticker rotation behavior.
+    sticker_layer_rotations: tuple["CubeLayerRotation", ...] | None = None
     # Layer selected by the fast removal-based move-recognition mode.  This is
     # deliberately separate from ``layer_rotations``: the selected layer is
     # highlighted, but the displayed cube is not turned.
@@ -528,6 +549,7 @@ class StickerPnPCandidate:
     turn_layer_scores: tuple[tuple[str, float, float, float], ...] = ()
     turn_fit_sticker_score: float = float("inf")
     turn_fit_color_score: float = float("inf")
+    turn_color_unreliable: bool = False
     # Per-observation p(observation | prior), indexed as
     # [canonical sticker identity, observed mask].
     turn_color_likelihoods: np.ndarray | None = None
@@ -535,6 +557,21 @@ class StickerPnPCandidate:
     turn_fit_evaluated: bool = False
     turn_fit_static_scores: tuple[float, float, float] | None = None
     turn_fit_articulated_scores: tuple[float, float, float] | None = None
+    # Optional action-vs-static lookahead diagnostics.  The future scores are
+    # equal-weight geometric-plus-color scores evaluated under the two
+    # competing states.
+    turn_fit_lookahead_action_score: float = float("inf")
+    turn_fit_lookahead_static_score: float = float("inf")
+    turn_fit_lookahead_action_future_scores: tuple[float, ...] = ()
+    turn_fit_lookahead_static_future_scores: tuple[float, ...] = ()
+    turn_fit_lookahead_rejected: bool = False
+    turn_search_diagnostics: dict[str, object] | None = None
+    turn_selected_trial_id: str | None = None
+    # Explicit discrete state update chosen by the color/state rollout.  None
+    # preserves the legacy angle-to-move behavior; an empty tuple explicitly
+    # means that this new-format candidate makes no state change.
+    turn_state_moves: tuple[str, ...] | None = None
+    turn_color_offset_degrees: float = 0.0
     final_solve_image_points: np.ndarray | None = None
     pre_final_rvec: np.ndarray | None = None
     pre_final_tvec: np.ndarray | None = None
@@ -639,9 +676,10 @@ class CubeGeometryState:
         raise KeyError(f"Unknown sticker identity {label!r}")
 
     def apply_move(self, move: str) -> "CubeGeometryState":
-        state = CubeState(dict(self.facelets))
-        state.apply_move(move)
-        return type(self)(dict(state.colors))
+        return type(self)({
+            target: self.facelets[source]
+            for target, source in _cube_geometry_move_permutation(move)
+        })
 
     def apply_moves(self, moves: tuple[str, ...] | list[str]) -> "CubeGeometryState":
         state = self
@@ -655,6 +693,57 @@ class CubeGeometryState:
             for key, label in self.facelets.items()
             for position, axis, side in (key,)
         }
+
+
+@lru_cache(maxsize=128)
+def _cube_geometry_move_permutation(move: str) -> tuple[tuple, ...]:
+    """Compute exact move geometry once; state search only needs label permutations."""
+
+    identity = CubeGeometryState.identity()
+    source_by_label = {label: key for key, label in identity.facelets.items()}
+    moved = CubeState(dict(identity.facelets))
+    moved.apply_move(move)
+    return tuple((target, source_by_label[label]) for target, label in moved.colors.items())
+
+
+@lru_cache(maxsize=4096)
+def cube_moves_cancel(previous_move: str, move: str) -> bool:
+    """Recognize exact inverses, including wide-turn aliases and half turns."""
+
+    previous_sources = dict(_cube_geometry_move_permutation(previous_move))
+    return all(
+        previous_sources[source] == target
+        for target, source in _cube_geometry_move_permutation(move)
+    )
+
+
+def move_sequence_has_immediate_undo(
+    previous_move: str | None,
+    moves: tuple[str, ...],
+) -> bool:
+    """Check consecutive committed moves; neutral frames do not reset history."""
+
+    for move in moves:
+        if previous_move is not None and cube_moves_cancel(previous_move, move):
+            return True
+        previous_move = move
+    return False
+
+
+def advance_without_state_revisit(
+    state: CubeGeometryState,
+    moves: tuple[str, ...],
+    visited_states: frozenset[tuple],
+) -> tuple[CubeGeometryState, frozenset[tuple]] | None:
+    """Reject cycles such as four same-direction turns; holding is allowed."""
+
+    for move in moves:
+        state = state.apply_move(move)
+        signature = state.signature()
+        if signature in visited_states:
+            return None
+        visited_states = visited_states | {signature}
+    return state, visited_states
 
 
 def cube_rotation_to_notation(rotation: CubeLayerRotation) -> str | None:
@@ -724,6 +813,9 @@ def completed_candidate_moves(
 
     if candidate is None:
         return ()
+    explicit_moves = getattr(candidate, "turn_state_moves", None)
+    if explicit_moves is not None:
+        return tuple(str(move) for move in explicit_moves)
     return tuple(
         notation
         for notation in (
@@ -733,6 +825,545 @@ def completed_candidate_moves(
         if notation is not None
     )
 
+
+def move_lookahead_weights(frame_count: int) -> tuple[float, ...]:
+    """Return normalized front-half/back-half weights for a forecast window."""
+
+    if frame_count < 1:
+        raise ValueError("Lookahead frame count must be positive")
+    if frame_count == 1:
+        return (1.0,)
+    front_count = frame_count // 2
+    back_count = frame_count - front_count
+    front_weight = 0.30 / front_count
+    back_weight = 0.70 / back_count
+    return (front_weight,) * front_count + (back_weight,) * back_count
+
+
+def move_lookahead_weighted_score(
+    current_score: float,
+    future_scores: tuple[float, ...] | list[float],
+) -> float:
+    """Combine one current-frame score with the available future scores.
+
+    The future contribution is normalized over the available frames. An
+    unavailable frame is omitted by the caller, while a nonfinite score
+    invalidates the path: failing to explain an observed frame is not missing
+    data. With no future frames, use only the current-frame score.
+    """
+
+    current = float(current_score)
+    if not np.isfinite(current):
+        return float("inf")
+    future = [float(score) for score in future_scores]
+    if not all(np.isfinite(score) for score in future):
+        return float("inf")
+    if not future:
+        return current
+    scores = (current, *future)
+    weights = move_lookahead_weights(len(scores))
+    return float(sum(weight * score for weight, score in zip(weights, scores)))
+
+
+@dataclass(frozen=True)
+class MoveLookaheadPath:
+    state: CubeGeometryState
+    first_trial: dict[str, object]
+    future_scores: tuple[float, ...] = ()
+    last_move: str | None = None
+    future_trials: tuple[dict[str, object], ...] = ()
+    move_count: int = 0
+
+
+def move_lookahead_path_score(path: MoveLookaheadPath) -> float:
+    """Combine observation fit with a sparse, whole-sequence move prior."""
+
+    return move_lookahead_weighted_score(
+        float(path.first_trial['state_score']), path.future_scores,
+    ) + PNP_TURN_LOOKAHEAD_MOVE_COST * path.move_count
+
+
+def turn_trial_log_payload(trial: dict[str, object]) -> dict[str, object]:
+    """Describe a trial without copying its projection arrays into the log."""
+
+    names = (
+        'trial_id', 'label', 'is_baseline', 'geometry_option_index', 'layer_axis',
+        'layer_side', 'layer_count', 'color_offset', 'state_moves', 'state_score',
+        'color_error', 'color_match_count', 'inlier_count', 'layer_inlier_count',
+        'keypoint_inlier_count', 'keypoint_layer_inlier_count',
+    )
+    result = {name: trial[name] for name in names if name in trial}
+    for output, source in (
+        ('global_mean_error', 'combined_mean_error'), ('global_robust_error', 'robust_error'),
+        ('keypoint_mean_error', 'keypoint_error'), ('heatmap_mean_error', 'sticker_error'),
+        ('heatmap_match_count', 'sticker_match_count'), ('keypoint_p90_error', 'p90_error'),
+    ):
+        result[output] = trial.get(source)
+    result['layer_rotations'] = [
+        dict(axis=rotation.axis, side=rotation.side, angle_degrees=rotation.angle_degrees,
+             layer_count=rotation.layer_count)
+        for rotation in trial.get('layer_rotations', ())
+    ]
+    return result
+
+
+def turn_trial_has_invalid_color(trial: dict[str, object]) -> bool:
+    """Missing color is neutral; an available nonfinite color fit is invalid."""
+
+    return 'color_error' in trial and not np.isfinite(float(trial['color_error']))
+
+
+def search_move_lookahead_paths(
+    state_before: CubeGeometryState,
+    current_trials: tuple[dict[str, object], ...],
+    future_frame_indices: tuple[int, ...],
+    trials_for_states: Callable[
+        [int, tuple[CubeGeometryState, ...]],
+        tuple[tuple[dict[str, object], ...] | None, ...],
+    ],
+    *,
+    state_batch_size: int = PNP_TURN_LOOKAHEAD_STATE_BATCH_SIZE,
+    state_change_limit: int | None = PNP_TURN_LOOKAHEAD_STATE_CHANGE_LIMIT,
+    previous_move: str | None = None,
+    diagnostics: dict[str, object] | None = None,
+    previous_states: tuple[tuple, ...] = (),
+    frame_score_lower_bounds: tuple[float, ...] | None = None,
+    state_evaluation_budget: int | None = None,
+    warm_start_moves: tuple[tuple[str, ...] | None, ...] | None = None,
+    seed_greedy: bool = False,
+    retain_forecast: bool = False,
+) -> tuple[MoveLookaheadPath, ...]:
+    """Search color-shortlisted state changes with bounds and no beam cutoff.
+
+    Collapse the hold geometries before branching. A complete no-turn rollout
+    supplies the initial upper bound. Explore optimistic completions first;
+    color orders equally promising children. Merge prefixes by (depth, state),
+    and discard one only when dominated or unable to improve the incumbent.
+    At every parent keep the best hold plus the top color-ranked state
+    changes; None disables that shortlist. Batch size only limits GPU work
+    per call. Bounds prove optimality within the shortlisted search space.
+    Supplied bounds must be valid for every state. Missing frame bounds
+    disable bound pruning across those unknown frames. An optional total
+    frame/state budget includes the current state and seed rollouts; a budget
+    stop returns only complete forecasts and reports an unresolved bound gap.
+    A state-changing trial that returns to this window's starting state is
+    ineligible at every depth. Holds remain valid. Warm-start and greedy
+    rollouts obey the same rule and per-parent shortlist. No history before
+    this window or intermediate-state revisit restriction is imposed.
+    """
+
+    if state_batch_size < 1:
+        raise ValueError('State batch size must be positive')
+    if state_change_limit is not None and state_change_limit < 0:
+        raise ValueError('State-change limit must be nonnegative or None')
+    count = len(future_frame_indices) + 1
+    starting_signature = state_before.signature()
+    if state_evaluation_budget is not None and state_evaluation_budget < count:
+        raise ValueError('State budget must cover at least one state per search frame')
+    if warm_start_moves is not None and len(warm_start_moves) != count:
+        raise ValueError('Warm start must provide one move choice per search frame')
+    weights = move_lookahead_weights(count)
+    bounds = tuple(frame_score_lower_bounds) if frame_score_lower_bounds is not None else (-float('inf'),) * count
+    if len(bounds) != count or any(np.isnan(value) for value in bounds):
+        raise ValueError('Provide one non-NaN lower bound per search frame')
+    # Treat unsupported/nonfinite bounds as unknown, rather than assuming
+    # zero: predictive likelihood densities can produce negative NLLs.
+    suffix = [0.0] * (count + 1)
+    for depth in range(count - 1, -1, -1):
+        suffix[depth] = (weights[depth] * bounds[depth] + suffix[depth + 1]
+                         if np.isfinite(bounds[depth]) else -float('inf'))
+    roots = {}
+    if diagnostics is not None:
+        roots = {id(trial): dict(trial_id=trial.get('trial_id', f'root-{i}'),
+                                trial=turn_trial_log_payload(trial), status='eligible',
+                                last_retained_depth=None, pruning_counts={})
+                 for i, trial in enumerate(current_trials)}
+        diagnostics.update(roots=list(roots.values()), depths=[],
+                           frame_score_lower_bounds=list(bounds), incumbent_updates=[],
+                           state_change_limit=state_change_limit, prune_root_state_returns=True)
+    stats = [dict(depth=d, attempted_trials=0, invalid_score=0, unavailable=0,
+                  immediate_undo=0, state_revisit=0, root_return=0, input_paths=0, scored_states=0,
+                  expanded_paths=0, merged_paths=0, collapsed_holds=0,
+                  bound_pruned_paths=0, color_pruned_paths=0, invalid_color=0,
+                  unreliable_color_states=0, completed_paths=0, queued_paths=0)
+             for d in range(count)]
+    trial_cache: list[dict[tuple, tuple[dict[str, object], ...] | None]] = [{} for _ in range(count)]
+    trial_cache[0][state_before.signature()] = current_trials
+    stats[0]['scored_states'] = 1
+    seen: list[dict[tuple, tuple]] = [{} for _ in range(count)]
+    completions: dict[int, MoveLookaheadPath] = {}
+    incumbent: MoveLookaheadPath | None = None
+    queue: list[tuple] = []
+    serial = 0
+    evaluated_states = 1  # Current-frame trials are supplied by the caller.
+    budget_exhausted = False
+    pending_lower_bound = float('inf')
+    seed_results = []
+
+    class BudgetExhausted(Exception):
+        pass
+
+    def prefix_rank(path: MoveLookaheadPath) -> tuple:
+        scores = (float(path.first_trial['state_score']), *path.future_scores)
+        value = sum(weight * score for weight, score in zip(weights, scores))
+        return value + PNP_TURN_LOOKAHEAD_MOVE_COST * path.move_count, path.first_trial['rank']
+
+    def record(path: MoveLookaheadPath, reason: str, depth: int) -> None:
+        stats[depth][reason] += 1
+        if diagnostics is not None:
+            root = roots[id(path.first_trial)]
+            root['pruning_counts'][reason] = root['pruning_counts'].get(reason, 0) + 1
+            root['eliminated_depth'] = depth
+            if reason == 'bound_pruned_paths':
+                examples = root.setdefault('pruning_examples', [])
+                if len(examples) < 3:
+                    prefix = prefix_rank(path)[0]
+                    examples.append(dict(depth=depth, prefix_cost=prefix,
+                                         remaining_lower_bound=suffix[depth + 1],
+                                         lower_bound=prefix + suffix[depth + 1],
+                                         incumbent_score=prefix_rank(incumbent)[0] if incumbent is not None else None))
+
+    def complete(path: MoveLookaheadPath) -> None:
+        nonlocal incumbent
+        key = id(path.first_trial)
+        previous = completions.get(key)
+        if previous is None or prefix_rank(path) < prefix_rank(previous):
+            completions[key] = path
+        stats[-1]['completed_paths'] += 1
+        if incumbent is None or prefix_rank(path) < prefix_rank(incumbent):
+            incumbent = path
+            if diagnostics is not None:
+                diagnostics['incumbent_updates'].append(dict(
+                    score=move_lookahead_path_score(path), move_count=path.move_count,
+                    trial_id=path.first_trial.get('trial_id')))
+
+    def evaluate(depth: int, states: tuple[CubeGeometryState, ...]):
+        nonlocal evaluated_states, budget_exhausted
+        cache = trial_cache[depth]
+        missing = {state.signature(): state for state in states if state.signature() not in cache}
+        if missing:
+            if state_evaluation_budget is not None and evaluated_states + len(missing) > state_evaluation_budget:
+                budget_exhausted = True
+                raise BudgetExhausted
+            evaluated_states += len(missing)
+            values = trials_for_states(future_frame_indices[depth - 1], tuple(missing.values()))
+            cache.update(zip(missing, values, strict=True))
+            stats[depth]['scored_states'] += len(missing)
+        return tuple(cache[state.signature()] for state in states)
+
+    def hold(trials):
+        return min((trial for trial in trials or ()
+                    if not trial['state_moves'] and np.isfinite(float(trial['state_score']))
+                    and not turn_trial_has_invalid_color(trial)),
+                   key=lambda trial: trial['rank'], default=None)
+
+    # Establish a complete solution before examining alternative states.
+    first_hold = hold(current_trials)
+    no_turn = None
+    if first_hold is not None:
+        no_turn = MoveLookaheadPath(state_before, first_hold, last_move=previous_move)
+        for depth in range(1, count):
+            trial = hold(evaluate(depth, (state_before,))[0])
+            if trial is None:
+                no_turn = None
+                break
+            no_turn = replace(no_turn, future_scores=(*no_turn.future_scores, float(trial['state_score'])),
+                              future_trials=(*no_turn.future_trials, trial) if diagnostics is not None or retain_forecast else ())
+        if no_turn is not None:
+            complete(no_turn)
+    baseline = min((trial for trial in current_trials if trial.get('is_baseline')
+                    and np.isfinite(float(trial['state_score']))
+                    and not turn_trial_has_invalid_color(trial)), key=lambda trial: trial['rank'], default=None)
+    baseline_comparison = None
+    if no_turn is not None and baseline is not None:
+        baseline_comparison = no_turn if baseline is first_hold else replace(no_turn, first_trial=baseline)
+    if baseline_comparison is not None and baseline_comparison is not no_turn:
+        complete(baseline_comparison)
+
+    def rollout(moves_by_depth, name):
+        """Re-score a complete seed within the same per-parent shortlist."""
+        before = state_before
+        path = None
+        repaired = 0
+        root_return_pruned = 0
+        for depth in range(count):
+            trials = current_trials if depth == 0 else evaluate(depth, (before,))[0]
+            unique = {}
+            for trial in trials or ():
+                if not np.isfinite(float(trial['state_score'])) or turn_trial_has_invalid_color(trial):
+                    continue
+                after = before.apply_moves(tuple(trial['state_moves']))
+                key = after.signature()
+                if trial['state_moves'] and key == starting_signature:
+                    root_return_pruned += 1
+                    continue
+                edge = weights[depth] * float(trial['state_score']) + PNP_TURN_LOOKAHEAD_MOVE_COST * len(trial['state_moves'])
+                previous = unique.get(key)
+                if previous is None or (edge, trial['rank']) < previous[0]:
+                    unique[key] = ((edge, trial['rank']), trial, after)
+            holds = [item for item in unique.values() if not item[1]['state_moves']]
+            changes = sorted((item for item in unique.values() if item[1]['state_moves']),
+                             key=lambda item: (float(item[1].get('color_error', item[1]['state_score'])), item[1]['rank']))
+            choices = holds + (changes if state_change_limit is None else changes[:state_change_limit])
+            desired = moves_by_depth[depth]
+            matching = [item for item in choices if desired is not None and tuple(item[1]['state_moves']) == desired]
+            if desired is not None and not matching:
+                repaired += 1
+            choice = min(matching or choices, key=lambda item: item[0], default=None)
+            if choice is None:
+                seed_results.append(dict(source=name, status='no_legal_continuation', depth=depth,
+                                         root_return_pruned=root_return_pruned))
+                return
+            _rank, trial, after = choice
+            moves = tuple(trial['state_moves'])
+            path = (MoveLookaheadPath(after, trial, last_move=moves[-1] if moves else previous_move,
+                                      move_count=len(moves)) if path is None else
+                    MoveLookaheadPath(after, path.first_trial, (*path.future_scores, float(trial['state_score'])),
+                                      moves[-1] if moves else path.last_move,
+                                      (*path.future_trials, trial), path.move_count + len(moves)))
+            before = after
+        complete(path)
+        seed_results.append(dict(source=name, status='complete', score=move_lookahead_path_score(path),
+                                 repaired_steps=repaired, root_return_pruned=root_return_pruned))
+
+    # A valid lower bound even when a seed spends the budget before the queue
+    # is initialized. Once exploration starts, use the tighter pending frontier.
+    initial_lower_bound = min((weights[0] * float(trial['state_score'])
+                               + PNP_TURN_LOOKAHEAD_MOVE_COST * len(trial['state_moves'])
+                               + suffix[1] for trial in current_trials
+                               if np.isfinite(float(trial['state_score']))
+                               and not turn_trial_has_invalid_color(trial)), default=float('inf'))
+    try:
+        if warm_start_moves is not None:
+            rollout(warm_start_moves, 'previous_forecast')
+        if seed_greedy:
+            rollout((None,) * count, 'greedy')
+    except BudgetExhausted:
+        pending_lower_bound = initial_lower_bound
+        seed_results.append(dict(source='seeding', status='budget_exhausted'))
+
+    def offer(path: MoveLookaheadPath, depth: int, color: float) -> None:
+        nonlocal serial
+        stats[depth]['expanded_paths'] += 1
+        if depth == count - 1:
+            complete(path)
+            return
+        signature = path.state.signature()
+        rank = prefix_rank(path)
+        previous = seen[depth].get(signature)
+        if previous is not None and previous <= rank:
+            record(path, 'merged_paths', depth)
+            return
+        seen[depth][signature] = rank
+        optimistic = rank[0] + suffix[depth + 1]
+        if incumbent is not None and optimistic > prefix_rank(incumbent)[0]:
+            record(path, 'bound_pruned_paths', depth)
+            return
+        serial += 1
+        heapq.heappush(queue, (optimistic, color, -depth, serial, path))
+        stats[depth]['queued_paths'] += 1
+        if diagnostics is not None:
+            roots[id(path.first_trial)]['last_retained_depth'] = depth
+
+    def expand(parent: MoveLookaheadPath | None, trials, depth: int) -> None:
+        before = state_before if parent is None else parent.state
+        stats[depth]['input_paths'] += 1
+        if trials is None:
+            if parent is not None:
+                record(parent, 'unavailable', depth)
+            return
+        # At most one hold and 24 changes for the standard 12 geometries.
+        # Deduplicate any equivalent move aliases as well, using the actual
+        # whole-window edge cost rather than the color ordering heuristic.
+        choices: dict[tuple, tuple[dict[str, object], CubeGeometryState]] = {}
+        hold_count = 0
+        invalid_color_count = 0
+        for trial in trials:
+            stats[depth]['attempted_trials'] += 1
+            score = float(trial['state_score'])
+            if not np.isfinite(score):
+                if parent is None:
+                    stats[depth]['invalid_score'] += 1
+                else:
+                    record(parent, 'invalid_score', depth)
+                if parent is None and diagnostics is not None:
+                    roots[id(trial)].update(status='invalid_score', eliminated_depth=0)
+                continue
+            if turn_trial_has_invalid_color(trial):
+                invalid_color_count += 1
+                if parent is None:
+                    stats[depth]['invalid_color'] += 1
+                    if diagnostics is not None:
+                        roots[id(trial)].update(status='invalid_color', eliminated_depth=depth)
+                else:
+                    record(parent, 'invalid_color', depth)
+                continue
+            moves = tuple(trial['state_moves'])
+            hold_count += not bool(moves)
+            after = before.apply_moves(moves)
+            key = after.signature()
+            if moves and key == starting_signature:
+                if parent is None:
+                    stats[depth]['root_return'] += 1
+                    if diagnostics is not None:
+                        roots[id(trial)].update(status='root_return', eliminated_depth=depth)
+                else:
+                    record(parent, 'root_return', depth)
+                    if diagnostics is not None:
+                        examples = roots[id(parent.first_trial)].setdefault('root_return_examples', [])
+                        if len(examples) < 3:
+                            examples.append(dict(depth=depth, state_moves=moves, trial_id=trial.get('trial_id')))
+                continue
+            previous = choices.get(key)
+            edge_rank = (weights[depth] * score + PNP_TURN_LOOKAHEAD_MOVE_COST * len(moves), trial['rank'])
+            if previous is None or edge_rank < (
+                weights[depth] * float(previous[0]['state_score'])
+                + PNP_TURN_LOOKAHEAD_MOVE_COST * len(previous[0]['state_moves']), previous[0]['rank'],
+            ):
+                choices[key] = (trial, after)
+        if not choices and invalid_color_count:
+            stats[depth]['unreliable_color_states'] += 1
+        stats[depth]['collapsed_holds'] += max(0, hold_count - 1)
+        if parent is None and diagnostics is not None:
+            chosen = {id(trial) for trial, _ in choices.values()}
+            for trial in trials:
+                if id(trial) not in chosen and roots[id(trial)]['status'] == 'eligible':
+                    roots[id(trial)].update(status='merged', eliminated_depth=0)
+        ordered = sorted(choices.values(), key=lambda item: (
+            bool(item[0]['state_moves']), float(item[0].get('color_error', item[0]['state_score'])), item[0]['rank']))
+        if state_change_limit is not None:
+            holds = [item for item in ordered if not item[0]['state_moves']]
+            changes = [item for item in ordered if item[0]['state_moves']]
+            for trial, _after in changes[state_change_limit:]:
+                if parent is None:
+                    stats[depth]['color_pruned_paths'] += 1
+                    if diagnostics is not None:
+                        roots[id(trial)].update(status='color_pruned', eliminated_depth=depth)
+                else:
+                    record(parent, 'color_pruned_paths', depth)
+            ordered = holds + changes[:state_change_limit]
+        for trial, after in ordered:
+            moves = tuple(trial['state_moves'])
+            path = (MoveLookaheadPath(after, trial, last_move=moves[-1] if moves else previous_move,
+                                      move_count=len(moves)) if parent is None else
+                    MoveLookaheadPath(after, parent.first_trial,
+                                      (*parent.future_scores, float(trial['state_score'])),
+                                      moves[-1] if moves else parent.last_move,
+                                      (*parent.future_trials, trial) if diagnostics is not None or retain_forecast else (),
+                                      parent.move_count + len(moves)))
+            offer(path, depth, float(trial.get('color_error', trial['state_score'])))
+
+    try:
+        expand(None, current_trials, 0)
+        peak_queue = len(queue)
+        while queue and not budget_exhausted:
+            batch = []
+            while queue and len(batch) < state_batch_size:
+                optimistic, _color, _neg_depth, _serial, path = heapq.heappop(queue)
+                depth = len(path.future_scores)
+                if seen[depth].get(path.state.signature()) != prefix_rank(path):
+                    record(path, 'merged_paths', depth)
+                    continue
+                if incumbent is not None and optimistic > prefix_rank(incumbent)[0]:
+                    record(path, 'bound_pruned_paths', depth)
+                    continue
+                batch.append(path)
+            pending_lower_bound = min((prefix_rank(path)[0] + suffix[len(path.future_scores) + 1]
+                                       for path in batch), default=float('inf'))
+            by_depth: dict[int, list[MoveLookaheadPath]] = {}
+            for path in batch:
+                by_depth.setdefault(len(path.future_scores) + 1, []).append(path)
+            for depth, parents in by_depth.items():
+                viable = []
+                for parent in parents:
+                    if incumbent is not None and prefix_rank(parent)[0] + suffix[depth] > prefix_rank(incumbent)[0]:
+                        record(parent, 'bound_pruned_paths', depth - 1)
+                    else:
+                        viable.append(parent)
+                parents = viable
+                if not parents:
+                    continue
+                values = evaluate(depth, tuple(path.state for path in parents))
+                for parent, trials in zip(parents, values, strict=True):
+                    # An earlier completion in this batch may tighten the bound.
+                    if incumbent is not None and prefix_rank(parent)[0] + suffix[depth] > prefix_rank(incumbent)[0]:
+                        record(parent, 'bound_pruned_paths', depth - 1)
+                        continue
+                    expand(parent, trials, depth)
+            peak_queue = max(peak_queue, len(queue))
+
+    except BudgetExhausted:
+        pass
+
+    result = sorted(completions.values(), key=prefix_rank)
+    for comparison in (no_turn, baseline_comparison):
+        if comparison is not None and not any(
+            path.first_trial is comparison.first_trial and path.future_scores == comparison.future_scores
+            and path.move_count == comparison.move_count for path in result
+        ):
+            result.append(comparison)
+    if diagnostics is not None:
+        shortlisted = any(item['color_pruned_paths'] for item in stats)
+        incumbent_score = move_lookahead_path_score(incumbent) if incumbent is not None else None
+        lower_bound = (min(pending_lower_bound, *(item[0] for item in queue),
+                           incumbent_score if incumbent_score is not None else float('inf'))
+                       if budget_exhausted else incumbent_score)
+        diagnostics.update(optimality=('budget_exhausted' if incumbent is not None else 'budget_exhausted_no_path')
+                           if budget_exhausted else
+                           ('proven_within_shortlist' if shortlisted else 'proven') if incumbent is not None else 'no_finite_path',
+                           termination_reason='state_budget' if budget_exhausted else 'search_complete',
+                           state_evaluation_budget=state_evaluation_budget, evaluated_states=evaluated_states,
+                           budget_exhausted=budget_exhausted, seeds=seed_results,
+                           search_space='color_shortlist' if shortlisted else 'all_state_changes',
+                           best_lower_bound=lower_bound,
+                           optimality_gap=max(0.0, incumbent_score - lower_bound)
+                           if incumbent_score is not None and lower_bound is not None else None,
+                           peak_queued_paths=peak_queue,
+                           initial_no_turn_score=move_lookahead_path_score(no_turn) if no_turn is not None else None)
+        for path in result:
+            root = roots[id(path.first_trial)]
+            root.update(status='complete', last_retained_depth=count - 1)
+            root.pop('eliminated_depth', None)
+            root['best_sequence_score'] = min(root.get('best_sequence_score', float('inf')), move_lookahead_path_score(path))
+        for root in roots.values():
+            if root['status'] == 'eligible':
+                reasons = root['pruning_counts']
+                root.update(status='budget_unfinished' if budget_exhausted else
+                            'bound_pruned' if reasons.get('bound_pruned_paths') else
+                            'merged' if reasons.get('merged_paths') else
+                            'root_return' if reasons.get('root_return') else
+                            'invalid_color' if reasons.get('invalid_color') else 'no_legal_continuation')
+        for depth, item in enumerate(stats):
+            item.update(distinct_states=len(trial_cache[depth]),
+                        remaining_lower_bound=suffix[depth + 1],
+                        beam_pruned_paths=0, retained_paths=0,
+                        baseline_extra=False, no_turn_extra=False)
+        diagnostics['depths'] = stats
+    return tuple(result)
+
+
+def move_lookahead_path_log(path: MoveLookaheadPath, frames: tuple[int, ...]) -> dict[str, object]:
+    """Record the forecast as steps, without retaining full cube-state copies."""
+
+    trials = (path.first_trial, *path.future_trials)
+    future_count = len(path.future_scores)
+    weights = move_lookahead_weights(future_count + 1) if future_count else (1.0,)
+    steps = []
+    for depth, (frame, trial) in enumerate(zip(frames, trials, strict=True)):
+        weight = weights[depth]
+        steps.append(dict(frame_index=frame, depth=depth, **turn_trial_log_payload(trial),
+                          weight=weight, weighted_fit_score=weight * float(trial['state_score']),
+                          move_cost=PNP_TURN_LOOKAHEAD_MOVE_COST * len(trial['state_moves']),
+                          weighted_score=weight * float(trial['state_score'])
+                          + PNP_TURN_LOOKAHEAD_MOVE_COST * len(trial['state_moves'])))
+    return dict(trial_id=path.first_trial.get('trial_id'),
+                total_score=move_lookahead_path_score(path),
+                observation_score=move_lookahead_weighted_score(float(path.first_trial['state_score']), path.future_scores),
+                move_cost=PNP_TURN_LOOKAHEAD_MOVE_COST * path.move_count,
+                move_count=path.move_count,
+                current_score=float(path.first_trial['state_score']),
+                future_mean=float(np.mean(path.future_scores)) if future_count else None,
+                steps=steps)
 
 @dataclass
 class MoveAccumulator:
@@ -744,9 +1375,17 @@ class MoveAccumulator:
     _last_emitted_signature: tuple[str, ...] | None = None
     _last_core_tvec: np.ndarray | None = None
     _state: CubeState | None = None
+    _observation_index: int = 0
+    _recent_states: list[tuple[int, tuple]] = field(default_factory=list)
     _geometry_state: CubeGeometryState = field(
         default_factory=CubeGeometryState.identity
     )
+
+    def recent_geometry_states(self) -> tuple[tuple, ...]:
+        """States departed within the lookback window before the next frame."""
+
+        return tuple(signature for index, signature in self._recent_states
+                     if self._observation_index + 1 - index <= PNP_TURN_LOOKAHEAD_FRAMES)
 
     def _initialize_state(self, sticker_color_names: dict[str, str] | None) -> None:
         if self._state is not None or not sticker_color_names:
@@ -792,6 +1431,9 @@ class MoveAccumulator:
         displacement_candidate: StickerPnPCandidate | None = None,
         sticker_color_names: dict[str, str] | None = None,
     ) -> None:
+        self._observation_index += 1
+        self._recent_states[:] = [entry for entry in self._recent_states
+                                 if self._observation_index - entry[0] <= PNP_TURN_LOOKAHEAD_FRAMES]
         self._initialize_state(sticker_color_names)
         if candidate is None:
             self.current_fit = "rejected" if displacement_candidate is not None else "none"
@@ -837,7 +1479,9 @@ class MoveAccumulator:
         if candidate_geometry is not None or signature != self._last_emitted_signature:
             self.moves.extend(notations)
             self._last_emitted_signature = signature
-            self._geometry_state = self._geometry_state.apply_moves(notations)
+            for notation in notations:
+                self._recent_states.append((self._observation_index, self._geometry_state.signature()))
+                self._geometry_state = self._geometry_state.apply_move(notation)
             if self._state is not None:
                 for notation in notations:
                     self._state.apply_move(notation)
@@ -999,6 +1643,21 @@ def turn_search_angles() -> np.ndarray:
         + PNP_LAYER_MISALIGNMENT_STEP_DEGREES,
         PNP_LAYER_MISALIGNMENT_STEP_DEGREES,
         dtype=np.float64,
+    )
+
+
+def turn_geometric_search_angles() -> np.ndarray:
+    """Return the partial-turn grid used by the stateful move search."""
+
+    # Keep the endpoints requested by the state rollout and explicitly add
+    # zero because a six-degree grid starting at -45 does not land on it.
+    return np.unique(
+        np.concatenate(
+            (
+                np.arange(-45.0, 45.0 + 6.0, 6.0, dtype=np.float64),
+                np.asarray((0.0,), dtype=np.float64),
+            )
+        )
     )
 
 
@@ -2419,9 +3078,9 @@ def recover_cached_pose_symmetries(
     collected color observations without building profiles, scoring colors, or
     classifying identities. When ``recover_orientation`` is true, it applies
     the separate color-based symmetry recovery to an already-fitted trace.
-    When move recognition is enabled, per-mask colors add a global-profile
-    predictive-likelihood term to turn fitting; static pose refinement remains
-    keypoint-first.
+    When move recognition is enabled, each frame first caches geometric
+    partial-turn options. Color offsets then drive a bounded ten-frame state
+    search with adaptive branch-and-bound; static pose refinement remains keypoint-first.
     """
 
     if (recover_orientation or recognize_moves) and global_profiles is None:
@@ -2490,6 +3149,9 @@ def recover_cached_pose_symmetries(
             initial_calibration_trace, known_initial_colors or {}, global_profiles, None,
         )
         global_profiles.update(refined)
+        # Future frames may already have been scored with the old profiles.
+        lookahead_color_trial_cache.clear()
+        lookahead_frame_lower_bound_cache.clear()
         if calibration_observations is not None and any(grouped.values()):
             calibration_observations.clear()
             calibration_observations.update(grouped)
@@ -2499,9 +3161,404 @@ def recover_cached_pose_symmetries(
     previous_continuity_candidate: StickerPnPCandidate | None = None
     continuity_symmetry_tracker = CubeSymmetryTracker()
     cube_geometry_state = CubeGeometryState.identity()
+    last_committed_move: str | None = None
+    committed_state_history: list[tuple[int, tuple]] = []
     pending_calibration_move: tuple[int, tuple] | None = None
     locked_orientation_symmetry: np.ndarray | None = None
     locked_orientation_permutation: dict[str, str] | None = None
+    lookahead_frame_lower_bound_cache: dict[int, float] = {}
+    lookahead_geometry_cache: dict[
+        int,
+        tuple[StickerPnPCandidate, dict[str, object]] | None,
+    ] = {}
+    lookahead_color_trial_cache: dict[
+        tuple[int, tuple],
+        tuple[StickerPnPCandidate, tuple[dict[str, object], ...]] | None,
+    ] = {}
+    lookahead_scoring_device = _turn_torch_scoring_device("mps")
+    lookahead_forecast: dict[int, tuple[str, ...]] = {}
+    lookahead_forecast_expected_state: tuple | None = None
+
+    def prepare_lookahead_geometry(
+        cache_index: int,
+        candidate_override: StickerPnPCandidate | None = None,
+    ) -> tuple[StickerPnPCandidate, dict[str, object]] | None:
+        """Prepare one frame's geometry once, independent of cube state."""
+
+        if cache_index in lookahead_geometry_cache:
+            cached = lookahead_geometry_cache[cache_index]
+            if candidate_override is None:
+                return cached
+            if cached is not None:
+                return candidate_override, cached[1]
+        if cache_index < 0 or cache_index >= total_records:
+            return None
+        record = cache[cache_index]
+        frame_candidate = candidate_override
+        if frame_candidate is None:
+            frame_candidate = getattr(record, "pose_candidate", None)
+            if not isinstance(frame_candidate, StickerPnPCandidate):
+                lookahead_geometry_cache[cache_index] = None
+                return None
+            if recover_orientation:
+                if locked_orientation_symmetry is None:
+                    return None
+                frame_candidate = transform_candidate_by_symmetry(
+                    frame_candidate,
+                    locked_orientation_symmetry,
+                )
+        if not isinstance(frame_candidate, StickerPnPCandidate):
+            return None
+        if (
+            not getattr(frame_candidate, "sticker_mask_colors", ())
+            and getattr(record, "sticker_masks", None) is not None
+            and getattr(record, "roi_xyxy", None) is not None
+        ):
+            mask_color_entries = sticker_mask_rgb_observations(
+                record.frame,
+                record.roi_xyxy,
+                record.sticker_masks,
+                sticker_mask_erosion,
+            )
+            frame_candidate = replace(
+                frame_candidate,
+                sticker_mask_colors=tuple(
+                    rgb for _mask_index, rgb in mask_color_entries
+                ),
+            )
+        if lookahead_scoring_device is None:
+            return None
+        frame_candidate = replace(
+            frame_candidate,
+            layer_rotations=(),
+            sticker_layer_rotations=None,
+            turn_state_moves=None,
+        )
+        assignment_error_limit = (
+            PNP_FINAL_ASSIGNMENT_ERROR_FRACTION
+            * projected_cube_diameter(frame_candidate)
+        )
+        geometry_frame = _build_turn_geometry_frame(
+            frame_candidate,
+            assignment_error_limit,
+            lookahead_scoring_device,
+        )
+        if geometry_frame is None:
+            result = None
+        else:
+            result = (frame_candidate, geometry_frame)
+        lookahead_geometry_cache[cache_index] = result
+        return result
+
+    def color_trials_for_state(
+        cache_index: int,
+        geometry_state: CubeGeometryState,
+        candidate_override: StickerPnPCandidate | None = None,
+    ) -> tuple[StickerPnPCandidate, tuple[dict[str, object], ...]] | None:
+        """Return every color-offset option for one frame/state pair."""
+
+        prepared = prepare_lookahead_geometry(cache_index, candidate_override)
+        if prepared is None or lookahead_scoring_device is None:
+            return None
+        frame_candidate, geometry_frame = prepared
+        cache_key = (cache_index, geometry_state.signature())
+        if candidate_override is None and cache_key in lookahead_color_trial_cache:
+            return lookahead_color_trial_cache[cache_key]
+        state_candidate = replace(
+            frame_candidate,
+            cube_geometry_state=geometry_state.copy(),
+            layer_rotations=(),
+            sticker_layer_rotations=None,
+            turn_state_moves=None,
+        )
+        color_likelihoods = turn_color_predictive_likelihoods(
+            state_candidate,
+            turn_color_priors,
+            global_profiles,
+            None,
+        )
+        if color_likelihoods is None:
+            color_likelihoods = getattr(
+                state_candidate,
+                "turn_color_likelihoods",
+                None,
+            )
+        assignment_error_limit = (
+            PNP_FINAL_ASSIGNMENT_ERROR_FRACTION
+            * projected_cube_diameter(state_candidate)
+        )
+        trials = _score_turn_color_offsets_on_gpu(
+            state_candidate,
+            tuple(geometry_frame["options"]),
+            assignment_error_limit,
+            lookahead_scoring_device,
+            color_likelihoods,
+            projection_cache=geometry_frame.setdefault("color_projection_cache", {}),
+        )
+        if not trials:
+            result = None
+        else:
+            # Every scored option participates in the rollout.  There is no
+            # inlier-count, color-rescue, or static-baseline acceptance gate;
+            # the lowest lookahead score is the decision criterion.
+            result = (state_candidate, tuple(trials))
+        if candidate_override is None:
+            lookahead_color_trial_cache[cache_key] = result
+        return result
+
+    def color_trials_for_states(
+        cache_index: int,
+        states: tuple[CubeGeometryState, ...],
+    ) -> tuple[tuple[dict[str, object], ...] | None, ...]:
+        """Score uncached frontier states together using one GPU batch."""
+
+        prepared = prepare_lookahead_geometry(cache_index)
+        if prepared is None:
+            return (None,) * len(states)
+        frame_candidate, geometry_frame = prepared
+        missing = tuple(
+            state for state in states
+            if (cache_index, state.signature()) not in lookahead_color_trial_cache
+        )
+        if missing:
+            color_likelihoods = turn_color_predictive_likelihoods(
+                frame_candidate, turn_color_priors, global_profiles, None,
+            )
+            if color_likelihoods is None:
+                color_likelihoods = getattr(frame_candidate, "turn_color_likelihoods", None)
+            trials_by_state = _score_turn_color_offsets_for_states_on_gpu(
+                frame_candidate, tuple(geometry_frame["options"]),
+                PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * projected_cube_diameter(frame_candidate),
+                lookahead_scoring_device, color_likelihoods, missing,
+                projection_cache=geometry_frame.setdefault("color_projection_cache", {}),
+            )
+            for index, state in enumerate(missing):
+                trials = trials_by_state[index] if trials_by_state is not None else None
+                lookahead_color_trial_cache[(cache_index, state.signature())] = (
+                    (frame_candidate, tuple(trials)) if trials else None
+                )
+        results = []
+        for state in states:
+            cached = lookahead_color_trial_cache[(cache_index, state.signature())]
+            results.append(cached[1] if cached is not None else None)
+        return tuple(results)
+
+    def frame_score_lower_bound(cache_index: int) -> float:
+        if cache_index not in lookahead_frame_lower_bound_cache:
+            prepared = prepare_lookahead_geometry(cache_index)
+            if prepared is None or lookahead_scoring_device is None:
+                return -float('inf')
+            frame_candidate, geometry_frame = prepared
+            likelihoods = turn_color_predictive_likelihoods(
+                frame_candidate, turn_color_priors, global_profiles, None,
+            )
+            if likelihoods is None:
+                likelihoods = getattr(frame_candidate, 'turn_color_likelihoods', None)
+            lookahead_frame_lower_bound_cache[cache_index] = _turn_color_frame_score_lower_bound(
+                frame_candidate, tuple(geometry_frame['options']),
+                PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * projected_cube_diameter(frame_candidate),
+                lookahead_scoring_device, likelihoods,
+                projection_cache=geometry_frame.setdefault("color_projection_cache", {}),
+            )
+        return lookahead_frame_lower_bound_cache[cache_index]
+
+    def apply_move_lookahead(
+        selected: StickerPnPCandidate,
+        static_candidate: StickerPnPCandidate,
+        state_before: CubeGeometryState,
+        current_record_index: int,
+    ) -> StickerPnPCandidate:
+        """Choose a transition with cached, warm-started, budgeted lookahead."""
+
+        nonlocal lookahead_forecast, lookahead_forecast_expected_state
+        fallback = selected
+        previous_states = tuple(signature for _index, signature in committed_state_history)
+        started = perf_counter()
+        search_debug = (
+            dict(version=11, algorithm="adaptive_branch_and_bound", status="not_started",
+                 previous_move=last_committed_move, beam_width=None,
+                 state_batch_size=PNP_TURN_LOOKAHEAD_STATE_BATCH_SIZE,
+                 state_change_limit=PNP_TURN_LOOKAHEAD_STATE_CHANGE_LIMIT,
+                 recent_committed_states=len(previous_states), prune_state_revisits=False,
+                 prune_root_state_returns=True,
+                 prune_immediate_undo=False, merge_key="cube_state", preserve_no_turn_path=True,
+                 move_cost_per_turn=PNP_TURN_LOOKAHEAD_MOVE_COST,
+                 requested_future_frames=PNP_TURN_LOOKAHEAD_FRAMES,
+                 weights=dict(schedule="front_back_uniform", front=0.30, back=0.70),
+                 fallback_undo_blocked=False)
+            if turn_candidate_log is not None else None
+        )
+
+        def fallback_with_diagnostics(reason: str) -> StickerPnPCandidate:
+            # Failed/nonfinite fits cannot authorize an unfiltered local move.
+            known_bad_color = (bool(getattr(selected, 'turn_fit_evaluated', False))
+                               and not np.isfinite(selected.turn_fit_color_score))
+            unreliable = reason == 'no_surviving_path' or known_bad_color or selected.turn_color_unreliable
+            result = _unreliable_color_hold(selected, static_candidate) if unreliable else fallback
+            if search_debug is not None:
+                search_debug.update(status="fallback", fallback_reason=reason,
+                                    color_evidence_unreliable=bool(unreliable),
+                                    elapsed_ms=1000.0 * (perf_counter() - started))
+            return replace(result, turn_search_diagnostics=search_debug)
+        current_cache_index = current_record_index - 1
+        evaluation = color_trials_for_state(
+            current_cache_index,
+            state_before,
+            static_candidate,
+        )
+        if evaluation is None or not evaluation[1]:
+            return fallback_with_diagnostics("current_frame_unavailable")
+        _current_candidate, current_trials = evaluation
+        score_frontier = color_trials_for_states
+        if search_debug is not None:
+            geometry = lookahead_geometry_cache[current_cache_index][1]
+            search_debug["geometry"] = dict(
+                tested_configurations=len(geometry.get("trials", ())),
+                retained_options=len(geometry.get("options", ())),
+                options=[turn_trial_log_payload(trial) for trial in geometry.get("options", ())],
+            )
+            evaluation_stats = dict(future_state_requests=0, cache_hits=0, states_scored=0, gpu_batches=0)
+            search_debug["evaluation_cache"] = evaluation_stats
+
+            def score_frontier(index: int, states: tuple[CubeGeometryState, ...]):
+                hits = sum((index, state.signature()) in lookahead_color_trial_cache for state in states)
+                evaluation_stats["future_state_requests"] += len(states)
+                evaluation_stats["cache_hits"] += hits
+                evaluation_stats["states_scored"] += len(states) - hits
+                evaluation_stats["gpu_batches"] += int(hits < len(states))
+                return color_trials_for_states(index, states)
+        current_has_accepted_trial = any(
+            np.isfinite(float(trial['state_score'])) and not turn_trial_has_invalid_color(trial)
+            for trial in current_trials
+        )
+        future_indices = tuple(
+            index for index in range(
+                current_cache_index + 1,
+                min(total_records, current_cache_index + PNP_TURN_LOOKAHEAD_FRAMES + 1),
+            )
+            if prepare_lookahead_geometry(index) is not None
+        ) if current_has_accepted_trial else ()
+        frames = (cache[current_cache_index].frame_index, *(cache[index].frame_index for index in future_indices))
+        if search_debug is not None:
+            search_debug.update(
+                frames=list(frames),
+                skipped_frames=[
+                    cache[index].frame_index for index in range(
+                        current_cache_index + 1,
+                        min(total_records, current_cache_index + PNP_TURN_LOOKAHEAD_FRAMES + 1),
+                    ) if index not in future_indices
+                ],
+                weights=dict(
+                    schedule="front_back_uniform",
+                    front=0.30,
+                    back=0.70,
+                    normalized=list(move_lookahead_weights(len(frames))),
+                ),
+            )
+        reused_forecast = lookahead_forecast_expected_state == state_before.signature()
+        run_debug = search_debug if search_debug is not None else {}
+        seed_moves = tuple(lookahead_forecast.get(index) for index in (current_cache_index, *future_indices)) if reused_forecast else None
+        search_paths = search_move_lookahead_paths(
+            state_before, current_trials, future_indices, score_frontier,
+            previous_move=last_committed_move, diagnostics=run_debug,
+            state_evaluation_budget=PNP_TURN_LOOKAHEAD_STATE_BUDGET,
+            warm_start_moves=seed_moves, seed_greedy=True, retain_forecast=True,
+            previous_states=previous_states,
+            frame_score_lower_bounds=(-float('inf'), *(frame_score_lower_bound(index) for index in future_indices)),
+        )
+        frames = (cache[current_cache_index].frame_index, *(cache[index].frame_index for index in future_indices))
+        if search_debug is not None:
+            projection_caches = [lookahead_geometry_cache[index][1].get('color_projection_cache', {})
+                                 for index in (current_cache_index, *future_indices)]
+            search_debug.update(
+                state_evaluation_budget=PNP_TURN_LOOKAHEAD_STATE_BUDGET,
+                decision_evaluated_states=run_debug['evaluated_states'],
+                reused_previous_forecast=reused_forecast,
+                projection_cache=dict(builds=sum(item.get('builds', 0) for item in projection_caches),
+                                      hits=sum(item.get('hits', 0) for item in projection_caches),
+                                      assignment_builds=sum(item.get('assignments', {}).get('builds', 0) for item in projection_caches),
+                                      assignment_hits=sum(item.get('assignments', {}).get('hits', 0) for item in projection_caches)),
+                frames=list(frames),
+                weights=dict(schedule='front_back_uniform', front=0.30, back=0.70,
+                             normalized=list(move_lookahead_weights(len(frames)))),
+            )
+            for depth in search_debug['depths']:
+                depth['frame_index'] = frames[depth['depth']]
+        paths = [
+            (move_lookahead_path_score(path), path.first_trial, path.future_scores)
+            for path in search_paths
+        ]
+        if not paths:
+            lookahead_forecast = {}
+            lookahead_forecast_expected_state = None
+            return fallback_with_diagnostics('state_budget_no_complete_path' if run_debug.get('budget_exhausted') else 'no_surviving_path')
+        winner = min(search_paths, key=lambda path: (move_lookahead_path_score(path), path.first_trial['rank']))
+        lookahead_forecast = {index: tuple(trial['state_moves'])
+                              for index, trial in zip((current_cache_index, *future_indices),
+                                                      (winner.first_trial, *winner.future_trials), strict=True)}
+        lookahead_forecast_expected_state = state_before.apply_moves(tuple(winner.first_trial['state_moves'])).signature()
+        chosen_score, chosen_trial, chosen_future_scores = min(
+            paths,
+            key=lambda path: (path[0], path[1]["rank"]),
+        )
+        static_paths = [
+            path for path in paths if bool(path[1]["is_baseline"])
+        ]
+        static_path = min(
+            static_paths,
+            key=lambda path: (path[0], path[1]["rank"]),
+            default=None,
+        )
+        annotated = _candidate_with_turn_trial(
+            selected,
+            static_candidate,
+            chosen_trial,
+        )
+        if search_debug is not None:
+            ordered_paths = sorted(search_paths, key=lambda path: (
+                move_lookahead_path_score(path),
+                path.first_trial["rank"],
+            ))
+            best_by_root = {}
+            for path in ordered_paths:
+                best_by_root.setdefault(id(path.first_trial), path)
+            finalists = list(best_by_root.values())[:8]
+            best_static = next((path for path in ordered_paths if path.first_trial["is_baseline"]), None)
+            if best_static is not None and all(path is not best_static for path in finalists):
+                finalists.append(best_static)
+            eligible = [trial for trial in current_trials if np.isfinite(float(trial["state_score"]))
+                        and not turn_trial_has_invalid_color(trial)]
+            no_turn_path = next((path for path in ordered_paths if path.move_count == 0), None)
+            local_best = min(eligible, key=lambda trial: (
+                float(trial["state_score"]) + PNP_TURN_LOOKAHEAD_MOVE_COST * len(trial["state_moves"]),
+                trial["rank"],
+            ), default=None)
+            search_debug.update(
+                status="searched",
+                selected_trial_id=chosen_trial.get("trial_id"),
+                local_best_trial_id=local_best.get("trial_id") if local_best is not None else None,
+                changed_local_choice=local_best is not chosen_trial,
+                selected_path=move_lookahead_path_log(ordered_paths[0], frames),
+                no_turn_path=move_lookahead_path_log(no_turn_path, frames) if no_turn_path is not None else None,
+                improvement_over_no_turn=(move_lookahead_path_score(no_turn_path) - chosen_score) if no_turn_path is not None else None,
+                finalists=[move_lookahead_path_log(path, frames) for path in finalists],
+                elapsed_ms=1000.0 * (perf_counter() - started),
+            )
+        return replace(
+            annotated,
+            turn_search_diagnostics=search_debug,
+            turn_fit_lookahead_action_score=float(chosen_score),
+            turn_fit_lookahead_static_score=(
+                float(static_path[0]) if static_path is not None else float("inf")
+            ),
+            turn_fit_lookahead_action_future_scores=tuple(chosen_future_scores),
+            turn_fit_lookahead_static_future_scores=(
+                tuple(static_path[2]) if static_path is not None else ()
+            ),
+            # Static is a valid winning option, not a rejected action.  Keep
+            # the legacy diagnostic field false now that no gate is applied.
+            turn_fit_lookahead_rejected=False,
+        )
 
     # Choose the initial offset before replaying any turns. This also applies
     # the same offset to earlier frames with too few visible color samples.
@@ -2539,6 +3596,19 @@ def recover_cached_pose_symmetries(
     )
     total_records = len(cache)
     for record_index, record in enumerate(cache, start=1):
+        committed_state_history[:] = [
+            entry for entry in committed_state_history
+            if record_index - 1 - entry[0] <= PNP_TURN_LOOKAHEAD_FRAMES
+        ]
+        # Adaptive search visits many states. Retain only frames that a future
+        # decision can reuse, rather than growing these caches with clip length.
+        for past_index in tuple(lookahead_geometry_cache):
+            if past_index < record_index - 1:
+                del lookahead_geometry_cache[past_index]
+                lookahead_frame_lower_bound_cache.pop(past_index, None)
+        for key in tuple(lookahead_color_trial_cache):
+            if key[0] < record_index - 1:
+                del lookahead_color_trial_cache[key]
         if (pending_calibration_move is not None
                 and record.frame_index - pending_calibration_move[0] > INITIAL_CALIBRATION_MOVE_PATIENCE_FRAMES):
             calibrate_initial_profiles(pending_calibration_move[0])
@@ -2677,7 +3747,9 @@ def recover_cached_pose_symmetries(
                 )
             next_candidate = cache[record_index].pose_candidate if record_index < total_records else None
             motion_rejected = False
-            if previous_continuity_candidate is not None and isinstance(next_candidate, StickerPnPCandidate):
+            if (POSE_TWO_SIDED_MOTION_REJECTION_ENABLED
+                    and previous_continuity_candidate is not None
+                    and isinstance(next_candidate, StickerPnPCandidate)):
                 current = np.asarray(selected_candidate.tvec, dtype=np.float64).reshape(3)
                 previous = np.asarray(previous_continuity_candidate.tvec, dtype=np.float64).reshape(3)
                 following = np.asarray(next_candidate.tvec, dtype=np.float64).reshape(3)
@@ -2890,6 +3962,11 @@ def recover_cached_pose_symmetries(
                         rgb for _mask_index, rgb in mask_color_entries
                     ),
                 )
+            static_candidate_before_turn = selected_candidate
+            current_geometry = prepare_lookahead_geometry(
+                record_index - 1,
+                static_candidate_before_turn,
+            )
             selected_candidate = solve_pnp_from_low_error_assignments(
                 selected_candidate,
                 recover_layer_turns=True,
@@ -2897,6 +3974,17 @@ def recover_cached_pose_symmetries(
                 turn_global_profiles=global_profiles,
                 turn_expected_color_by_label=None,
                 record_all_turn_candidates=record_all_turn_candidates,
+                turn_geometry_frame=(
+                    current_geometry[1] if current_geometry is not None else None
+                ),
+                turn_previous_move=last_committed_move,
+                turn_previous_states=tuple(signature for _index, signature in committed_state_history),
+            )
+            selected_candidate = apply_move_lookahead(
+                selected_candidate,
+                static_candidate_before_turn,
+                cube_geometry_state,
+                record_index,
             )
         selected_candidate = replace(
             selected_candidate,
@@ -2940,7 +4028,10 @@ def recover_cached_pose_symmetries(
             committed_moves = completed_candidate_moves(selected_candidate)
             if committed_moves:
                 prior_signature = cube_geometry_state.signature()
-                cube_geometry_state = cube_geometry_state.apply_moves(committed_moves)
+                for move in committed_moves:
+                    committed_state_history.append((record_index - 1, cube_geometry_state.signature()))
+                    cube_geometry_state = cube_geometry_state.apply_move(move)
+                last_committed_move = committed_moves[-1]
                 if calibrate_initial_colors and not calibration_done:
                     if pending_calibration_move is None:
                         pending_calibration_move = (record.frame_index, prior_signature)
@@ -2948,8 +4039,9 @@ def recover_cached_pose_symmetries(
                     if cube_geometry_state.signature() == pending_calibration_move[1]:
                         print(f"Color calibration resumed at frame {record.frame_index}: moves canceled.", flush=True)
                         pending_calibration_move = None
-            elif not any(abs(float(rotation.angle_degrees)) > 1e-6
-                         for rotation in selected_candidate.layer_rotations) and pending_calibration_move is None:
+            elif (not any(abs(float(rotation.angle_degrees)) > 1e-6
+                          for rotation in selected_candidate.layer_rotations)
+                  and pending_calibration_move is None and not selected_candidate.turn_color_unreliable):
                 # Partial turns that return to rest do not commit a move, but
                 # their moving frames are not reliable calibration samples.
                 accepted_initial_pose = True
@@ -2958,7 +4050,8 @@ def recover_cached_pose_symmetries(
                         record.frame_index, selected_observations,
                         observation_weights=selected_observation_weights,
                     )
-        if recognize_moves and global_profiles is not None and known_initial_colors is None:
+        if (recognize_moves and global_profiles is not None and known_initial_colors is None
+                and not selected_candidate.turn_color_unreliable):
             turn_observations = selected_observations
             if (
                 getattr(record, "sticker_masks", None) is not None
@@ -2991,6 +4084,9 @@ def recover_cached_pose_symmetries(
                 global_profiles,
                 turn_observation_weights,
             )
+            # The frame/state key alone cannot identify scores after learning.
+            lookahead_color_trial_cache.clear()
+            lookahead_frame_lower_bound_cache.clear()
         corrected_trace.observe(
             record.frame_index,
             selected_observations,
@@ -4537,6 +5633,12 @@ def transform_candidate_by_symmetry(
             )
         ),
         layer_rotations=transformed_layer_rotations,
+        sticker_layer_rotations=(
+            None if candidate.sticker_layer_rotations is None else tuple(
+                transform_layer_rotation_by_symmetry(rotation, symmetry)
+                for rotation in candidate.sticker_layer_rotations
+            )
+        ),
         turn_candidate_scores=transformed_scores,
         turn_candidate_debug=transformed_debug,
         rvec=transformed_rvec,
@@ -4811,7 +5913,9 @@ def _gpu_sticker_center_fit_metrics(
     max_error: float,
     *,
     return_tensors: bool = False,
-) -> tuple[object, object, object]:
+    layer_mask: object | None = None,
+    return_layer_match_counts: bool = False,
+) -> tuple[object, ...]:
     """Score batched sticker centers with accelerator-resident nearest matching.
 
     The mask centroids are intentionally allowed to share a projected face.
@@ -4825,8 +5929,14 @@ def _gpu_sticker_center_fit_metrics(
         count = int(projected_face_centers.shape[0])
         if return_tensors:
             zero = projected_face_centers.new_zeros(count)
-            return zero, zero, zero.to(dtype=torch.int32)
-        return np.zeros(count), np.zeros(count), np.zeros(count, dtype=np.int32)
+            result = (zero, zero, zero.to(dtype=torch.int32))
+            if return_layer_match_counts:
+                return result + (zero.to(dtype=torch.int32),)
+            return result
+        result = (np.zeros(count), np.zeros(count), np.zeros(count, dtype=np.int32))
+        if return_layer_match_counts:
+            return result + (np.zeros(count, dtype=np.int32),)
+        return result
     uncertainties = np.asarray(
         getattr(candidate, "sticker_mask_center_uncertainties", ()),
         dtype=np.float64,
@@ -4906,13 +6016,38 @@ def _gpu_sticker_center_fit_metrics(
         finite & (nearest_distances < max_error),
         dim=1,
     )
+    layer_match_counts_t = None
+    if layer_mask is not None:
+        layer_distances = torch.where(
+            visible_faces[:, None, :] & layer_mask[:, None, :],
+            distances,
+            torch.full_like(distances, float("inf")),
+        )
+        nearest_layer_distances = torch.min(layer_distances, dim=2).values
+        layer_match_counts_t = torch.count_nonzero(
+            torch.isfinite(nearest_layer_distances)
+            & (nearest_layer_distances < max_error),
+            dim=1,
+        )
     if return_tensors:
-        return means_t, robust_t, match_counts_t
-    return (
+        result = (means_t, robust_t, match_counts_t)
+        if return_layer_match_counts:
+            if layer_match_counts_t is None:
+                layer_match_counts_t = torch.zeros_like(match_counts_t)
+            return result + (layer_match_counts_t,)
+        return result
+    result = (
         means_t.detach().cpu().numpy().astype(np.float64, copy=False),
         robust_t.detach().cpu().numpy().astype(np.float64, copy=False),
         match_counts_t.detach().cpu().numpy().astype(np.int32, copy=False),
     )
+    if return_layer_match_counts:
+        if layer_match_counts_t is None:
+            layer_match_counts_t = torch.zeros_like(match_counts_t)
+        return result + (
+            layer_match_counts_t.detach().cpu().numpy().astype(np.int32, copy=False),
+        )
+    return result
 
 
 def _gpu_sticker_color_fit_metrics(
@@ -4927,6 +6062,7 @@ def _gpu_sticker_color_fit_metrics(
     color_likelihoods: np.ndarray | None,
     *,
     return_tensors: bool = False,
+    assignment_cache: dict | None = None,
 ) -> tuple[object, object]:
     """Score mask colors against moving physical sticker identities on-device."""
 
@@ -4946,52 +6082,84 @@ def _gpu_sticker_color_fit_metrics(
             zero = projected_face_centers.new_zeros(batch)
             return zero, zero.to(dtype=torch.int32)
         return np.zeros(batch, dtype=np.float64), np.zeros(batch, dtype=np.int32)
-    observed = np.asarray(centers[:count], dtype=np.float64).reshape(-1, 2)
-    uncertainties = np.asarray(
-        getattr(candidate, "sticker_mask_center_uncertainties", ()),
-        dtype=np.float64,
-    ).reshape(-1)
-    if len(uncertainties) != count or not np.isfinite(uncertainties[:count]).all():
-        uncertainties = np.ones(count, dtype=np.float64)
-    else:
-        uncertainties = np.maximum(uncertainties[:count], 1.0)
-    weights = 1.0 / np.square(uncertainties)
-    observed_t = torch.as_tensor(
-        observed,
-        dtype=projected_face_centers.dtype,
-        device=projected_face_centers.device,
-    )
-    distances = torch.linalg.vector_norm(
-        observed_t[None, :, None, :] - projected_face_centers[:, None, :, :],
-        dim=-1,
-    )
-    polygons = projected_face_polygons
-    edges = torch.roll(polygons, shifts=-1, dims=2) - polygons
-    relative = observed_t[None, None, :, None, :] - polygons[:, :, None, :, :]
-    cross = (
-        edges[:, :, None, :, 0] * relative[:, :, :, :, 1]
-        - edges[:, :, None, :, 1] * relative[:, :, :, :, 0]
-    )
-    polygon_tolerance = torch.as_tensor(
-        1e-4,
-        dtype=polygons.dtype,
-        device=polygons.device,
-    )
-    inside_positive = torch.all(cross >= -polygon_tolerance, dim=3)
-    inside_negative = torch.all(cross <= polygon_tolerance, dim=3)
-    inside = (inside_positive | inside_negative).permute(0, 2, 1)
-    distances = torch.where(
-        visible_faces[:, None, :] & inside,
-        distances,
-        torch.full_like(distances, float("inf")),
-    )
-    nearest_distances, nearest_faces = torch.min(distances, dim=2)
+    assignment_key = (count, float(max_error),
+                      np.asarray(centers[:count], dtype=np.float64).tobytes(),
+                      np.asarray(getattr(candidate, 'sticker_mask_center_uncertainties', ()), dtype=np.float64).tobytes())
+    cached = assignment_cache.get('value') if assignment_cache is not None and assignment_cache.get('key') == assignment_key else None
+    if cached is None:
+        observed = np.asarray(centers[:count], dtype=np.float64).reshape(-1, 2)
+        uncertainties = np.asarray(
+            getattr(candidate, "sticker_mask_center_uncertainties", ()),
+            dtype=np.float64,
+        ).reshape(-1)
+        if len(uncertainties) != count or not np.isfinite(uncertainties[:count]).all():
+            uncertainties = np.ones(count, dtype=np.float64)
+        else:
+            uncertainties = np.maximum(uncertainties[:count], 1.0)
+        weights = 1.0 / np.square(uncertainties)
+        observed_t = torch.as_tensor(
+            observed,
+            dtype=projected_face_centers.dtype,
+            device=projected_face_centers.device,
+        )
+        distances = torch.linalg.vector_norm(
+            observed_t[None, :, None, :] - projected_face_centers[:, None, :, :],
+            dim=-1,
+        )
+        polygons = projected_face_polygons
+        edges = torch.roll(polygons, shifts=-1, dims=2) - polygons
+        relative = observed_t[None, None, :, None, :] - polygons[:, :, None, :, :]
+        cross = (
+            edges[:, :, None, :, 0] * relative[:, :, :, :, 1]
+            - edges[:, :, None, :, 1] * relative[:, :, :, :, 0]
+        )
+        polygon_tolerance = torch.as_tensor(
+            1e-4,
+            dtype=polygons.dtype,
+            device=polygons.device,
+        )
+        inside_positive = torch.all(cross >= -polygon_tolerance, dim=3)
+        inside_negative = torch.all(cross <= polygon_tolerance, dim=3)
+        inside = (inside_positive | inside_negative).permute(0, 2, 1)
+        distances = torch.where(
+            visible_faces[:, None, :] & inside,
+            distances,
+            torch.full_like(distances, float("inf")),
+        )
+        nearest_distances, nearest_faces = torch.min(distances, dim=2)
+        finite = torch.isfinite(nearest_distances)
+        safe_weights = torch.as_tensor(
+            weights,
+            dtype=projected_face_centers.dtype,
+            device=projected_face_centers.device,
+        )[None, :].expand_as(nearest_distances)
+        safe_weights = torch.where(
+            finite,
+            safe_weights,
+            torch.zeros_like(safe_weights),
+        )
+        match_counts = torch.count_nonzero(
+            finite & (nearest_distances <= max_error),
+            dim=1,
+        )
+        cached = (nearest_faces, safe_weights, match_counts)
+        if assignment_cache is not None:
+            assignment_cache.update(key=assignment_key, value=cached,
+                                    builds=assignment_cache.get('builds', 0) + 1)
+    elif assignment_cache is not None:
+        assignment_cache['hits'] = assignment_cache.get('hits', 0) + 1
+    nearest_faces, safe_weights, match_counts = cached
     identity_indices = torch.as_tensor(
         sticker_identity_indices,
         dtype=torch.long,
         device=projected_face_centers.device,
     )
-    selected_identity_indices = identity_indices[nearest_faces]
+    # The frontier shares projected geometry; only the identity at each fixed face
+    # differs between states. Gather every state's likelihoods in one batch.
+    selected_identity_indices = (
+        identity_indices[nearest_faces] if identity_indices.ndim == 1
+        else identity_indices[:, nearest_faces]
+    )
     likelihoods_t = torch.as_tensor(
         np.asarray(color_likelihoods[:, :count], dtype=np.float64),
         dtype=projected_face_centers.dtype,
@@ -5002,29 +6170,16 @@ def _gpu_sticker_color_fit_metrics(
         selected_identity_indices,
         observation_indices[None, :],
     ]
-    finite = torch.isfinite(nearest_distances)
-    safe_weights = torch.as_tensor(
-        weights,
-        dtype=projected_face_centers.dtype,
-        device=projected_face_centers.device,
-    )[None, :].expand_as(nearest_distances)
-    safe_weights = torch.where(
-        finite,
-        safe_weights,
-        torch.zeros_like(safe_weights),
-    )
     log_likelihoods = torch.log(torch.clamp(selected_likelihoods, min=1e-30))
     total_weight = torch.sum(safe_weights, dim=1)
     color_error = torch.where(
         total_weight > 0.0,
-        -torch.sum(safe_weights * log_likelihoods, dim=1)
+        -torch.sum(safe_weights * log_likelihoods, dim=-1)
         / torch.clamp(total_weight, min=1e-12),
         torch.full_like(total_weight, float("inf")),
     )
-    match_counts = torch.count_nonzero(
-        finite & (nearest_distances <= max_error),
-        dim=1,
-    )
+    if identity_indices.ndim > 1:
+        match_counts = match_counts[None, :].expand(identity_indices.shape[0], -1)
     if return_tensors:
         return color_error, match_counts
     return (
@@ -5044,7 +6199,7 @@ def _gpu_keypoint_fit_metrics(
     observed_classes: object | None,
     scale: float,
     assignment_error_limit: float,
-) -> tuple[object, object, object, object, object]:
+) -> tuple[object, object, object, object, object, object]:
     """Compute the existing keypoint ranking statistics for all trials."""
 
     finite = torch.isfinite(distances)
@@ -5090,7 +6245,7 @@ def _gpu_keypoint_fit_metrics(
     p90 = torch.where(valid_trial, p90, infinity)
     inliers = torch.where(valid_trial, torch.count_nonzero(finite & (distances <= assignment_error_limit), dim=1), 0)
     layer_inliers = torch.where(valid_trial, torch.count_nonzero(layer_finite & (distances <= assignment_error_limit), dim=1), 0)
-    return mean, robust, p90, inliers, layer_inliers
+    return mean, robust, p90, inliers, layer_inliers, valid_trial
 
 
 def _score_turn_configurations_on_gpu(
@@ -5100,6 +6255,9 @@ def _score_turn_configurations_on_gpu(
     color_likelihoods: np.ndarray | None = None,
     *,
     materialize_projections: bool = True,
+    angle_values: np.ndarray | None = None,
+    enforce_layer_observation_gate: bool = True,
+    enforce_validity_gate: bool = True,
 ) -> list[dict[str, object]] | None:
     """Batch exhaustive turn projection and scoring on a Torch device.
 
@@ -5136,7 +6294,11 @@ def _score_turn_configurations_on_gpu(
             geometry_state,
             sticker_identity_indices,
         )
-        angles = turn_search_angles()
+        angles = (
+            turn_search_angles()
+            if angle_values is None
+            else np.asarray(angle_values, dtype=np.float64).reshape(-1)
+        )
         eligible_layers = {
             (axis, side, layer_count): turn_layer_observation_count(
                 candidate,
@@ -5163,7 +6325,7 @@ def _score_turn_configurations_on_gpu(
                             f"static {layer_face_debug_label(axis, side)}",
                         )
                     )
-                    if (
+                    if enforce_layer_observation_gate and (
                         int(cube_layer_mask(base_object_points, axis, side, layer_count).sum()) < 3
                         or eligible_layers[(axis, side, layer_count)]
                         < MIN_TURN_LAYER_OBSERVATIONS
@@ -5387,6 +6549,13 @@ def _score_turn_configurations_on_gpu(
             sticker_coordinates >= sticker_boundary[:, None] - 1e-4,
             sticker_coordinates <= -sticker_boundary[:, None] + 1e-4,
         ) & active[:, None]
+        # Use the un-gated layer mask for observation accounting so static
+        # baselines and turn trials treat centroid observations identically.
+        sticker_observation_layer_mask = torch.where(
+            sides[:, None] > 0.0,
+            sticker_coordinates >= sticker_boundary[:, None] - 1e-4,
+            sticker_coordinates <= -sticker_boundary[:, None] + 1e-4,
+        )
         expanded_faces = sticker_faces_t[None, :, :, :].expand(count, -1, -1, -1)
         rotated_faces = torch.matmul(
             expanded_faces - point_center[:, None, None, :],
@@ -5415,7 +6584,10 @@ def _score_turn_configurations_on_gpu(
         face_centers_camera = torch.einsum("ij,bfj->bfi", camera_rotation, transformed_faces.mean(dim=2)) + tvec
         face_normals_camera = torch.einsum("ij,bfj->bfi", camera_rotation, transformed_face_normals)
         visible_faces = torch.sum(face_normals_camera * -face_centers_camera, dim=2) > 0.0
-        sticker_mean, sticker_robust, sticker_matches = _gpu_sticker_center_fit_metrics(
+        (
+            sticker_mean, sticker_robust, sticker_matches,
+            sticker_layer_matches,
+        ) = _gpu_sticker_center_fit_metrics(
             candidate,
             torch,
             projected_face_centers,
@@ -5423,6 +6595,8 @@ def _score_turn_configurations_on_gpu(
             float(scale),
             float(assignment_error_limit),
             return_tensors=True,
+            layer_mask=sticker_observation_layer_mask,
+            return_layer_match_counts=True,
         )
         color_errors, color_matches = _gpu_sticker_color_fit_metrics(
             candidate,
@@ -5436,7 +6610,10 @@ def _score_turn_configurations_on_gpu(
             color_likelihoods,
             return_tensors=True,
         )
-        keypoint_mean_t, keypoint_robust_t, p90_t, inliers_t, layer_inliers_t = (
+        (
+            keypoint_mean_t, keypoint_robust_t, p90_t,
+            inliers_t, layer_inliers_t, keypoint_valid_t,
+        ) = (
             _gpu_keypoint_fit_metrics(
                 torch, assigned_distances, assigned_objects, assigned_classes,
                 axes, sides, layer_counts,
@@ -5448,20 +6625,24 @@ def _score_turn_configurations_on_gpu(
         # compact vectors once; Python retains the existing ordering rules.
         score_vectors = torch.stack((
             sticker_mean, sticker_robust, sticker_matches.to(dtype=dtype),
+            sticker_layer_matches.to(dtype=dtype),
             color_errors, color_matches.to(dtype=dtype),
             keypoint_mean_t, keypoint_robust_t, p90_t,
             inliers_t.to(dtype=dtype), layer_inliers_t.to(dtype=dtype),
+            keypoint_valid_t.to(dtype=dtype),
         )).detach().cpu().numpy()
         sticker_mean = score_vectors[0].astype(np.float64, copy=False)
         sticker_robust = score_vectors[1].astype(np.float64, copy=False)
         sticker_matches = score_vectors[2].astype(np.int32, copy=False)
-        color_errors = score_vectors[3].astype(np.float64, copy=False)
-        color_matches = score_vectors[4].astype(np.int32, copy=False)
-        keypoint_means = score_vectors[5]
-        keypoint_robust = score_vectors[6]
-        p90_values = score_vectors[7]
-        inlier_counts = score_vectors[8].astype(np.int32, copy=False)
-        layer_inlier_counts = score_vectors[9].astype(np.int32, copy=False)
+        sticker_layer_matches = score_vectors[3].astype(np.int32, copy=False)
+        color_errors = score_vectors[4].astype(np.float64, copy=False)
+        color_matches = score_vectors[5].astype(np.int32, copy=False)
+        keypoint_means = score_vectors[6]
+        keypoint_robust = score_vectors[7]
+        p90_values = score_vectors[8]
+        keypoint_inlier_counts = score_vectors[9].astype(np.int32, copy=False)
+        keypoint_layer_inlier_counts = score_vectors[10].astype(np.int32, copy=False)
+        keypoint_valid = score_vectors[11].astype(bool, copy=False)
         assigned_projected_cpu = (
             assigned_projected.detach().cpu().numpy()
             if materialize_projections else None
@@ -5477,11 +6658,25 @@ def _score_turn_configurations_on_gpu(
         results: list[dict[str, object]] = []
         for trial_index, configuration in enumerate(configurations):
             axis, side, layer_count, _angle, is_baseline, rotations, label = configuration
-            mean_error = keypoint_error = float(keypoint_means[trial_index])
+            keypoint_error = float(keypoint_means[trial_index])
             robust_error = float(keypoint_robust[trial_index])
             p90_error = float(p90_values[trial_index])
-            inlier_count = int(inlier_counts[trial_index])
-            layer_inlier_count = int(layer_inlier_counts[trial_index])
+            keypoint_inlier_count = int(keypoint_inlier_counts[trial_index])
+            keypoint_layer_inlier_count = int(keypoint_layer_inlier_counts[trial_index])
+            centroid_layer_match_count = int(sticker_layer_matches[trial_index])
+            combined_valid = bool(keypoint_valid[trial_index]) or centroid_layer_match_count > 0
+            # A missing keypoint component is allowed when centroid
+            # observations validate the same layer; the available observation
+            # terms then contribute identically to the combined score.
+            if not np.isfinite(keypoint_error):
+                keypoint_error = 0.0
+            if not np.isfinite(robust_error):
+                robust_error = 0.0
+            if not np.isfinite(p90_error):
+                p90_error = 0.0
+            mean_error = keypoint_error
+            inlier_count = keypoint_inlier_count + int(sticker_matches[trial_index])
+            layer_inlier_count = keypoint_layer_inlier_count + centroid_layer_match_count
             combined_mean_error = keypoint_error + (
                 PNP_TURN_MASK_CENTER_WEIGHT * float(sticker_mean[trial_index])
                 if np.isfinite(sticker_mean[trial_index])
@@ -5502,6 +6697,10 @@ def _score_turn_configurations_on_gpu(
                 if np.isfinite(color_errors[trial_index])
                 else 0.0
             )
+            if enforce_validity_gate and not combined_valid:
+                combined_mean_error = float("inf")
+                combined_robust_error = float("inf")
+                p90_error = float("inf")
             results.append(
                 {
                     "is_baseline": is_baseline,
@@ -5514,8 +6713,11 @@ def _score_turn_configurations_on_gpu(
                     "keypoint_robust_error": robust_error,
                     "sticker_robust_error": float(sticker_robust[trial_index]),
                     "sticker_match_count": int(sticker_matches[trial_index]),
+                    "sticker_layer_match_count": centroid_layer_match_count,
                     "color_error": float(color_errors[trial_index]),
                     "color_match_count": int(color_matches[trial_index]),
+                    "keypoint_inlier_count": keypoint_inlier_count,
+                    "keypoint_layer_inlier_count": keypoint_layer_inlier_count,
                     "inlier_count": inlier_count,
                     "layer_inlier_count": layer_inlier_count,
                     "p90_error": p90_error,
@@ -5546,6 +6748,412 @@ def _score_turn_configurations_on_gpu(
         return None
 
 
+def _build_turn_geometry_frame(
+    candidate: StickerPnPCandidate,
+    assignment_error_limit: float,
+    scoring_device: object,
+) -> dict[str, object] | None:
+    """Cache the best partial geometric fit for each of the 12 layer choices."""
+
+    trials = _score_turn_configurations_on_gpu(
+        candidate,
+        assignment_error_limit,
+        scoring_device,
+        color_likelihoods=None,
+        materialize_projections=False,
+        angle_values=turn_geometric_search_angles(),
+        enforce_layer_observation_gate=False,
+        enforce_validity_gate=False,
+    )
+    if not trials:
+        return None
+    options_by_layer: dict[tuple[int, int, int], dict[str, object]] = {}
+    static_trials: list[dict[str, object]] = []
+    for trial in trials:
+        key = (
+            int(trial["layer_axis"]),
+            int(trial["layer_side"]),
+            int(trial["layer_count"]),
+        )
+        if bool(trial["is_baseline"]):
+            static_trials.append(trial)
+        previous = options_by_layer.get(key)
+        if previous is None or trial["rank"] < previous["rank"]:
+            options_by_layer[key] = trial
+    materialized_options: list[dict[str, object]] = []
+    for key in sorted(options_by_layer):
+        option = dict(options_by_layer[key])
+        for field_name in (
+            "assignment_projected_points",
+            "assignment_object_points",
+            "assignment_projected_class_ids",
+        ):
+            value = option.get(field_name)
+            if hasattr(value, "detach"):
+                value = value.detach().cpu().numpy()
+            option[field_name] = value
+        materialized_options.append(option)
+    options = tuple(materialized_options)
+    if len(options) != 12 or not static_trials:
+        return None
+    return {
+        "trials": tuple(trials),
+        "options": options,
+        "static_trials": tuple(static_trials),
+    }
+
+
+def _turn_color_frame_score_lower_bound(
+    candidate: StickerPnPCandidate,
+    geometry_options: tuple[dict[str, object], ...],
+    assignment_error_limit: float,
+    scoring_device: object,
+    color_likelihoods: np.ndarray | None,
+    *, projection_cache: dict | None = None,
+) -> float:
+    """Relax sticker permutation constraints to bound every state/offset.
+
+    Each observation receives its maximum likelihood over all identities.
+    Keep the real per-option coverage, uncertainty weights and geometric cost.
+    Every feasible cube assignment is at least as costly as this relaxation.
+    """
+
+    if color_likelihoods is None:
+        return min((float(option.get('combined_mean_error', -float('inf')))
+                    for option in geometry_options), default=-float('inf'))
+    likelihoods = np.asarray(color_likelihoods, dtype=np.float64)
+    if likelihoods.ndim != 2 or not likelihoods.size or not np.isfinite(likelihoods).all():
+        return -float('inf')
+    optimistic = np.broadcast_to(likelihoods.max(axis=0, keepdims=True), likelihoods.shape).copy()
+    trials = _score_turn_color_offsets_on_gpu(
+        candidate, geometry_options, assignment_error_limit, scoring_device, optimistic, projection_cache=projection_cache,
+    )
+    if not trials:
+        return -float('inf')
+    lower = min(float(trial['state_score']) for trial in trials)
+    if not np.isfinite(lower):
+        return -float('inf')
+    # Round down conservatively across accelerator dtypes/reduction order.
+    slack = 1e-6 if str(scoring_device).startswith('mps') else 1e-10
+    return lower - slack * (1.0 + abs(lower))
+
+
+def _score_turn_color_offsets_on_gpu(
+    candidate: StickerPnPCandidate,
+    geometry_options: tuple[dict[str, object], ...],
+    assignment_error_limit: float,
+    scoring_device: object,
+    color_likelihoods: np.ndarray | None,
+    *, projection_cache: dict | None = None,
+) -> list[dict[str, object]] | None:
+    """Score only the -90/0/+90 color offsets for cached geometry options."""
+
+    results = _score_turn_color_offsets_for_states_on_gpu(
+        candidate, geometry_options, assignment_error_limit, scoring_device,
+        color_likelihoods, (getattr(candidate, "cube_geometry_state", None),), projection_cache=projection_cache,
+    )
+    return results[0] if results is not None else None
+
+
+def _score_turn_color_offsets_for_states_on_gpu(
+    candidate: StickerPnPCandidate,
+    geometry_options: tuple[dict[str, object], ...],
+    assignment_error_limit: float,
+    scoring_device: object,
+    color_likelihoods: np.ndarray | None,
+    geometry_states: tuple[CubeGeometryState | None, ...],
+    *, projection_cache: dict | None = None,
+) -> list[list[dict[str, object]]] | None:
+    """Project each option once and score all frontier states on the GPU."""
+
+    if not geometry_states:
+        return []
+    if not geometry_options:
+        return [[] for _state in geometry_states]
+    try:
+        import torch
+
+        canonical_identity_indices = _turn_gpu_static_geometry()[-1]
+        sticker_identity_indices = np.stack([
+            _turn_gpu_identity_indices_for_state(state, canonical_identity_indices)
+            for state in geometry_states
+        ])
+        device = scoring_device
+        dtype = torch.float32 if str(device).startswith("mps") else torch.float64
+        configurations: list[tuple[int, float, int, int, int, float]] = []
+        for option_index, option in enumerate(geometry_options):
+            axis = int(option["layer_axis"])
+            side = int(option["layer_side"])
+            layer_count = int(option["layer_count"])
+            rotations = tuple(option.get("layer_rotations", ()))
+            base_angle = (
+                float(rotations[0].angle_degrees)
+                if rotations
+                else 0.0
+            )
+            for offset in (-90.0, 0.0, 90.0):
+                configurations.append(
+                    (
+                        option_index,
+                        offset,
+                        axis,
+                        side,
+                        layer_count,
+                        base_angle + offset,
+                    )
+                )
+
+        count = len(configurations)
+        projection_key = (str(device), tuple(configurations), *(np.asarray(value, dtype=np.float64).tobytes()
+                          for value in (candidate.rvec, candidate.tvec, candidate.camera_matrix, candidate.dist_coeffs)))
+        projected = projection_cache.get('projected') if projection_cache is not None and projection_cache.get('key') == projection_key else None
+        if projected is None:
+            axes = torch.as_tensor(
+                [item[2] for item in configurations],
+                dtype=torch.long,
+                device=device,
+            )
+            sides = torch.as_tensor(
+                [item[3] for item in configurations],
+                dtype=dtype,
+                device=device,
+            )
+            layer_counts = torch.as_tensor(
+                [item[4] for item in configurations],
+                dtype=dtype,
+                device=device,
+            )
+            angles = torch.as_tensor(
+                [item[5] for item in configurations],
+                dtype=dtype,
+                device=device,
+            )
+            active = torch.as_tensor(
+                [abs(item[5]) > 1e-6 for item in configurations],
+                dtype=torch.bool,
+                device=device,
+            )
+            (
+                _base_points_t,
+                _base_normals_t,
+                _triangles_t,
+                _triangle_centers_t,
+                sticker_faces_t,
+                sticker_face_centers_t,
+                sticker_normals_t,
+                _base_face_mask_t,
+                _trial_classes,
+            ) = _turn_gpu_static_tensors(str(device), dtype)
+            camera_rotation_np, _ = cv2.Rodrigues(
+                np.asarray(candidate.rvec, dtype=np.float64).reshape(3, 1)
+            )
+            camera_rotation = torch.as_tensor(
+                camera_rotation_np,
+                dtype=dtype,
+                device=device,
+            )
+            tvec = torch.as_tensor(
+                np.asarray(candidate.tvec, dtype=np.float64).reshape(1, 1, 3),
+                dtype=dtype,
+                device=device,
+            )
+            camera_matrix = torch.as_tensor(
+                np.asarray(candidate.camera_matrix, dtype=np.float64),
+                dtype=dtype,
+                device=device,
+            )
+            dist_coeffs = torch.as_tensor(
+                np.asarray(candidate.dist_coeffs, dtype=np.float64),
+                dtype=dtype,
+                device=device,
+            )
+            rotation = _torch_axis_rotation_matrices(
+                torch,
+                axes,
+                sides * angles * (np.pi / 180.0),
+            )
+            sticker_coordinates = sticker_face_centers_t[:, axes].T
+            sticker_boundary = (
+                CUBE_HALF_SIZE_MM
+                - layer_counts * CUBE_LAYER_SIZE_MM
+                + CUBE_LAYER_SIZE_MM / 2.0
+            )
+            sticker_layer_mask = torch.where(
+                sides[:, None] > 0.0,
+                sticker_coordinates >= sticker_boundary[:, None] - 1e-4,
+                sticker_coordinates <= -sticker_boundary[:, None] + 1e-4,
+            ) & active[:, None]
+            expanded_faces = sticker_faces_t[None, :, :, :].expand(
+                count, -1, -1, -1
+            )
+            point_center = torch.zeros((count, 3), dtype=dtype, device=device)
+            point_center[torch.arange(count, device=device), axes] = (
+                sides * CUBE_HALF_SIZE_MM
+            )
+            rotated_faces = torch.matmul(
+                expanded_faces - point_center[:, None, None, :],
+                rotation[:, None, :, :].transpose(2, 3),
+            ) + point_center[:, None, None, :]
+            transformed_faces = torch.where(
+                sticker_layer_mask[:, :, None, None],
+                rotated_faces,
+                expanded_faces,
+            )
+            projected_face_polygons = _torch_project_turn_points(
+                torch,
+                transformed_faces,
+                camera_rotation,
+                tvec,
+                camera_matrix,
+                dist_coeffs,
+            )
+            projected_face_centers = projected_face_polygons.mean(dim=2)
+            transformed_face_normals = torch.einsum(
+                "bij,bfj->bfi",
+                rotation,
+                sticker_normals_t[None, :, :].expand(count, -1, -1),
+            )
+            transformed_face_normals = torch.where(
+                sticker_layer_mask[:, :, None],
+                transformed_face_normals,
+                sticker_normals_t[None, :, :].expand(count, -1, -1),
+            )
+            face_centers_camera = (
+                torch.einsum(
+                    "ij,bfj->bfi",
+                    camera_rotation,
+                    transformed_faces.mean(dim=2),
+                )
+                + tvec
+            )
+            face_normals_camera = torch.einsum(
+                "ij,bfj->bfi",
+                camera_rotation,
+                transformed_face_normals,
+            )
+            visible_faces = torch.sum(
+                face_normals_camera * -face_centers_camera,
+                dim=2,
+            ) > 0.0
+            scale = projected_cube_diameter(candidate)
+            if not np.isfinite(scale) or scale <= 0.0:
+                return None
+            projected = (projected_face_centers, projected_face_polygons, visible_faces, scale)
+            if projection_cache is not None:
+                projection_cache.update(key=projection_key, projected=projected, assignments={},
+                                        builds=projection_cache.get('builds', 0) + 1)
+        elif projection_cache is not None:
+            projection_cache['hits'] = projection_cache.get('hits', 0) + 1
+        projected_face_centers, projected_face_polygons, visible_faces, scale = projected
+        color_errors, color_matches = _gpu_sticker_color_fit_metrics(
+            candidate,
+            torch,
+            projected_face_centers,
+            projected_face_polygons,
+            visible_faces,
+            sticker_identity_indices,
+            float(scale),
+            float(assignment_error_limit),
+            color_likelihoods,
+            return_tensors=True,
+            assignment_cache=projection_cache.get("assignments") if projection_cache is not None else None,
+        )
+        color_vectors = torch.stack(
+            (color_errors, color_matches.to(dtype=dtype))
+        ).detach().cpu().numpy()
+        color_errors_np = color_vectors[0].astype(np.float64, copy=False)
+        color_matches_np = color_vectors[1].astype(np.int32, copy=False)
+        # Without color inputs the shared metric returns one neutral vector.
+        if color_errors_np.ndim == 1:
+            color_errors_np = np.broadcast_to(color_errors_np, (len(geometry_states), count))
+            color_matches_np = np.broadcast_to(color_matches_np, (len(geometry_states), count))
+
+        results_by_state: list[list[dict[str, object]]] = []
+        for state_index in range(len(geometry_states)):
+            results: list[dict[str, object]] = []
+            for index, (option_index, offset, axis, side, layer_count, _angle) in enumerate(configurations):
+                option = geometry_options[option_index]
+                geometry_rotations = tuple(option.get("layer_rotations", ()))
+                state_moves: tuple[str, ...] = ()
+                if abs(offset) > 1e-6:
+                    notation = cube_rotation_to_notation(
+                        CubeLayerRotation(axis, side, offset, layer_count)
+                    )
+                    if notation is not None:
+                        state_moves = (notation,)
+                color_error = float(color_errors_np[state_index, index])
+                # The metric returns zero when color inputs are absent, but inf
+                # when available observations cannot be matched to this trial.
+                # Only the former is neutral evidence.
+                color_cost = (
+                    PNP_TURN_COLOR_WEIGHT * color_error
+                    if np.isfinite(color_error)
+                    else float("inf")
+                )
+                geometry_score = float(option["combined_mean_error"])
+                combined_score = geometry_score + color_cost
+                # Geometry and color are searched in separate stages, but the
+                # resulting per-frame score used by state selection/lookahead
+                # remains equally weighted.
+                state_score = combined_score
+                inlier_count = int(option.get("inlier_count", 0))
+                layer_inlier_count = int(option.get("layer_inlier_count", 0))
+                results.append(
+                    {
+                        "trial_id": f"{option_index}:{offset:+g}",
+                        "is_baseline": bool(
+                            option.get("is_baseline", False)
+                            and not state_moves
+                        ),
+                        "geometry_option_index": option_index,
+                        "layer_axis": axis,
+                        "layer_side": side,
+                        "layer_count": layer_count,
+                        "color_offset": float(offset),
+                        "state_moves": state_moves,
+                        "layer_rotations": geometry_rotations,
+                        "label": (
+                            f"{option['label']} offset {offset:+.0f}"
+                        ),
+                        "global_mean_error": combined_score,
+                        "combined_mean_error": combined_score,
+                        # State selection and lookahead use this equal-weight
+                        # geometric-plus-color score. The geometry and color
+                        # calculations themselves remain decoupled.
+                        "state_score": state_score,
+                        "rank": (
+                            state_score,
+                            -float(inlier_count),
+                            float(option.get("p90_error", float("inf"))),
+                            -float(layer_inlier_count),
+                        ),
+                        "robust_error": float(option.get("robust_error", float("inf")))
+                        + color_cost,
+                        "keypoint_error": float(option.get("keypoint_error", float("inf"))),
+                        "sticker_error": float(option.get("sticker_error", float("inf"))),
+                        "keypoint_robust_error": float(option.get("keypoint_robust_error", float("inf"))),
+                        "sticker_robust_error": float(option.get("sticker_robust_error", float("inf"))),
+                        "sticker_match_count": int(option.get("sticker_match_count", 0)),
+                        "sticker_layer_match_count": int(option.get("sticker_layer_match_count", 0)),
+                        "color_error": color_error,
+                        "color_match_count": int(color_matches_np[state_index, index]),
+                        "keypoint_inlier_count": int(option.get("keypoint_inlier_count", 0)),
+                        "keypoint_layer_inlier_count": int(option.get("keypoint_layer_inlier_count", 0)),
+                        "inlier_count": inlier_count,
+                        "layer_inlier_count": layer_inlier_count,
+                        "p90_error": float(option.get("p90_error", float("inf"))),
+                        "mean_error": float(option.get("mean_error", float("inf"))),
+                        "assignment_projected_points": option["assignment_projected_points"],
+                        "assignment_object_points": option["assignment_object_points"],
+                        "assignment_projected_class_ids": option["assignment_projected_class_ids"],
+                    }
+                )
+            results_by_state.append(results)
+        return results_by_state
+    except (RuntimeError, ValueError, TypeError, IndexError, cv2.error):
+        return None
+
+
 def turn_trial_exceeds_static_baseline(
     trial: dict[str, object],
     static_baseline_by_layer: dict[tuple[int, int, int], object],
@@ -5557,8 +7165,10 @@ def turn_trial_exceeds_static_baseline(
     accepting a turn.  Compare each tested turn with the static trial for the
     same axis, side, and layer width instead.
 
-    A turn configuration must either explain strictly more observations than
-    static or provide a sufficiently strong color-likelihood improvement.
+    A turn configuration must either explain strictly more unified inliers
+    than static or provide a sufficiently strong color-likelihood improvement.
+    Keypoint/centroid validity is still enforced by the fit scorer before a
+    candidate can be selected.
     The 45-degree rule is applied only after selection, when deciding whether
     the selected fit commits a discrete cube-state update for the next frame.
     """
@@ -5574,18 +7184,16 @@ def turn_trial_exceeds_static_baseline(
     if baseline is None:
         return False
 
-    # Keep compatibility with older integer-baseline callers and with the
-    # real search's complete static-trial baseline.
+    # More unified observations waive the color-improvement requirement.
+    # `inlier_count` includes both keypoint and sticker-centroid matches.
     baseline_inliers = int(
-        baseline["inlier_count"] if isinstance(baseline, dict) else baseline
+        baseline.get("inlier_count", 0) if isinstance(baseline, dict) else baseline
     )
-    if int(trial["inlier_count"]) > baseline_inliers:
+    if int(trial.get("inlier_count", 0)) > baseline_inliers:
         return True
 
-    # Color is a rescue path for real turns whose global inlier count ties or
-    # loses to static because a moving layer is partially occluded.  The
-    # comparison is on negative-log likelihood, so lower is better: a ratio
-    # of 0.5 means the turn's color error is at least 2x better than static.
+    # Otherwise compare negative-log likelihood, where lower is better: a
+    # ratio of 0.5 means the turn's color error is at least 2x better.
     if not isinstance(baseline, dict):
         return False
     trial_color_error = float(trial.get("color_error", float("inf")))
@@ -5736,6 +7344,7 @@ def recover_misaligned_cube_layers(
         trial
         for trial in ordered_trials
         if turn_trial_exceeds_static_baseline(trial, static_baseline_by_layer)
+        and not turn_trial_has_invalid_color(trial)
     ]
     articulated_scores: tuple[float, float, float] | None = None
     best: dict[str, object] | None = None
@@ -5815,6 +7424,7 @@ def recover_misaligned_cube_layers(
     )
     turn_candidate_diagnostics = tuple(
         {
+            "trial_id": trial.get("trial_id"),
             "label": str(trial["label"]),
             "is_baseline": bool(trial["is_baseline"]),
             "layer_axis": int(trial["layer_axis"]),
@@ -5837,8 +7447,11 @@ def recover_misaligned_cube_layers(
             "heatmap_mean_error": float(trial["sticker_error"]),
             "heatmap_robust_error": float(trial["sticker_robust_error"]),
             "heatmap_match_count": int(trial["sticker_match_count"]),
+            "heatmap_layer_match_count": int(trial["sticker_layer_match_count"]),
             "color_error": float(trial["color_error"]),
             "color_match_count": int(trial["color_match_count"]),
+            "keypoint_inlier_count": int(trial["keypoint_inlier_count"]),
+            "keypoint_layer_inlier_count": int(trial["keypoint_layer_inlier_count"]),
             "inlier_count": int(trial["inlier_count"]),
             "layer_inlier_count": int(trial["layer_inlier_count"]),
         }
@@ -5853,7 +7466,8 @@ def recover_misaligned_cube_layers(
         turn_fit_articulated_scores=articulated_scores,
     )
     if best is None:
-        return diagnostic_candidate
+        return replace(diagnostic_candidate, turn_color_unreliable=bool(
+            ranked_trials and all(turn_trial_has_invalid_color(trial) for trial in ranked_trials)))
 
     best_rotations = best["layer_rotations"]
     best_sticker_object_points = apply_cube_layer_rotations(
@@ -5879,8 +7493,295 @@ def recover_misaligned_cube_layers(
         assignment_projected_points=best["assignment_projected_points"],
         assignment_projected_class_ids=best["assignment_projected_class_ids"],
         layer_rotations=best_rotations,
+        turn_fit_color_score=float(best["color_error"]),
+        turn_color_unreliable=False,
         turn_fit_articulated_scores=articulated_scores,
     )
+
+
+def recover_misaligned_cube_layers_from_geometry(
+    candidate: StickerPnPCandidate,
+    assignment_error_limit: float,
+    geometry_frame: dict[str, object],
+    record_all_turn_candidates: bool = False,
+    color_priors: dict[str, np.ndarray] | None = None,
+    global_profiles: dict[str, GlobalColorProfile] | None = None,
+    expected_color_by_label: dict[str, str] | None = None,
+    previous_move: str | None = None,
+    previous_states: tuple[tuple, ...] = (),
+) -> StickerPnPCandidate:
+    """Choose state offsets using a frame's already-cached geometry fits."""
+
+    options = tuple(geometry_frame.get("options", ()))
+    static_trials = tuple(geometry_frame.get("static_trials", ()))
+    if not options or not static_trials:
+        return replace(
+            candidate,
+            layer_rotations=(),
+            turn_state_moves=(),
+            turn_fit_articulated_scores=None,
+            turn_fit_evaluated=False,
+        )
+    color_likelihoods = turn_color_predictive_likelihoods(
+        candidate,
+        color_priors,
+        global_profiles,
+        expected_color_by_label,
+    )
+    if color_likelihoods is None:
+        color_likelihoods = getattr(candidate, "turn_color_likelihoods", None)
+    scoring_device = _turn_torch_scoring_device("mps")
+    if scoring_device is None:
+        raise RuntimeError("Move recognition requires an available Apple MPS device")
+    color_trials = _score_turn_color_offsets_on_gpu(
+        candidate,
+        options,
+        assignment_error_limit,
+        scoring_device,
+        color_likelihoods,
+    )
+    if not color_trials:
+        return replace(
+            candidate,
+            turn_color_likelihoods=color_likelihoods,
+            turn_fit_evaluated=True,
+            turn_state_moves=(),
+            turn_fit_articulated_scores=None,
+        )
+
+    # History does not exclude a finite single-frame option or fallback.
+    best_trial = min(
+        (trial for trial in color_trials if np.isfinite(float(trial["state_score"]))
+         and not turn_trial_has_invalid_color(trial)),
+        key=lambda trial: (float(trial["state_score"])
+                           + PNP_TURN_LOOKAHEAD_MOVE_COST * len(trial["state_moves"]), trial["rank"]),
+        default=None,
+    )
+    if best_trial is None:
+        return replace(
+            candidate,
+            layer_rotations=(),
+            sticker_layer_rotations=(),
+            turn_selected_trial_id=None,
+            turn_color_offset_degrees=0.0,
+            turn_color_unreliable=any(turn_trial_has_invalid_color(trial) for trial in color_trials),
+            turn_candidate_diagnostics=tuple(dict(turn_trial_log_payload(trial),
+                invalid_color=turn_trial_has_invalid_color(trial)) for trial in color_trials),
+            turn_color_likelihoods=color_likelihoods,
+            turn_fit_evaluated=True,
+            turn_state_moves=(),
+            turn_fit_articulated_scores=None,
+        )
+    best = None if bool(best_trial["is_baseline"]) else best_trial
+    static_trial = min(
+        (
+            trial
+            for trial in color_trials
+            if bool(trial["is_baseline"])
+        ),
+        key=lambda trial: trial["rank"],
+        default=None,
+    )
+    if static_trial is None:
+        return replace(
+            candidate,
+            turn_color_likelihoods=color_likelihoods,
+            turn_fit_evaluated=True,
+            turn_state_moves=(),
+            turn_fit_articulated_scores=None,
+        )
+    static_scores = (
+        float(static_trial["keypoint_error"]),
+        float(static_trial["sticker_error"]),
+        float(static_trial["combined_mean_error"]),
+    )
+    layer_scores = tuple(
+        (
+            str(trial["label"]),
+            float(trial["keypoint_error"]),
+            float(trial["sticker_error"]),
+            float(trial["combined_mean_error"]),
+        )
+        for trial in static_trials
+    )
+    articulated_scores = (
+        (
+            float(best["keypoint_error"]),
+            float(best["sticker_error"]),
+            float(best["combined_mean_error"]),
+        )
+        if best is not None
+        else None
+    )
+    ordered_trials = sorted(color_trials, key=lambda trial: trial["rank"])
+    recorded_trials = (
+        ordered_trials
+        if record_all_turn_candidates
+        else ordered_trials[:PNP_TURN_DEBUG_CANDIDATE_COUNT]
+    )
+    if best is not None and all(best is not trial for trial in recorded_trials):
+        recorded_trials.append(best)
+    turn_candidate_scores = tuple(
+        (
+            str(trial["label"]),
+            float(trial["robust_error"]),
+            int(trial["inlier_count"]),
+            float(trial["p90_error"]),
+            float(trial["mean_error"]),
+        )
+        for trial in recorded_trials
+    )
+    turn_candidate_debug = tuple(
+        TurnCandidateDebug(
+            label=str(trial["label"]),
+            layer_rotations=trial["layer_rotations"],
+            assignment_projected_points=trial["assignment_projected_points"],
+            assignment_object_points=trial["assignment_object_points"],
+            assignment_projected_class_ids=trial["assignment_projected_class_ids"],
+        )
+        for trial in recorded_trials
+    )
+    turn_candidate_diagnostics = tuple(
+        {
+            "trial_id": trial.get("trial_id"),
+            "label": str(trial["label"]),
+            "is_baseline": bool(trial["is_baseline"]),
+            "layer_axis": int(trial["layer_axis"]),
+            "layer_side": int(trial["layer_side"]),
+            "layer_count": int(trial["layer_count"]),
+            "layer_rotations": [
+                {
+                    "axis": int(rotation.axis),
+                    "side": int(rotation.side),
+                    "angle_degrees": float(rotation.angle_degrees),
+                    "layer_count": int(rotation.layer_count),
+                }
+                for rotation in trial["layer_rotations"]
+            ],
+            "color_offset": float(trial["color_offset"]),
+            "state_moves": list(trial["state_moves"]),
+            "global_mean_error": float(trial["combined_mean_error"]),
+            "state_score": float(trial["state_score"]),
+            "global_robust_error": float(trial["robust_error"]),
+            "keypoint_mean_error": float(trial["keypoint_error"]),
+            "keypoint_robust_error": float(trial["keypoint_robust_error"]),
+            "heatmap_mean_error": float(trial["sticker_error"]),
+            "heatmap_robust_error": float(trial["sticker_robust_error"]),
+            "heatmap_match_count": int(trial["sticker_match_count"]),
+            "heatmap_layer_match_count": int(trial["sticker_layer_match_count"]),
+            "color_error": float(trial["color_error"]),
+            "color_match_count": int(trial["color_match_count"]),
+            "keypoint_inlier_count": int(trial["keypoint_inlier_count"]),
+            "keypoint_layer_inlier_count": int(trial["keypoint_layer_inlier_count"]),
+            "inlier_count": int(trial["inlier_count"]),
+            "layer_inlier_count": int(trial["layer_inlier_count"]),
+        }
+        for trial in recorded_trials
+    )
+    diagnostic_candidate = replace(
+        candidate,
+        turn_layer_scores=layer_scores,
+        turn_candidate_scores=turn_candidate_scores,
+        turn_candidate_debug=turn_candidate_debug,
+        turn_candidate_diagnostics=turn_candidate_diagnostics,
+        turn_fit_sticker_score=float(static_trial["sticker_error"]),
+        turn_fit_color_score=float(static_trial["color_error"]),
+        turn_color_likelihoods=color_likelihoods,
+        turn_fit_unexplained_keypoints=int(
+            getattr(candidate, "turn_fit_unexplained_keypoints", 0)
+        ),
+        turn_fit_evaluated=True,
+        turn_fit_static_scores=static_scores,
+        turn_fit_articulated_scores=articulated_scores,
+        turn_fit_search_rvec=np.asarray(candidate.rvec, dtype=np.float64).copy(),
+        turn_fit_search_tvec=np.asarray(candidate.tvec, dtype=np.float64).copy(),
+        turn_state_moves=(),
+        turn_color_unreliable=False,
+        turn_color_offset_degrees=0.0,
+    )
+    if best is None:
+        return diagnostic_candidate
+
+    return _candidate_with_turn_trial(diagnostic_candidate, candidate, best)
+
+
+def _candidate_with_turn_trial(
+    diagnostic_candidate: StickerPnPCandidate,
+    static_candidate: StickerPnPCandidate,
+    trial: dict[str, object],
+) -> StickerPnPCandidate:
+    """Apply one cached geometry/color trial to a diagnostic candidate."""
+
+    rotations = tuple(trial.get("layer_rotations", ()))
+    sticker_rotations = rotations
+    offset = float(trial.get("color_offset", 0.0))
+    if abs(offset) > 1e-6:
+        # Color scoring rotates the identities by partial angle + offset.
+        # Keep the committed state before this move for the accumulator, and
+        # render those identities with that same full rotation on this frame.
+        base_angle = float(rotations[0].angle_degrees) if rotations else 0.0
+        sticker_rotations = (CubeLayerRotation(
+            int(trial["layer_axis"]), int(trial["layer_side"]),
+            base_angle + offset, int(trial["layer_count"]),
+        ),)
+    object_points = apply_cube_layer_rotations(
+        static_candidate.object_points,
+        rotations,
+    )
+    try:
+        projected_sticker_points, _ = cv2.projectPoints(
+            object_points,
+            static_candidate.rvec,
+            static_candidate.tvec,
+            static_candidate.camera_matrix,
+            static_candidate.dist_coeffs,
+        )
+        projected_sticker_points = projected_sticker_points.reshape(-1, 2)
+    except cv2.error:
+        projected_sticker_points = static_candidate.projected_sticker_points
+    articulated_scores = None if bool(trial.get("is_baseline", False)) else (
+        float(trial.get("keypoint_error", float("inf"))),
+        float(trial.get("sticker_error", float("inf"))),
+        float(trial.get("combined_mean_error", float("inf"))),
+    )
+    return replace(
+        diagnostic_candidate,
+        # A different trial may have refined the diagnostic pose already.
+        # This trial's cached assignments and color score use the static pose.
+        rvec=np.asarray(static_candidate.rvec, dtype=np.float64).copy(),
+        tvec=np.asarray(static_candidate.tvec, dtype=np.float64).copy(),
+        pre_final_rvec=static_candidate.pre_final_rvec,
+        pre_final_tvec=static_candidate.pre_final_tvec,
+        final_solve_image_points=static_candidate.final_solve_image_points,
+        object_points=object_points,
+        projected_sticker_points=projected_sticker_points,
+        assignment_object_points=trial.get("assignment_object_points"),
+        assignment_projected_points=trial.get("assignment_projected_points"),
+        assignment_projected_class_ids=trial.get("assignment_projected_class_ids"),
+        layer_rotations=rotations,
+        sticker_layer_rotations=sticker_rotations,
+        turn_state_moves=tuple(trial.get("state_moves", ())),
+        turn_color_unreliable=False,
+        turn_fit_color_score=float(trial.get("color_error", diagnostic_candidate.turn_fit_color_score)),
+        turn_selected_trial_id=trial.get("trial_id"),
+        turn_color_offset_degrees=float(trial.get("color_offset", 0.0)),
+        turn_fit_articulated_scores=articulated_scores,
+    )
+
+
+def _unreliable_color_hold(
+    diagnostic_candidate: StickerPnPCandidate,
+    static_candidate: StickerPnPCandidate,
+) -> StickerPnPCandidate:
+    """Keep static geometry/state when available color scoring fails."""
+
+    held = _candidate_with_turn_trial(diagnostic_candidate, static_candidate, dict(
+        trial_id=None, is_baseline=True, layer_rotations=(), state_moves=(), color_offset=0.0,
+        assignment_object_points=static_candidate.assignment_object_points,
+        assignment_projected_points=static_candidate.assignment_projected_points,
+        assignment_projected_class_ids=static_candidate.assignment_projected_class_ids,
+    ))
+    return replace(held, turn_color_unreliable=True)
 
 
 def sticker_identity_object_center(identity: StickerIdentity) -> np.ndarray:
@@ -6137,7 +8038,9 @@ def sticker_mask_color_turn_fit_metrics(
     count = min(len(observed), len(colors), len(color_likelihoods[0]))
     if count <= 0 or not np.isfinite(max_error) or max_error <= 0.0:
         return 0.0, 0
-    trial_candidate = replace(candidate, layer_rotations=layer_rotations)
+    trial_candidate = replace(
+        candidate, layer_rotations=layer_rotations, sticker_layer_rotations=None,
+    )
     try:
         projected_faces = projected_sticker_faces(trial_candidate, rvec, tvec)
     except (cv2.error, ValueError, FloatingPointError):
@@ -6772,6 +8675,9 @@ def solve_pnp_from_low_error_assignments(
     turn_color_priors: dict[str, np.ndarray] | None = None,
     turn_global_profiles: dict[str, GlobalColorProfile] | None = None,
     turn_expected_color_by_label: dict[str, str] | None = None,
+    turn_geometry_frame: dict[str, object] | None = None,
+    turn_previous_move: str | None = None,
+    turn_previous_states: tuple[tuple, ...] = (),
 ) -> StickerPnPCandidate:
     """Run one final PnP solve using the candidate's full assignment.
 
@@ -6811,13 +8717,29 @@ def solve_pnp_from_low_error_assignments(
         PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * cube_diameter
     )
     if recover_layer_turns:
-        candidate = recover_misaligned_cube_layers(
+        if turn_geometry_frame is None:
+            torch_device = _turn_torch_scoring_device("mps")
+            if torch_device is None:
+                raise RuntimeError(
+                    "Move recognition requires an available Apple MPS device"
+                )
+            turn_geometry_frame = _build_turn_geometry_frame(
+                candidate,
+                assignment_error_limit,
+                torch_device,
+            )
+        if turn_geometry_frame is None:
+            return candidate
+        candidate = recover_misaligned_cube_layers_from_geometry(
             candidate,
             assignment_error_limit,
+            turn_geometry_frame,
             record_all_turn_candidates=record_all_turn_candidates,
             color_priors=turn_color_priors,
             global_profiles=turn_global_profiles,
             expected_color_by_label=turn_expected_color_by_label,
+            previous_move=turn_previous_move,
+            previous_states=turn_previous_states,
         )
     else:
         # Make the static-pose contract explicit even if a caller passes a
@@ -6825,6 +8747,7 @@ def solve_pnp_from_low_error_assignments(
         candidate = replace(
             candidate,
             layer_rotations=(),
+            sticker_layer_rotations=None,
             turn_candidate_scores=(),
             turn_candidate_debug=(),
         )
@@ -6879,8 +8802,8 @@ def solve_pnp_from_low_error_assignments(
                 image_points[solve_indices],
                 candidate.camera_matrix,
                 candidate.dist_coeffs,
-                rvec=np.asarray(candidate.rvec, dtype=np.float64).reshape(3, 1),
-                tvec=np.asarray(candidate.tvec, dtype=np.float64).reshape(3, 1),
+                rvec=np.asarray(candidate.rvec, dtype=np.float64).reshape(3, 1).copy(),
+                tvec=np.asarray(candidate.tvec, dtype=np.float64).reshape(3, 1).copy(),
                 useExtrinsicGuess=True,
                 flags=cv2.SOLVEPNP_ITERATIVE,
             )
@@ -7609,6 +9532,13 @@ def sticker_geometry_key(
     return (identity.cubie_index, identity.axis, identity.side)
 
 
+def physical_sticker_rotations(candidate: StickerPnPCandidate) -> tuple[CubeLayerRotation, ...]:
+    """Return rotations carrying identities, including any discrete offset."""
+
+    rotations = getattr(candidate, "sticker_layer_rotations", None)
+    return tuple(candidate.layer_rotations) if rotations is None else tuple(rotations)
+
+
 def projected_sticker_faces(
     candidate: StickerPnPCandidate,
     rvec: np.ndarray,
@@ -7652,7 +9582,7 @@ def projected_sticker_faces(
         transformed_center, transformed_face = apply_cubelet_layer_rotations(
             current_center,
             face_points,
-            candidate.layer_rotations,
+            physical_sticker_rotations(candidate),
         )
         normal = np.cross(
             transformed_face[1] - transformed_face[0],
@@ -7757,7 +9687,7 @@ def sticker_view_reliability_weight(
     transformed_center, transformed_face = apply_cubelet_layer_rotations(
         center,
         face,
-        candidate.layer_rotations,
+        physical_sticker_rotations(candidate),
     )
     normal = np.cross(
         transformed_face[1] - transformed_face[0],
@@ -8553,6 +10483,19 @@ def append_turn_candidate_log(
             }
             for label, mean_score, inlier_count, p90_error, keypoint_mean_error in scores
         ]
+    search_diagnostics = getattr(candidate, "turn_search_diagnostics", None) if candidate is not None else None
+    if isinstance(search_diagnostics, dict) and search_diagnostics.get("roots"):
+        # These are the actual root trials the search considered, even if the
+        # single-frame fit returned early or kept only a diagnostic subset.
+        candidates = [dict(
+            root["trial"], trial_id=root["trial_id"],
+            search_status=root["status"], last_retained_depth=root["last_retained_depth"],
+            eliminated_depth=root.get("eliminated_depth"),
+            best_sequence_score=root.get("best_sequence_score"),
+            pruning_counts=root["pruning_counts"],
+            pruning_examples=root.get("pruning_examples", []),
+            root_return_examples=root.get("root_return_examples", []),
+        ) for root in search_diagnostics["roots"]]
     static_scores = (
         list(getattr(candidate, "turn_fit_static_scores", ()))
         if candidate is not None
@@ -8661,6 +10604,7 @@ def append_turn_candidate_log(
             }
         )
     record = {
+        "log_schema_version": 2,
         "frame_index": frame_index,
         "has_pose": candidate is not None,
         "turn_fit_evaluated": bool(
@@ -8688,15 +10632,65 @@ def append_turn_candidate_log(
         "turn_color_likelihoods": color_likelihoods,
         "static_fit_scores": static_scores,
         "selected_fit_scores": articulated_scores,
+        "lookahead_action_score": float(
+            getattr(candidate, "turn_fit_lookahead_action_score", float("inf"))
+            if candidate is not None
+            else float("inf")
+        ),
+        "lookahead_static_score": float(
+            getattr(candidate, "turn_fit_lookahead_static_score", float("inf"))
+            if candidate is not None
+            else float("inf")
+        ),
+        "lookahead_action_future_scores": (
+            list(getattr(candidate, "turn_fit_lookahead_action_future_scores", ()))
+            if candidate is not None
+            else []
+        ),
+        "lookahead_static_future_scores": (
+            list(getattr(candidate, "turn_fit_lookahead_static_future_scores", ()))
+            if candidate is not None
+            else []
+        ),
+        "lookahead_rejected": bool(
+            getattr(candidate, "turn_fit_lookahead_rejected", False)
+            if candidate is not None
+            else False
+        ),
+        "lookahead_frames": PNP_TURN_LOOKAHEAD_FRAMES,
+        "lookahead_beam_width": None,
+        "lookahead_state_batch_size": PNP_TURN_LOOKAHEAD_STATE_BATCH_SIZE,
+        "lookahead_state_change_limit": PNP_TURN_LOOKAHEAD_STATE_CHANGE_LIMIT,
+        "lookahead_state_evaluation_budget": PNP_TURN_LOOKAHEAD_STATE_BUDGET,
+        "color_evidence_unreliable": bool(getattr(candidate, "turn_color_unreliable", False)),
+        "search": search_diagnostics,
+        "selected_trial_id": getattr(candidate, "turn_selected_trial_id", None) if candidate is not None else None,
         "selected": (
-            candidate_turn_debug_label(candidate)
+            next((trial["label"] for trial in candidates
+                  if trial.get("trial_id") is not None
+                  and trial["trial_id"] == getattr(candidate, "turn_selected_trial_id", None)),
+                 candidate_turn_debug_label(candidate))
             if candidate is not None
             else None
         ),
-        "turn_recovery_mode": "angle-search",
+        "turn_recovery_mode": "geometric-options-color-rollout",
         "selected_layer": None,
         "selected_layer_rotations": selected_rotations,
+        "selected_sticker_layer_rotations": [
+            {
+                "axis": int(rotation.axis),
+                "side": int(rotation.side),
+                "angle_degrees": float(rotation.angle_degrees),
+                "layer_count": int(rotation.layer_count),
+            }
+            for rotation in (physical_sticker_rotations(candidate) if candidate is not None else ())
+        ],
         "selected_committed_moves": list(completed_candidate_moves(candidate)),
+        "selected_color_offset_degrees": float(
+            getattr(candidate, "turn_color_offset_degrees", 0.0)
+            if candidate is not None
+            else 0.0
+        ),
         "cube_geometry_state_before": (
             getattr(candidate, "cube_geometry_state").to_json()
             if candidate is not None
@@ -10022,6 +12016,13 @@ def render_frame(
                     selected_candidate,
                     recover_layer_turns=True,
                     record_all_turn_candidates=turn_candidate_log is not None,
+                    turn_previous_move=(
+                        move_accumulator.moves[-1]
+                        if move_accumulator is not None and move_accumulator.moves else None
+                    ),
+                    turn_previous_states=(
+                        move_accumulator.recent_geometry_states() if move_accumulator is not None else ()
+                    ),
                 )
             pnp_candidate = replace(
                 selected_candidate, orientation_anchor=orientation_anchor_for_candidate(selected_candidate)
@@ -10630,6 +12631,18 @@ def configure_camera(capture: cv2.VideoCapture, args: argparse.Namespace) -> Non
     )
 
 
+def parse_turn_search_budget(value: str) -> int | None:
+    if value.lower() in ('none', 'unlimited'):
+        return None
+    try:
+        result = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError('Use an integer >= 11, or unlimited') from error
+    if result < PNP_TURN_LOOKAHEAD_FRAMES + 1:
+        raise argparse.ArgumentTypeError('State budget must be at least 11, or unlimited')
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Render the independent cube-keypoint model with bbox-to-ROI tracking."
@@ -10753,6 +12766,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--recognize-moves", action=argparse.BooleanOptionalAction, default=False,
         help="Enable layer-turn search after pose and orientation recovery.",
+    )
+    parser.add_argument(
+        "--turn-search-state-budget", type=parse_turn_search_budget,
+        default=PNP_TURN_LOOKAHEAD_STATE_BUDGET,
+        help="Maximum frame/state evaluations per decision, including seeds and retries (default: 1024; unlimited disables).",
     )
     parser.add_argument(
         "--initial-scramble",
@@ -10978,8 +12996,9 @@ def classify_cached_colors(
 
 def main() -> int:
     args = build_parser().parse_args()
-    global PNP_ASSIGNMENT_MODE
+    global PNP_ASSIGNMENT_MODE, PNP_TURN_LOOKAHEAD_STATE_BUDGET
     PNP_ASSIGNMENT_MODE = args.pnp_assignment_mode
+    PNP_TURN_LOOKAHEAD_STATE_BUDGET = args.turn_search_state_budget
     initial_state = CubeState.from_scramble(args.initial_scramble)
     known_initial_colors = {
         identity.label: initial_state.color_at(

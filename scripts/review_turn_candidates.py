@@ -55,7 +55,7 @@ def format_score(value: object) -> str:
     try:
         number = float(value)
     except (TypeError, ValueError):
-        return "—"
+        return "n/a"
     return f"{number:.4f}" if np.isfinite(number) else "inf"
 
 
@@ -132,13 +132,31 @@ def selected_candidate_index(record: dict[str, object]) -> int | None:
     """Locate the logged selected configuration, independent of ranking order."""
 
     candidates = review_candidates(record)
+    selected_id = record.get("selected_trial_id")
+    if selected_id is not None:
+        return next((index for index, candidate in enumerate(candidates)
+                     if candidate.get("trial_id") == selected_id), None)
     rotations = record.get("selected_layer_rotations")
     if not isinstance(rotations, list):
         return None
     for index, candidate in enumerate(candidates):
         if candidate.get("layer_rotations") == rotations:
+            # Legacy logs may share the same partial geometry across offsets.
+            if "state_moves" in candidate and "selected_committed_moves" in record:
+                if candidate["state_moves"] != record["selected_committed_moves"]:
+                    continue
+            if "color_offset" in candidate and "selected_color_offset_degrees" in record:
+                if candidate["color_offset"] != record["selected_color_offset_degrees"]:
+                    continue
             return index
     return None
+
+
+def search_debug_payload(record: dict[str, object] | None) -> dict[str, object] | None:
+    """Return recorded search evidence; do not infer forecasts for old logs."""
+
+    value = record.get("search") if isinstance(record, dict) else None
+    return value if isinstance(value, dict) else None
 
 
 def pose_for_candidate(
@@ -611,13 +629,29 @@ button,input,textarea { background:#15181d; color:inherit; border:1px solid var(
 button { cursor:pointer; } button:hover, .candidate:hover { border-color:var(--accent); }
 main { display:grid; grid-template-columns:minmax(520px, 1fr) 420px; gap:12px; padding:12px; height:calc(100vh - 62px); }
 .preview { display:grid; grid-template-columns:1fr 1fr; gap:10px; min-width:0; }
+.workspace { min-width:0; overflow:auto; }
+.search-panel { background:var(--panel); border:1px solid var(--line); border-radius:6px; margin-top:12px; padding:12px; }
+.search-panel h3 { margin:0 0 8px; font-size:15px; }
+.search-panel p { margin:6px 0 10px; line-height:1.5; }
+.search-panel details { margin-top:12px; }
+.search-panel summary { cursor:pointer; padding:5px 0; }
+.search-panel select { max-width:100%; background:var(--bg); color:inherit; padding:6px; border:1px solid var(--line); }
+.search-table { overflow:auto; margin-top:8px; }
+.search-panel table { width:100%; border-collapse:collapse; font-size:12px; white-space:nowrap; }
+.search-panel th, .search-panel td { padding:6px 9px; border-bottom:1px solid var(--line); text-align:right; }
+.search-panel th:first-child, .search-panel td:first-child { text-align:left; }
+.search-panel th { color:#aeb8c4; font-weight:500; }
+.search-panel tbody tr:first-child { background:#27313c; }
+.search-panel button { padding:3px 6px; }
+.candidate.pruned { border-left:3px solid #ba8552; }
 .image-panel { background:#0d0f12; border:1px solid var(--line); border-radius:6px; padding:7px; min-width:0; }
-.image-panel img { width:100%; height:auto; display:block; object-fit:contain; max-height:calc(100vh - 130px); }
+.image-panel img { width:100%; height:auto; display:block; object-fit:contain; max-height:46vh; }
 #candidateImage { cursor:crosshair; }
 .image-panel h3 { margin:2px 0 7px; font-size:13px; color:#b6c0cc; }
 .sidebar { background:var(--panel); border:1px solid var(--line); border-radius:6px; display:flex; flex-direction:column; min-height:0; }
 .sidebar-top { padding:10px; border-bottom:1px solid var(--line); }
-#candidates { overflow:auto; padding:7px; }
+#candidates { overflow:auto; padding:7px; flex:1; min-height:0; }
+[hidden] { display:none !important; }
 details.group { border:1px solid var(--line); border-radius:5px; margin-bottom:6px; }
 details.group summary { cursor:pointer; padding:8px; font-weight:600; color:#cbd5e0; }
 details.group summary:hover { color:#fff; }
@@ -645,10 +679,28 @@ label { display:flex; gap:5px; align-items:center; }
   <span id="status" class="status muted"></span>
 </header>
 <main>
+  <div class="workspace">
   <section class="preview">
     <div class="image-panel"><h3>Source frame</h3><img id="sourceImage"></div>
     <div class="image-panel"><h3 id="candidateTitle">Candidate</h3><img id="candidateImage"></div>
   </section>
+  <section class="search-panel" aria-label="Search diagnostics">
+    <h3>Search decision</h3>
+    <div id="searchSummary" class="muted"></div>
+    <p id="searchComparison"></p>
+    <label id="searchPathLabel">Forecast <select id="searchPath" aria-label="Forecast"></select></label>
+    <p id="searchPathNote" class="muted"></p>
+    <div id="searchSteps" class="search-table"></div>
+    <details id="searchDepthPanel"><summary>Search expansion and pruning at each frame</summary>
+      <p class="muted">Counts describe path expansions. Adaptive search keeps the best hold and top color-ranked changes per parent, merges prefixes by frame and cube state, and uses bounds to prune the shortlisted paths. GPU batch size is not a state cutoff. Older logs may use beam or history restrictions. Future choices are forecasts from this frame.</p>
+      <div id="searchDepths" class="search-table"></div>
+    </details>
+    <details id="searchGeometryPanel"><summary>Stage 1: retained geometric fits</summary>
+      <p id="searchGeometryNote" class="muted"></p>
+      <div id="searchGeometry" class="search-table"></div>
+    </details>
+  </section>
+  </div>
   <aside class="sidebar">
     <div class="sidebar-top">
       <div id="frameInfo" class="muted"></div>
@@ -683,11 +735,15 @@ function groupTitle(key) {
   return `${axisName}${sideName} · ${width===1?'single':'double'} layer`;
 }
 function groupSortKey(items) {
-  const remainderScores=items.map(item=>Number(item.candidate.remainder_score)).filter(Number.isFinite);
+  const finite=value=>typeof value==='number' && Number.isFinite(value);
+  const sequenceScores=items.map(item=>item.candidate.best_sequence_score).filter(finite);
+  if(sequenceScores.length)return [Math.min(...sequenceScores),0];
+  if(items.some(item=>item.candidate.search_status))return [Infinity,0];
+  const remainderScores=items.map(item=>item.candidate.remainder_score).filter(finite);
   if(remainderScores.length) {
-    return [-Math.max(...remainderScores), Math.min(...items.map(item=>Number(item.candidate.global_mean_error)).filter(Number.isFinite))];
+    return [-Math.max(...remainderScores), Math.min(...items.map(item=>item.candidate.global_mean_error).filter(finite))];
   }
-  const meanScores=items.map(item=>Number(item.candidate.global_mean_error)).filter(Number.isFinite);
+  const meanScores=items.map(item=>item.candidate.global_mean_error).filter(finite);
   return [meanScores.length ? Math.min(...meanScores) : Infinity, 0];
 }
 function compareGroups(first, second, groupsForSort) {
@@ -695,6 +751,10 @@ function compareGroups(first, second, groupsForSort) {
   return a[0]-b[0] || a[1]-b[1] || first.localeCompare(second);
 }
 function candidateAngle(candidate) {
+  if(typeof candidate.color_offset==='number') {
+    const rotation=(candidate.layer_rotations||[])[0];
+    return (rotation?.angle_degrees||0)+candidate.color_offset;
+  }
   if(candidate.is_baseline) return 0;
   const rotations=candidate.layer_rotations||[];
   return rotations.length ? Number(rotations[rotations.length-1].angle_degrees) : null;
@@ -799,6 +859,114 @@ function layerAt(event,width) {
   const edge=face.edges.map(item=>({...item,distance:segmentDistance(point,face.polygon[item.start],face.polygon[item.end])})).sort((a,b)=>a.distance-b.distance)[0];
   chooseLayer(edge ? edge.axis : face.axis, edge ? edge.side : face.side, width);
 }
+function scoreText(value) {
+  return typeof value==='number' && Number.isFinite(value) ? value.toFixed(4) : '—';
+}
+function moveText(trial) { return (trial?.state_moves||[]).join(' ') || 'hold'; }
+const searchStatusLabels={invalid_color:'invalid: nonfinite color fit', budget_unfinished:'unfinished: state budget reached', color_ceiling:'rejected: absolute color ceiling', color_pruned:'excluded: color shortlist', complete:'complete path found', bound_pruned:'pruned: cannot beat complete solution', survived:'survived', immediate_undo:'pruned: immediate undo',
+  root_return:'pruned: returned to window-start state',
+  state_revisit:'pruned: earlier cube state revisited',
+  invalid_score:'pruned: invalid fit', merged:'merged into a cheaper equivalent path',
+  beam_pruned:'pruned: beam limit', no_legal_continuation:'no surviving continuation', eligible:'eligible'};
+function appendSearchTable(root, headers, rows) {
+  root.replaceChildren();
+  const table=document.createElement('table'), head=document.createElement('thead'), body=document.createElement('tbody');
+  const header=document.createElement('tr');
+  headers.forEach(text=>{const cell=document.createElement('th');cell.textContent=text;header.appendChild(cell);});
+  head.appendChild(header);table.appendChild(head);
+  rows.forEach(values=>{
+    const row=document.createElement('tr');
+    values.forEach(value=>{const cell=document.createElement('td');if(value instanceof Node)cell.appendChild(value);else cell.textContent=String(value??'—');row.appendChild(cell);});
+    body.appendChild(row);
+  });
+  table.appendChild(body);root.appendChild(table);
+}
+function reviewSearchFrame(frame) {
+  if(!meta.frames.some(item=>item.frame_index===frame))return;
+  frameIndex=frame; candidateIndex=null; activeLayer=null; loadFrame();
+}
+function searchForecasts(search) {
+  const paths=[...(search.finalists||[])];
+  if(search.no_turn_path)paths.push({...search.no_turn_path,comparison_kind:'no_turn'});
+  return paths;
+}
+function renderSearchPath(search,index) {
+  const path=searchForecasts(search)[index];
+  if(!path){$('searchSteps').replaceChildren();return;}
+  const rows=(path.steps||[]).map(step=>{
+    const button=document.createElement('button');button.textContent=String(step.frame_index);
+    button.title='Review this frame and its own recorded decision';button.onclick=()=>reviewSearchFrame(step.frame_index);
+    return [button,moveText(step),(step.layer_rotations||[]).map(r=>`${r.angle_degrees}°`).join(', ')||'0°',
+      `${step.color_offset??0}°`,scoreText(step.state_score),scoreText(step.color_error),
+      `${(100*(step.weight??0)).toLocaleString(undefined,{maximumFractionDigits:2})}%`,scoreText(step.move_cost??0),scoreText(step.weighted_score)];
+  });
+  appendSearchTable($('searchSteps'),['Frame','Move','Partial angle','Offset','Frame fit','Color','Weight','Move cost','Contribution'],rows);
+  $('searchPathNote').textContent=`Sequence ${scoreText(path.total_score)}${path.observation_score!=null?` (fit ${scoreText(path.observation_score)} + move cost ${scoreText(path.move_cost)})`:''} · current ${scoreText(path.current_score)} · future mean ${scoreText(path.future_mean)}. Forecast recorded at frame ${frameIndex}; frame buttons open that frame’s own decision.`;
+}
+function renderSearchDiagnostics(search,candidate) {
+  const hasSearch=search && typeof search==='object';
+  $('searchPathLabel').hidden=!hasSearch || !search.finalists?.length;
+  $('searchDepthPanel').hidden=!hasSearch || !search.depths?.length;
+  $('searchGeometryPanel').hidden=!hasSearch || !search.geometry?.options?.length;
+  $('searchPathNote').textContent='';$('searchSteps').replaceChildren();$('searchDepths').replaceChildren();
+  if(!hasSearch){
+    $('searchSummary').textContent='No lookahead trace in this record. Cached video recognition with --turn-candidate-log records forecasts and pruning.';
+    $('searchComparison').textContent='Frame-level candidates from older logs and live searches remain available.';return;
+  }
+  const elapsed=typeof search.elapsed_ms==='number'?`${search.elapsed_ms.toFixed(1)} ms`:'timing unavailable';
+  const skipped=search.skipped_frames?.length?` · skipped ${search.skipped_frames.join(', ')}`:'';
+  const adaptive=search.algorithm==='adaptive_branch_and_bound';
+  const method=adaptive?`adaptive · ${search.state_change_limit!=null?`top ${search.state_change_limit} changes per parent + hold`:'all state changes'} · GPU batch ${search.state_batch_size??'—'} · no beam cutoff`:`beam ${search.beam_width??'—'}`;
+  $('searchSummary').textContent=`Previous move: ${search.previous_move||'none'} · ${method} · ${Math.max(0,(search.frames?.length||1)-1)} future frames · ${elapsed}${skipped}`;
+  if(adaptive)$('searchSummary').textContent+=` · ${search.optimality==='proven'?'optimal for scored options':search.optimality==='proven_within_shortlist'?'optimal within color shortlist':search.optimality||'search incomplete'} · peak queue ${search.peak_queued_paths??'—'}`;
+  if(search.state_evaluation_budget!=null)$('searchSummary').textContent+=` · state budget ${search.decision_evaluated_states??search.evaluated_states??'—'}/${search.state_evaluation_budget}`;
+  if(search.budget_exhausted)$('searchSummary').textContent+=search.selected_path?' · budget reached; best complete forecast, optimality not proven':' · budget reached before finding a complete forecast';
+  if(search.optimality_gap!=null)$('searchSummary').textContent+=` · bound gap ${scoreText(search.optimality_gap)}`;
+  if(search.seeds?.length)$('searchSummary').textContent+=` · seeds ${search.seeds.map(seed=>`${seed.source}: ${seed.status}${seed.score!=null?` (${scoreText(seed.score)})`:''}${seed.root_return_pruned?` [${seed.root_return_pruned} root returns excluded]`:''}`).join(', ')}`;
+  if(search.projection_cache)$('searchSummary').textContent+=` · assignments ${search.projection_cache.assignment_builds} built / ${search.projection_cache.assignment_hits} reused`;
+  if(search.unreliable_color_frames?.length)$('searchSummary').textContent+=` · unreliable future color omitted at ${search.unreliable_color_frames.join(', ')}`;
+  if(search.color_error_ceiling_enabled===false)$('searchSummary').textContent+=' · color ceiling disabled';
+  else if(search.color_error_ceiling!=null)$('searchSummary').textContent+=` · color ceiling ${scoreText(search.color_error_ceiling)}`;
+  if(search.prune_root_state_returns)$('searchSummary').textContent+=' · returns to window-start state pruned';
+  else if(search.prune_immediate_undo===false && search.prune_state_revisits===false)$('searchSummary').textContent+=' · inverse moves and state revisits allowed';
+  if(search.prune_state_revisits)$('searchSummary').textContent+=` · state-cycle guard (${search.recent_committed_states??0} recent states)`;
+  if(search.evaluation_cache){const cache=search.evaluation_cache;
+    $('searchSummary').textContent+=` · ${cache.states_scored} states scored / ${cache.cache_hits} cached · ${cache.gpu_batches} GPU batches`;}
+  if(search.status==='fallback') {
+    const reasons={current_frame_unavailable:'current-frame trials unavailable',no_surviving_path:'no path survived the horizon',state_budget_no_complete_path:'state budget reached before finding a complete forecast'};
+    $('searchComparison').textContent=`Fallback: ${reasons[search.fallback_reason]||search.fallback_reason||'search unavailable'}${search.fallback_undo_blocked?' · local undo blocked; held the previous state':''}${search.fallback_state_revisit_blocked?' · state revisit blocked; held the previous state':''}${search.color_evidence_unreliable?' · unreliable color evidence; state held':''}.`;
+  } else {
+    const roots=search.roots||[], chosen=roots.find(root=>root.trial_id===search.selected_trial_id), local=roots.find(root=>root.trial_id===search.local_best_trial_id);
+    $('searchComparison').textContent=`Chosen ${chosen?.trial?.label||search.selected_trial_id||'—'}: sequence ${scoreText(search.selected_path?.total_score)}. ${search.changed_local_choice?`Lookahead changed the current-frame winner (${local?.trial?.label||search.local_best_trial_id||'—'}, fit ${scoreText(local?.trial?.state_score)}).`:'Lookahead kept the current-frame winner.'}`;
+  }
+  if(search.color_failure_retries?.length)$('searchComparison').textContent+=` Omitted future color evidence: ${search.color_failure_retries.map(item=>`${item.frame_index} (${item.rejected_candidates??'—'} ceiling rejections)`).join(', ')}.`;
+  if(search.no_turn_path)$('searchComparison').textContent+=` Complete no-turn forecast ${scoreText(search.no_turn_path.total_score)}; chosen advantage ${scoreText(search.improvement_over_no_turn)} after move costs.`;
+  const finals=searchForecasts(search), select=$('searchPath');select.replaceChildren();
+  finals.forEach((path,index)=>{const option=document.createElement('option');option.value=index;
+    option.textContent=`${path.comparison_kind==='no_turn'?'Complete no-turn continuation':index===0?'Winner':`Alternative ${index}`} · ${moveText(path.steps?.[0])} · ${path.steps?.[0]?.label||path.trial_id||''} · ${scoreText(path.total_score)}`;select.appendChild(option);});
+  let pathIndex=finals.findIndex(path=>path.trial_id===candidate?.trial_id);if(pathIndex<0)pathIndex=0;
+  select.value=pathIndex;select.onchange=()=>renderSearchPath(search,Number(select.value));
+  renderSearchPath(search,pathIndex);
+  if(candidate?.search_status && !finals.some(path=>path.trial_id===candidate.trial_id))
+    $('searchPathNote').textContent=`Inspected candidate: ${searchStatusLabels[candidate.search_status]||candidate.search_status}. No saved finalist forecast for it. `+$('searchPathNote').textContent;
+  if(adaptive) {
+    appendSearchTable($('searchDepths'),['Frame','Parents expanded','States scored','Trials','Collapsed holds','Root returns pruned','Color excluded',search.version>=10?'Nonfinite color':'Ceiling rejected','Unreliable states','Merged prefixes','Bound pruned','Completed','Queued','Future lower bound'],
+      (search.depths||[]).map(depth=>[depth.frame_index,depth.input_paths,depth.scored_states,depth.attempted_trials,
+        depth.collapsed_holds,depth.root_return??0,depth.color_pruned_paths??0,depth.invalid_color??depth.color_ceiling_rejected??0,depth.unreliable_color_states??0,depth.merged_paths,depth.bound_pruned_paths,depth.completed_paths,depth.queued_paths,scoreText(depth.remaining_lower_bound)]));
+  } else {
+    appendSearchTable($('searchDepths'),['Frame','Input paths','States evaluated','Trials','Undo','State revisit','Invalid','Unavailable','Merged','Beam pruned','Kept','Distinct states','No-turn extra'],
+      (search.depths||[]).map(depth=>[depth.frame_index,depth.input_paths,depth.scored_states,depth.attempted_trials,
+        depth.immediate_undo,depth.state_revisit??'—',depth.invalid_score,depth.unavailable,depth.merged_paths,depth.beam_pruned_paths,depth.retained_paths,depth.distinct_states,depth.no_turn_extra??'—']));
+  }
+  const geometry=search.geometry;
+  if(geometry){
+    $('searchGeometryNote').textContent=`${geometry.tested_configurations} configurations tested; ${geometry.retained_options} partial fits retained. Stage 2 tests three sticker offsets on each retained fit.`;
+    appendSearchTable($('searchGeometry'),['Layer','Partial angle','Geometry fit','Keypoints','Centroids','Inliers'],
+      (geometry.options||[]).map(trial=>[trial.label,(trial.layer_rotations||[]).map(r=>`${r.angle_degrees}°`).join(', ')||'0°',
+        scoreText(trial.global_mean_error),scoreText(trial.keypoint_mean_error),scoreText(trial.heatmap_mean_error),trial.inlier_count]));
+  }
+}
+
 async function loadFrame() {
   const version=++loadVersion;
   current=record(); if(!current) return;
@@ -809,6 +977,8 @@ async function loadFrame() {
   if(candidateIndex===null) candidateIndex=current.selected_index ?? 0;
   candidateIndex=Math.max(0, Math.min(candidateIndex, Math.max(0,count-1)));
   renderColorLikelihoods(data, candidates[candidateIndex]);
+  renderSearchDiagnostics(data.search,candidates[candidateIndex]);
+  if(data.color_evidence_unreliable && !data.search)$('searchComparison').textContent='Unreliable color evidence; state held.';
   $('frame').value=frameIndex;
   $('sourceImage').onerror=()=>$('status').textContent=`Could not decode video frame ${frameIndex}; check the source video.`;
   $('candidateImage').onerror=()=>$('status').textContent=`Could not decode video frame ${frameIndex}; check the source video.`;
@@ -818,11 +988,13 @@ async function loadFrame() {
   if(count) getJson(`/api/face-regions?frame=${frameIndex}&candidate=${candidateIndex}`).then(data=>{if(version===loadVersion) faceRegions=data.faces;});
   $('frameInfo').textContent=`frame ${frameIndex} · ${count} tested configurations · selected: ${current.selected || 'none'}`;
   const staticOnly=count===1 && data.candidates[0].label.includes('turn search not tested');
+  const selectedCandidate=data.candidates[current.selected_index];
+  const selectionLabel=selectedCandidate?`${moveText(selectedCandidate)} · ${selectedCandidate.label}`:(current.selected||'none');
   $('frameInfo').textContent=staticOnly
     ? `frame ${frameIndex} · turn search not tested · showing static pose`
-    : `frame ${frameIndex} · ${count} tested configurations · ranked by geometry + color · selected: ${current.selected || 'none'}`;
+    : `frame ${frameIndex} · ${count} tested configurations · ${data.search?'selection uses sequence score':'current-frame scores'} · selected: ${selectionLabel}`;
   $('candidateTitle').textContent=staticOnly ? 'Static pose (turn search not tested)' : (count ? `Candidate ${candidateIndex+1}/${count}` : 'No tested candidate');
-  $('layerInfo').textContent=activeLayer ? `${groupTitle(`${activeLayer.axis}:${activeLayer.side}:${activeLayer.width}`)} · angle ${candidateAngle(candidates[candidateIndex])}° · , / . to adjust` : 'Click a layer; double-click for two layers. Use , / . to turn.';
+  $('layerInfo').textContent=activeLayer ? `${groupTitle(`${activeLayer.axis}:${activeLayer.side}:${activeLayer.width}`)} · sticker angle ${candidateAngle(candidates[candidateIndex])}° · , / . to adjust` : 'Click a layer; double-click for two layers. Use , / . to turn.';
   $('correct').disabled=!count; $('selectNext').disabled=!count;
   $('status').textContent=meta.labels[String(frameIndex)] ? `saved: ${meta.labels[String(frameIndex)].label}` : 'unlabeled';
   const list=$('candidates'); list.innerHTML='';
@@ -841,12 +1013,29 @@ async function loadFrame() {
     const itemContainer=document.createElement('div'); itemContainer.className='group-items';
     if(!items.length){ const empty=document.createElement('div'); empty.className='muted'; empty.style.padding='5px 0 9px'; empty.textContent='No configuration tested'; itemContainer.appendChild(empty); }
     items.forEach(({candidate:c,index:i})=>{
-      const el=document.createElement('div'); el.className='candidate'+(i===candidateIndex?' selected':'')+(c.is_baseline?' baseline':'');
-      const colorError=Number(c.color_error ?? c.color_mean_error);
-      const colorMatches=Number(c.color_match_count);
-      const colorText=Number.isFinite(colorError) ? ` · color ${colorError.toFixed(4)}` : '';
-      const colorMatchText=Number.isFinite(colorMatches) ? `/${colorMatches} color matches` : '';
-      el.innerHTML=`<div class="title">${i}: ${c.label}${i===current.selected_index?' · renderer selection':''}</div><div class="metrics">rank ${(c.global_mean_error??NaN).toFixed(4)} · accept ${(c.global_robust_error??NaN).toFixed(4)} · kp ${(c.keypoint_mean_error??NaN).toFixed(4)} · heat ${(c.heatmap_mean_error??NaN).toFixed(4)}${colorText}${colorMatchText} · inliers ${c.inlier_count??0}</div>`;
+      const el=document.createElement('div'); el.className='candidate'+(i===candidateIndex?' selected':'')+(c.is_baseline?' baseline':'')+(c.search_status && !['survived','complete','budget_unfinished'].includes(c.search_status)?' pruned':'');
+      const title=document.createElement('div');title.className='title';
+      title.textContent=`${i}: ${c.label}${i===current.selected_index?' · renderer selection':''}`;
+      const metrics=document.createElement('div');metrics.className='metrics';
+      metrics.textContent=`frame fit ${scoreText(c.global_mean_error)} · kp ${scoreText(c.keypoint_mean_error)} · heat ${scoreText(c.heatmap_mean_error)} · color ${scoreText(c.color_error??c.color_mean_error)} · matches ${c.color_match_count??'—'} · inliers ${c.inlier_count??'—'}`;
+      el.append(title,metrics);
+      if(c.search_status){const state=document.createElement('div');state.className='metrics';
+        state.textContent=`${moveText(c)} · ${searchStatusLabels[c.search_status]||c.search_status}${typeof c.best_sequence_score==='number'?` · best sequence ${scoreText(c.best_sequence_score)}`:''}${c.eliminated_depth!=null?` at depth ${c.eliminated_depth}`:''}`;
+        if(c.pruning_counts?.immediate_undo)state.textContent+=` · ${c.pruning_counts.immediate_undo} undo branches pruned`;
+        if(c.pruning_counts?.state_revisit)state.textContent+=` · ${c.pruning_counts.state_revisit} state cycles pruned`;
+        if(c.pruning_counts?.root_return)state.textContent+=` · ${c.pruning_counts.root_return} returns to window-start state pruned`;
+        if(c.root_return_examples?.length){const example=c.root_return_examples[0];
+          state.textContent+=` · root-return example at depth ${example.depth}: ${moveText(example)}`;}
+        if(c.invalid_color)state.textContent+=' · nonfinite color fit';
+        if(c.pruning_counts?.invalid_color)state.textContent+=` · ${c.pruning_counts.invalid_color} nonfinite color fits`;
+        if(c.color_error_ceiling_rejected)state.textContent+=' · above color ceiling';
+        if(c.pruning_counts?.color_ceiling_rejected)state.textContent+=` · ${c.pruning_counts.color_ceiling_rejected} candidates rejected by color ceiling`;
+        if(c.pruning_counts?.color_pruned_paths)state.textContent+=` · ${c.pruning_counts.color_pruned_paths} changes excluded by color shortlist`;
+        if(c.pruning_counts?.bound_pruned_paths)state.textContent+=` · ${c.pruning_counts.bound_pruned_paths} prefixes excluded by bounds`;
+        if(c.pruning_examples?.length){const example=c.pruning_examples[0];
+          state.textContent+=` · example at depth ${example.depth}: lower bound ${scoreText(example.lower_bound)} vs best complete ${scoreText(example.incumbent_score)}`;}
+        if(c.pruning_counts?.invalid_score)state.textContent+=` · ${c.pruning_counts.invalid_score} invalid fits pruned`;
+        state.title=JSON.stringify(c.pruning_counts||{});el.appendChild(state);}
       el.onclick=()=>{ const parts=key.split(':').map(Number); activeLayer=parts.length===3 && parts.every(Number.isFinite) ? {axis:parts[0],side:parts[1],width:parts[2]} : null; selectCandidate(i); }; itemContainer.appendChild(el);
     });
     details.appendChild(itemContainer); list.appendChild(details);
@@ -933,6 +1122,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "color_likelihoods": [],
             }
             payload["candidates"] = [] if record is None else review_candidates(record)
+            payload["search"] = search_debug_payload(record)
             self._send_json(
                 payload
             )

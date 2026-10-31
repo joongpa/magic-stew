@@ -86,6 +86,15 @@ def test_move_accumulator_does_not_reemit_same_state_after_neutral_frame():
     assert accumulator.displacement_mm == 0.0
 
 
+def test_explicit_state_move_overrides_partial_display_rotation():
+    candidate = SimpleNamespace(
+        layer_rotations=(render_script.CubeLayerRotation(0, 1, 30.0, 1),),
+        turn_state_moves=("R",),
+    )
+
+    assert render_script.completed_candidate_moves(candidate) == ("R",)
+
+
 def test_move_accumulator_displays_core_displacement_between_good_poses():
     rotation = render_script.CubeLayerRotation(0, 1, 90.0, 1)
     first = SimpleNamespace(
@@ -103,6 +112,18 @@ def test_move_accumulator_displays_core_displacement_between_good_poses():
 
     assert len(accumulator.moves) == 1
     assert accumulator.displacement_mm == 12.0
+
+
+def test_move_lookahead_weights_use_uniform_front_and_back_blocks():
+    assert render_script.move_lookahead_weights(4) == pytest.approx((0.15, 0.15, 0.35, 0.35))
+    assert render_script.move_lookahead_weights(11) == pytest.approx(
+        (0.06,) * 5 + (0.70 / 6.0,) * 6,
+    )
+    assert render_script.move_lookahead_weighted_score(2.0, [4.0, 4.0, 4.0]) == pytest.approx(3.7)
+    assert render_script.move_lookahead_weighted_score(2.0, []) == pytest.approx(2.0)
+    # An observed frame with an impossible fit must invalidate the path.
+    assert np.isinf(render_script.move_lookahead_weighted_score(2.0, [float("inf")]))
+    assert np.isinf(render_script.move_lookahead_weighted_score(2.0, [float("nan")]))
 
 
 def test_move_accumulator_displays_rejected_pose_displacement_without_accepting_it():
@@ -647,6 +668,813 @@ def test_combined_headless_progress_keeps_neural_and_pose_counts_together(capsys
     output = capsys.readouterr().out
     assert "neural pass: 3/10" in output
     assert "pose pass: 2/10" in output
+
+
+def _lookahead_test_candidate():
+    return render_script.StickerPnPCandidate(
+        sticker_type="corner", sticker_average_confidence=0.9,
+        image_points=np.zeros((4, 2), dtype=np.float32),
+        object_points=render_script.canonical_sticker_object_points("corner"),
+        projected_sticker_points=np.zeros((4, 2), dtype=np.float32),
+        camera_matrix=render_script.default_camera_matrix((256, 256), 1.2),
+        dist_coeffs=np.zeros((4, 1)), rvec=np.zeros((3, 1)),
+        tvec=np.asarray([[0.0], [0.0], [200.0]]), reprojection_error=0.0,
+    )
+
+
+def _lookahead_trial(score, moves=(), *, baseline=False):
+    return dict(state_score=score, rank=(score,), state_moves=moves, is_baseline=baseline)
+
+
+def test_search_diagnostics_explain_pruning_without_changing_the_search(tmp_path):
+    state = render_script.CubeGeometryState.identity().apply_move("R")
+    trials = tuple(dict(_lookahead_trial(score, moves, baseline=baseline), trial_id=name, label=name)
+                   for name, score, moves, baseline in (
+                       ("keep", 1.0, (), False), ("merge", 2.0, (), False),
+                       ("beam", 3.0, ("U",), False), ("undo", 0.0, ("R'",), False),
+                       ("invalid", float("inf"), (), False), ("static", 4.0, (), True),
+                   ))
+
+    def evaluate(frame, states):
+        return ((_lookahead_trial(1.0), _lookahead_trial(0.0, ("R'",))),) * len(states)
+
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        state, trials, (1,), evaluate, state_batch_size=1, previous_move="R", diagnostics=debug,
+    )
+    plain = render_script.search_move_lookahead_paths(
+        state, trials, (1,), evaluate, state_batch_size=1, previous_move="R",
+    )
+    assert [(path.first_trial["trial_id"], path.future_scores) for path in paths] == [
+        (path.first_trial["trial_id"], path.future_scores) for path in plain
+    ]
+    assert {root["trial_id"]: root["status"] for root in debug["roots"]} == {
+        "keep": "complete", "merge": "merged", "beam": "complete",
+        "undo": "complete", "invalid": "invalid_score", "static": "complete",
+    }
+    assert debug["depths"][0]["collapsed_holds"] == 2
+    assert all(depth["beam_pruned_paths"] == 0 for depth in debug["depths"])
+    assert debug["depths"][1]["immediate_undo"] == 0
+    assert debug["depths"][1]["scored_states"] == 3
+    assert debug["optimality"] == "proven"
+    forecast = render_script.move_lookahead_path_log(paths[0], (100, 103))
+    assert [step["frame_index"] for step in forecast["steps"]] == [100, 103]
+    assert sum(step["weighted_score"] for step in forecast["steps"]) == pytest.approx(forecast["total_score"])
+    assert all(not path.future_trials for path in plain)
+    log = tmp_path / "scores.jsonl"
+    render_script.append_turn_candidate_log(
+        log, replace(_lookahead_test_candidate(), turn_search_diagnostics=debug), 100,
+    )
+    recorded = json.loads(log.read_text())
+    invalid = next(trial for trial in recorded["candidates"] if trial["trial_id"] == "invalid")
+    assert invalid["state_score"] is None
+    assert invalid["search_status"] == "invalid_score"
+    json.dumps(recorded, allow_nan=False)
+
+
+def test_search_diagnostics_record_why_the_frontier_was_exhausted():
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        render_script.CubeGeometryState.identity(), (_lookahead_trial(0.0, ("R",)),),
+        (1,), lambda frame, states: ((_lookahead_trial(float("inf")),),) * len(states),
+        diagnostics=debug,
+    )
+    assert not paths
+    assert debug["depths"][1]["invalid_score"] == 1
+    assert debug["depths"][1]["retained_paths"] == 0
+    assert debug["roots"][0]["status"] == "no_legal_continuation"
+    assert debug["roots"][0]["eliminated_depth"] == 1
+
+
+def _write_search_debug_log(tmp_path, monkeypatch):
+    candidate = _lookahead_test_candidate()
+    initial = render_script.CubeGeometryState.identity().signature()
+    records = []
+    for cache_index, frame_index in enumerate((10, 12, 15)):
+        pose = replace(candidate, tvec=np.asarray([[float(cache_index)], [0.0], [200.0]]))
+        records.append(SimpleNamespace(frame_index=frame_index, pose_candidate=pose,
+                                       pose_candidates=(pose,), sticker_masks=None))
+
+    def trial(score, moves=()):
+        return dict(_lookahead_trial(score, moves, baseline=not moves),
+                    trial_id="0:-90" if moves else "0:+0", label="R offset -90" if moves else "static R",
+                    layer_axis=0, layer_side=1, layer_count=1, color_offset=-90.0 if moves else 0.0,
+                    layer_rotations=(), combined_mean_error=score, keypoint_error=0.0,
+                    sticker_error=0.0, color_error=score)
+
+    def score(pose, *args, **kwargs):
+        frame = int(pose.tvec[0, 0])
+        wrong = pose.cube_geometry_state.signature() == initial
+        return [trial(0.0 if frame == 0 or not wrong else 2.0),
+                trial(0.1 if frame == 0 else 5.0, ("R",))]
+
+    monkeypatch.setattr(render_script, "_turn_torch_scoring_device", lambda _: "cpu")
+    monkeypatch.setattr(render_script, "_build_turn_geometry_frame", lambda *args:
+                        dict(options=(trial(0.0),), trials=(trial(0.0),), static_trials=(trial(0.0),)))
+    monkeypatch.setattr(render_script, "_score_turn_color_offsets_on_gpu", score)
+    monkeypatch.setattr(render_script, "_score_turn_color_offsets_for_states_on_gpu",
+                        lambda pose, options, limit, device, likelihoods, states, **kwargs:
+                        [score(replace(pose, cube_geometry_state=state)) for state in states])
+    monkeypatch.setattr(render_script, "turn_color_predictive_likelihoods", lambda *args: None)
+    monkeypatch.setattr(render_script, "solve_pnp_from_low_error_assignments", lambda pose, **kwargs: pose)
+    monkeypatch.setattr(render_script, "pose_reprojection_error_is_acceptable", lambda _: True)
+    log_path = tmp_path / "turn_candidate_scores.jsonl"
+    render_script.recover_cached_pose_symmetries(
+        records, render_script.StickerColorTrace.create(), pose_prepared=True,
+        recover_orientation=False, recognize_moves=True, global_profiles={}, known_initial_colors={},
+        turn_candidate_log=log_path,
+    )
+    return log_path
+
+
+def test_move_search_log_records_actual_forecast_frames_and_selected_offset(tmp_path, monkeypatch):
+    path = _write_search_debug_log(tmp_path, monkeypatch)
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    first = records[0]
+    assert first["log_schema_version"] == 2
+    assert first["search"]["version"] == 11
+    assert first["selected_trial_id"] == "0:-90"
+    assert first["selected"] == "R offset -90"
+    assert first["search"]["changed_local_choice"] is True
+    assert first["search"]["local_best_trial_id"] == "0:+0"
+    assert [step["frame_index"] for step in first["search"]["selected_path"]["steps"]] == [10, 12, 15]
+    assert first["search"]["selected_path"]["total_score"] == pytest.approx(0.04)
+    assert first["candidates"][0]["trial_id"] == "0:+0"
+    assert first["candidates"][1]["trial_id"] == "0:-90"
+    assert first["candidates"][1]["best_sequence_score"] == pytest.approx(0.04)
+    assert records[1]["search"]["previous_move"] == "R"
+    assert records[1]["search"]["reused_previous_forecast"]
+    assert records[1]["search"]["seeds"][0]["source"] == "previous_forecast"
+    assert all(row['search']['decision_evaluated_states'] <= 1024 for row in records)
+    assert first["search"]["geometry"]["retained_options"] == 1
+    assert first["search"]["evaluation_cache"]["gpu_batches"] == 4
+    assert first["search"]["algorithm"] == "adaptive_branch_and_bound"
+    assert first["search"]["optimality"] == "proven"
+    assert first["lookahead_beam_width"] is None
+    assert first["search"]["prune_state_revisits"] is False
+    assert first["search"]["prune_immediate_undo"] is False
+    assert first["search"]["prune_root_state_returns"] is True
+    assert first["search"]["merge_key"] == "cube_state"
+    assert first["search"]["no_turn_path"]["move_count"] == 0
+    assert all(not step["state_moves"] for step in first["search"]["no_turn_path"]["steps"])
+    assert first["search"]["improvement_over_no_turn"] > 0
+    json.dumps(records, allow_nan=False)
+
+
+def test_move_lookahead_keeps_a_locally_worse_future_to_choose_the_right_first_move():
+    state = render_script.CubeGeometryState.identity()
+    initial = state.signature()
+    bad = state.apply_moves(("U",)).signature()
+    good = state.apply_moves(("F",)).signature()
+    baseline = _lookahead_trial(0.0, baseline=True)
+    action = _lookahead_trial(0.2, ("R",))
+
+    def evaluate(frame, states):
+        trials = []
+        for future_state in states:
+            signature = future_state.signature()
+            if frame == 1 and signature == initial:
+                trials.append((_lookahead_trial(0.0, ("U",)), _lookahead_trial(1.0, ("F",))))
+            else:
+                score = 10.0 if signature == bad else (0.0 if signature == good else 0.3)
+                trials.append((_lookahead_trial(score),))
+        return tuple(trials)
+
+    paths = render_script.search_move_lookahead_paths(
+        state, (baseline, action), tuple(range(1, 11)), evaluate, state_batch_size=3,
+    )
+    winner = min(paths, key=lambda path: render_script.move_lookahead_weighted_score(
+        path.first_trial["state_score"], path.future_scores,
+    ))
+    assert winner.first_trial is baseline
+    assert winner.state.signature() == good
+    assert winner.future_scores == (1.0,) + (0.0,) * 9
+    assert render_script.move_lookahead_weighted_score(
+        winner.first_trial["state_score"], winner.future_scores,
+    ) == pytest.approx(0.06)
+
+
+def test_move_lookahead_matches_exhaustive_search_and_scores_merged_states_once():
+    from itertools import product
+
+    state = render_script.CubeGeometryState.identity()
+    target = state.apply_moves(("U", "R"))
+    moves = ((), ("U",), ("R",), ("R'",))
+    evaluated = []
+    evaluated_states = {}
+
+    def trials(frame, before):
+        result = []
+        for action in moves:
+            after = before.apply_moves(action)
+            wrong = sum(after.facelets[key] != target.facelets[key] for key in after.facelets)
+            result.append(_lookahead_trial(wrong / 54.0 + 0.1 * len(action), action,
+                                           baseline=not action))
+        return tuple(result)
+
+    def evaluate(frame, states):
+        signatures = [value.signature() for value in states]
+        assert len(signatures) == len(set(signatures))
+        previous = evaluated_states.setdefault(frame, set())
+        assert not previous.intersection(signatures)
+        previous.update(signatures)
+        evaluated.append((frame, len(states)))
+        return tuple(trials(frame, before) for before in states)
+
+    paths = render_script.search_move_lookahead_paths(
+        state, trials(0, state), (1, 2, 3), evaluate, state_batch_size=128,
+    )
+    actual = min(render_script.move_lookahead_path_score(path) for path in paths)
+    exhaustive = []
+    for choices in product(range(len(moves)), repeat=4):
+        before = state
+        scores = []
+        move_count = 0
+        for frame, choice in enumerate(choices):
+            trial = trials(frame, before)[choice]
+            scores.append(trial["state_score"])
+            before = before.apply_moves(trial["state_moves"])
+            move_count += len(trial["state_moves"])
+            if trial["state_moves"] and before.signature() == state.signature():
+                break
+        else:
+            exhaustive.append(render_script.move_lookahead_weighted_score(scores[0], scores[1:])
+                              + render_script.PNP_TURN_LOOKAHEAD_MOVE_COST * move_count)
+    assert actual == pytest.approx(min(exhaustive))
+    assert set(evaluated_states) == {1, 2, 3}
+    assert all(count > 0 for _, count in evaluated)
+
+
+def test_move_lookahead_rejects_impossible_future_paths():
+    state = render_script.CubeGeometryState.identity()
+    baseline = _lookahead_trial(0.0, baseline=True)
+    action = _lookahead_trial(1.0, ("R",))
+
+    def evaluate(frame, states):
+        return tuple((
+            _lookahead_trial(float("inf") if before.signature() == state.signature() else 0.0),
+        ) for before in states)
+
+    paths = render_script.search_move_lookahead_paths(state, (baseline, action), (1,), evaluate)
+    assert len(paths) == 1
+    assert paths[0].first_trial is action
+
+
+@pytest.mark.parametrize("move,undo", [
+    ("R", "R'"), ("R'", "R"), ("Rw", "Rw'"), ("r", "Rw'"), ("R2", "R2"),
+])
+@pytest.mark.parametrize("neutral_frames", [0, 2, 9])
+def test_move_lookahead_prunes_returns_to_start_even_after_neutral_frames(move, undo, neutral_frames):
+    state = render_script.CubeGeometryState.identity()
+    first = _lookahead_trial(0.0, (move,))
+
+    def evaluate(frame, states):
+        trials = ((_lookahead_trial(0.0),) if frame <= neutral_frames else (
+            _lookahead_trial(0.0, (undo,)), _lookahead_trial(1.0, ("U",)),
+        ))
+        return (trials,) * len(states)
+
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        state, (first,), tuple(range(1, neutral_frames + 2)), evaluate,
+        diagnostics=debug,
+    )
+    winner = min(paths, key=lambda path: render_script.move_lookahead_weighted_score(
+        path.first_trial["state_score"], path.future_scores))
+    assert winner.last_move == "U"
+    assert winner.future_scores == (0.0,) * neutral_frames + (1.0,)
+    assert winner.state.signature() == state.apply_moves((move, "U")).signature()
+    assert debug["depths"][neutral_frames + 1]["root_return"] == 1
+    assert debug["roots"][0]["pruning_counts"]["root_return"] == 1
+    assert debug["roots"][0]["root_return_examples"][0]["state_moves"] == (undo,)
+
+
+def test_move_lookahead_allows_current_undo_and_repeated_turns():
+    state = render_script.CubeGeometryState.identity().apply_move("R")
+    inverse = _lookahead_trial(0.0, ("R'",))
+    neutral = _lookahead_trial(1.0, baseline=True)
+    repeated = _lookahead_trial(2.0, ("R",))
+    paths = render_script.search_move_lookahead_paths(
+        state, (inverse, neutral, repeated), (), lambda *args: (), previous_move="R",
+    )
+    assert any(path.first_trial is inverse for path in paths)
+    assert any(path.first_trial is repeated for path in paths)
+    assert next(path for path in paths if path.first_trial is neutral).last_move == "R"
+
+
+def test_move_lookahead_prunes_a_multi_move_trial_returning_to_start():
+    state = render_script.CubeGeometryState.identity()
+    inverse = _lookahead_trial(0.0, ("R", "R'"))
+    valid = _lookahead_trial(1.0, ("R", "U", "R'"))
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        state, (inverse, valid), (), lambda *args: (), diagnostics=debug,
+    )
+    assert len(paths) == 1
+    assert paths[0].first_trial is valid
+    assert debug["roots"][0]["status"] == "root_return"
+    assert debug["depths"][0]["root_return"] == 1
+
+
+def test_move_lookahead_merges_distinct_last_moves_when_cube_states_merge():
+    state = render_script.CubeGeometryState.identity()
+    first_r = _lookahead_trial(1.0, ("R",))
+    first_l = _lookahead_trial(0.0, ("L",))
+    r_state = state.apply_move("R").signature()
+    frontier_sizes = []
+
+    def evaluate(frame, states):
+        frontier_sizes.append(len(states))
+        if frame == 1:
+            return tuple((
+                _lookahead_trial(0.0, ("L",) if before.signature() == r_state else ("R",)),
+            ) for before in states)
+        return ((_lookahead_trial(0.0, ("R'",)),),) * len(states)
+
+    paths = render_script.search_move_lookahead_paths(
+        state, (first_r, first_l), (1, 2), evaluate,
+    )
+    # R L and L R have the same future options now that history does not
+    # exclude inverses. The cheaper L R prefix correctly dominates.
+    assert frontier_sizes == [2, 1]
+    assert len(paths) == 1
+    assert paths[0].first_trial is first_l
+    assert paths[0].state.signature() == state.apply_move("L").signature()
+
+
+def test_move_lookahead_prunes_full_cycles_but_allows_half_turns():
+    state = render_script.CubeGeometryState.identity()
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        state, (_lookahead_trial(0.0, ("R",)),), (1, 2, 3),
+        lambda frame, states: ((_lookahead_trial(0.0, ("R",)), _lookahead_trial(1.0)),) * len(states),
+        diagnostics=debug,
+    )
+    assert paths
+    assert debug["depths"][3]["state_revisit"] == 0
+    assert debug["depths"][3]["root_return"] > 0
+    assert all(path.state.signature() != state.signature() for path in paths)
+    half = render_script.search_move_lookahead_paths(
+        state, (_lookahead_trial(0.0, ("R",)),), (1,),
+        lambda frame, states: ((_lookahead_trial(0.0, ("R",)),),) * len(states),
+    )
+    assert half[0].state.signature() == state.apply_moves(("R", "R")).signature()
+
+
+def test_move_lookahead_does_not_block_recent_states_in_a_new_window():
+    initial = render_script.CubeGeometryState.identity()
+    past = tuple(initial.apply_moves(("R",) * turns).signature() for turns in range(3))
+    current = initial.apply_moves(("R",) * 3)
+    cycle = _lookahead_trial(0.0, ("R",))
+    hold = _lookahead_trial(1.0, baseline=True)
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        current, (cycle, hold), (), lambda *args: (), previous_move="R",
+        previous_states=past, diagnostics=debug,
+    )
+    assert len(paths) == 2
+    assert paths[0].first_trial is cycle
+    assert debug["roots"][0]["status"] == "complete"
+
+
+def test_move_lookahead_catches_an_intermediate_loop_when_the_window_advances():
+    initial = render_script.CubeGeometryState.identity()
+    after_r = initial.apply_move("R")
+    # From the R frame, U U' returns to an intermediate state and is allowed.
+    paths = render_script.search_move_lookahead_paths(
+        initial, (_lookahead_trial(0.0, ("R",)),), (1, 2),
+        lambda frame, states: ((_lookahead_trial(0.0, ("U",) if frame == 1 else ("U'",)),),) * len(states),
+    )
+    assert paths[0].state.signature() == after_r.signature()
+    # Once U is the current frame, U' returns to that window's root.
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        after_r, (_lookahead_trial(0.0, ("U",)),), (2,),
+        lambda frame, states: ((_lookahead_trial(0.0, ("U'",)), _lookahead_trial(1.0)),) * len(states),
+        diagnostics=debug,
+    )
+    assert paths[0].state.signature() == after_r.apply_move("U").signature()
+    assert debug["depths"][1]["root_return"] == 1
+
+
+def test_move_lookahead_preserves_holds_and_offsets_at_the_starting_state():
+    initial = render_script.CubeGeometryState.identity()
+    tilted_hold = dict(_lookahead_trial(0.0, baseline=True), layer_rotations=(
+        render_script.CubeLayerRotation(0, 1, 21.0, 1),))
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        initial, (tilted_hold,), tuple(range(1, 11)),
+        lambda frame, states: ((tilted_hold,),) * len(states), diagnostics=debug,
+        seed_greedy=True, state_evaluation_budget=11,
+    )
+    assert paths
+    assert all(path.state.signature() == initial.signature() and path.move_count == 0 for path in paths)
+    assert all(depth["root_return"] == 0 for depth in debug["depths"])
+    assert debug["seeds"][0]["root_return_pruned"] == 0
+
+
+@pytest.mark.parametrize("seed", ["warm_start", "greedy"])
+def test_move_lookahead_seed_cannot_bypass_root_return_pruning(seed):
+    initial = render_script.CubeGeometryState.identity()
+    first = _lookahead_trial(0.0, ("R",))
+    debug = {}
+
+    def evaluate(frame, states):
+        trials = ((_lookahead_trial(0.0),) if frame < 10 else (
+            _lookahead_trial(0.0, ("R'",)), _lookahead_trial(0.5, ("U",)), _lookahead_trial(1.0),
+        ))
+        return (trials,) * len(states)
+
+    paths = render_script.search_move_lookahead_paths(
+        initial, (first,), tuple(range(1, 11)), evaluate, diagnostics=debug,
+        state_evaluation_budget=11, state_change_limit=1,
+        warm_start_moves=(("R",),) + ((),) * 9 + (("R'",),) if seed == "warm_start" else None,
+        seed_greedy=seed == "greedy",
+    )
+    winner = min(paths, key=render_script.move_lookahead_path_score)
+    assert winner.state.signature() == initial.apply_moves(("R", "U")).signature()
+    assert winner.future_trials[-1]["state_moves"] == ("U",)
+    assert all(path.state.signature() != initial.signature() for path in paths)
+    assert debug["seeds"][0]["root_return_pruned"] == 1
+    assert debug["seeds"][0]["repaired_steps"] == (1 if seed == "warm_start" else 0)
+    assert debug["evaluated_states"] <= 11
+
+
+def test_root_return_rejections_and_examples_are_saved_in_candidate_log(tmp_path):
+    initial = render_script.CubeGeometryState.identity()
+    debug = {}
+    render_script.search_move_lookahead_paths(
+        initial, (_lookahead_trial(0.0, ("R",)),), (1,),
+        lambda frame, states: ((_lookahead_trial(0.0, ("R'",)),),) * len(states),
+        diagnostics=debug,
+    )
+    assert debug["roots"][0]["status"] == "root_return"
+    log = tmp_path / "scores.jsonl"
+    render_script.append_turn_candidate_log(
+        log, replace(_lookahead_test_candidate(), turn_search_diagnostics=debug), 10,
+    )
+    record = json.loads(log.read_text())
+    assert record["search"]["prune_root_state_returns"] is True
+    assert record["candidates"][0]["pruning_counts"]["root_return"] == 1
+    assert record["candidates"][0]["root_return_examples"][0]["state_moves"] == ["R'"]
+
+
+def test_move_lookahead_merges_distinct_visited_histories_with_the_same_state_and_last_move():
+    initial = render_script.CubeGeometryState.identity()
+    first_r, first_l = _lookahead_trial(1.0, ("R",)), _lookahead_trial(0.0, ("L",))
+    r_state = initial.apply_move("R").signature()
+
+    def evaluate(frame, states):
+        if frame == 1:
+            return tuple((_lookahead_trial(0.0, ("L",) if state.signature() == r_state else ("R",)),)
+                         for state in states)
+        return ((_lookahead_trial(0.0, ("R",) if frame == 2 else ("R2",)),),) * len(states)
+
+    paths = render_script.search_move_lookahead_paths(initial, (first_r, first_l), (1, 2, 3), evaluate)
+    # Visited states no longer affect future availability. The cheaper
+    # L R prefix can be merged with R L and may revisit L later.
+    assert len(paths) == 1
+    assert paths[0].first_trial is first_l
+    assert paths[0].state.signature() == initial.apply_move("L").signature()
+
+
+@pytest.mark.parametrize("last_frame", [9, 11])
+def test_state_revisit_is_allowed_through_neutral_frames_and_fallback(monkeypatch, last_frame):
+    candidate = _lookahead_test_candidate()
+    turns = (0, 3, 6, last_frame)
+    records = []
+    for frame in range(last_frame + 1):
+        pose = replace(candidate, tvec=np.asarray([[float(frame)], [0.0], [200.0]]))
+        records.append(SimpleNamespace(frame_index=frame, pose_candidate=pose, pose_candidates=(pose,), sticker_masks=None))
+    monkeypatch.setattr(render_script, "_turn_torch_scoring_device", lambda _: "cpu")
+    monkeypatch.setattr(render_script, "_build_turn_geometry_frame", lambda *args: None)
+    monkeypatch.setattr(render_script, "solve_pnp_from_low_error_assignments",
+                        lambda pose, **kwargs: replace(pose, turn_state_moves=("R",) if int(pose.tvec[0, 0]) in turns else ()))
+    monkeypatch.setattr(render_script, "pose_reprojection_error_is_acceptable", lambda _: True)
+    render_script.recover_cached_pose_symmetries(
+        records, render_script.StickerColorTrace.create(), pose_prepared=True,
+        recover_orientation=False, recognize_moves=True, global_profiles={}, known_initial_colors={},
+    )
+    assert [render_script.completed_candidate_moves(records[index].pose_candidate) for index in turns] == [
+        ("R",), ("R",), ("R",), ("R",),
+    ]
+
+
+def test_live_accumulator_retains_recent_departed_states_through_neutral_frames():
+    accumulator = render_script.MoveAccumulator()
+    initial = accumulator._geometry_state.signature()
+    candidate = replace(_lookahead_test_candidate(), cube_geometry_state=accumulator._geometry_state.copy(),
+                        turn_state_moves=("R",))
+    accumulator.observe(candidate)
+    for _ in range(9):
+        accumulator.observe(None)
+    assert initial in accumulator.recent_geometry_states()
+    accumulator.observe(None)
+    assert initial not in accumulator.recent_geometry_states()
+
+
+@pytest.mark.parametrize("geometry_mode", ["available", "missing", "forced_return"])
+def test_move_search_allows_undo_of_the_previous_committed_window_or_fallback(monkeypatch, geometry_mode):
+    candidate = _lookahead_test_candidate()
+    records = []
+    for frame in range(3):
+        pose = replace(candidate, tvec=np.asarray([[float(frame)], [0.0], [200.0]]))
+        records.append(SimpleNamespace(
+            frame_index=frame, pose_candidate=pose, pose_candidates=(pose,), sticker_masks=None,
+        ))
+    previous_moves = []
+
+    def local_search(pose, **kwargs):
+        frame = int(pose.tvec[0, 0])
+        previous_moves.append(kwargs["turn_previous_move"])
+        return replace(pose, turn_state_moves=("R",) if frame == 0 else (("R'",) if frame == 2 else ()))
+
+    def score(pose, *args, **kwargs):
+        frame = int(pose.tvec[0, 0])
+        if frame == 0:
+            return [_lookahead_trial(0.0, ("R",))]
+        if frame == 1:
+            return [_lookahead_trial(0.0, baseline=True)]
+        trials = [_lookahead_trial(0.0, ("R'",))]
+        if geometry_mode == "available":
+            trials.append(_lookahead_trial(1.0, baseline=True))
+        return trials
+
+    monkeypatch.setattr(render_script, "_turn_torch_scoring_device", lambda _: "cpu")
+    monkeypatch.setattr(render_script, "_build_turn_geometry_frame", lambda *args:
+                        None if geometry_mode == "missing" else {"options": ({},)})
+    monkeypatch.setattr(render_script, "turn_color_predictive_likelihoods", lambda *args: None)
+    monkeypatch.setattr(render_script, "_score_turn_color_offsets_on_gpu", score)
+    monkeypatch.setattr(render_script, "_score_turn_color_offsets_for_states_on_gpu",
+                        lambda pose, options, limit, device, likelihoods, states, **kwargs: [score(pose) for state in states])
+    monkeypatch.setattr(render_script, "solve_pnp_from_low_error_assignments", local_search)
+    monkeypatch.setattr(render_script, "pose_reprojection_error_is_acceptable", lambda _: True)
+    render_script.recover_cached_pose_symmetries(
+        records, render_script.StickerColorTrace.create(), pose_prepared=True,
+        recover_orientation=False, recognize_moves=True, global_profiles={}, known_initial_colors={},
+    )
+    if geometry_mode == "forced_return":
+        # With no alternate continuation, the first forecast's only path
+        # returns to its root and is rejected. Fallback holds instead.
+        assert previous_moves == [None, None, None]
+        assert [render_script.completed_candidate_moves(record.pose_candidate) for record in records] == [
+            (), (), ("R'",),
+        ]
+        assert records[-1].pose_candidate.cube_geometry_state.signature() == render_script.CubeGeometryState.identity().signature()
+    else:
+        assert previous_moves == [None, "R", "R"]
+        assert [render_script.completed_candidate_moves(record.pose_candidate) for record in records] == [
+            ("R",), (), ("R'",),
+        ]
+        assert records[-1].pose_candidate.cube_geometry_state.signature() == (
+            render_script.CubeGeometryState.identity().apply_move("R").signature()
+        )
+
+
+def test_cached_geometry_move_permutations_match_cube_state():
+    geometry = render_script.CubeGeometryState.identity()
+    reference = render_script.CubeState(dict(geometry.facelets))
+    for base in ("R", "L", "U", "D", "F", "B", "Rw", "Lw", "Uw", "Dw", "Fw", "Bw", "x", "y", "z"):
+        for suffix in ("", "'", "2"):
+            move = base + suffix
+            geometry = geometry.apply_move(move)
+            reference.apply_move(move)
+            assert geometry.facelets == reference.colors
+
+
+@pytest.mark.parametrize("layer_count", [1, 2])
+@pytest.mark.parametrize("offset", [-90.0, 0.0, 90.0])
+@pytest.mark.parametrize("partial_angle", [0.0, 15.0])
+def test_selected_candidate_projects_the_sticker_identities_used_by_color_scoring(layer_count, offset, partial_angle):
+    candidate = replace(
+        _lookahead_test_candidate(),
+        rvec=np.asarray([[0.18], [-0.25], [0.12]]),
+        cube_geometry_state=render_script.CubeGeometryState.identity().apply_moves(("R", "U")),
+    )
+    partial = render_script.CubeLayerRotation(2, -1, partial_angle, layer_count)
+    geometry_rotations = (partial,) if partial_angle else ()
+    full = replace(partial, angle_degrees=partial.angle_degrees + offset)
+    notation = render_script.cube_rotation_to_notation(replace(partial, angle_degrees=offset))
+    trial = dict(
+        layer_rotations=geometry_rotations, layer_axis=2, layer_side=-1, layer_count=layer_count,
+        color_offset=offset, state_moves=(notation,) if notation else (), is_baseline=False,
+    )
+    # A local trial can refine the diagnostic pose before lookahead picks a
+    # different one. Its camera must not leak into the selected cached trial.
+    diagnostic = replace(candidate, tvec=candidate.tvec + np.asarray([[10.0], [0.0], [0.0]]))
+    selected = render_script._candidate_with_turn_trial(diagnostic, candidate, trial)
+    expected = replace(candidate, layer_rotations=(full,))
+    projected = render_script.projected_sticker_faces(selected, selected.rvec, selected.tvec)
+    reference = render_script.projected_sticker_faces(expected, expected.rvec, expected.tvec)
+    assert [entry[0].label for entry in projected] == [entry[0].label for entry in reference]
+    for (identity, depth, polygon), (_, expected_depth, expected_polygon) in zip(projected, reference):
+        np.testing.assert_allclose(polygon, expected_polygon, atol=1e-5)
+        assert depth == pytest.approx(expected_depth)
+        assert render_script.sticker_view_reliability_weight(selected, identity) == pytest.approx(
+            render_script.sticker_view_reliability_weight(expected, identity),
+        )
+    assert selected.layer_rotations == geometry_rotations
+    np.testing.assert_array_equal(selected.rvec, candidate.rvec)
+    np.testing.assert_array_equal(selected.tvec, candidate.tvec)
+    assert selected.cube_geometry_state.signature() == candidate.cube_geometry_state.signature()
+    assert render_script.completed_candidate_moves(selected) == trial["state_moves"]
+    # Replay still consumes this pre-move model and commits exactly once.
+    accumulator = render_script.MoveAccumulator()
+    accumulator._geometry_state = candidate.cube_geometry_state.copy()
+    accumulator.observe(selected)
+    assert accumulator._geometry_state.signature() == candidate.cube_geometry_state.apply_moves(
+        trial["state_moves"],
+    ).signature()
+
+
+@pytest.mark.parametrize("has_colors", [True, False])
+def test_batched_color_offsets_match_cpu_identity_projection_and_share_geometry(monkeypatch, has_colors):
+    torch = pytest.importorskip("torch")
+    candidate = replace(_lookahead_test_candidate(), rvec=np.asarray([[0.18], [-0.25], [0.12]]))
+    faces = render_script.projected_sticker_faces(candidate, candidate.rvec, candidate.tvec)
+    centers = tuple(polygon.mean(axis=0) for identity, depth, polygon in faces)
+    candidate = replace(candidate, sticker_mask_centers=centers,
+                        sticker_mask_colors=(np.asarray([255, 0, 0], dtype=np.uint8),) * len(centers))
+    option = dict(
+        layer_axis=2, layer_side=-1, layer_count=1, layer_rotations=(),
+        label="static D", is_baseline=True, combined_mean_error=0.03,
+        assignment_projected_points=None, assignment_object_points=None,
+        assignment_projected_class_ids=None,
+    )
+    states = (render_script.CubeGeometryState.identity(),
+              render_script.CubeGeometryState.identity().apply_moves(("R", "U")))
+    likelihoods = np.random.default_rng(12).uniform(0.01, 0.99, (54, len(centers))) if has_colors else None
+    project = render_script._torch_project_turn_points
+    calls = []
+
+    def count_projection(*args, **kwargs):
+        calls.append(1)
+        return project(*args, **kwargs)
+
+    monkeypatch.setattr(render_script, "_torch_project_turn_points", count_projection)
+    scores = render_script._score_turn_color_offsets_for_states_on_gpu(
+        candidate, (option,), 10.0, torch.device("cpu"), likelihoods, states,
+    )
+    assert calls == [1]
+    assert len(scores) == 2
+    for state, trials in zip(states, scores):
+        for trial in trials:
+            rotation = render_script.CubeLayerRotation(2, -1, trial["color_offset"], 1)
+            expected_error, expected_count = render_script.sticker_mask_color_turn_fit_metrics(
+                replace(candidate, cube_geometry_state=state), candidate.rvec, candidate.tvec,
+                (rotation,), 10.0, likelihoods,
+            )
+            assert trial["color_error"] == pytest.approx(expected_error, abs=1e-6)
+            assert trial["color_match_count"] == expected_count
+
+
+@pytest.mark.parametrize("color_error", [0.0, 0.7, float("inf"), float("nan")])
+def test_color_offset_scores_preserve_invalid_color_fits(monkeypatch, color_error):
+    torch = pytest.importorskip("torch")
+    candidate = _lookahead_test_candidate()
+    option = dict(
+        layer_axis=0, layer_side=1, layer_count=1, layer_rotations=(),
+        label="static R", is_baseline=True, combined_mean_error=0.03,
+        robust_error=0.04, assignment_projected_points=None,
+        assignment_object_points=None, assignment_projected_class_ids=None,
+    )
+
+    def color_metrics(_candidate, _torch, centers, *args, **kwargs):
+        return (
+            centers.new_full((len(centers),), color_error),
+            torch.zeros(len(centers), dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(render_script, "_gpu_sticker_color_fit_metrics", color_metrics)
+    trials = render_script._score_turn_color_offsets_on_gpu(
+        candidate, (option,), 10.0, torch.device("cpu"), None,
+    )
+    assert len(trials) == 3
+    for trial in trials:
+        if np.isfinite(color_error):
+            assert trial["state_score"] == pytest.approx(0.03 + color_error)
+            assert trial["robust_error"] == pytest.approx(0.04 + color_error)
+        else:
+            assert trial["state_score"] == float("inf")
+            assert trial["robust_error"] == float("inf")
+
+
+def test_all_invalid_color_trials_do_not_commit_a_move(monkeypatch):
+    candidate = _lookahead_test_candidate()
+    monkeypatch.setattr(render_script, "_turn_torch_scoring_device", lambda _: "cpu")
+    monkeypatch.setattr(render_script, "turn_color_predictive_likelihoods", lambda *args: None)
+    monkeypatch.setattr(
+        render_script, "_score_turn_color_offsets_on_gpu",
+        lambda *args: [dict(state_score=float("inf"), rank=(float("inf"),),
+                           state_moves=("R",), is_baseline=False)],
+    )
+    result = render_script.recover_misaligned_cube_layers_from_geometry(
+        candidate, 10.0, dict(options=({},), static_trials=({},)),
+    )
+    assert result.turn_state_moves == ()
+    assert result.layer_rotations == ()
+
+
+@pytest.mark.parametrize("prevent_cycle", [False, True])
+def test_single_frame_search_allows_inverse_even_with_recent_state_history(monkeypatch, prevent_cycle):
+    torch = pytest.importorskip("torch")
+    initial = render_script.CubeGeometryState.identity()
+    candidate = replace(_lookahead_test_candidate(), cube_geometry_state=(
+        initial.apply_moves(("R",) * 3) if prevent_cycle else initial
+    ))
+    option = dict(
+        layer_axis=0, layer_side=1, layer_count=1, layer_rotations=(),
+        label="static R", is_baseline=True, combined_mean_error=0.03,
+        keypoint_error=0.01, sticker_error=0.02, robust_error=0.04,
+        assignment_projected_points=None, assignment_object_points=None,
+        assignment_projected_class_ids=None,
+    )
+    trials = render_script._score_turn_color_offsets_on_gpu(
+        candidate, (option,), 10.0, torch.device("cpu"), None,
+    )
+    for trial in trials:
+        score = {("R'",): 0.0, ("R",): 1.0, (): 2.0}[trial["state_moves"]]
+        trial.update(state_score=score, combined_mean_error=score, rank=(score,))
+    monkeypatch.setattr(render_script, "_turn_torch_scoring_device", lambda _: "cpu")
+    monkeypatch.setattr(render_script, "turn_color_predictive_likelihoods", lambda *args: None)
+    monkeypatch.setattr(render_script, "_score_turn_color_offsets_on_gpu", lambda *args: trials)
+    result = render_script.recover_misaligned_cube_layers_from_geometry(
+        candidate, 10.0, dict(options=(option,), static_trials=(option,)), previous_move="R",
+        previous_states=tuple(initial.apply_moves(("R",) * turns).signature() for turns in range(3))
+        if prevent_cycle else (),
+    )
+    assert result.turn_state_moves == ("R'",)
+
+
+@pytest.mark.parametrize("change", ["profiles", "priors"])
+def test_lookahead_recalculates_cached_scores_after_color_model_changes(monkeypatch, change):
+    candidate = _lookahead_test_candidate()
+    trace = render_script.StickerColorTrace.create()
+    label = trace.identities[0].label
+    count = 25 if change == "profiles" else 3
+    records = []
+    for frame in range(count):
+        pose = replace(candidate, tvec=np.asarray([[float(frame)], [0.0], [200.0]]))
+        records.append(SimpleNamespace(
+            frame_index=frame, pose_candidate=pose, pose_candidates=(pose,),
+            sticker_masks=None,
+        ))
+        trace.observe(frame, {label: np.asarray([180, 40, 20], dtype=np.uint8)})
+    generation = 0
+    scores = []
+    bound_generations = []
+
+    def update_model(*args, **kwargs):
+        nonlocal generation
+        generation += 1
+        return {"red": object()}, {}
+
+    def score(pose, *args, **kwargs):
+        frame = int(pose.tvec[0, 0])
+        scores.append((frame, pose.cube_geometry_state.signature(), generation))
+        moves = ("R",) if change == "profiles" and frame == 1 else ()
+        return [dict(
+            state_score=0.0, rank=(0.0,), state_moves=moves,
+            is_baseline=not moves, layer_rotations=(),
+        )]
+
+    def lower_bound(pose, *args, **kwargs):
+        bound_generations.append((int(pose.tvec[0, 0]), generation))
+        return -float("inf")
+
+    monkeypatch.setattr(render_script, "_turn_color_frame_score_lower_bound", lower_bound)
+    monkeypatch.setattr(render_script, "_turn_torch_scoring_device", lambda _: "cpu")
+    monkeypatch.setattr(render_script, "_build_turn_geometry_frame", lambda *args: {"options": ({},)})
+    monkeypatch.setattr(render_script, "_score_turn_color_offsets_on_gpu", score)
+    monkeypatch.setattr(
+        render_script, "_score_turn_color_offsets_for_states_on_gpu",
+        lambda pose, options, limit, device, likelihoods, states, **kwargs: [
+            score(replace(pose, cube_geometry_state=state)) for state in states
+        ],
+    )
+    monkeypatch.setattr(render_script, "turn_color_predictive_likelihoods", lambda *args: None)
+    monkeypatch.setattr(render_script, "solve_pnp_from_low_error_assignments", lambda pose, **kwargs: pose)
+    monkeypatch.setattr(render_script, "pose_reprojection_error_is_acceptable", lambda _: True)
+    monkeypatch.setattr(render_script, "refine_global_color_profiles_from_initial_state", update_model)
+    monkeypatch.setattr(render_script, "_update_sticker_color_posteriors", update_model)
+    render_script.recover_cached_pose_symmetries(
+        records, trace, pose_prepared=True, recover_orientation=False,
+        recognize_moves=True, global_profiles={"red": object()},
+        known_initial_colors={label: "red"} if change == "profiles" else None,
+        calibrate_initial_colors=change == "profiles",
+    )
+    # Frame 23 was cached before calibration at frame 22; frame 1 was cached
+    # before learning from frame 0. Both must be evaluated under the new model.
+    target = 23 if change == "profiles" else 1
+    signature = render_script.CubeGeometryState.identity().apply_moves(
+        ("R",) if change == "profiles" else (),
+    ).signature()
+    versions = {version for frame, state, version in scores
+                if frame == target and state == signature}
+    assert 0 in versions
+    assert 1 in versions
+    bound_target = 23 if change == "profiles" else 2
+    assert {version for frame, version in bound_generations if frame == bound_target} == {0, 1}
 
 
 def test_async_pose_consumer_only_selects_candidates(monkeypatch):
@@ -1405,7 +2233,8 @@ def test_cached_pose_symmetry_recovery_uses_color_matching_after_continuity(caps
     ) < 1e-6
 
 
-def test_cached_pose_recovery_rejects_core_displacement_with_motion_filter():
+def test_cached_pose_recovery_rejects_core_displacement_with_motion_filter(monkeypatch):
+    monkeypatch.setattr(render_script, "POSE_TWO_SIDED_MOTION_REJECTION_ENABLED", True)
     def make_candidate(x_position):
         return render_script.StickerPnPCandidate(
             sticker_type="corner",
@@ -2421,34 +3250,31 @@ def test_recover_misaligned_layer_updates_assignment_geometry(monkeypatch):
     assert len(logged.turn_candidate_debug) == len(logged.turn_candidate_scores)
 
 
-def test_turn_acceptance_compares_against_matching_static_baseline():
-    static_inliers = {
-        (0, 1, 1): 19,
-        (0, 1, 2): 19,
-    }
-    tied_turn = {
-        "is_baseline": False,
+def test_turn_acceptance_uses_more_unified_inliers_as_a_waiver():
+    static = {
+        "is_baseline": True,
         "layer_axis": 0,
         "layer_side": 1,
         "layer_count": 1,
         "inlier_count": 19,
+        "color_error": 2.0,
     }
-    improving_turn = {
-        **tied_turn,
+    color_only_turn = {
+        "is_baseline": False,
+        "layer_axis": 0,
+        "layer_side": 1,
+        "layer_count": 1,
         "inlier_count": 20,
+        "color_error": 1.5,
     }
 
-    assert not render_script.turn_trial_exceeds_static_baseline(
-        tied_turn,
-        static_inliers,
-    )
     assert render_script.turn_trial_exceeds_static_baseline(
-        improving_turn,
-        static_inliers,
+        color_only_turn,
+        {(0, 1, 1): static},
     )
 
 
-def test_completed_turn_still_requires_more_global_inliers_than_static():
+def test_turn_without_color_improvement_is_rejected():
     static = {
         "is_baseline": True,
         "layer_axis": 0,
@@ -2782,8 +3608,6 @@ def test_pose_hypothesis_buffer_keeps_current_set_separate_from_history():
     assert buffer.previous_candidates() == (second,)
 
 
-
-
 def test_hypothesis_selection_prefers_continuity_only_for_close_visual_scores():
     def candidate(error, angle):
         return SimpleNamespace(
@@ -2829,8 +3653,8 @@ def test_hypothesis_selection_uses_translation_for_candidates_under_shared_fit_g
         lambda value: float(value.visual),
     )
     visually_best_but_far = candidate(49.0, 0.036, 0.01)
-    temporally_best = candidate(11.0, 0.040, 1.0)
-    rejected = candidate(1.0, 0.051, 0.0)
+    temporally_best = candidate(11.0, 0.120, 1.0)
+    rejected = candidate(1.0, 0.121, 0.0)
     previous = SimpleNamespace(
         rvec=np.zeros((3, 1), dtype=np.float64),
         tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
@@ -2843,9 +3667,34 @@ def test_hypothesis_selection_uses_translation_for_candidates_under_shared_fit_g
     )
 
     assert selected is temporally_best
-    assert render_script.PNP_POSE_REPROJECTION_ERROR_THRESHOLD == pytest.approx(0.05)
+    assert render_script.PNP_POSE_REPROJECTION_ERROR_THRESHOLD == pytest.approx(0.12)
     assert not render_script.PNP_POSE_REPROJECTION_ERROR_REJECTION_ENABLED
     assert render_script.pose_reprojection_error_is_acceptable(rejected)
+
+
+def test_two_sided_translation_rejection_is_temporarily_disabled(monkeypatch):
+    candidate = render_script.StickerPnPCandidate(
+        sticker_type="corner", sticker_average_confidence=0.9,
+        image_points=np.zeros((4, 2), dtype=np.float32),
+        object_points=np.zeros((4, 3), dtype=np.float32),
+        projected_sticker_points=np.zeros((4, 2), dtype=np.float32),
+        camera_matrix=np.eye(3), dist_coeffs=np.zeros((4, 1)),
+        rvec=np.zeros((3, 1)), tvec=np.array([[0.0], [0.0], [200.0]]),
+        reprojection_error=0.0, overall_reprojection_error=0.0,
+    )
+    monkeypatch.setattr(render_script, "select_pose_hypothesis", lambda candidates, *_: candidates[0])
+    monkeypatch.setattr(render_script, "canonicalize_pose_symmetry", lambda pose, _: pose)
+    monkeypatch.setattr(render_script, "pose_reprojection_error_is_acceptable", lambda _: True)
+    assert not render_script.POSE_TWO_SIDED_MOTION_REJECTION_ENABLED
+    for enabled in (False, True):
+        monkeypatch.setattr(render_script, "POSE_TWO_SIDED_MOTION_REJECTION_ENABLED", enabled)
+        poses = [replace(candidate, tvec=np.array([[x], [0.0], [200.0]])) for x in (0.0, 100.0, 0.0)]
+        records = [SimpleNamespace(frame_index=i, pose_candidate=pose, pose_candidates=(pose,))
+                   for i, pose in enumerate(poses)]
+        render_script.recover_cached_pose_symmetries(
+            records, render_script.StickerColorTrace.create(), recover_orientation=False,
+        )
+        assert (records[1].pose_candidate is None) is enabled
 
 
 def test_hypothesis_selection_keeps_much_better_visual_candidate_on_turn():
@@ -3223,9 +4072,10 @@ def test_calibration_move_patience_cancels_only_within_twenty_frames(monkeypatch
     def search(pose, **kwargs):
         index = len(searches)
         searches.append(kwargs["turn_global_profiles"]["red"])
-        angle = 90.0 if index == 1 else (-90.0 if index == inverse_frame else 0.0)
-        rotations = (render_script.CubeLayerRotation(0, 1, angle),) if angle else ()
-        return replace(pose, layer_rotations=rotations)
+        # Opposite faces commute: R L R' L' restores the initial state without
+        # an adjacent inverse pair, which move search now forbids.
+        moves = ("R", "L") if index == 1 else (("R'", "L'") if index == inverse_frame else ())
+        return replace(pose, turn_state_moves=moves)
 
     monkeypatch.setattr(render_script, "solve_pnp_from_low_error_assignments", search)
     monkeypatch.setattr(render_script, "pose_reprojection_error_is_acceptable", lambda _: True)
@@ -3330,18 +4180,564 @@ def test_batched_keypoint_statistics_match_reference_scoring():
         torch, torch.tensor(distances), torch.tensor(objects), torch.tensor(classes),
         axes, sides, layers, torch.tensor(observed_classes), 10.0, 2.0,
     )
-    means, robust, p90, inliers, layer_inliers = [v.numpy() for v in values]
+    means, robust, p90, inliers, layer_inliers, valid_trials = [v.numpy() for v in values]
     for index in (0, 1):
-        valid = np.isfinite(distances[index])
-        normalized = distances[index, valid] / 10.0
+        finite = np.isfinite(distances[index])
+        normalized = distances[index, finite] / 10.0
         assert means[index] == pytest.approx(float(np.mean(normalized)), abs=1e-7)
         assert p90[index] == pytest.approx(float(np.percentile(normalized, 90)), abs=1e-7)
         assert robust[index] == pytest.approx(float(np.median(normalized) + 0.5 * np.percentile(normalized, 90)), abs=1e-7)
-        assert inliers[index] == int(np.count_nonzero(valid & (distances[index] <= 2.0)))
+        assert inliers[index] == int(np.count_nonzero(finite & (distances[index] <= 2.0)))
         layer = render_script.cube_layer_mask(objects[index], 0, int(sides[index]), 1)
-        assert layer_inliers[index] == int(np.count_nonzero(valid & layer & (distances[index] <= 2.0)))
+        assert layer_inliers[index] == int(np.count_nonzero(finite & layer & (distances[index] <= 2.0)))
     assert np.all(np.isinf(means[2:]))
     assert np.all(np.isinf(robust[2:]))
     assert np.all(np.isinf(p90[2:]))
     assert np.array_equal(inliers[2:], [0, 0])
     assert np.array_equal(layer_inliers[2:], [0, 0])
+    assert np.array_equal(valid_trials, [True, True, False, False])
+
+
+def test_move_lookahead_preserves_a_complete_no_turn_path_until_later_evidence():
+    initial = render_script.CubeGeometryState.identity()
+    static = _lookahead_trial(2.0, baseline=True)
+    action = _lookahead_trial(0.0, ("R",))
+    debug = {}
+
+    def evaluate(frame, states):
+        if frame == 1:
+            return tuple((
+                (_lookahead_trial(2.0, baseline=True), _lookahead_trial(0.0, ("L",)))
+                if state.signature() == initial.signature() else (_lookahead_trial(0.0),)
+            ) for state in states)
+        return tuple((_lookahead_trial(0.0 if state.signature() == initial.signature() else 10.0),)
+                     for state in states)
+
+    paths = render_script.search_move_lookahead_paths(
+        initial, (static, action), (1, 2), evaluate, state_batch_size=1, diagnostics=debug,
+    )
+    winner = min(paths, key=lambda path: render_script.move_lookahead_weighted_score(
+        path.first_trial["state_score"], path.future_scores))
+    assert winner.first_trial is static
+    assert winner.move_count == 0
+    assert winner.future_scores == (2.0, 0.0)
+    assert debug["initial_no_turn_score"] == pytest.approx(render_script.move_lookahead_path_score(winner))
+    assert debug["optimality"] == "proven"
+    assert all(not trial["state_moves"] for trial in winner.future_trials)
+
+
+def test_no_turn_comparison_does_not_depend_on_exact_static_geometry():
+    initial = render_script.CubeGeometryState.identity()
+    partial_hold = _lookahead_trial(2.0)  # Non-baseline geometry, zero state offset.
+    paths = render_script.search_move_lookahead_paths(
+        initial, (partial_hold, _lookahead_trial(0.0, ("R",))), (1,),
+        lambda frame, states: tuple((_lookahead_trial(
+            0.0 if state.signature() == initial.signature() else 10.0),) for state in states),
+        state_batch_size=1,
+    )
+    winner = min(paths, key=lambda path: render_script.move_lookahead_weighted_score(
+        path.first_trial["state_score"], path.future_scores))
+    assert winner.first_trial is partial_hold
+    assert winner.move_count == 0
+
+
+def test_sequence_move_cost_rejects_tiny_gains_without_excluding_a_move():
+    initial = render_script.CubeGeometryState.identity()
+    static = _lookahead_trial(1.0, baseline=True)
+    action = _lookahead_trial(0.999, ("R",))
+    paths = render_script.search_move_lookahead_paths(
+        initial, (static, action), (), lambda *args: (),
+    )
+    assert any(path.first_trial is action for path in paths)
+    assert min(paths, key=render_script.move_lookahead_path_score).first_trial is static
+
+
+def test_future_evidence_can_pay_for_a_move_with_a_worse_current_fit():
+    initial = render_script.CubeGeometryState.identity()
+    static = _lookahead_trial(1.0, baseline=True)
+    action = _lookahead_trial(1.2, ("R",))
+    paths = render_script.search_move_lookahead_paths(
+        initial, (static, action), (1, 2),
+        lambda frame, states: tuple((_lookahead_trial(
+            1.0 if state.signature() == initial.signature() else 0.0),) for state in states),
+    )
+    winner = min(paths, key=render_script.move_lookahead_path_score)
+    assert winner.first_trial is action
+    assert render_script.move_lookahead_path_score(winner) == pytest.approx(0.36 + 0.01)
+
+
+def test_move_cost_is_charged_once_per_turn_outside_temporal_weights():
+    initial = render_script.CubeGeometryState.identity()
+    paths = render_script.search_move_lookahead_paths(
+        initial, (_lookahead_trial(0.0, ("R",)),), (1, 2),
+        lambda frame, states: ((_lookahead_trial(0.0, ("U",) if frame == 2 else ()),),) * len(states),
+        diagnostics={},
+    )
+    path = paths[0]
+    assert path.move_count == 2
+    assert path.state.signature() == initial.apply_moves(("R", "U")).signature()
+    forecast = render_script.move_lookahead_path_log(path, (70, 71, 72))
+    assert forecast["observation_score"] == 0.0
+    assert forecast["move_cost"] == pytest.approx(0.02)
+    assert forecast["total_score"] == pytest.approx(0.02)
+    assert [step["move_cost"] for step in forecast["steps"]] == pytest.approx([0.01, 0.0, 0.01])
+    assert sum(step["weighted_score"] for step in forecast["steps"]) == pytest.approx(forecast["total_score"])
+
+
+@pytest.mark.parametrize("state_batch_size", [1, 5, 32])
+def test_adaptive_search_can_choose_the_24th_color_ranked_change(state_batch_size):
+    initial = render_script.CubeGeometryState.identity()
+    moves = [base + suffix for base in ("R", "L", "U", "D", "F", "B", "Rw", "Lw", "Uw", "Dw", "Fw", "Bw")
+             for suffix in ("", "'")]
+    target = initial.apply_move(moves[-1]).signature()
+    static = dict(_lookahead_trial(0.2, baseline=True), color_error=0.2)
+    changes = tuple(dict(_lookahead_trial(0.4 + i / 100.0, (move,)), color_error=i / 100.0)
+                    for i, move in enumerate(moves))
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        initial, (static, *changes), (1,),
+        lambda frame, states: tuple((_lookahead_trial(0.0 if state.signature() == target else 5.0),)
+                                    for state in states),
+        state_batch_size=state_batch_size, state_change_limit=None,
+        frame_score_lower_bounds=(0.0, 0.0), diagnostics=debug,
+    )
+    winner = min(paths, key=render_script.move_lookahead_path_score)
+    assert winner.first_trial is changes[-1]
+    assert winner.first_trial["state_moves"] == ("Bw'",)
+    assert debug["optimality"] == "proven"
+
+
+def test_adaptive_search_collapses_12_holds_before_expanding():
+    initial = render_script.CubeGeometryState.identity()
+    holds = tuple(dict(_lookahead_trial(0.2 + i / 10.0, baseline=i == 0),
+                       trial_id=f"{i}:+0", color_error=0.2) for i in range(12))
+    evaluated = []
+
+    def evaluate(frame, states):
+        evaluated.append((frame, len(states)))
+        return ((_lookahead_trial(0.1),),) * len(states)
+
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        initial, holds, (1,), evaluate, diagnostics=debug, frame_score_lower_bounds=(0.0, 0.0),
+    )
+    assert min(paths, key=render_script.move_lookahead_path_score).first_trial is holds[0]
+    assert debug["depths"][0]["collapsed_holds"] == 11
+    assert debug["depths"][0]["expanded_paths"] == 1
+    assert evaluated == [(1, 1)]
+
+
+@pytest.mark.parametrize("bounds", [None, (0.0, -2.0)])
+def test_adaptive_bound_allows_negative_future_error_to_rescue_a_prefix(bounds):
+    initial = render_script.CubeGeometryState.identity()
+    hold = _lookahead_trial(0.0, baseline=True)
+    action = _lookahead_trial(1.0, ("R",))
+    paths = render_script.search_move_lookahead_paths(
+        initial, (hold, action), (1,),
+        lambda frame, states: tuple((_lookahead_trial(
+            0.0 if state.signature() == initial.signature() else -2.0),) for state in states),
+        frame_score_lower_bounds=bounds,
+    )
+    assert min(paths, key=render_script.move_lookahead_path_score).first_trial is action
+
+
+def test_adaptive_bound_prunes_only_when_a_complete_solution_cannot_be_beaten():
+    initial = render_script.CubeGeometryState.identity()
+    hold = _lookahead_trial(0.0, baseline=True)
+    action = _lookahead_trial(1.0, ("R",))
+    evaluated = []
+
+    def evaluate(frame, states):
+        evaluated.extend(state.signature() for state in states)
+        return ((_lookahead_trial(0.0),),) * len(states)
+
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        initial, (hold, action), (1,), evaluate,
+        frame_score_lower_bounds=(0.0, 0.0), diagnostics=debug,
+    )
+    assert min(paths, key=render_script.move_lookahead_path_score).first_trial is hold
+    assert evaluated == [initial.signature()]
+    assert debug["roots"][1]["status"] == "bound_pruned"
+    example = debug["roots"][1]["pruning_examples"][0]
+    assert example["lower_bound"] > example["incumbent_score"]
+    assert debug["optimality"] == "proven"
+
+
+def test_optimistic_color_bound_is_valid_for_every_state_and_offset():
+    torch = pytest.importorskip("torch")
+    candidate = replace(_lookahead_test_candidate(), rvec=np.asarray([[0.18], [-0.25], [0.12]]))
+    faces = render_script.projected_sticker_faces(candidate, candidate.rvec, candidate.tvec)
+    centers = tuple(polygon.mean(axis=0) for _, _, polygon in faces)
+    candidate = replace(candidate, sticker_mask_centers=centers,
+                        sticker_mask_colors=(np.asarray([255, 0, 0], dtype=np.uint8),) * len(centers))
+    options = tuple(dict(layer_axis=axis, layer_side=side, layer_count=width,
+                         layer_rotations=(render_script.CubeLayerRotation(axis, side, angle, width),) if angle else (),
+                         label=f"option-{i}", is_baseline=not angle, combined_mean_error=0.03 + i / 100.0,
+                         assignment_projected_points=None, assignment_object_points=None,
+                         assignment_projected_class_ids=None)
+                    for i, (axis, side, width, angle) in enumerate(((2, -1, 1, 0.0), (0, 1, 2, 15.0), (1, -1, 1, -21.0))))
+    initial = render_script.CubeGeometryState.identity()
+    states = (initial, initial.apply_moves(("R", "U")), initial.apply_moves(("Bw", "L'")))
+    # Densities greater than one deliberately exercise negative color errors.
+    likelihoods = np.random.default_rng(12).uniform(0.01, 2.0, (54, len(centers)))
+    lower = render_script._turn_color_frame_score_lower_bound(
+        candidate, options, 10.0, torch.device("cpu"), likelihoods,
+    )
+    scores = render_script._score_turn_color_offsets_for_states_on_gpu(
+        candidate, options, 10.0, torch.device("cpu"), likelihoods, states,
+    )
+    assert np.isfinite(lower)
+    assert all(lower <= trial["state_score"] for trials in scores for trial in trials)
+
+
+def test_color_shortlist_keeps_hold_and_top_10_changes_at_the_root():
+    initial = render_script.CubeGeometryState.identity()
+    moves = [base + suffix for base in ("R", "L", "U", "D", "F", "B", "Rw", "Lw", "Uw", "Dw", "Fw", "Bw")
+             for suffix in ("", "'")]
+    target = initial.apply_move(moves[-1]).signature()
+    hold = dict(_lookahead_trial(0.2, baseline=True), color_error=3.9)
+    changes = tuple(dict(_lookahead_trial(0.4 + i / 100.0, (move,)), color_error=i / 100.0)
+                    for i, move in enumerate(moves))
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        initial, (hold, *changes), (1,),
+        lambda frame, states: tuple((_lookahead_trial(0.0 if state.signature() == target else 5.0),)
+                                    for state in states),
+        frame_score_lower_bounds=(0.0, 0.0), diagnostics=debug,
+    )
+    assert min(paths, key=render_script.move_lookahead_path_score).first_trial is hold
+    assert debug["state_change_limit"] == 10
+    assert debug["depths"][0]["expanded_paths"] == 11
+    assert debug["depths"][0]["color_pruned_paths"] == 14
+    assert all(root["status"] == "color_pruned" for root in debug["roots"][11:])
+    assert debug["optimality"] == "proven_within_shortlist"
+
+
+def test_color_shortlist_applies_again_in_future_frames_and_uses_color_rank():
+    initial = render_script.CubeGeometryState.identity()
+    moves = [base + suffix for base in ("R", "L", "U", "D", "F", "B", "Rw", "Lw", "Uw", "Dw", "Fw", "Bw")
+             for suffix in ("", "'")]
+    hold = dict(_lookahead_trial(10.0), color_error=0.0)
+    changes = tuple(dict(_lookahead_trial(4.0 if i < 10 else 0.3, (move,)), color_error=i / 100.0)
+                    for i, move in enumerate(moves))
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        initial, (_lookahead_trial(0.0, baseline=True),), (1,),
+        lambda frame, states: ((hold, *changes),) * len(states), diagnostics=debug,
+    )
+    winner = min(paths, key=render_script.move_lookahead_path_score)
+    assert winner.future_trials[0]["state_moves"] == ("R",)
+    assert debug["depths"][1]["expanded_paths"] == 11
+    assert debug["depths"][1]["color_pruned_paths"] == 14
+    assert debug["optimality"] == "proven_within_shortlist"
+
+
+@pytest.mark.parametrize("known_colors", [True, False])
+def test_unreliable_color_holds_do_not_train_color_models(monkeypatch, known_colors):
+    candidate = _lookahead_test_candidate()
+    trace = render_script.StickerColorTrace.create()
+    label = trace.identities[0].label
+    records = []
+    for frame in range(2):
+        trace.observe(frame, {label: np.asarray([180, 40, 20], dtype=np.uint8)})
+        records.append(SimpleNamespace(frame_index=frame, pose_candidate=candidate,
+                                       pose_candidates=(candidate,), sticker_masks=None))
+    learned = []
+    monkeypatch.setattr(render_script, "_turn_torch_scoring_device", lambda _: "cpu")
+    monkeypatch.setattr(render_script, "_build_turn_geometry_frame", lambda *args: None)
+    monkeypatch.setattr(render_script, "solve_pnp_from_low_error_assignments", lambda pose, **kwargs:
+                        replace(pose, turn_state_moves=("R",), turn_fit_evaluated=True, turn_fit_color_score=float("inf")))
+    monkeypatch.setattr(render_script, "pose_reprojection_error_is_acceptable", lambda _: True)
+    monkeypatch.setattr(render_script, "_update_sticker_color_posteriors", lambda *args, **kwargs: learned.append("posterior"))
+    monkeypatch.setattr(render_script, "refine_global_color_profiles_from_initial_state",
+                        lambda *args, **kwargs: learned.append("profiles"))
+    render_script.recover_cached_pose_symmetries(
+        records, trace, pose_prepared=True, recover_orientation=False, recognize_moves=True,
+        global_profiles={}, known_initial_colors={label: "red"} if known_colors else None,
+        calibrate_initial_colors=known_colors,
+    )
+    assert all(record.pose_candidate.turn_color_unreliable for record in records)
+    assert learned == []
+
+
+def test_selected_color_score_tracks_the_trial_instead_of_the_static_reference():
+    candidate = replace(_lookahead_test_candidate(), turn_fit_color_score=10.0, turn_color_unreliable=True)
+    selected = render_script._candidate_with_turn_trial(candidate, candidate, dict(
+        trial_id="0:-90", is_baseline=False, layer_axis=0, layer_side=1, layer_count=1,
+        layer_rotations=(), color_offset=-90.0, state_moves=("R",), color_error=0.4,
+    ))
+    assert selected.turn_fit_color_score == 0.4
+    assert selected.turn_color_unreliable is False
+
+
+def test_local_accepted_hold_clears_an_old_unreliable_color_flag(monkeypatch):
+    torch = pytest.importorskip("torch")
+    candidate = replace(_lookahead_test_candidate(), turn_color_unreliable=True)
+    option = dict(layer_axis=0, layer_side=1, layer_count=1, layer_rotations=(),
+                  label="static R", is_baseline=True, combined_mean_error=0.03,
+                  keypoint_error=0.01, sticker_error=0.02, robust_error=0.04,
+                  assignment_projected_points=None, assignment_object_points=None,
+                  assignment_projected_class_ids=None)
+    monkeypatch.setattr(render_script, "_turn_torch_scoring_device", lambda _: torch.device("cpu"))
+    monkeypatch.setattr(render_script, "turn_color_predictive_likelihoods", lambda *args: None)
+    result = render_script.recover_misaligned_cube_layers_from_geometry(
+        candidate, 10.0, dict(options=(option,), static_trials=(option,)),
+    )
+    assert result.turn_state_moves == ()
+    assert result.turn_color_unreliable is False
+
+
+def test_state_budget_returns_a_complete_forecast_and_honest_bound():
+    initial = render_script.CubeGeometryState.identity()
+    hold = _lookahead_trial(5.0, baseline=True)
+    change = _lookahead_trial(0.0, ("R",))
+    evaluated = []
+
+    def evaluate(frame, states):
+        evaluated.extend((frame, state.signature()) for state in states)
+        return ((_lookahead_trial(5.0),),) * len(states)
+
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        initial, (hold, change), (1, 2), evaluate, diagnostics=debug,
+        state_evaluation_budget=3, frame_score_lower_bounds=(0.0, 0.0, 0.0),
+    )
+    winner = min(paths, key=render_script.move_lookahead_path_score)
+    assert winner.first_trial is hold
+    assert len(winner.future_scores) == len(winner.future_trials) == 2
+    assert debug['budget_exhausted']
+    assert debug['optimality'] == 'budget_exhausted'
+    assert debug['termination_reason'] == 'state_budget'
+    assert debug['evaluated_states'] == 1 + len(evaluated) == 3
+    assert debug['best_lower_bound'] <= render_script.move_lookahead_path_score(winner)
+    assert debug['optimality_gap'] > 0
+
+
+def test_greedy_seed_supplies_complete_path_without_any_hold():
+    initial = render_script.CubeGeometryState.identity()
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        initial, (_lookahead_trial(1.0, ('R',)),), (1, 2),
+        lambda frame, states: ((_lookahead_trial(1.0, ('U',)),),) * len(states),
+        diagnostics=debug, state_evaluation_budget=3, seed_greedy=True,
+    )
+    winner = min(paths, key=render_script.move_lookahead_path_score)
+    assert winner.move_count == 3
+    assert len(winner.future_trials) == 2
+    assert winner.state.signature() == initial.apply_moves(('R', 'U', 'U')).signature()
+    assert debug['seeds'][0]['status'] == 'complete'
+    assert debug['evaluated_states'] <= 3
+
+
+def test_warm_start_is_rescored_and_cannot_bypass_color_shortlist():
+    initial = render_script.CubeGeometryState.identity()
+    hold = dict(_lookahead_trial(5.0, baseline=True), color_error=0.1)
+    first = dict(_lookahead_trial(1.0, ('R',)), color_error=0.1)
+    excluded = dict(_lookahead_trial(0.0, ('U',)), color_error=0.2)
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        initial, (hold, first, excluded), (1,),
+        lambda frame, states: ((_lookahead_trial(1.0),),) * len(states),
+        warm_start_moves=(('U',), ()), state_change_limit=1, diagnostics=debug,
+    )
+    winner = min(paths, key=render_script.move_lookahead_path_score)
+    assert winner.first_trial is first
+    assert all(path.first_trial is not excluded for path in paths)
+    assert debug['seeds'][0]['source'] == 'previous_forecast'
+    assert debug['seeds'][0]['repaired_steps'] == 1
+    assert debug['optimality'] == 'proven_within_shortlist'
+
+
+def test_budget_stop_without_complete_path_is_not_reported_as_proven_failure():
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        render_script.CubeGeometryState.identity(),
+        (_lookahead_trial(0.0, ('R',)), _lookahead_trial(1.0, ('U',))), (1,),
+        lambda frame, states: ((dict(_lookahead_trial(0.0), color_error=float("inf")),),) * len(states),
+        seed_greedy=True, state_evaluation_budget=2, diagnostics=debug,
+    )
+    assert not paths
+    assert debug['budget_exhausted']
+    assert debug['optimality'] == 'budget_exhausted_no_path'
+    assert debug['evaluated_states'] == 2
+    assert any(root['status'] == 'budget_unfinished' for root in debug['roots'])
+
+
+def test_search_budget_parser_and_validation():
+    parser = render_script.build_parser()
+    args = ['--source', 'frame.png', '--initial-scramble', '']
+    assert parser.parse_args(args).turn_search_state_budget == 1024
+    assert parser.parse_args([*args, '--turn-search-state-budget', '256']).turn_search_state_budget == 256
+    assert parser.parse_args([*args, '--turn-search-state-budget', 'unlimited']).turn_search_state_budget is None
+    for bad in ('0', '10', '-1', '1.5', 'nan'):
+        with pytest.raises(SystemExit):
+            parser.parse_args([*args, '--turn-search-state-budget', bad])
+    with pytest.raises(ValueError, match='at least one state'):
+        render_script.search_move_lookahead_paths(
+            render_script.CubeGeometryState.identity(), (), (1, 2), lambda *args: (), state_evaluation_budget=2,
+        )
+
+
+@pytest.mark.parametrize('change', ['likelihoods', 'observations', 'uncertainty', 'pose', 'geometry', 'limit'])
+def test_projection_assignment_cache_matches_fresh_scoring_and_invalidates(change):
+    torch = pytest.importorskip('torch')
+    candidate = replace(_lookahead_test_candidate(), rvec=np.asarray([[0.18], [-0.25], [0.12]]))
+    faces = render_script.projected_sticker_faces(candidate, candidate.rvec, candidate.tvec)
+    centers = tuple(polygon.mean(axis=0) for _, _, polygon in faces)
+    candidate = replace(candidate, sticker_mask_centers=centers,
+                        sticker_mask_colors=(np.asarray([255, 0, 0], dtype=np.uint8),) * len(centers),
+                        sticker_mask_center_uncertainties=(1.0,) * len(centers))
+    options = (dict(layer_axis=2, layer_side=-1, layer_count=1, layer_rotations=(),
+                    label='static', is_baseline=True, combined_mean_error=0.03,
+                    assignment_projected_points=None, assignment_object_points=None,
+                    assignment_projected_class_ids=None),)
+    initial = render_script.CubeGeometryState.identity()
+    states = (initial, initial.apply_moves(('R', 'U')))
+    likelihoods = np.random.default_rng(19).uniform(0.01, 2.0, (54, len(centers)))
+    cache = {}
+    score = render_script._score_turn_color_offsets_for_states_on_gpu
+    score(candidate, options, 10.0, torch.device('cpu'), likelihoods, states[:1], projection_cache=cache)
+    score(candidate, options, 10.0, torch.device('cpu'), likelihoods, states[1:], projection_cache=cache)
+    assert cache['builds'] == cache['assignments']['builds'] == 1
+    assert cache['hits'] == cache['assignments']['hits'] == 1
+    limit = 10.0
+    if change == 'likelihoods':
+        likelihoods = likelihoods[:, ::-1].copy()
+    elif change == 'observations':
+        candidate = replace(candidate, sticker_mask_centers=tuple(center + [1.0, -2.0] for center in centers))
+    elif change == 'uncertainty':
+        candidate = replace(candidate, sticker_mask_center_uncertainties=tuple(1.0 + i % 3 for i in range(len(centers))))
+    elif change == 'pose':
+        candidate = replace(candidate, rvec=candidate.rvec + 0.02)
+    elif change == 'geometry':
+        options = (dict(options[0], layer_rotations=(render_script.CubeLayerRotation(2, -1, 15.0, 1),)),)
+    elif change == 'limit':
+        limit = 1.0
+    cached = score(candidate, options, limit, torch.device('cpu'), likelihoods, states, projection_cache=cache)
+    fresh = score(candidate, options, limit, torch.device('cpu'), likelihoods, states)
+    np.testing.assert_allclose([[t['state_score'] for t in ts] for ts in cached],
+                               [[t['state_score'] for t in ts] for ts in fresh], rtol=0, atol=1e-12)
+    assert [[t['color_match_count'] for t in ts] for ts in cached] == [[t['color_match_count'] for t in ts] for ts in fresh]
+    assert cache['builds'] == (2 if change in ('pose', 'geometry') else 1)
+    if change in ('observations', 'uncertainty', 'limit'):
+        assert cache['assignments']['builds'] == 2
+    if change == 'likelihoods':
+        assert cache['assignments']['builds'] == 1
+
+
+def test_wrapper_state_budget_keeps_complete_forecasts_and_json_safe_bounds(tmp_path, monkeypatch):
+    monkeypatch.setattr(render_script, 'PNP_TURN_LOOKAHEAD_STATE_BUDGET', 3)
+    path = _write_search_debug_log(tmp_path, monkeypatch)
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    first = records[0]['search']
+    assert first['budget_exhausted']
+    assert first['decision_evaluated_states'] <= 3
+    assert first['state_evaluation_budget'] == 3
+    assert len(first['selected_path']['steps']) == 3
+    assert first['optimality'] == 'budget_exhausted'
+    assert records[1]['search']['reused_previous_forecast']
+    json.dumps(records, allow_nan=False)
+
+
+def test_default_color_scoring_keeps_large_finite_errors_and_full_horizon(monkeypatch, tmp_path):
+    candidate = _lookahead_test_candidate()
+    colors = (0.8, 24.2, 0.79)
+    records = [SimpleNamespace(frame_index=f, pose_candidate=replace(candidate,
+                tvec=np.asarray([[float(f)], [0.0], [200.0]])), pose_candidates=(), sticker_masks=None)
+               for f in range(3)]
+
+    def score(pose, *args, **kwargs):
+        color = colors[int(pose.tvec[0, 0])]
+        return [dict(_lookahead_trial(color, baseline=True), color_error=color)]
+
+    monkeypatch.setattr(render_script, '_turn_torch_scoring_device', lambda _: 'cpu')
+    monkeypatch.setattr(render_script, '_build_turn_geometry_frame', lambda *args: dict(options=({},)))
+    monkeypatch.setattr(render_script, 'turn_color_predictive_likelihoods', lambda *args: None)
+    monkeypatch.setattr(render_script, '_score_turn_color_offsets_on_gpu', score)
+    monkeypatch.setattr(render_script, '_score_turn_color_offsets_for_states_on_gpu',
+                        lambda pose, options, limit, device, likelihoods, states, **kwargs: [score(pose) for _ in states])
+    monkeypatch.setattr(render_script, 'solve_pnp_from_low_error_assignments', lambda pose, **kwargs: pose)
+    monkeypatch.setattr(render_script, 'pose_reprojection_error_is_acceptable', lambda _: True)
+    log = tmp_path / 'scores.jsonl'
+    render_script.recover_cached_pose_symmetries(
+        records, render_script.StickerColorTrace.create(), pose_prepared=True,
+        recover_orientation=False, recognize_moves=True, global_profiles={}, known_initial_colors={},
+        turn_candidate_log=log,
+    )
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    assert rows[0]['search']['frames'] == [0, 1, 2]
+    assert [step['color_error'] for step in rows[0]['search']['selected_path']['steps']] == list(colors)
+    assert rows[1]['turn_fit_color_score'] == 24.2
+    assert all(not row['color_evidence_unreliable'] for row in rows)
+    assert all(depth['invalid_color'] == 0 for row in rows for depth in row['search']['depths'])
+    json.dumps(rows, allow_nan=False)
+
+
+@pytest.mark.parametrize('moves', [(), ('R',)])
+@pytest.mark.parametrize('color', [4.01, 1e6])
+def test_large_finite_color_scores_do_not_disqualify_hold_or_turn(moves, color):
+    trial = dict(_lookahead_trial(color, moves, baseline=not moves), color_error=color)
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        render_script.CubeGeometryState.identity(), (trial,), (), lambda *args: (), diagnostics=debug,
+    )
+    assert paths
+    assert min(paths, key=render_script.move_lookahead_path_score).first_trial is trial
+    assert debug['depths'][0]['invalid_color'] == 0
+
+
+@pytest.mark.parametrize('color', [float('nan'), float('inf'), -float('inf')])
+@pytest.mark.parametrize('moves', [(), ('R',)])
+def test_available_nonfinite_color_fit_is_still_invalid(color, moves):
+    trial = dict(_lookahead_trial(0.0, moves, baseline=not moves), color_error=color)
+    debug = {}
+    paths = render_script.search_move_lookahead_paths(
+        render_script.CubeGeometryState.identity(), (trial,), (), lambda *args: (),
+        diagnostics=debug, seed_greedy=True,
+    )
+    assert not paths
+    assert debug['depths'][0]['invalid_color'] == 1
+    assert debug['roots'][0]['status'] == 'invalid_color'
+
+
+def test_removed_color_cutoff_is_not_a_cli_option():
+    parser = render_script.build_parser()
+    args = ['--source', 'frame.png', '--initial-scramble', '']
+    parsed = parser.parse_args(args)
+    assert not hasattr(parsed, 'turn_color_error_ceiling')
+    with pytest.raises(SystemExit):
+        parser.parse_args([*args, '--turn-color-error-ceiling', '4.0'])
+
+
+def test_failed_future_color_does_not_trigger_evidence_omission(monkeypatch, tmp_path):
+    candidate = _lookahead_test_candidate()
+    records = [SimpleNamespace(frame_index=f, pose_candidate=replace(candidate,
+                tvec=np.asarray([[float(f)], [0.0], [200.0]])), pose_candidates=(), sticker_masks=None)
+               for f in range(3)]
+
+    def score(pose, *args, **kwargs):
+        color = float('inf') if int(pose.tvec[0, 0]) == 1 else 0.5
+        return [dict(_lookahead_trial(color, baseline=True), color_error=color)]
+
+    monkeypatch.setattr(render_script, '_turn_torch_scoring_device', lambda _: 'cpu')
+    monkeypatch.setattr(render_script, '_build_turn_geometry_frame', lambda *args: dict(options=({},)))
+    monkeypatch.setattr(render_script, 'turn_color_predictive_likelihoods', lambda *args: None)
+    monkeypatch.setattr(render_script, '_score_turn_color_offsets_on_gpu', score)
+    monkeypatch.setattr(render_script, '_score_turn_color_offsets_for_states_on_gpu',
+                        lambda pose, options, limit, device, likelihoods, states, **kwargs: [score(pose) for _ in states])
+    monkeypatch.setattr(render_script, 'solve_pnp_from_low_error_assignments', lambda pose, **kwargs: pose)
+    monkeypatch.setattr(render_script, 'pose_reprojection_error_is_acceptable', lambda _: True)
+    log = tmp_path / 'scores.jsonl'
+    render_script.recover_cached_pose_symmetries(
+        records, render_script.StickerColorTrace.create(), pose_prepared=True,
+        recover_orientation=False, recognize_moves=True, global_profiles={}, known_initial_colors={},
+        turn_candidate_log=log,
+    )
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    assert rows[0]['search']['frames'] == [0, 1, 2]
+    assert rows[0]['search']['skipped_frames'] == []
+    assert rows[0]['search']['fallback_reason'] == 'no_surviving_path'
+    assert rows[0]['search']['optimality'] == 'no_finite_path'
+    assert all(not row['selected_committed_moves'] for row in rows)
+    json.dumps(rows, allow_nan=False)

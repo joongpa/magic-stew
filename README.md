@@ -393,6 +393,18 @@ turn configurations, their global mean and robust scores, keypoint/heatmap
 components, inlier counts, trigger diagnostics, and the selected result. It
 also includes the search-time camera/pose inputs, observed keypoints/classes,
 fixed assignments, and heatmap centers needed to reproject every logged pose.
+New logs include a search trace: the last committed move, current-frame winner
+versus sequence winner, retained geometric options, cache/batch counts, and
+per-depth counts for collapsed holds, states scored, equivalent-prefix merging,
+bound pruning, completed paths and queued work. Logs include future lower
+bounds, incumbent updates, optimality status and examples of pruned bounds.
+Inverse and state-revisit pruning are disabled; older logs may record beam or
+history restrictions. Every starting candidate has a recorded fate. Up to eight best
+forecasts for distinct starting candidates, plus static-first and complete
+no-turn comparisons when needed, include the predicted move, actual video frame index, score components,
+and weighted contribution at each step. These diagnostics are collected only
+when logging is enabled; future steps are forecasts, not committed moves.
+Stable trial IDs distinguish sticker offsets that share identical geometry.
 Annotated candidate images are saved unless `--turn-candidate-images` points
 elsewhere.
 With `--recognize-moves`, pose refinement and geometric turn search run on
@@ -415,19 +427,75 @@ Without `--recognize-moves`, the default pose-symmetry option uses the same
 closest-color-profile orientation recovery as the original pose pipeline. It
 evaluates the 24 proper cube symmetries and uses profile likelihood plus pose
 continuity to select the closest orientation before rendering.
-Pose continuity uses a two-sided 40 mm translation check: an isolated
-candidate is rejected when it differs from both the preceding accepted pose
-and the next candidate by more than 40 mm.
+The outright reprojection threshold and the two-sided 40 mm translation
+rejection are temporarily disabled. Reprojection and translation still
+contribute to pose selection, and invalid geometry remains ineligible.
 
-Move recognition defaults to the exhaustive angle-search mode. It tests every
-single/double layer configuration over the `-90°` through `90°` range in 6°
-increments, ranking each
-configuration with a regularized mean of normalized keypoint reprojection,
-sticker-mask-centroid fit, and—when global color profiles and sticker priors
-are available—a `p(observation|prior)` color fit weighted at twice the
-combined keypoint-plus-centroid terms. Mask centroids use closest
-projected sticker faces so the accelerator can score the complete batch without
-Hungarian matching.
+Move recognition first fits partial geometry for each single/double layer
+choice over `-45°` through `45°` in 6° increments, also testing zero. It then
+scores the `-90°`, zero, and `90°` sticker offsets against the current cube
+state. Keypoint reprojection, sticker-mask-centroid fit, and available color
+likelihoods each contribute with weight one; an impossible color fit is invalid.
+The cached video search uses adaptive branch-and-bound over the next ten
+frames, with no beam width. It first scores a complete no-turn continuation.
+Each parent then keeps one best hold fit plus the top 10 state changes ranked
+by current color error (`PNP_TURN_LOOKAHEAD_STATE_CHANGE_LIMIT`). This cutoff
+applies at every depth; equivalent hold geometries are collapsed before expansion.
+Promising prefixes are scheduled by optimistic full-window cost, with current
+color score guiding exploration. At every depth, a committed move that returns
+to the state at the start of the current window is pruned before shortlisting.
+Holds and partial geometric offsets remain allowed. Intermediate-state revisits
+and returns to states from earlier windows remain eligible. Prefixes reaching
+the same cube state at the same frame have identical future options, so a
+cheaper prefix dominates.
+
+For each future frame, an optimistic color fit lets every observation use its
+best possible sticker identity while retaining the actual geometry, coverage
+and uncertainty weighting. This relaxes physical sticker constraints and
+bounds every feasible state from below, including negative color errors.
+Among eligible transitions, a prefix is pruned only if dominated or if its
+accumulated cost plus the remaining lower bound cannot beat the best complete solution. Unknown bounds
+disable that pruning rather than assuming zero. Finishing the search proves the best sequence within the per-parent color
+shortlists. Lower-ranked changes can therefore be missed. Runtime varies
+with ambiguity. A default **1024 frame/state evaluation budget per decision**
+limits exploration, including the current state, complete-path seeds and cache hits. Configure it with `--turn-search-state-budget 512`,
+or use `--turn-search-state-budget unlimited` for exhaustive search within the
+shortlists. A budget stop returns the best **complete** forecast found, rather
+than comparing unfinished prefixes. It is approximate; logs and the reviewer
+show `budget_exhausted`, evaluations used, the remaining lower bound and its
+gap from the winning score. Unknown bounds leave the gap unavailable.
+
+Alongside the complete no-turn challenger, the search re-scores and extends the
+previous decision's winning forecast, provided its expected state matches the
+actual current state. A greedy full-window rollout supplies another starting
+solution. Seeds obey the same root-return restriction, per-parent shortlist
+and finite-score checks, and are re-evaluated when color profiles change. They improve the incumbent before
+branch-and-bound exploration; they do not force later decisions.
+
+Projection and observation-to-face assignments are cached per frame across
+state batches and lower-bound scoring. Changing pose, layer geometry, observation
+centers, uncertainty weights or the assignment threshold invalidates the relevant
+cache. Color likelihood changes reuse only the geometry/assignments and recompute
+color costs. Past-frame caches are evicted as the window advances.
+
+Uncached states at the same depth share GPU calls. The scheduling batch size
+`PNP_TURN_LOOKAHEAD_STATE_BATCH_SIZE` (32) limits work per call, not which
+states can survive. Scores use two uniform blocks: the front half contributes
+30% total and the back half 70%. For an odd window, the back half contains the
+extra frame. The sequence objective adds `PNP_TURN_LOOKAHEAD_MOVE_COST`
+(0.01) per turn outside those temporal weights. Strong future evidence can
+therefore justify a worse current fit without relative inlier/color acceptance
+gates. Static-first and complete no-turn comparisons are logged separately.
+Color error remains a finite observation cost with no absolute cutoff. Large
+errors stay in both candidate forecasts and the no-turn comparison. A future scoring
+failure invalidates its path instead of triggering evidence omission and retry;
+only unavailable geometry is skipped. Nonfinite fits remain invalid, and an unusable current
+frame holds without training color models. Runtime is controlled separately by
+`--turn-search-state-budget`.
+There is no angular speed limit. Physical sticker projection and color
+sampling include the selected quarter-turn offset on the current frame.
+Mask centroids use closest projected sticker faces so the accelerator can
+score the complete batch without Hungarian matching.
 The live output also shows the accumulated standard moves in the fixed
 white-top/U and green-front/F frame.
 Neural inference runs on CPU with segmentation and pose calls in parallel.
@@ -449,6 +517,13 @@ save `Correct`, `Uncertain`, or `No valid pose`. The
 labels are written to `turn_candidate_scores.labels.json` beside the JSONL and
 do not modify the inference log. Tested options are grouped into collapsible
 single-layer and double-layer sections for each of the six layer sides.
+The Search decision panel compares the current-frame and sequence winners.
+Choose a retained forecast to inspect its move/hold decisions and weighted
+scores; frame buttons open each frame's own recorded decision. Expand the
+search table to see collapsed holds, merges, bound pruning, and future lower bounds, or expand
+the geometric-fit table to inspect stage one. Candidate cards show their
+search fate and best retained sequence score. Older logs remain viewable,
+but need a new recognition run to populate these traces.
 Click a visible projected layer to select it, double-click for a double-layer
 turn, then use `,` and `.` to step through the logged angles. Click the center
 sticker for that face's layer or an outer row for an adjacent layer. New logs
