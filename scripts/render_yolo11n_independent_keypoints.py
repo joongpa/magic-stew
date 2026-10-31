@@ -338,11 +338,11 @@ STICKER_MASK_CONTAINMENT_THRESHOLD = 0.90
 # coverage penalty is converted to cube-normalized distance units before it is
 # combined with keypoint reprojection error.
 PNP_TURN_MASK_CENTER_WEIGHT = 1.0
-# Color contributes twice the total weight of the combined geometric terms in
+# Color contributes the same total weight as the combined geometric terms in
 # the final turn ranking. Geometry is keypoint error plus the sticker-centroid
 # term, while color is the negative log predictive likelihood
 # p(observation | prior).
-PNP_TURN_COLOR_WEIGHT = 4.0
+PNP_TURN_COLOR_WEIGHT = 2.0
 MIN_TURN_LAYER_OBSERVATIONS = 3
 PNP_TURN_CENTER_TOLERANCE_FRACTION = 0.02
 PNP_TURN_CENTER_UNCERTAINTY_TOLERANCE_CAP = 0.01
@@ -352,11 +352,13 @@ PNP_TURN_CENTER_PENALTY_SCALE = 0.05
 # so the same setting works at different distances from the camera. Keep this
 # separate from the acceptance threshold while the turn score is being tuned.
 PNP_FINAL_ASSIGNMENT_ERROR_FRACTION = 0.05
-# Disabled temporarily: retain finite-error checks, but do not reject a pose
-# or turn solely because its normalized reprojection score exceeds a cutoff.
-PNP_POSE_REPROJECTION_ERROR_THRESHOLD: float | None = None
-PNP_LAYER_MISALIGNMENT_MIN_DEGREES = -180.0
-PNP_LAYER_MISALIGNMENT_MAX_DEGREES = 180.0
+# This is the normalized fit threshold used for temporal candidate
+# tie-breaking. Outright acceptance rejection remains disabled while this
+# threshold is being evaluated on live footage.
+PNP_POSE_REPROJECTION_ERROR_THRESHOLD = 0.05
+PNP_POSE_REPROJECTION_ERROR_REJECTION_ENABLED = False
+PNP_LAYER_MISALIGNMENT_MIN_DEGREES = -90.0
+PNP_LAYER_MISALIGNMENT_MAX_DEGREES = 90.0
 PNP_LAYER_MISALIGNMENT_STEP_DEGREES = 6.0
 POSE_MOTION_DISPLACEMENT_TOLERANCE_MM = 40.0
 # Retained for CLI/API compatibility. Move fitting currently evaluates all six
@@ -1256,11 +1258,12 @@ def layer_rotation_debug_label(
 
 
 def turn_search_angles() -> np.ndarray:
-    """Return the exhaustive turn angles with one representative per period."""
+    """Return the inclusive exhaustive turn-angle grid."""
 
     return np.arange(
         PNP_LAYER_MISALIGNMENT_MIN_DEGREES,
-        PNP_LAYER_MISALIGNMENT_MAX_DEGREES,
+        PNP_LAYER_MISALIGNMENT_MAX_DEGREES
+        + PNP_LAYER_MISALIGNMENT_STEP_DEGREES,
         PNP_LAYER_MISALIGNMENT_STEP_DEGREES,
         dtype=np.float64,
     )
@@ -2903,8 +2906,11 @@ def recover_cached_pose_symmetries(
     raw_by_frame = _trace_observations_by_frame(trace)
     raw_weights_by_frame = _trace_observation_weights_by_frame(trace)
     corrected_trace = StickerColorTrace.create()
-    previous_candidate: StickerPnPCandidate | None = None
+    previous_continuity_candidate: StickerPnPCandidate | None = None
+    continuity_symmetry_tracker = CubeSymmetryTracker()
     cube_geometry_state = CubeGeometryState.identity()
+    locked_orientation_symmetry: np.ndarray | None = None
+    locked_orientation_permutation: dict[str, str] | None = None
 
     total_records = len(cache)
     for record_index, record in enumerate(cache, start=1):
@@ -2975,9 +2981,6 @@ def recover_cached_pose_symmetries(
                 )
             return tuple(refined_hypotheses)
 
-        use_known_initial_colors = (
-            recover_orientation and known_initial_colors is not None
-        )
         if recover_orientation:
             (
                 current_log_likelihood,
@@ -2993,7 +2996,9 @@ def recover_cached_pose_symmetries(
                     global_profiles,
                     raw_observation_weights,
                     expected_color_by_label=(
-                        known_initial_colors if use_known_initial_colors else None
+                        known_initial_colors
+                        if known_initial_colors is not None
+                        else None
                     ),
                 )
             )
@@ -3023,8 +3028,100 @@ def recover_cached_pose_symmetries(
         selected_observations = current_observations
         selected_observation_weights = current_observation_weights
         selected_log_likelihood = current_log_likelihood
-        if recover_orientation and observation_count >= POSE_SYMMETRY_RECOVERY_MIN_OBSERVATIONS:
-            scored = []
+        if refine_pose:
+            selected_hypotheses = refine_hypotheses(selected_hypotheses)
+            selected_candidate = selected_hypotheses[selected_candidate_index]
+
+        # Preserve the existing symmetry and refinement order. Continuity is
+        # applied only after the best pose has been selected and refined.
+        continuity_candidate = select_pose_hypothesis(
+            selected_hypotheses,
+            pose_motion_filter.predict_pose()
+            if pose_motion_filter is not None
+            else None,
+            (
+                (previous_continuity_candidate,)
+                if previous_continuity_candidate is not None
+                else ()
+            ),
+            max_core_displacement_mm=(
+                pose_motion_filter.config.max_displacement_mm
+                if pose_motion_filter is not None
+                else POSE_MOTION_DISPLACEMENT_TOLERANCE_MM
+            ),
+        )
+        if continuity_candidate is not None:
+            selected_candidate = continuity_candidate
+            selected_candidate_index = next(
+                index
+                for index, hypothesis in enumerate(selected_hypotheses)
+                if hypothesis is continuity_candidate
+            )
+        motion_rejected = False
+        if pose_motion_filter is not None:
+            predicted_pose = pose_motion_filter.predict_pose()
+            next_candidate = None
+            if record_index < total_records:
+                next_candidate = cache[record_index].pose_candidate
+            if predicted_pose is not None and isinstance(
+                next_candidate,
+                StickerPnPCandidate,
+            ):
+                _predicted_rvec, predicted_tvec = predicted_pose
+                tolerance = float(pose_motion_filter.config.max_displacement_mm)
+                before_displacement = float(
+                    np.linalg.norm(
+                        np.asarray(selected_candidate.tvec, dtype=np.float64).reshape(3)
+                        - np.asarray(predicted_tvec, dtype=np.float64).reshape(3)
+                    )
+                )
+                after_displacement = float(
+                    np.linalg.norm(
+                        np.asarray(next_candidate.tvec, dtype=np.float64).reshape(3)
+                        - np.asarray(selected_candidate.tvec, dtype=np.float64).reshape(3)
+                    )
+                )
+                motion_rejected = (
+                    before_displacement > tolerance
+                    and after_displacement > tolerance
+                )
+        if not motion_rejected:
+            selected_candidate = apply_temporal_pose_filter(
+                selected_candidate,
+                pose_motion_filter,
+            )
+
+        # Keep the pose in one continuous cube coordinate frame before color
+        # recovery changes that frame.  The cached path must use the same
+        # symmetry canonicalization as the live path: the PnP roots can be
+        # physically equivalent while assigning the cube axes differently.
+        # Color recovery is then applied to this already-continuous pose and
+        # its fixed mapping is reused on later frames.
+        selected_candidate = canonicalize_pose_symmetry(
+            selected_candidate,
+            continuity_symmetry_tracker,
+        )
+        selected_hypotheses = tuple(
+            selected_candidate if index == selected_candidate_index else hypothesis
+            for index, hypothesis in enumerate(selected_hypotheses)
+        )
+        # This is the continuity state for the next frame. Keep it before
+        # color orientation recovery and move fitting so neither display
+        # operation can change root matching on the next frame.
+        continuity_reference_candidate = selected_candidate
+
+        # Orientation recovery is deliberately the final pose operation. The
+        # candidate root, temporal continuity choice, motion rejection, and
+        # temporal smoothing must all finish before cube symmetries are
+        # applied to the accepted pose. Color matching establishes this
+        # whole-cube frame once; later frames reuse the same center-to-axis
+        # mapping and never re-rank the 24 symmetries.
+        scored = []
+        if (
+            recover_orientation
+            and locked_orientation_symmetry is None
+            and observation_count >= POSE_SYMMETRY_RECOVERY_MIN_OBSERVATIONS
+        ):
             for symmetry_index, (symmetry, permutation) in enumerate(permutations):
                 (
                     log_likelihood,
@@ -3032,30 +3129,33 @@ def recover_cached_pose_symmetries(
                     _low_count,
                     remapped_observations,
                     remapped_observation_weights,
-                ) = (
-                    _score_symmetry_observations(
-                        raw_observations,
-                        permutation,
-                        priors,
-                        global_profiles,
-                        raw_observation_weights,
-                        expected_color_by_label=(
-                            known_initial_colors if use_known_initial_colors else None
-                        ),
-                    )
+                ) = _score_symmetry_observations(
+                    raw_observations,
+                    permutation,
+                    priors,
+                    global_profiles,
+                    raw_observation_weights,
+                    expected_color_by_label=(
+                        known_initial_colors
+                        if known_initial_colors is not None
+                        else None
+                    ),
                 )
                 if count != observation_count:
                     continue
                 transformed_candidate = transform_candidate_by_symmetry(
-                    candidate_hypotheses[selected_candidate_index],
+                    selected_candidate,
                     symmetry,
                 )
                 continuity_distance = (
                     pose_hypothesis_distance(
                         transformed_candidate,
-                        (previous_candidate.rvec, previous_candidate.tvec),
+                        (
+                            previous_continuity_candidate.rvec,
+                            previous_continuity_candidate.tvec,
+                        ),
                     )
-                    if previous_candidate is not None
+                    if previous_continuity_candidate is not None
                     else 0.0
                 )
                 scored.append(
@@ -3069,25 +3169,32 @@ def recover_cached_pose_symmetries(
                     )
                 )
             if scored:
-                best_continuity_score = max(item[2] for item in scored)
-                continuity_ties = [
+                # Candidate/root continuity has already been resolved above.
+                # Color matching chooses the initial whole-cube frame exactly
+                # once; it is never re-ranked on later frames.
+                best_log_likelihood = max(item[1] for item in scored)
+                color_ties = [
                     item
                     for item in scored
-                    if best_continuity_score - item[2] <= 1e-9
+                    if best_log_likelihood - item[1] <= 1e-9
                 ]
                 (
                     best_symmetry_index,
-                    best_log_likelihood,
+                    best_symmetry_log_likelihood,
                     _best_continuity_score,
                     best_candidate,
                     best_observations,
                     best_observation_weights,
                 ) = max(
-                    continuity_ties,
-                    key=lambda item: (
-                        item[1],
-                        int(item[0] == identity_symmetry_index),
-                    ),
+                    color_ties,
+                    key=lambda item: int(item[0] == identity_symmetry_index),
+                )
+                locked_orientation_symmetry = np.asarray(
+                    permutations[best_symmetry_index][0],
+                    dtype=np.float64,
+                ).copy()
+                locked_orientation_permutation = dict(
+                    permutations[best_symmetry_index][1]
                 )
                 if debug:
                     print(
@@ -3117,17 +3224,39 @@ def recover_cached_pose_symmetries(
                 selected_candidate = best_candidate
                 selected_observations = best_observations
                 selected_observation_weights = best_observation_weights
-                selected_log_likelihood = best_log_likelihood
-
-                # Keep the candidate set aligned with the selected symmetry.
-                selected_symmetry = permutations[best_symmetry_index][0]
+                selected_log_likelihood = best_symmetry_log_likelihood
                 selected_hypotheses = tuple(
-                    transform_candidate_by_symmetry(hypothesis, selected_symmetry)
-                    for hypothesis in candidate_hypotheses
+                    selected_candidate if index == selected_candidate_index else hypothesis
+                    for index, hypothesis in enumerate(selected_hypotheses)
                 )
-        if refine_pose:
-            selected_hypotheses = refine_hypotheses(selected_hypotheses)
-            selected_candidate = selected_hypotheses[selected_candidate_index]
+        elif recover_orientation and locked_orientation_symmetry is not None:
+            # Keep the fixed orientation even when this frame has too few
+            # observations to participate in color matching. The permutation
+            # is reused directly, so no color likelihood is evaluated again.
+            selected_candidate = transform_candidate_by_symmetry(
+                selected_candidate,
+                locked_orientation_symmetry,
+            )
+            selected_observations = {
+                target_label: np.asarray(raw_observations[source_label], dtype=np.uint8).copy()
+                for target_label, source_label in (
+                    locked_orientation_permutation or {}
+                ).items()
+                if source_label in raw_observations
+            }
+            selected_observation_weights = {
+                target_label: float(
+                    np.clip(raw_observation_weights.get(source_label, 1.0), 0.0, 1.0)
+                )
+                for target_label, source_label in (
+                    locked_orientation_permutation or {}
+                ).items()
+                if source_label in raw_observations
+            }
+            selected_hypotheses = tuple(
+                selected_candidate if index == selected_candidate_index else hypothesis
+                for index, hypothesis in enumerate(selected_hypotheses)
+            )
 
         if recognize_moves:
             # Turn fitting is incremental: the candidate's persistent sticker
@@ -3168,39 +3297,6 @@ def recover_cached_pose_symmetries(
             selected_candidate,
             orientation_anchor=orientation_anchor_for_candidate(selected_candidate),
         )
-        motion_rejected = False
-        if pose_motion_filter is not None:
-            predicted_pose = pose_motion_filter.predict_pose()
-            next_candidate = None
-            if record_index < total_records:
-                next_candidate = cache[record_index].pose_candidate
-            if predicted_pose is not None and isinstance(
-                next_candidate,
-                StickerPnPCandidate,
-            ):
-                _predicted_rvec, predicted_tvec = predicted_pose
-                tolerance = float(pose_motion_filter.config.max_displacement_mm)
-                before_displacement = float(
-                    np.linalg.norm(
-                        np.asarray(selected_candidate.tvec, dtype=np.float64).reshape(3)
-                        - np.asarray(predicted_tvec, dtype=np.float64).reshape(3)
-                    )
-                )
-                after_displacement = float(
-                    np.linalg.norm(
-                        np.asarray(next_candidate.tvec, dtype=np.float64).reshape(3)
-                        - np.asarray(selected_candidate.tvec, dtype=np.float64).reshape(3)
-                    )
-                )
-                motion_rejected = (
-                    before_displacement > tolerance
-                    and after_displacement > tolerance
-                )
-        if not motion_rejected:
-            selected_candidate = apply_temporal_pose_filter(
-                selected_candidate,
-                pose_motion_filter,
-            )
         record.pose_diagnostic_candidate = None
         if motion_rejected or not pose_reprojection_error_is_acceptable(selected_candidate):
             # Keep the color trace available for the independent classifier,
@@ -3233,7 +3329,8 @@ def recover_cached_pose_symmetries(
             continue
         record.pose_candidate = selected_candidate
         record.pose_candidates = selected_hypotheses
-        previous_candidate = selected_candidate
+        previous_continuity_candidate = continuity_reference_candidate
+        continuity_symmetry_tracker.observe(continuity_reference_candidate.rvec)
         if recognize_moves:
             committed_moves = completed_candidate_moves(selected_candidate)
             if committed_moves:
@@ -5641,7 +5738,7 @@ def sticker_correspondence_object_indices(
     return tuple(candidates)
 
 
-def solve_sticker_pnp(
+def solve_sticker_pnp_candidates(
     frame_points: np.ndarray,
     point_class_ids: np.ndarray,
     match: StickerKeypointMatch,
@@ -5654,12 +5751,12 @@ def solve_sticker_pnp(
     sticker_mask_centers: tuple[np.ndarray, ...] | None = None,
     sticker_mask_center_uncertainties: tuple[float, ...] | None = None,
     sticker_mask_colors: tuple[np.ndarray, ...] | None = None,
-) -> StickerPnPCandidate | None:
-    """Solve a cube pose from the selected sticker's ordered keypoints."""
+) -> tuple[StickerPnPCandidate, ...]:
+    """Return every valid PnP pose from the selected sticker correspondence."""
 
     observed_indices = list(match.keypoint_indices)
     if match.sticker_type == "unknown" or len(observed_indices) not in (3, 4):
-        return None
+        return tuple()
     observed_points = np.asarray(frame_points[observed_indices], dtype=np.float32)
     observed_class_ids = [int(point_class_ids[index]) for index in observed_indices]
     index_sequences = sticker_correspondence_object_indices(
@@ -5668,7 +5765,7 @@ def solve_sticker_pnp(
         observed_points,
     )
     if not index_sequences:
-        return None
+        return tuple()
 
     camera_matrix = default_camera_matrix(image_size, focal_scale)
     dist_coeffs = np.zeros((4, 1), dtype=np.float64)
@@ -5739,12 +5836,10 @@ def solve_sticker_pnp(
                     dist_coeffs,
                     flags=cv2.SOLVEPNP_IPPE,
                 )
-            elif sticker_contour is not None:
-                # Keep the multi-branch solve only when contour evidence is
-                # available to disambiguate the three-point hypotheses. The
-                # initial candidate pass deliberately omits contour geometry;
-                # using solvePnPGeneric there doubles the downstream scoring
-                # work for every three-point fallback.
+            else:
+                # Three-point hypotheses are coplanar and can have multiple
+                # valid camera poses. Preserve every SQPNP root, including in
+                # the initial pass where contour geometry is unavailable.
                 ok, rvecs, tvecs, _ = cv2.solvePnPGeneric(
                     object_points,
                     observed_points,
@@ -5752,15 +5847,6 @@ def solve_sticker_pnp(
                     dist_coeffs,
                     flags=cv2.SOLVEPNP_SQPNP,
                 )
-            else:
-                ok, rvec, tvec = cv2.solvePnP(
-                    object_points,
-                    observed_points,
-                    camera_matrix,
-                    dist_coeffs,
-                    flags=cv2.SOLVEPNP_SQPNP,
-                )
-                rvecs, tvecs = (rvec,), (tvec,)
         except cv2.error:
             continue
         if not ok or not rvecs or not tvecs:
@@ -5857,14 +5943,49 @@ def solve_sticker_pnp(
                 )
             )
     if not candidates:
-        return None
-    return min(
-        candidates,
-        key=lambda item: (
-            item.overall_reprojection_error,
-            item.reprojection_error,
-        ),
+        return tuple()
+    return tuple(
+        sorted(
+            candidates,
+            key=lambda item: (
+                item.overall_reprojection_error,
+                item.reprojection_error,
+            ),
+        )
     )
+
+
+def solve_sticker_pnp(
+    frame_points: np.ndarray,
+    point_class_ids: np.ndarray,
+    match: StickerKeypointMatch,
+    image_size: tuple[int, int],
+    focal_scale: float,
+    sticker_contour: np.ndarray | None = None,
+    scoring_points: np.ndarray | None = None,
+    sticker_contours: tuple[np.ndarray, ...] | None = None,
+    sticker_boundary_samples: tuple[np.ndarray, ...] | None = None,
+    sticker_mask_centers: tuple[np.ndarray, ...] | None = None,
+    sticker_mask_center_uncertainties: tuple[float, ...] | None = None,
+    sticker_mask_colors: tuple[np.ndarray, ...] | None = None,
+) -> StickerPnPCandidate | None:
+    """Compatibility wrapper returning the best pose for one correspondence."""
+
+    candidates = solve_sticker_pnp_candidates(
+        frame_points,
+        point_class_ids,
+        match,
+        image_size,
+        focal_scale,
+        sticker_contour,
+        scoring_points,
+        sticker_contours,
+        sticker_boundary_samples,
+        sticker_mask_centers,
+        sticker_mask_center_uncertainties,
+        sticker_mask_colors,
+    )
+    return candidates[0] if candidates else None
 
 
 def assignment_geometric_quality(
@@ -6208,7 +6329,7 @@ def pose_reprojection_error_is_acceptable(candidate: object) -> bool:
         return True
     metric = pose_reprojection_fit_metric(candidate)
     return np.isfinite(metric) and (
-        PNP_POSE_REPROJECTION_ERROR_THRESHOLD is None
+        not PNP_POSE_REPROJECTION_ERROR_REJECTION_ENABLED
         or metric <= PNP_POSE_REPROJECTION_ERROR_THRESHOLD
     )
 
@@ -6533,7 +6654,7 @@ def transform_candidate_by_symmetry(
     def transform_optional_rvec(value: np.ndarray | None) -> np.ndarray | None:
         return None if value is None else transform_rvec_by_symmetry(value, symmetry)
 
-    return replace(
+    transformed = replace(
         candidate,
         object_points=transform_object_points_by_symmetry(
             candidate.object_points,
@@ -6559,6 +6680,14 @@ def transform_candidate_by_symmetry(
             np.asarray(symmetry, dtype=np.float64).reshape(3, 3)
             @ prior_object_symmetry
         ),
+    )
+    # Symmetry changes both the cube-frame object points and the camera pose.
+    # Recompute cached projections so sticker centers, assignment residuals,
+    # and color sampling remain aligned after final orientation recovery.
+    return refresh_candidate_pose_projection(
+        transformed,
+        transformed.rvec,
+        transformed.tvec,
     )
 
 
@@ -7649,6 +7778,41 @@ def _turn_gpu_static_geometry() -> tuple[np.ndarray, ...]:
     )
 
 
+def _turn_gpu_identity_indices_for_state(
+    geometry_state: CubeGeometryState | None,
+    canonical_geometry_identity_indices: np.ndarray,
+) -> np.ndarray:
+    """Map each fixed surface position to its current physical identity."""
+
+    canonical_indices = np.asarray(
+        canonical_geometry_identity_indices,
+        dtype=np.int64,
+    ).reshape(-1)
+    if geometry_state is None:
+        return canonical_indices.copy()
+
+    identities = canonical_sticker_identities()
+    identity_index_by_label = {
+        identity.label: index
+        for index, identity in enumerate(identities)
+    }
+    remapped: list[int] = []
+    for canonical_index in canonical_indices:
+        if canonical_index < 0 or canonical_index >= len(identities):
+            raise ValueError("Invalid canonical sticker identity index")
+        canonical_identity = identities[int(canonical_index)]
+        position = (
+            canonical_identity.cubie_index,
+            canonical_identity.axis,
+            canonical_identity.side,
+        )
+        label = geometry_state.facelets.get(position)
+        if label is None or label not in identity_index_by_label:
+            raise ValueError("Incomplete cube geometry state")
+        remapped.append(identity_index_by_label[label])
+    return np.asarray(remapped, dtype=np.int64)
+
+
 def _torch_axis_rotation_matrices(torch_module: object, axes: object, angles: object) -> object:
     """Return one Rodrigues matrix per axis/angle pair."""
 
@@ -7958,15 +8122,6 @@ def _score_turn_configurations_on_gpu(
         import torch
 
         geometry_state = getattr(candidate, "cube_geometry_state", None)
-        if (
-            geometry_state is not None
-            and geometry_state.signature() != CubeGeometryState.identity().signature()
-        ):
-            # The batched accelerator geometry is canonical.  Once a
-            # committed move has permuted persistent sticker identities, use
-            # the CPU path until the equivalent state-aware GPU geometry is
-            # available rather than silently scoring the wrong identities.
-            return None
         base_rotations = tuple(candidate.layer_rotations)
         if base_rotations:
             return None
@@ -7995,6 +8150,10 @@ def _score_turn_configurations_on_gpu(
             sticker_normals,
             sticker_identity_indices,
         ) = _turn_gpu_static_geometry()
+        sticker_identity_indices = _turn_gpu_identity_indices_for_state(
+            geometry_state,
+            sticker_identity_indices,
+        )
         angles = turn_search_angles()
         eligible_layers = {
             (axis, side, layer_count): turn_layer_observation_count(
@@ -8438,12 +8597,6 @@ def turn_trial_exceeds_static_baseline(
             for rotation in trial_rotations[-1:]
         )
         if is_completed_move:
-            # The search pre-filter counts observations that fall inside the
-            # layer, but those observations are not necessarily explained by
-            # the trial.  Do not let a completed move override static based
-            # on a tiny number of accidental layer matches.
-            if int(trial.get("layer_inlier_count", 0)) < MIN_TURN_LAYER_OBSERVATIONS:
-                return False
             trial_rank = tuple(trial.get("rank", ()))
             baseline_rank = tuple(baseline.get("rank", ()))
             return bool(trial_rank and baseline_rank and trial_rank < baseline_rank)
@@ -10655,7 +10808,7 @@ def best_sticker_pnp_candidates(
                 and 0 <= match.mask_index < len(local_masks or ())
             ):
                 sticker_contour = sticker_contours_by_mask[match.mask_index]
-            candidate = solve_sticker_pnp(
+            solved_candidates = solve_sticker_pnp_candidates(
                 frame_points,
                 point_class_ids,
                 match,
@@ -10669,8 +10822,7 @@ def best_sticker_pnp_candidates(
                 sticker_mask_center_uncertainties,
                 sticker_mask_colors,
             )
-            if candidate is not None:
-                candidates.append(candidate)
+            candidates.extend(solved_candidates)
         candidates.sort(
             key=lambda candidate: (
                 pose_hypothesis_visual_score(candidate),
@@ -10820,12 +10972,14 @@ def select_pose_hypothesis(
     previous_candidates: tuple[StickerPnPCandidate, ...] = (),
     max_core_displacement_mm: float = POSE_MOTION_DISPLACEMENT_TOLERANCE_MM,
 ) -> StickerPnPCandidate | None:
-    """Select a pose using only core translation continuity.
+    """Select a pose using the shared fit gate and translation continuity.
 
-    Candidates whose cube-core translation moves more than the configured
-    tolerance from the last accepted pose are rejected. Among candidates that
-    remain, visual quality is the only selection criterion. Rotation,
-    acceleration, jerk, and hypothesis history do not participate.
+    Finite-error candidates remain eligible while the outright acceptance
+    gate is disabled. If any candidates meet the shared fit threshold, only
+    those candidates participate in temporal tie-breaking; the pose with the
+    smallest translation delta from the previous accepted frame wins. Visual
+    fit remains the deterministic fallback when no previous pose is available
+    and breaks exact translation ties.
     """
 
     if not candidates:
@@ -10855,7 +11009,41 @@ def select_pose_hypothesis(
         ]
         if not accepted:
             return None
-    return min(accepted, key=lambda item: item[1])[0]
+    thresholded = [
+        item
+        for item in accepted
+        if pose_reprojection_fit_metric(item[0])
+        <= PNP_POSE_REPROJECTION_ERROR_THRESHOLD
+    ]
+    # The threshold narrows temporal tie-breaking when possible, but does not
+    # reject the frame while the outright acceptance gate is disabled.
+    ranking_pool = thresholded or accepted
+    previous_pose = None
+    if previous_candidates:
+        previous_candidate = previous_candidates[-1]
+        if hasattr(previous_candidate, "tvec"):
+            previous_pose = (
+                getattr(previous_candidate, "rvec", np.zeros((3, 1))),
+                previous_candidate.tvec,
+            )
+    if previous_pose is None:
+        previous_pose = predicted_pose
+    if previous_pose is None:
+        return min(ranking_pool, key=lambda item: item[1])[0]
+    _previous_rvec, previous_tvec = previous_pose
+    previous_translation = np.asarray(previous_tvec, dtype=np.float64).reshape(3)
+    return min(
+        ranking_pool,
+        key=lambda item: (
+            float(
+                np.linalg.norm(
+                    np.asarray(item[0].tvec, dtype=np.float64).reshape(3)
+                    - previous_translation
+                )
+            ),
+            item[1],
+        ),
+    )[0]
 
 
 def predict_pose_result(
@@ -13861,7 +14049,7 @@ def render_frame(
         )
         prepared_candidates = prepare_pose_hypotheses(
             current_candidates,
-            symmetry_tracker,
+            None,
         )
         # Move recognition must not change the static candidate selected from
         # the current frame.  Turn fitting happens only after static PnP
@@ -13883,7 +14071,7 @@ def render_frame(
     if pnp_candidate is not None and (args.show_pnp or recognize_moves):
         hypotheses_to_refine = (
             candidate_hypotheses
-            if cached_final_only and candidate_hypotheses
+            if candidate_hypotheses
             else (pnp_candidate,)
         )
         refined: list[StickerPnPCandidate] = []
@@ -13895,14 +14083,6 @@ def render_frame(
                 max_turn_face_candidates=args.pnp_turn_face_candidates,
                 record_all_turn_candidates=False,
             )
-            if symmetry_tracker is not None:
-                # Apply the continuity choice after refinement too.  This is
-                # normally a no-op, but protects the displayed axes if a
-                # refinement crosses a Rodrigues branch.
-                refined_candidate = canonicalize_pose_symmetry(
-                    refined_candidate,
-                    symmetry_tracker,
-                )
             refined.append(refined_candidate)
         refined_candidates = tuple(refined)
         selected_candidate = select_pose_hypothesis(
@@ -13945,6 +14125,12 @@ def render_frame(
                 pose_motion_filter,
             )
             if symmetry_tracker is not None:
+                # Recover orientation only after root selection, move fitting,
+                # and temporal smoothing have completed.
+                pnp_candidate = canonicalize_pose_symmetry(
+                    pnp_candidate,
+                    symmetry_tracker,
+                )
                 symmetry_tracker.observe(pnp_candidate.rvec)
         else:
             # Do not display or classify a pose that fails the normalized
@@ -14048,6 +14234,14 @@ def render_frame(
         # Rejected diagnostic fits are for visualization only.  They must not
         # advance the accumulated move history or become the next fit prior.
         output = draw_move_accumulator_overlay(output, move_accumulator)
+    if pose_hypothesis_buffer is not None:
+        # Keep only the accepted pose for temporal tie-breaking.  The buffer
+        # still records empty frames so the last accepted pose remains the
+        # prior when a frame is temporarily rejected.
+        pose_hypothesis_buffer.append(
+            (pnp_candidate,) if pnp_candidate is not None else (),
+            frame_index,
+        )
     log_turn_frame(pnp_candidate)
     # Match the live pipeline: keep using this ROI until the independent pose
     # model fails, then fall back to the bbox detector on the next frame.
@@ -14803,7 +14997,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Recovery strategy. angle-search tests every single/double "
             "layer configuration using keypoint and sticker-centroid fit over "
-            "the exhaustive -180..174 degree search in 6 degree steps; "
+            "the exhaustive -90..90 degree search in 6 degree steps; "
             "layer-removal is the faster "
             "subtractive alternative."
         ),

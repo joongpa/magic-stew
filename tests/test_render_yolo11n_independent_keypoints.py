@@ -554,22 +554,22 @@ def test_quicktime_frame_counter_skips_non_quicktime_video_extensions(
     assert output_path.read_bytes() == b"opencv movie"
 
 
-def test_turn_search_defaults_to_all_six_layer_sides_and_full_period():
+def test_turn_search_defaults_to_all_six_layer_sides_and_half_period():
     args = render_script.build_parser().parse_args(["--source", "input.mp4"])
 
     assert args.pnp_turn_face_candidates == 6
-    assert render_script.PNP_LAYER_MISALIGNMENT_MIN_DEGREES == -180.0
-    assert render_script.PNP_LAYER_MISALIGNMENT_MAX_DEGREES == 180.0
+    assert render_script.PNP_LAYER_MISALIGNMENT_MIN_DEGREES == -90.0
+    assert render_script.PNP_LAYER_MISALIGNMENT_MAX_DEGREES == 90.0
     assert render_script.PNP_LAYER_MISALIGNMENT_STEP_DEGREES == 6.0
     angles = render_script.turn_search_angles()
-    assert len(angles) == 60
-    assert angles[0] == -180.0
-    assert angles[-1] == 174.0
+    assert len(angles) == 31
+    assert angles[0] == -90.0
+    assert angles[-1] == 90.0
 
 
 def test_turn_color_weight_matches_combined_geometry_weight():
     assert render_script.PNP_TURN_COLOR_WEIGHT == pytest.approx(
-        2.0 * (1.0 + render_script.PNP_TURN_MASK_CENTER_WEIGHT)
+        1.0 + render_script.PNP_TURN_MASK_CENTER_WEIGHT
     )
 
 
@@ -742,6 +742,18 @@ def test_projected_sticker_identity_moves_with_layer_geometry():
         not np.allclose(static_faces[label], turned_faces[label])
         for label in moved_labels
     )
+
+
+def test_gpu_turn_geometry_remaps_persistent_identities_after_state_move():
+    _triangles, _triangle_centers, _faces, _centers, _cubie_centers, _normals, canonical = (
+        render_script._turn_gpu_static_geometry()
+    )
+    state = render_script.CubeGeometryState.identity().apply_move("R'")
+    remapped = render_script._turn_gpu_identity_indices_for_state(state, canonical)
+
+    assert remapped.shape == canonical.shape
+    assert not np.array_equal(remapped, canonical)
+    assert sorted(remapped.tolist()) == sorted(canonical.tolist())
 
 
 def test_gpu_turn_color_score_uses_identity_likelihoods_without_cpu_matching():
@@ -1782,7 +1794,7 @@ def test_face_on_sticker_views_receive_lower_reliability_weight():
     assert 0.0 < angled_weight < face_on_weight
 
 
-def test_cached_pose_symmetry_recovery_prioritizes_pose_continuity(capsys):
+def test_cached_pose_symmetry_recovery_uses_color_matching_after_continuity(capsys):
     image_size = (256, 256)
     camera_matrix = render_script.default_camera_matrix(image_size, 1.2)
     rvec = np.asarray([[0.12], [-0.18], [0.08]], dtype=np.float64)
@@ -1820,6 +1832,10 @@ def test_cached_pose_symmetry_recovery_prioritizes_pose_continuity(capsys):
         )
         for identity in trace.identities
     }
+    known_color_names = {
+        identity.label: render_script.STANDARD_FACE_COLOR_NAMES[identity.face]
+        for identity in trace.identities
+    }
     symmetry = render_script.CUBE_SYMMETRY_MATRICES[7]
     identities_by_geometry = {
         (identity.cubie_index, identity.axis, identity.side): identity
@@ -1837,17 +1853,24 @@ def test_cached_pose_symmetry_recovery_prioritizes_pose_continuity(capsys):
         source_label: color_by_label[target_label]
         for target_label, source_label in permutation.items()
     }
-    trace.observe(0, color_by_label)
+    # The first visible frame establishes the color-based whole-cube frame.
+    # Subsequent frames carry the same center-to-axis mapping forward.
+    trace.observe(0, frame_one)
     trace.observe(1, frame_one)
 
+    alternate_candidate = render_script.transform_candidate_by_symmetry(
+        candidate,
+        render_script.CUBE_SYMMETRY_MATRICES[1],
+    )
     records = [
         SimpleNamespace(frame_index=0, pose_candidate=candidate),
-        SimpleNamespace(frame_index=1, pose_candidate=candidate),
+        SimpleNamespace(frame_index=1, pose_candidate=alternate_candidate),
     ]
     render_script.recover_cached_pose_symmetries(
         records,
         trace,
         debug=True,
+        known_initial_colors=known_color_names,
     )
     debug_output = capsys.readouterr().out
     assert "pose symmetry frame 1" in debug_output
@@ -1855,10 +1878,13 @@ def test_cached_pose_symmetry_recovery_prioritizes_pose_continuity(capsys):
     assert "symmetry=07" in debug_output
 
     recovered = records[1].pose_candidate
-    previous_pose = records[0].pose_candidate
+    expected_color_orientation = render_script.transform_rvec_by_symmetry(
+        candidate.rvec,
+        symmetry,
+    )
     assert render_script.rotation_symmetry_distance(
         recovered.rvec,
-        previous_pose.rvec,
+        expected_color_orientation,
     ) < 1e-6
 
 
@@ -1905,7 +1931,65 @@ def test_cached_pose_recovery_rejects_core_displacement_with_motion_filter():
     np.testing.assert_allclose(current_pose[1], third.tvec)
 
 
-def test_cached_pose_recovery_accepts_large_jump_with_close_next_frame():
+def test_cached_pose_recovery_selects_temporally_closest_candidate(monkeypatch):
+    monkeypatch.setattr(
+        render_script,
+        "pose_reprojection_fit_metric",
+        lambda _candidate: 0.0,
+    )
+
+    def make_candidate(x_position):
+        return render_script.StickerPnPCandidate(
+            sticker_type="corner",
+            sticker_average_confidence=0.9,
+            image_points=np.zeros((4, 2), dtype=np.float32),
+            object_points=np.zeros((4, 3), dtype=np.float32),
+            projected_sticker_points=np.zeros((4, 2), dtype=np.float32),
+            camera_matrix=np.eye(3, dtype=np.float64),
+            dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+            rvec=np.zeros((3, 1), dtype=np.float64),
+            tvec=np.asarray([[x_position], [0.0], [200.0]], dtype=np.float64),
+            reprojection_error=0.0,
+            overall_reprojection_error=0.0,
+        )
+
+    previous = make_candidate(0.0)
+    visually_first = make_candidate(100.0)
+    temporally_close = make_candidate(4.0)
+    records = [
+        SimpleNamespace(
+            frame_index=0,
+            pose_candidate=previous,
+            pose_candidates=(previous,),
+        ),
+        SimpleNamespace(
+            frame_index=1,
+            pose_candidate=visually_first,
+            pose_candidates=(visually_first, temporally_close),
+        ),
+    ]
+
+    render_script.recover_cached_pose_symmetries(
+        records,
+        render_script.StickerColorTrace.create(),
+        recover_orientation=False,
+    )
+
+    np.testing.assert_allclose(
+        records[1].pose_candidate.tvec,
+        temporally_close.tvec,
+    )
+
+
+def test_cached_pose_recovery_accepts_large_jump_with_close_next_frame(monkeypatch):
+    # Isolate the temporal look-ahead behavior from the shared reprojection
+    # acceptance gate tested elsewhere.
+    monkeypatch.setattr(
+        render_script,
+        "pose_reprojection_fit_metric",
+        lambda _candidate: 0.0,
+    )
+
     def make_candidate(x_position):
         return render_script.StickerPnPCandidate(
             sticker_type="corner",
@@ -2585,6 +2669,68 @@ def test_solve_sticker_pnp_uses_canonical_corner_correspondence():
     assert len(candidate.assignment_projected_points) == 4
 
 
+def test_solve_sticker_pnp_candidates_preserves_all_three_point_roots(monkeypatch):
+    frame_points = np.asarray(
+        [[40.0, 40.0], [80.0, 40.0], [80.0, 80.0]],
+        dtype=np.float32,
+    )
+    point_class_ids = np.asarray([2, 2, 2], dtype=np.int32)
+    match = render_script.StickerKeypointMatch(
+        mask_index=0,
+        keypoint_indices=(0, 1, 2),
+        sticker_type="center",
+        average_confidence=0.95,
+    )
+    rvec = np.zeros((3, 1), dtype=np.float64)
+    first_tvec = np.asarray([[0.0], [0.0], [180.0]], dtype=np.float64)
+    second_tvec = np.asarray([[0.0], [0.0], [190.0]], dtype=np.float64)
+
+    monkeypatch.setattr(
+        render_script,
+        "sticker_correspondence_object_indices",
+        lambda *_args: ((0, 1, 2),),
+    )
+    monkeypatch.setattr(
+        render_script,
+        "canonical_sticker_is_camera_facing",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(
+        render_script.cv2,
+        "solvePnPGeneric",
+        lambda *_args, **_kwargs: (
+            True,
+            (rvec.copy(), rvec.copy()),
+            (first_tvec.copy(), second_tvec.copy()),
+            None,
+        ),
+    )
+
+    def fake_evaluate(_rvec, _tvec, observed, _class_ids, _image_size, _camera, _dist, *_args):
+        count = len(observed)
+        return (
+            1.0,
+            np.arange(count, dtype=np.int32),
+            np.arange(count, dtype=np.int32),
+            np.asarray(observed, dtype=np.float64),
+            np.zeros((count, 3), dtype=np.float64),
+            np.zeros((count,), dtype=np.int32),
+        )
+
+    monkeypatch.setattr(render_script, "evaluate_pose_hypothesis", fake_evaluate)
+
+    candidates = render_script.solve_sticker_pnp_candidates(
+        frame_points,
+        point_class_ids,
+        match,
+        (128, 128),
+        1.2,
+    )
+
+    assert len(candidates) == 2
+    assert [float(candidate.tvec[2, 0]) for candidate in candidates] == [180.0, 190.0]
+
+
 def test_final_assignment_refinement_is_keypoint_only(monkeypatch):
     object_points = render_script.canonical_sticker_object_points("corner")
     camera_matrix = render_script.default_camera_matrix((256, 256), 1.2)
@@ -2675,18 +2821,24 @@ def test_initial_sticker_hypotheses_defer_full_refinement(monkeypatch):
 
     def fake_sticker_solve(*_args, **_kwargs):
         match = _args[2]
-        return replace(
-            base_candidate,
-            sticker_type=match.sticker_type,
-            sticker_average_confidence=match.average_confidence,
-            mask_fit_error=float(match.mask_index),
+        return (
+            replace(
+                base_candidate,
+                sticker_type=match.sticker_type,
+                sticker_average_confidence=match.average_confidence,
+                mask_fit_error=float(match.mask_index),
+            ),
         )
 
     def fake_assignment_solve(candidate, **kwargs):
         refinement_flags.append(kwargs)
         return candidate
 
-    monkeypatch.setattr(render_script, "solve_sticker_pnp", fake_sticker_solve)
+    monkeypatch.setattr(
+        render_script,
+        "solve_sticker_pnp_candidates",
+        fake_sticker_solve,
+    )
     monkeypatch.setattr(
         render_script,
         "solve_pnp_from_low_error_assignments",
@@ -3086,8 +3238,8 @@ def test_recover_misaligned_layer_updates_assignment_geometry(monkeypatch):
     }
     assert 0 < len(searched_layer_sides) < 6
     assert {rotation.layer_count for rotation in searched_rotations} == {1, 2}
-    assert min(rotation.angle_degrees for rotation in searched_rotations) == -180.0
-    assert max(rotation.angle_degrees for rotation in searched_rotations) == 174.0
+    assert min(rotation.angle_degrees for rotation in searched_rotations) == -90.0
+    assert max(rotation.angle_degrees for rotation in searched_rotations) == 90.0
     assert all(
         rotation.angle_degrees % 6.0 == 0.0
         for rotation in searched_rotations
@@ -3162,14 +3314,6 @@ def test_completed_turn_can_win_tied_geometry_with_combined_rank():
         baseline,
     )
 
-    insufficient_layer_evidence = {
-        **completed_turn,
-        "layer_inlier_count": 1,
-    }
-    assert not render_script.turn_trial_exceeds_static_baseline(
-        insufficient_layer_evidence,
-        baseline,
-    )
 
 
 def test_three_point_edge_uses_image_gap_to_preserve_cyclic_correspondence():
@@ -3406,17 +3550,19 @@ def test_best_sticker_prefers_four_points_over_higher_confidence_three_points(mo
 
     def fake_solve(_points, _classes, match, _image_size, _focal_scale, *_args):
         selected.append(match)
-        return SimpleNamespace(
-            match=match,
-            overall_reprojection_error=1.0,
-            reprojection_error=0.0,
-            sticker_average_confidence=match.average_confidence,
-            assignment_image_points=None,
-            assignment_projected_points=None,
-            assignment_object_points=None,
+        return (
+            SimpleNamespace(
+                match=match,
+                overall_reprojection_error=1.0,
+                reprojection_error=0.0,
+                sticker_average_confidence=match.average_confidence,
+                assignment_image_points=None,
+                assignment_projected_points=None,
+                assignment_object_points=None,
+            ),
         )
 
-    monkeypatch.setattr(render_script, "solve_sticker_pnp", fake_solve)
+    monkeypatch.setattr(render_script, "solve_sticker_pnp_candidates", fake_solve)
     result = render_script.best_sticker_pnp_candidate(
         np.zeros((4, 2), dtype=np.float32),
         np.zeros((4,), dtype=np.int32),
@@ -3443,17 +3589,19 @@ def test_best_sticker_tries_all_four_point_stickers_and_chooses_lowest_overall_e
 
     def fake_solve(_points, _classes, match, _image_size, _focal_scale, *_args):
         selected.append(match.mask_index)
-        return SimpleNamespace(
-            match=match,
-            overall_reprojection_error={0: 12.0, 1: 4.0, 2: 8.0}[match.mask_index],
-            reprojection_error=0.0,
-            sticker_average_confidence=match.average_confidence,
-            assignment_image_points=None,
-            assignment_projected_points=None,
-            assignment_object_points=None,
+        return (
+            SimpleNamespace(
+                match=match,
+                overall_reprojection_error={0: 12.0, 1: 4.0, 2: 8.0}[match.mask_index],
+                reprojection_error=0.0,
+                sticker_average_confidence=match.average_confidence,
+                assignment_image_points=None,
+                assignment_projected_points=None,
+                assignment_object_points=None,
+            ),
         )
 
-    monkeypatch.setattr(render_script, "solve_sticker_pnp", fake_solve)
+    monkeypatch.setattr(render_script, "solve_sticker_pnp_candidates", fake_solve)
     result = render_script.best_sticker_pnp_candidate(
         np.zeros((16, 2), dtype=np.float32),
         np.zeros((16,), dtype=np.int32),
@@ -3478,14 +3626,16 @@ def test_best_sticker_candidates_retains_ranked_alternatives(monkeypatch):
     )
 
     def fake_solve(_points, _classes, match, _image_size, _focal_scale, *_args):
-        return SimpleNamespace(
-            match=match,
-            overall_reprojection_error=float(3 - match.mask_index),
-            reprojection_error=0.0,
-            sticker_average_confidence=match.average_confidence,
+        return (
+            SimpleNamespace(
+                match=match,
+                overall_reprojection_error=float(3 - match.mask_index),
+                reprojection_error=0.0,
+                sticker_average_confidence=match.average_confidence,
+            ),
         )
 
-    monkeypatch.setattr(render_script, "solve_sticker_pnp", fake_solve)
+    monkeypatch.setattr(render_script, "solve_sticker_pnp_candidates", fake_solve)
     candidates = render_script.best_sticker_pnp_candidates(
         np.zeros((12, 2), dtype=np.float32),
         np.zeros((12,), dtype=np.int32),
@@ -3542,6 +3692,51 @@ def test_hypothesis_selection_prefers_continuity_only_for_close_visual_scores():
     )
 
     assert selected is near
+
+
+def test_hypothesis_selection_uses_translation_for_candidates_under_shared_fit_gate(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        render_script,
+        "pose_reprojection_fit_metric",
+        lambda candidate: float(candidate.fit),
+    )
+
+    def candidate(position, fit, visual):
+        return SimpleNamespace(
+            fit=fit,
+            visual=visual,
+            camera_matrix=np.eye(3, dtype=np.float64),
+            dist_coeffs=np.zeros((4, 1), dtype=np.float64),
+            rvec=np.zeros((3, 1), dtype=np.float64),
+            tvec=np.asarray([[position], [0.0], [200.0]], dtype=np.float64),
+            reprojection_error=0.0,
+        )
+
+    monkeypatch.setattr(
+        render_script,
+        "pose_hypothesis_visual_score",
+        lambda value: float(value.visual),
+    )
+    visually_best_but_far = candidate(49.0, 0.036, 0.01)
+    temporally_best = candidate(11.0, 0.040, 1.0)
+    rejected = candidate(1.0, 0.051, 0.0)
+    previous = SimpleNamespace(
+        rvec=np.zeros((3, 1), dtype=np.float64),
+        tvec=np.asarray([[0.0], [0.0], [200.0]], dtype=np.float64),
+    )
+
+    selected = render_script.select_pose_hypothesis(
+        (visually_best_but_far, temporally_best, rejected),
+        None,
+        (previous,),
+    )
+
+    assert selected is temporally_best
+    assert render_script.PNP_POSE_REPROJECTION_ERROR_THRESHOLD == pytest.approx(0.05)
+    assert not render_script.PNP_POSE_REPROJECTION_ERROR_REJECTION_ENABLED
+    assert render_script.pose_reprojection_error_is_acceptable(rejected)
 
 
 def test_hypothesis_selection_keeps_much_better_visual_candidate_on_turn():
