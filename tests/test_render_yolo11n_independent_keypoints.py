@@ -2296,6 +2296,23 @@ def test_recover_misaligned_layer_updates_assignment_geometry(monkeypatch):
         * render_script.projected_cube_diameter(candidate)
     )
 
+    full_trials = render_script._score_turn_configurations_on_gpu(
+        candidate, limit, torch.device("cpu"), materialize_projections=True,
+    )
+    deferred_trials = render_script._score_turn_configurations_on_gpu(
+        candidate, limit, torch.device("cpu"), materialize_projections=False,
+    )
+    assert full_trials and deferred_trials
+    assert len(full_trials) == len(deferred_trials)
+    for full, deferred in zip(full_trials, deferred_trials, strict=True):
+        assert full["label"] == deferred["label"]
+        assert full["rank"] == deferred["rank"]
+        assert full["robust_error"] == deferred["robust_error"]
+        np.testing.assert_array_equal(
+            full["assignment_projected_points"],
+            deferred["assignment_projected_points"].detach().cpu().numpy(),
+        )
+
     recovered = render_script.recover_misaligned_cube_layers(candidate, limit)
     logged = render_script.recover_misaligned_cube_layers(
         candidate,
@@ -2359,7 +2376,7 @@ def test_turn_acceptance_compares_against_matching_static_baseline():
     )
 
 
-def test_completed_turn_can_win_tied_geometry_with_combined_rank():
+def test_completed_turn_still_requires_more_global_inliers_than_static():
     static = {
         "is_baseline": True,
         "layer_axis": 0,
@@ -2389,7 +2406,7 @@ def test_completed_turn_can_win_tied_geometry_with_combined_rank():
     }
 
     baseline = {(0, 1, 1): static}
-    assert render_script.turn_trial_exceeds_static_baseline(
+    assert not render_script.turn_trial_exceeds_static_baseline(
         completed_turn,
         baseline,
     )
@@ -3024,3 +3041,40 @@ def test_initial_orientation_applies_to_frames_before_first_color_match(monkeypa
     assert len(transformed) == 2
     for symmetry in transformed:
         np.testing.assert_array_equal(symmetry, permutations[7][0])
+
+
+def test_batched_keypoint_statistics_match_reference_scoring():
+    import torch
+
+    distances = np.array([
+        [1.0, 2.0, 5.0, np.inf],
+        [0.2, 0.4, 0.8, 1.6],
+        [1.0, 2.0, 3.0, 4.0],
+        [np.inf, np.inf, np.inf, np.inf],
+    ], dtype=np.float32)
+    objects = np.zeros((4, 4, 3), dtype=np.float32)
+    objects[:, :, 0] = np.array([27.5, 27.5, -27.5, -27.5])
+    classes = np.array([[0, 1, 2, 0], [0, 1, 2, 0], [1, 1, 2, 0], [0, 1, 2, 0]])
+    observed_classes = np.array([0, 1, 2, 0])
+    axes = torch.zeros(4, dtype=torch.long)
+    sides = torch.tensor([1.0, -1.0, 1.0, 1.0])
+    layers = torch.tensor([1.0, 1.0, 1.0, 1.0])
+    values = render_script._gpu_keypoint_fit_metrics(
+        torch, torch.tensor(distances), torch.tensor(objects), torch.tensor(classes),
+        axes, sides, layers, torch.tensor(observed_classes), 10.0, 2.0,
+    )
+    means, robust, p90, inliers, layer_inliers = [v.numpy() for v in values]
+    for index in (0, 1):
+        valid = np.isfinite(distances[index])
+        normalized = distances[index, valid] / 10.0
+        assert means[index] == pytest.approx(float(np.mean(normalized)), abs=1e-7)
+        assert p90[index] == pytest.approx(float(np.percentile(normalized, 90)), abs=1e-7)
+        assert robust[index] == pytest.approx(float(np.median(normalized) + 0.5 * np.percentile(normalized, 90)), abs=1e-7)
+        assert inliers[index] == int(np.count_nonzero(valid & (distances[index] <= 2.0)))
+        layer = render_script.cube_layer_mask(objects[index], 0, int(sides[index]), 1)
+        assert layer_inliers[index] == int(np.count_nonzero(valid & layer & (distances[index] <= 2.0)))
+    assert np.all(np.isinf(means[2:]))
+    assert np.all(np.isinf(robust[2:]))
+    assert np.all(np.isinf(p90[2:]))
+    assert np.array_equal(inliers[2:], [0, 0])
+    assert np.array_equal(layer_inliers[2:], [0, 0])

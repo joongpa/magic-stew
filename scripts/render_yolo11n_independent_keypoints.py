@@ -4543,6 +4543,32 @@ def _turn_gpu_static_geometry() -> tuple[np.ndarray, ...]:
     )
 
 
+@lru_cache(maxsize=4)
+def _turn_gpu_static_tensors(device: str, dtype: object) -> tuple[object, ...]:
+    """Keep immutable cube geometry on the scoring device between frames."""
+
+    import torch
+
+    triangles, triangle_centers, sticker_faces, _, sticker_centers, sticker_normals, _ = (
+        _turn_gpu_static_geometry()
+    )
+    return tuple(
+        torch.as_tensor(value, dtype=dtype, device=device)
+        for value in (
+            CUBE_LATTICE_OBJECT_POINTS_MM,
+            CUBE_LATTICE_BOUNDARY_NORMALS,
+            triangles,
+            triangle_centers,
+            sticker_faces,
+            sticker_centers,
+            sticker_normals,
+        )
+    ) + (
+        torch.as_tensor(CUBE_LATTICE_BOUNDARY_FACE_MASK, dtype=torch.bool, device=device),
+        torch.as_tensor(CUBE_LATTICE_CLASS_IDS, dtype=torch.long, device=device),
+    )
+
+
 def _turn_gpu_identity_indices_for_state(
     geometry_state: CubeGeometryState | None,
     canonical_geometry_identity_indices: np.ndarray,
@@ -4661,7 +4687,9 @@ def _gpu_sticker_center_fit_metrics(
     visible_faces: object,
     scale: float,
     max_error: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    *,
+    return_tensors: bool = False,
+) -> tuple[object, object, object]:
     """Score batched sticker centers with accelerator-resident nearest matching.
 
     The mask centroids are intentionally allowed to share a projected face.
@@ -4673,6 +4701,9 @@ def _gpu_sticker_center_fit_metrics(
     observed = np.asarray(getattr(candidate, "sticker_mask_centers", ()), dtype=np.float64).reshape(-1, 2)
     if len(observed) == 0:
         count = int(projected_face_centers.shape[0])
+        if return_tensors:
+            zero = projected_face_centers.new_zeros(count)
+            return zero, zero, zero.to(dtype=torch.int32)
         return np.zeros(count), np.zeros(count), np.zeros(count, dtype=np.int32)
     uncertainties = np.asarray(
         getattr(candidate, "sticker_mask_center_uncertainties", ()),
@@ -4753,6 +4784,8 @@ def _gpu_sticker_center_fit_metrics(
         finite & (nearest_distances < max_error),
         dim=1,
     )
+    if return_tensors:
+        return means_t, robust_t, match_counts_t
     return (
         means_t.detach().cpu().numpy().astype(np.float64, copy=False),
         robust_t.detach().cpu().numpy().astype(np.float64, copy=False),
@@ -4770,7 +4803,9 @@ def _gpu_sticker_color_fit_metrics(
     scale: float,
     max_error: float,
     color_likelihoods: np.ndarray | None,
-) -> tuple[np.ndarray, np.ndarray]:
+    *,
+    return_tensors: bool = False,
+) -> tuple[object, object]:
     """Score mask colors against moving physical sticker identities on-device."""
 
     torch = torch_module
@@ -4778,10 +4813,16 @@ def _gpu_sticker_color_fit_metrics(
     centers = tuple(getattr(candidate, "sticker_mask_centers", ()))
     if color_likelihoods is None or not colors or not centers:
         count = int(projected_face_centers.shape[0])
+        if return_tensors:
+            zero = projected_face_centers.new_zeros(count)
+            return zero, zero.to(dtype=torch.int32)
         return np.zeros(count, dtype=np.float64), np.zeros(count, dtype=np.int32)
     count = min(len(colors), len(centers), int(color_likelihoods.shape[1]))
     if count <= 0:
         batch = int(projected_face_centers.shape[0])
+        if return_tensors:
+            zero = projected_face_centers.new_zeros(batch)
+            return zero, zero.to(dtype=torch.int32)
         return np.zeros(batch, dtype=np.float64), np.zeros(batch, dtype=np.int32)
     observed = np.asarray(centers[:count], dtype=np.float64).reshape(-1, 2)
     uncertainties = np.asarray(
@@ -4862,10 +4903,72 @@ def _gpu_sticker_color_fit_metrics(
         finite & (nearest_distances <= max_error),
         dim=1,
     )
+    if return_tensors:
+        return color_error, match_counts
     return (
         color_error.detach().cpu().numpy().astype(np.float64, copy=False),
         match_counts.detach().cpu().numpy().astype(np.int32, copy=False),
     )
+
+
+def _gpu_keypoint_fit_metrics(
+    torch: object,
+    distances: object,
+    objects: object,
+    classes: object,
+    axes: object,
+    sides: object,
+    layer_counts: object,
+    observed_classes: object | None,
+    scale: float,
+    assignment_error_limit: float,
+) -> tuple[object, object, object, object, object]:
+    """Compute the existing keypoint ranking statistics for all trials."""
+
+    finite = torch.isfinite(distances)
+    coordinates = torch.gather(
+        objects, 2, axes[:, None, None].expand(-1, objects.shape[1], 1)
+    ).squeeze(-1)
+    boundary = CUBE_HALF_SIZE_MM - (layer_counts - 1.0) * CUBE_LAYER_SIZE_MM
+    layer_mask = torch.where(
+        sides[:, None] > 0.0,
+        coordinates >= boundary[:, None] - 1e-4,
+        coordinates <= -boundary[:, None] + 1e-4,
+    )
+    layer_finite = finite & layer_mask
+    valid_trial = torch.any(layer_finite, dim=1)
+    if observed_classes is not None:
+        known = (observed_classes[None, :] >= 0) & (classes >= 0) & layer_finite
+        valid_trial = valid_trial & ~torch.any(
+            known & (observed_classes[None, :] != classes), dim=1
+        )
+
+    normalized = distances / scale
+    finite_count = torch.count_nonzero(finite, dim=1)
+    mean = torch.sum(torch.where(finite, normalized, torch.zeros_like(normalized)), dim=1) / torch.clamp(finite_count, min=1)
+    sorted_values, _ = torch.sort(
+        torch.where(finite, normalized, torch.full_like(normalized, float("inf"))), dim=1
+    )
+
+    def percentile(fraction: float) -> object:
+        position = (torch.clamp(finite_count, min=1) - 1).to(dtype=distances.dtype) * fraction
+        lower = torch.floor(position).to(dtype=torch.long)
+        upper = torch.ceil(position).to(dtype=torch.long)
+        low_value = torch.gather(sorted_values, 1, lower[:, None]).squeeze(1)
+        high_value = torch.gather(sorted_values, 1, upper[:, None]).squeeze(1)
+        weight = position - lower.to(dtype=distances.dtype)
+        # Avoid inf - inf on trials with no finite points.
+        return torch.where(lower == upper, low_value, low_value + (high_value - low_value) * weight)
+
+    median = percentile(0.5)
+    p90 = percentile(0.9)
+    infinity = torch.full_like(mean, float("inf"))
+    mean = torch.where(valid_trial, mean, infinity)
+    robust = torch.where(valid_trial, median + 0.5 * p90, infinity)
+    p90 = torch.where(valid_trial, p90, infinity)
+    inliers = torch.where(valid_trial, torch.count_nonzero(finite & (distances <= assignment_error_limit), dim=1), 0)
+    layer_inliers = torch.where(valid_trial, torch.count_nonzero(layer_finite & (distances <= assignment_error_limit), dim=1), 0)
+    return mean, robust, p90, inliers, layer_inliers
 
 
 def _score_turn_configurations_on_gpu(
@@ -4873,14 +4976,16 @@ def _score_turn_configurations_on_gpu(
     assignment_error_limit: float,
     scoring_device: object,
     color_likelihoods: np.ndarray | None = None,
+    *,
+    materialize_projections: bool = True,
 ) -> list[dict[str, object]] | None:
-    """Batch exhaustive turn projection and scoring on CUDA or Apple MPS.
+    """Batch exhaustive turn projection and scoring on a Torch device.
 
     Mask centroids use nearest visible projected centers, so the complete
     numeric configuration score stays on the accelerator. All configuration
     geometry, projection, class-aware nearest assignment, and residual
-    calculation are batched on the GPU. Returning ``None`` lets callers use the established CPU path for
-    unsupported Torch accelerator environments or malformed candidates.
+    calculation are batched on the GPU. Return ``None`` if the input or
+    accelerator cannot be scored.
     """
 
     try:
@@ -4904,17 +5009,7 @@ def _score_turn_configurations_on_gpu(
         if not np.isfinite(scale) or scale <= 0.0:
             return None
         base_object_points = np.asarray(CUBE_LATTICE_OBJECT_POINTS_MM, dtype=np.float64)
-        base_normals = np.asarray(CUBE_LATTICE_BOUNDARY_NORMALS, dtype=np.float64)
-        base_face_mask = np.asarray(CUBE_LATTICE_BOUNDARY_FACE_MASK, dtype=bool)
-        (
-            triangles,
-            triangle_centers,
-            sticker_faces,
-            _sticker_centers,
-            sticker_cubie_centers,
-            sticker_normals,
-            sticker_identity_indices,
-        ) = _turn_gpu_static_geometry()
+        sticker_identity_indices = _turn_gpu_static_geometry()[-1]
         sticker_identity_indices = _turn_gpu_identity_indices_for_state(
             geometry_state,
             sticker_identity_indices,
@@ -4978,8 +5073,11 @@ def _score_turn_configurations_on_gpu(
         layer_counts = torch.as_tensor([item[2] for item in configurations], dtype=dtype, device=device)
         angles_t = torch.as_tensor([item[3] for item in configurations], dtype=dtype, device=device)
         active = torch.as_tensor([not item[4] for item in configurations], dtype=torch.bool, device=device)
-        base_points_t = torch.as_tensor(base_object_points, dtype=dtype, device=device)
-        base_normals_t = torch.as_tensor(base_normals, dtype=dtype, device=device)
+        (
+            base_points_t, base_normals_t, triangles_t, triangle_centers_t,
+            sticker_faces_t, sticker_face_centers_t, sticker_normals_t,
+            base_face_mask_t, trial_classes,
+        ) = _turn_gpu_static_tensors(str(device), dtype)
         camera_rotation_np, _ = cv2.Rodrigues(np.asarray(candidate.rvec, dtype=np.float64).reshape(3, 1))
         camera_rotation = torch.as_tensor(camera_rotation_np, dtype=dtype, device=device)
         tvec = torch.as_tensor(np.asarray(candidate.tvec, dtype=np.float64).reshape(1, 1, 3), dtype=dtype, device=device)
@@ -5003,11 +5101,10 @@ def _score_turn_configurations_on_gpu(
         rotated_normals = torch.einsum("bij,bnfj->bnfi", rotation, expanded_normals)
         transformed_normals = torch.where(point_layer_mask[:, :, None, None], rotated_normals, expanded_normals)
         front_facing = (
-            torch.as_tensor(base_face_mask, dtype=torch.bool, device=device)[None, :, :, None]
+            base_face_mask_t[None, :, :, None]
             & (torch.einsum("ij,bnfj->bnfi", camera_rotation, transformed_normals)[..., 2:3] < 0.0)
         ).any(dim=2).squeeze(-1)
 
-        triangle_centers_t = torch.as_tensor(triangle_centers, dtype=dtype, device=device)
         triangle_coordinates = triangle_centers_t[:, axes].T
         triangle_boundary = CUBE_HALF_SIZE_MM - layer_counts * CUBE_LAYER_SIZE_MM + CUBE_LAYER_SIZE_MM / 2.0
         triangle_layer_mask = torch.where(
@@ -5015,7 +5112,6 @@ def _score_turn_configurations_on_gpu(
             triangle_coordinates >= triangle_boundary[:, None] - 1e-4,
             triangle_coordinates <= -triangle_boundary[:, None] + 1e-4,
         ) & active[:, None]
-        triangles_t = torch.as_tensor(triangles, dtype=dtype, device=device)
         expanded_triangles = triangles_t[None, :, :, :].expand(count, -1, -1, -1)
         triangle_center_points = point_center[:, None, :]
         rotated_triangles = torch.matmul(
@@ -5106,7 +5202,6 @@ def _score_turn_configurations_on_gpu(
             if len(observed_classes) != len(image_points):
                 observed_classes = None
         use_class_aware_assignment = PNP_ASSIGNMENT_MODE == "class-aware"
-        trial_classes = torch.as_tensor(CUBE_LATTICE_CLASS_IDS, dtype=torch.long, device=device)
         if use_class_aware_assignment and observed_classes is not None:
             observed_class_t = torch.as_tensor(observed_classes, dtype=torch.long, device=device)
             mismatch = (
@@ -5163,8 +5258,6 @@ def _score_turn_configurations_on_gpu(
             assigned_classes = selected_classes
             assigned_distances = min_distances
 
-        sticker_face_centers_t = torch.as_tensor(sticker_cubie_centers, dtype=dtype, device=device)
-        sticker_normals_t = torch.as_tensor(sticker_normals, dtype=dtype, device=device)
         sticker_coordinates = sticker_face_centers_t[:, axes].T
         sticker_boundary = CUBE_HALF_SIZE_MM - layer_counts * CUBE_LAYER_SIZE_MM + CUBE_LAYER_SIZE_MM / 2.0
         sticker_layer_mask = torch.where(
@@ -5172,20 +5265,21 @@ def _score_turn_configurations_on_gpu(
             sticker_coordinates >= sticker_boundary[:, None] - 1e-4,
             sticker_coordinates <= -sticker_boundary[:, None] + 1e-4,
         ) & active[:, None]
-        expanded_faces = torch.as_tensor(sticker_faces, dtype=dtype, device=device)[None, :, :, :].expand(count, -1, -1, -1)
+        expanded_faces = sticker_faces_t[None, :, :, :].expand(count, -1, -1, -1)
         rotated_faces = torch.matmul(
             expanded_faces - point_center[:, None, None, :],
             rotation[:, None, :, :].transpose(2, 3),
         ) + point_center[:, None, None, :]
         transformed_faces = torch.where(sticker_layer_mask[:, :, None, None], rotated_faces, expanded_faces)
-        projected_face_centers = _torch_project_turn_points(
+        projected_face_polygons = _torch_project_turn_points(
             torch,
             transformed_faces,
             camera_rotation,
             tvec,
             camera_matrix,
             dist_coeffs,
-        ).mean(dim=2)
+        )
+        projected_face_centers = projected_face_polygons.mean(dim=2)
         transformed_face_normals = torch.einsum(
             "bij,bfj->bfi",
             rotation,
@@ -5206,14 +5300,7 @@ def _score_turn_configurations_on_gpu(
             visible_faces,
             float(scale),
             float(assignment_error_limit),
-        )
-        projected_face_polygons = _torch_project_turn_points(
-            torch,
-            transformed_faces,
-            camera_rotation,
-            tvec,
-            camera_matrix,
-            dist_coeffs,
+            return_tensors=True,
         )
         color_errors, color_matches = _gpu_sticker_color_fit_metrics(
             candidate,
@@ -5225,49 +5312,54 @@ def _score_turn_configurations_on_gpu(
             float(scale),
             float(assignment_error_limit),
             color_likelihoods,
+            return_tensors=True,
         )
-
-        assigned_distances_cpu = assigned_distances.detach().cpu().numpy()
-        assigned_objects_cpu = assigned_objects.detach().cpu().numpy()
-        assigned_projected_cpu = assigned_projected.detach().cpu().numpy()
-        assigned_classes_cpu = assigned_classes.detach().cpu().numpy()
+        keypoint_mean_t, keypoint_robust_t, p90_t, inliers_t, layer_inliers_t = (
+            _gpu_keypoint_fit_metrics(
+                torch, assigned_distances, assigned_objects, assigned_classes,
+                axes, sides, layer_counts,
+                observed_class_t if use_class_aware_assignment and observed_classes is not None else None,
+                float(scale), float(assignment_error_limit),
+            )
+        )
+        # All configuration statistics are computed on-device. Transfer the
+        # compact vectors once; Python retains the existing ordering rules.
+        score_vectors = torch.stack((
+            sticker_mean, sticker_robust, sticker_matches.to(dtype=dtype),
+            color_errors, color_matches.to(dtype=dtype),
+            keypoint_mean_t, keypoint_robust_t, p90_t,
+            inliers_t.to(dtype=dtype), layer_inliers_t.to(dtype=dtype),
+        )).detach().cpu().numpy()
+        sticker_mean = score_vectors[0].astype(np.float64, copy=False)
+        sticker_robust = score_vectors[1].astype(np.float64, copy=False)
+        sticker_matches = score_vectors[2].astype(np.int32, copy=False)
+        color_errors = score_vectors[3].astype(np.float64, copy=False)
+        color_matches = score_vectors[4].astype(np.int32, copy=False)
+        keypoint_means = score_vectors[5]
+        keypoint_robust = score_vectors[6]
+        p90_values = score_vectors[7]
+        inlier_counts = score_vectors[8].astype(np.int32, copy=False)
+        layer_inlier_counts = score_vectors[9].astype(np.int32, copy=False)
+        assigned_projected_cpu = (
+            assigned_projected.detach().cpu().numpy()
+            if materialize_projections else None
+        )
+        assigned_objects_cpu = (
+            assigned_objects.detach().cpu().numpy()
+            if materialize_projections else None
+        )
+        assigned_classes_cpu = (
+            assigned_classes.detach().cpu().numpy()
+            if materialize_projections else None
+        )
         results: list[dict[str, object]] = []
         for trial_index, configuration in enumerate(configurations):
             axis, side, layer_count, _angle, is_baseline, rotations, label = configuration
-            distances_i = assigned_distances_cpu[trial_index]
-            finite_distances = np.isfinite(distances_i)
-            layer_mask = cube_layer_mask(assigned_objects_cpu[trial_index], axis, side, layer_count)
-            layer_finite = finite_distances & layer_mask
-            if not np.any(layer_finite):
-                keypoint_error = robust_error = mean_error = p90_error = float("inf")
-                inlier_count = layer_inlier_count = 0
-            else:
-                if use_class_aware_assignment and observed_classes is not None:
-                    known = (
-                        (observed_classes >= 0)
-                        & (assigned_classes_cpu[trial_index] >= 0)
-                        & layer_finite
-                    )
-                    if np.any(known) and np.any(observed_classes[known] != assigned_classes_cpu[trial_index][known]):
-                        keypoint_error = robust_error = mean_error = p90_error = float("inf")
-                        inlier_count = layer_inlier_count = 0
-                        finite_distances = np.zeros_like(finite_distances)
-                    else:
-                        normalized = distances_i[finite_distances] / scale
-                        mean_error = float(np.mean(normalized))
-                        robust_error = float(np.median(normalized) + 0.5 * np.percentile(normalized, 90))
-                        p90_error = float(np.percentile(normalized, 90))
-                        keypoint_error = mean_error
-                        inlier_count = int(np.count_nonzero(finite_distances & (distances_i <= assignment_error_limit)))
-                        layer_inlier_count = int(np.count_nonzero(layer_finite & (distances_i <= assignment_error_limit)))
-                else:
-                    normalized = distances_i[finite_distances] / scale
-                    mean_error = float(np.mean(normalized))
-                    robust_error = float(np.median(normalized) + 0.5 * np.percentile(normalized, 90))
-                    p90_error = float(np.percentile(normalized, 90))
-                    keypoint_error = mean_error
-                    inlier_count = int(np.count_nonzero(finite_distances & (distances_i <= assignment_error_limit)))
-                    layer_inlier_count = int(np.count_nonzero(layer_finite & (distances_i <= assignment_error_limit)))
+            mean_error = keypoint_error = float(keypoint_means[trial_index])
+            robust_error = float(keypoint_robust[trial_index])
+            p90_error = float(p90_values[trial_index])
+            inlier_count = int(inlier_counts[trial_index])
+            layer_inlier_count = int(layer_inlier_counts[trial_index])
             combined_mean_error = keypoint_error + (
                 PNP_TURN_MASK_CENTER_WEIGHT * float(sticker_mean[trial_index])
                 if np.isfinite(sticker_mean[trial_index])
@@ -5310,9 +5402,19 @@ def _score_turn_configurations_on_gpu(
                     "layer_side": side,
                     "layer_count": layer_count,
                     "layer_rotations": rotations,
-                    "assignment_projected_points": assigned_projected_cpu[trial_index].copy(),
-                    "assignment_object_points": assigned_objects_cpu[trial_index].copy(),
-                    "assignment_projected_class_ids": assigned_classes_cpu[trial_index].copy(),
+                    "assignment_projected_points": (
+                        assigned_projected_cpu[trial_index].copy()
+                        if assigned_projected_cpu is not None
+                        else assigned_projected[trial_index]
+                    ),
+                    "assignment_object_points": (
+                        assigned_objects_cpu[trial_index].copy()
+                        if assigned_objects_cpu is not None else assigned_objects[trial_index]
+                    ),
+                    "assignment_projected_class_ids": (
+                        assigned_classes_cpu[trial_index].copy()
+                        if assigned_classes_cpu is not None else assigned_classes[trial_index]
+                    ),
                 }
             )
         return results
@@ -5333,12 +5435,10 @@ def turn_trial_exceeds_static_baseline(
     accepting a turn.  Compare each tested turn with the static trial for the
     same axis, side, and layer width instead.
 
-    Partial angles remain conservative: they must explain strictly more
-    observations than static.  An exact face/wide 90 or 180 degree move is a
-    discrete state transition, however, so it is allowed to tie static on
-    geometry and win on the complete combined rank (including color).  This
-    is important because a completed turn and the static pose can legitimately
-    have the same geometry inlier count.
+    Every turn configuration, including an exact or snapped completed move,
+    must explain strictly more observations than static. The 45-degree rule
+    is applied only after selection, when deciding whether the selected fit
+    commits a discrete cube-state update for the next frame.
     """
 
     if bool(trial["is_baseline"]):
@@ -5352,22 +5452,11 @@ def turn_trial_exceeds_static_baseline(
     if baseline is None:
         return False
 
-    # Keep compatibility with the small helper's older integer-baseline
-    # callers/tests, while the real search passes the complete static trial.
-    if isinstance(baseline, dict):
-        baseline_inliers = int(baseline["inlier_count"])
-        trial_rotations = tuple(trial.get("layer_rotations", ()))
-        is_completed_move = bool(trial_rotations) and all(
-            discrete_rotation_notation(rotation) is not None
-            for rotation in trial_rotations[-1:]
-        )
-        if is_completed_move:
-            trial_rank = tuple(trial.get("rank", ()))
-            baseline_rank = tuple(baseline.get("rank", ()))
-            return bool(trial_rank and baseline_rank and trial_rank < baseline_rank)
-    else:
-        baseline_inliers = int(baseline)
-
+    # Keep compatibility with older integer-baseline callers and with the
+    # real search's complete static-trial baseline.
+    baseline_inliers = int(
+        baseline["inlier_count"] if isinstance(baseline, dict) else baseline
+    )
     return int(trial["inlier_count"]) > baseline_inliers
 
 
@@ -5489,6 +5578,7 @@ def recover_misaligned_cube_layers(
     ranked_trials = _score_turn_configurations_on_gpu(
         candidate, assignment_error_limit, torch_device,
         color_likelihoods=color_likelihoods,
+        materialize_projections=record_all_turn_candidates,
     )
     if ranked_trials is None:
         raise RuntimeError("MPS move search could not score this frame")
@@ -5522,6 +5612,8 @@ def recover_misaligned_cube_layers(
         if (
             not np.isfinite(float(best["robust_error"]))
             or (
+                PNP_POSE_REPROJECTION_ERROR_REJECTION_ENABLED
+                and
                 PNP_POSE_REPROJECTION_ERROR_THRESHOLD is not None
                 and float(best["robust_error"]) > PNP_POSE_REPROJECTION_ERROR_THRESHOLD
             )
@@ -5544,6 +5636,24 @@ def recover_misaligned_cube_layers(
         if record_all_turn_candidates
         else ordered_trials[:PNP_TURN_DEBUG_CANDIDATE_COUNT]
     )
+    if not record_all_turn_candidates:
+        # Ranking does not need the projected coordinates. Transfer only the
+        # displayed candidates and the selected fit, together in one batch.
+        import torch
+
+        needed_trials = list(recorded_trials)
+        if best is not None and all(best is not trial for trial in needed_trials):
+            needed_trials.append(best)
+        if needed_trials:
+            for key in (
+                "assignment_projected_points", "assignment_object_points",
+                "assignment_projected_class_ids",
+            ):
+                values = torch.stack(
+                    [trial[key] for trial in needed_trials]
+                ).detach().cpu().numpy()
+                for trial, value in zip(needed_trials, values, strict=True):
+                    trial[key] = value.copy()
     turn_candidate_scores = tuple(
         (
             str(trial["label"]),
