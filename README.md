@@ -326,6 +326,7 @@ square ROI -> pose -> ROI-tracking flow used by the live pipeline:
 ```bash
 .venv/bin/python scripts/render_yolo11n_independent_keypoints.py \
   --source data/independent_keypoints_dataset_v2/images/000000.png \
+  --initial-scramble "" \
   --model runs/pose/runs/independent_keypoint_pose_v2/runs/cube_piece_keypoint_yolo11n_pose/weights/best.pt \
   --save runs/independent_keypoints_render.png \
   --no-display
@@ -349,10 +350,10 @@ companion file:
 ```bash
 .venv/bin/python scripts/render_yolo11n_independent_keypoints.py \
   --source /path/to/solve.mp4 \
+  --initial-scramble "R U2 F'" \
   --model runs/pose/runs/independent_keypoints_v3_weights.pt \
   --combined-seg-model runs/segment/runs/combinedSegmentWeights.pt \
   --rgb-html-plot runs/sticker_colors.html \
-  --color-plot-frames 180 \
   --no-display
 ```
 
@@ -393,26 +394,24 @@ Without `--recognize-moves`, the default pose-symmetry option uses the same
 closest-color-profile orientation recovery as the original pose pipeline. It
 evaluates the 24 proper cube symmetries and uses profile likelihood plus pose
 continuity to select the closest orientation before rendering.
-The optional `--pose-motion-filter` is intentionally simpler: it compares
-only the cube-core translation between accepted poses and rejects changes over
-40 mm; rotation, velocity, acceleration, and jerk are not used.
+Pose continuity uses a two-sided 40 mm translation check: an isolated
+candidate is rejected when it differs from both the preceding accepted pose
+and the next candidate by more than 40 mm.
 
 Move recognition defaults to the exhaustive angle-search mode. It tests every
-single/double layer configuration over the `-180°` through `174°` range in 6°
-increments (with `180°` omitted as the duplicate of `-180°`), ranking each
+single/double layer configuration over the `-90°` through `90°` range in 6°
+increments, ranking each
 configuration with a regularized mean of normalized keypoint reprojection,
 sticker-mask-centroid fit, and—when global color profiles and sticker priors
 are available—a `p(observation|prior)` color fit weighted at twice the
 combined keypoint-plus-centroid terms. Mask centroids use closest
 projected sticker faces so the accelerator can score the complete batch without
-Hungarian matching. Use
-`--pnp-turn-recovery-mode layer-removal` to opt into the faster subtractive
-alternative, which ranks the 12 layer options without rotating the geometry.
+Hungarian matching.
 The live output also shows the accumulated standard moves in the fixed
 white-top/U and green-front/F frame.
-When `--device` selects CUDA or Apple MPS, the exhaustive geometry and scoring
-pass is batched on that accelerator; unsupported accelerator setups fall back
-to the CPU implementation.
+Neural inference runs on CPU with segmentation and pose calls in parallel.
+Move search runs on Apple MPS; requesting move recognition without an
+available MPS device produces an error.
 
 To review the logged alternatives interactively, run the standalone browser
 reviewer against the same source video and log directory:
@@ -437,34 +436,23 @@ individual color evidence behind the aggregate score. The rendered cube also
 shows the matched likelihood beside each visible sticker identity when those
 values are available.
 
-During the initial pose-hypothesis pass, sticker segmentation adds a second
-refinement step after the keypoint assignment/PnP refinement. Its objective
-compares that pose against the collective projected sticker wireframe and mask boundaries:
-both directions use robust soft distance, and transverse crossings add a
-finite penalty. Missing internal boundaries, including masks that merge
-same-color stickers, are tolerated rather than treated as a hard failure.
-For a debugging overlay that labels only the currently visible projected
-stickers, add `--show-sticker-identities`; the labels use the stable `C##`,
-`E##`, and `K##` identity numbers used by the HTML plot.
-To classify center colors from the collected traces, classify the remaining
-stickers against those center profiles, and replay the source in a second pass
-with visible projected stickers colored, add `--show-classified-colors` (the
-older `--show-classified-stickers` and `--show-classified-centers` spellings
-remain supported). The standard
-color scheme is evaluated over its 24 legal cube rotations in OKLab, while
-sticker profiles use two-segment RGB regressions whose inflection reaches 255
-in at least one channel; those regressions are compared in OKLab subject to
-legal edge/corner constraints, including unique use of all 12 edge pieces and
-all 8 corner pieces. Use `--save-final-video OUTPUT.mp4` if the final cached
-pass should also be written to a separate video. This saves the pose output
-even when color classification is disabled; the older
-`--save-colored-video OUTPUT.mp4` spelling remains accepted as an alias.
+The renderer refines pose continuity, fits one global color profile set from
+the collected samples, and matches the required initial scramble to the
+observed colors to establish the cube orientation. Move search then uses the
+same profiles and updates the cube state. The independent color debug view
+remains available with `--debug-independent-color-posteriors`.
+
+Use `--show-sticker-identities` for visible projected `C##`, `E##`, and `K##`
+labels, and `--show-classified-colors` to display the known sticker colors.
+Use `--save-final-video OUTPUT.mp4` to save the final cached pass; the older
+`--save-colored-video` spelling remains an alias.
 For `.mp4`, `.m4v`, and `.mov` outputs, the script adds a QuickTime timecode
 track after rendering so QuickTime Player can enable its frame-counter display.
 This requires `ffmpeg` to be available on `PATH`.
 
-If the video starts from a known scramble, provide it so the color matcher
-uses the known sticker state and only solves the whole-cube orientation:
+Provide the initial scramble so the color matcher uses the known sticker
+state and solves the whole-cube orientation. Use `--initial-scramble ""` for
+a solved cube:
 
 ```bash
 .venv/bin/python scripts/render_yolo11n_independent_keypoints.py \
@@ -477,8 +465,8 @@ uses the known sticker state and only solves the whole-cube orientation:
 Scrambles use standard face-turn notation (`R`, `U2`, `F'`), wide-turn
 notation (`Rw`, `Uw2`, `Fw'`, or lowercase aliases such as `r`), and whole-
 cube rotations (`x/y/z`). They are interpreted in the fixed frame
-white-on-top/U and green-on-front/F. When supplied, measured color posteriors
-do not change the displayed sticker colors.
+white-on-top/U and green-on-front/F. Measured color posteriors do not
+change the known sticker colors.
 `--known-scramble` is an alias for `--initial-scramble`.
 
 For ground-truth overlays on the prepared dataset, use
