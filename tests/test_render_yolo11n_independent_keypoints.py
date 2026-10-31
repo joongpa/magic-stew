@@ -417,9 +417,9 @@ def test_turn_search_defaults_to_all_six_layer_sides_and_half_period():
     assert angles[-1] == 90.0
 
 
-def test_turn_color_weight_matches_combined_geometry_weight():
+def test_turn_color_weight_matches_each_geometry_term():
     assert render_script.PNP_TURN_COLOR_WEIGHT == pytest.approx(
-        1.0 + render_script.PNP_TURN_MASK_CENTER_WEIGHT
+        render_script.PNP_TURN_MASK_CENTER_WEIGHT
     )
 
 
@@ -1742,6 +1742,30 @@ def test_sticker_rgb_html_plot_has_selectors_for_all_stickers(tmp_path):
     )
 
 
+def test_rgb_plot_exposes_whole_color_observations_and_profiles(monkeypatch, tmp_path):
+    go = pytest.importorskip("plotly.graph_objects")
+    trace = render_script.StickerColorTrace.create()
+    trace.observe(0, {trace.identities[0].label: np.array([190, 40, 20])})
+    profiles, groups = render_script.build_global_color_profiles_from_samples([])
+    profiles, groups = render_script.refine_global_color_profiles_from_initial_state(
+        trace, {trace.identities[0].label: "red"}, profiles, None,
+    )
+    saved = []
+    monkeypatch.setattr(go.Figure, "write_html", lambda figure, *args, **kwargs: saved.append(figure))
+    render_script.save_sticker_rgb_html_plot(
+        trace, tmp_path / "colors.html", title="Colors",
+        global_profiles=profiles, global_observations=groups,
+    )
+    figure = saved[0]
+    whole = [item for item in figure.data if item.legendgroup == "global-colors"]
+    assert len(whole) == 2 * len(render_script.GLOBAL_COLOR_NAMES)
+    assert all(item.showlegend is not False for item in whole)
+    assert all(item.legendgrouptitle.text == "Whole colors and regressions" for item in whole)
+    assert next(item for item in whole if item.name == "red global profile regression").x.size > 0
+    assert next(item for item in whole if item.name == "blue global profile prior").x.size > 0
+    assert figure.layout.updatemenus[0].buttons[0].label == "All stickers and colors"
+
+
 def test_sticker_keypoint_matches_returns_a_consistent_circular_order():
     mask = np.zeros((32, 32), dtype=np.uint8)
     mask[8:24, 8:24] = 1
@@ -1840,6 +1864,50 @@ def test_debug_color_masks_classifies_mask_pixels_without_sticker_identity():
     assert np.all(output[0, 0] == image[0, 0])
 
 
+def test_colored_intersection_masks_use_original_pixels_and_global_profiles(monkeypatch):
+    source = np.zeros((32, 32, 3), dtype=np.uint8)
+    source[4:28, 2:16] = (30, 40, 190)
+    source[4:28, 16:30] = (190, 60, 35)
+    canvas = np.zeros_like(source)
+    cube = np.zeros((32, 32), dtype=bool)
+    cube[4:24, :] = True
+    predicted = ([np.ones((32, 32), dtype=bool)], {}, np.array([0]), cube)
+    identities = render_script.canonical_sticker_identities()
+    faces = [
+        (identities[0], 1, np.array([[2, 4], [15, 4], [15, 27], [2, 27]])),
+        (identities[1], 1, np.array([[16, 4], [29, 4], [29, 27], [16, 27]])),
+    ]
+    monkeypatch.setattr(render_script, "projected_sticker_faces", lambda *_: faces)
+    profiles, _ = render_script.build_global_color_profiles_from_samples([])
+    pose = SimpleNamespace(rvec=np.zeros((3, 1)), tvec=np.zeros((3, 1)))
+    output = render_script.draw_projected_classified_masks(
+        canvas, source, (0, 0, 32, 32), predicted, pose, profiles, opacity=1.0,
+    )
+    np.testing.assert_array_equal(output[10, 8], [0, 0, 255])
+    np.testing.assert_array_equal(output[10, 22], [255, 0, 0])
+    np.testing.assert_array_equal(output[26, 8], [0, 0, 0])
+
+
+def test_colored_masks_option_uses_final_cached_profile(monkeypatch):
+    seen = []
+    monkeypatch.setattr(render_script, "draw_context", lambda image, *args: image)
+    monkeypatch.setattr(render_script, "draw_projected_classified_masks",
+                        lambda image, source, roi, masks, pose, profiles, **kw: seen.append((source, pose, profiles)) or image)
+    frame = np.zeros((16, 16, 3), dtype=np.uint8)
+    record = render_script.NeuralFrameData(
+        frame_index=0, frame=frame, roi_xyxy=(0, 0, 16, 16), roi_source="tracker",
+        sticker_masks=None, local_points=np.empty((0, 2)), point_confidences=np.empty(0),
+        class_ids=np.empty(0), box_confidences=np.empty(0), pose_ready=True,
+    )
+    args = SimpleNamespace(show_colored_masks=True, view_size=16, show_keypoints=False,
+                           show_pnp=False, show_status=False)
+    profiles = {"marker": object()}
+    render_script.render_frame(frame, None, None, None, args, neural_data=record,
+                               cached_final_only=True, global_profiles=profiles)
+    assert len(seen) == 1
+    assert seen[0][0] is frame and seen[0][2] is profiles
+
+
 def test_sticker_mask_erosion_parser_and_roi_masks():
     assert render_script.build_parser().parse_args(["--initial-scramble", "", "--source", "frame.png"]).sticker_mask_erosion == 0
     args = render_script.build_parser().parse_args(
@@ -1850,6 +1918,10 @@ def test_sticker_mask_erosion_parser_and_roi_masks():
         ["--initial-scramble", "", "--source", "frame.png", "--debug-color-masks"]
     )
     assert debug_args.debug_color_masks is True
+    colored_args = render_script.build_parser().parse_args(
+        ["--initial-scramble", "", "--source", "frame.png", "--show-colored-masks"]
+    )
+    assert colored_args.show_colored_masks is True
     hidden_args = render_script.build_parser().parse_args(
         ["--initial-scramble", "",
             "--source",
@@ -2416,6 +2488,54 @@ def test_completed_turn_still_requires_more_global_inliers_than_static():
     )
 
 
+def test_turn_color_rescue_accepts_a_strong_color_improvement():
+    static = {
+        "is_baseline": True,
+        "layer_axis": 0,
+        "layer_side": 1,
+        "layer_count": 1,
+        "inlier_count": 19,
+        "color_error": 2.0,
+    }
+    color_rescued_turn = {
+        "is_baseline": False,
+        "layer_axis": 0,
+        "layer_side": 1,
+        "layer_count": 1,
+        "inlier_count": 19,
+        "color_error": 1.0,
+    }
+
+    assert render_script.turn_trial_exceeds_static_baseline(
+        color_rescued_turn,
+        {(0, 1, 1): static},
+    )
+
+
+def test_turn_color_rescue_rejects_a_small_color_improvement():
+    static = {
+        "is_baseline": True,
+        "layer_axis": 0,
+        "layer_side": 1,
+        "layer_count": 1,
+        "inlier_count": 19,
+        "color_error": 2.0,
+    }
+    weak_color_turn = {
+        "is_baseline": False,
+        "layer_axis": 0,
+        "layer_side": 1,
+        "layer_count": 1,
+        "inlier_count": 19,
+        "color_error": 1.01,
+    }
+
+    assert not render_script.turn_trial_exceeds_static_baseline(
+        weak_color_turn,
+        {(0, 1, 1): static},
+    )
+
+
 def test_three_point_edge_uses_image_gap_to_preserve_cyclic_correspondence():
     object_points = render_script.canonical_sticker_object_points("edge")
     # p0, p1, p2 are observed; p3 is the missing corner.  The p2 -> p0
@@ -2979,6 +3099,153 @@ def test_cached_pipeline_refines_then_builds_one_shared_profile_then_recovers(mo
     result = render_script.process_cached_pose_and_profiles(cache, initial_trace, args, colors, None)
     assert events == ["refine", "profiles", "orientation", "moves"]
     assert result == (final_trace, profiles, observations)
+
+
+def test_initial_state_profile_refinement_uses_labels_and_excludes_turn_frame():
+    trace = render_script.StickerColorTrace.create()
+    red, orange = (identity.label for identity in trace.identities[:2])
+    trace.observe(0, {red: np.array([190, 80, 30]), orange: np.array([200, 60, 20])})
+    trace.observe(1, {red: np.array([10, 240, 10])})
+    initial, _ = render_script.build_global_color_profiles_from_samples([])
+
+    refined, grouped = render_script.refine_global_color_profiles_from_initial_state(
+        trace, {red: "red", orange: "orange"}, initial, 1,
+    )
+
+    assert [entry[0] for entry in grouped["red"]] == [red]
+    assert [entry[0] for entry in grouped["orange"]] == [orange]
+    assert refined["red"].sample_count == 1
+    assert refined["orange"].sample_count == 1
+    assert refined["blue"] is initial["blue"]
+    assert refined["red"].labeled_samples == ((190.0, 80.0, 30.0),)
+    assert refined["orange"].labeled_samples == ((200.0, 60.0, 20.0),)
+
+
+def test_labeled_sample_evidence_is_bounded_and_falls_back_at_distance():
+    profiles, _ = render_script.build_global_color_profiles_from_samples([])
+    red_index = render_script.GLOBAL_COLOR_NAMES.index("red")
+    point = np.array([200, 50, 50], dtype=np.uint8)
+    baseline = render_script._rgb_observation_color_evidence(point, profiles)[red_index]
+    single = dict(profiles)
+    single["red"] = replace(profiles["red"], labeled_samples=((200., 50., 50.),),
+                            labeled_sample_weights=(1.,))
+    supported = dict(profiles)
+    supported["red"] = replace(profiles["red"], labeled_samples=((200., 50., 50.),) * 3,
+                               labeled_sample_weights=(1.,) * 3)
+    single_evidence = render_script._rgb_observation_color_evidence(point, single)[red_index]
+    supported_evidence = render_script._rgb_observation_color_evidence(point, supported)[red_index]
+    assert baseline < single_evidence < supported_evidence <= 1.0
+    distant = np.array([255, 255, 255], dtype=np.uint8)
+    assert render_script._rgb_observation_color_evidence(distant, supported)[red_index] == pytest.approx(
+        render_script._rgb_observation_color_evidence(distant, profiles)[red_index], abs=1e-5,
+    )
+
+
+@pytest.mark.parametrize("first_turn", [0, 1, None, "reversal"])
+def test_move_search_calibrates_once_without_replaying_frames(monkeypatch, first_turn, capsys):
+    trace = render_script.StickerColorTrace.create()
+    label = trace.identities[0].label
+    candidate = render_script.StickerPnPCandidate(
+        sticker_type="corner", sticker_average_confidence=0.9,
+        image_points=np.zeros((4, 2), dtype=np.float32),
+        object_points=np.zeros((4, 3), dtype=np.float32),
+        projected_sticker_points=np.zeros((4, 2), dtype=np.float32),
+        camera_matrix=np.eye(3), dist_coeffs=np.zeros((4, 1)),
+        rvec=np.zeros((3, 1)), tvec=np.asarray([[0.0], [0.0], [200.0]]),
+        reprojection_error=0.0, overall_reprojection_error=0.0,
+    )
+    records = []
+    for frame in range(5 if first_turn == "reversal" else 3):
+        trace.observe(frame, {label: np.array([180, 40, 20])})
+        records.append(SimpleNamespace(frame_index=frame, pose_candidate=candidate,
+                                       pose_candidates=(candidate,), sticker_masks=None))
+    profiles, observations = render_script.build_global_color_profiles_from_samples([])
+    original = profiles["red"]
+    searches = []
+
+    def search(pose, **kwargs):
+        index = len(searches)
+        searches.append(kwargs["turn_global_profiles"]["red"])
+        angle = ({0: 30.0, 1: -30.0, 3: 60.0}.get(index, 0.0)
+                 if first_turn == "reversal" else (60.0 if index == first_turn else 0.0))
+        rotations = (render_script.CubeLayerRotation(0, 1, angle),) if angle else ()
+        return replace(pose, layer_rotations=rotations)
+
+    monkeypatch.setattr(render_script, "solve_pnp_from_low_error_assignments", search)
+    monkeypatch.setattr(render_script, "pose_reprojection_error_is_acceptable", lambda _: True)
+    render_script.recover_cached_pose_symmetries(
+        records, trace, pose_prepared=True, recover_orientation=False,
+        recognize_moves=True, global_profiles=profiles, known_initial_colors={label: "red"},
+        calibrate_initial_colors=True, calibration_observations=observations,
+    )
+    message = capsys.readouterr().out
+    assert message.count("Color calibration stopped:") == 1
+    assert ("end of input without a lasting committed move" if first_turn is None
+            else f"first committed move at frame {3 if first_turn == 'reversal' else first_turn}") in message
+    assert len(searches) == (5 if first_turn == "reversal" else 3)
+    if first_turn == "reversal":
+        assert all(profile is original for profile in searches)
+        assert profiles["red"] is not original
+        assert [frame for _, frame, _ in observations["red"]] == [2]
+    elif first_turn == 1:
+        assert all(profile is original for profile in searches)
+        assert profiles["red"] is not original
+        assert [frame for _, frame, _ in observations["red"]] == [0]
+    elif first_turn == 0:
+        assert all(profile is original for profile in searches)
+        assert profiles["red"] is original
+    else:
+        assert all(profile is original for profile in searches)
+        assert [frame for _, frame, _ in observations["red"]] == [0, 1, 2]
+
+
+@pytest.mark.parametrize("inverse_frame", [21, 22])
+def test_calibration_move_patience_cancels_only_within_twenty_frames(monkeypatch, inverse_frame, capsys):
+    trace = render_script.StickerColorTrace.create()
+    label = trace.identities[0].label
+    candidate = render_script.StickerPnPCandidate(
+        sticker_type="corner", sticker_average_confidence=0.9,
+        image_points=np.zeros((4, 2), dtype=np.float32),
+        object_points=np.zeros((4, 3), dtype=np.float32),
+        projected_sticker_points=np.zeros((4, 2), dtype=np.float32),
+        camera_matrix=np.eye(3), dist_coeffs=np.zeros((4, 1)),
+        rvec=np.zeros((3, 1)), tvec=np.asarray([[0.0], [0.0], [200.0]]),
+        reprojection_error=0.0, overall_reprojection_error=0.0,
+    )
+    records = []
+    for frame in range(25):
+        trace.observe(frame, {label: np.array([180, 40, 20])})
+        records.append(SimpleNamespace(frame_index=frame, pose_candidate=candidate,
+                                       pose_candidates=(candidate,), sticker_masks=None))
+    profiles, observations = render_script.build_global_color_profiles_from_samples([])
+    searches = []
+
+    def search(pose, **kwargs):
+        index = len(searches)
+        searches.append(kwargs["turn_global_profiles"]["red"])
+        angle = 90.0 if index == 1 else (-90.0 if index == inverse_frame else 0.0)
+        rotations = (render_script.CubeLayerRotation(0, 1, angle),) if angle else ()
+        return replace(pose, layer_rotations=rotations)
+
+    monkeypatch.setattr(render_script, "solve_pnp_from_low_error_assignments", search)
+    monkeypatch.setattr(render_script, "pose_reprojection_error_is_acceptable", lambda _: True)
+    render_script.recover_cached_pose_symmetries(
+        records, trace, pose_prepared=True, recover_orientation=False,
+        recognize_moves=True, global_profiles=profiles, known_initial_colors={label: "red"},
+        calibrate_initial_colors=True, calibration_observations=observations,
+    )
+    output = capsys.readouterr().out
+    assert len(searches) == 25
+    if inverse_frame == 21:
+        assert "moves canceled" in output
+        assert "end of input without a lasting committed move" in output
+        assert [frame for _, frame, _ in observations["red"]] == [0, 22, 23, 24]
+    else:
+        assert "moves canceled" not in output
+        assert "first committed move at frame 1" in output
+        assert [frame for _, frame, _ in observations["red"]] == [0]
+        assert searches[21] is not profiles["red"]
+        assert searches[22] is profiles["red"]
 
 
 def test_initial_scramble_is_required_and_cpu_is_default():

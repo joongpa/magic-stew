@@ -365,6 +365,14 @@ boundaries.
 When `--show-sticker-mask` is enabled, the final output displays the
 transparent red distance-transform heatmap used to visualize sticker-mask
 peaks instead of the binary mask fill and boundary overlay.
+Use `--show-colored-masks` to replace that heatmap in the final replay with
+color predictions drawn on each projected sticker's intersection with the
+sticker/cube segmentation. Each intersection is classified independently
+from its pixels using the global profiles, without sticker identity or move
+history priors. With `--recognize-moves`, these include the labeled-sample
+calibration; otherwise the initial global profiles are used. A usable pose and
+enough reliable pixels are needed for an intersection to be colored. Add
+`--no-show-pnp` to hide the pose drawing while retaining the pose calculation.
 That same peak-to-centroid confidence tempers mask-center influence during pose
 refinement, so irregular or merged masks cannot pull the solve as strongly as
 clean, centered masks.
@@ -390,6 +398,19 @@ elsewhere.
 With `--recognize-moves`, pose refinement and geometric turn search run on
 every processed frame with a usable pose. The turn search is not throttled by
 frame interval, and it remains enabled even when pose drawing is disabled.
+During the turn search, stationary observations are grouped by their known
+initial sticker colors and used to refine the global color profiles. After a
+committed move, calibration pauses for 20 video frames; if subsequent moves
+restore the prior cube state within that window, calibration resumes. Otherwise,
+the samples collected before that move are used to refine the profiles for
+later frames. Frames during partial turns and while awaiting a reversal are
+excluded. If no lasting move is committed, all accepted stationary initial-state
+observations are used; colors with too little evidence keep their original
+profiles.
+After calibration, color likelihoods combine the regression distance with the
+distance to up to three nearby labeled samples. Sample distance contributes
+at most 30%, tapering with weak or distant sample coverage; the regression
+remains the fallback for colors without suitable labeled samples.
 Without `--recognize-moves`, the default pose-symmetry option uses the same
 closest-color-profile orientation recovery as the original pose pipeline. It
 evaluates the 24 proper cube symmetries and uses profile likelihood plus pose
