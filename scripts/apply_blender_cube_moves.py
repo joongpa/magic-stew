@@ -448,7 +448,12 @@ HAND_ASSET_IMPORTED = False
 SOLVED_LOCATION_PROP = "synthetic_solved_location"
 SOLVED_ROTATION_PROP = "synthetic_solved_rotation"
 DEFAULT_OUTPUT_DIR = "data/synthetic_cube_dataset"
-DEFAULT_IMAGE_SIZE = 128
+# RF-DETR Keypoint Preview supports custom square resolutions as long as they
+# satisfy the selected model's block-size constraint. Use the requested pair
+# of dataset scales, corresponding to the former 128px and 256px outputs.
+RFDETR_KEYPOINT_NATIVE_INPUT_SIZE = (576, 576)
+RFDETR_KEYPOINT_DATASET_RESOLUTIONS = ((144, 144), (288, 288))
+DEFAULT_IMAGE_SIZE = RFDETR_KEYPOINT_DATASET_RESOLUTIONS[0][0]
 DEFAULT_HARD_CASE = "none"
 SOLID_BACKGROUND_PATCH_HARD_CASE = "solid_background_patch"
 DIAGONAL_CAMERA_ROLL_HARD_CASE = "diagonal_camera_roll"
@@ -496,7 +501,9 @@ SECONDARY_CUBE_SCALE_RANGE = (0.45, 0.65)
 # set only the requested scene variables and return the same scene metadata
 # tuple as randomize_scene().
 HARD_CASE_BUILDERS: dict[str, object] = {}
-HIGH_RESOLUTION_IMAGE_SIZE = (256, 256)
+# The larger dataset variant is used at the same probability as the previous
+# 256px high-resolution path.
+HIGH_RESOLUTION_IMAGE_SIZE = RFDETR_KEYPOINT_DATASET_RESOLUTIONS[1]
 HIGH_RESOLUTION_PROBABILITY = 0.25
 # Purging Blender's orphan-ID graph is more expensive than ordinary object
 # cleanup, so do it periodically during long-running generation.
@@ -9411,6 +9418,12 @@ def generate_dataset(
     hard_case: str = DEFAULT_HARD_CASE,
     nvidia_gpu: bool = False,
 ) -> None:
+    if (width, height) not in RFDETR_KEYPOINT_DATASET_RESOLUTIONS:
+        raise ValueError(
+            "RF-DETR Keypoint dataset generation requires one of "
+            f"{RFDETR_KEYPOINT_DATASET_RESOLUTIONS}; "
+            f"received {width}x{height}."
+        )
     if nvidia_gpu:
         configure_nvidia_gpu()
     images_dir = output_dir / "images"
@@ -9424,6 +9437,11 @@ def generate_dataset(
         json.dumps(
             {
                 "format": "combined_landmark_and_sticker_keypoints_v1",
+                "model": "RF-DETRKeypointPreview",
+                "model_native_input_resolution": list(RFDETR_KEYPOINT_NATIVE_INPUT_SIZE),
+                "dataset_resolutions": [
+                    list(resolution) for resolution in RFDETR_KEYPOINT_DATASET_RESOLUTIONS
+                ],
                 "class_names": list(COMBINED_KEYPOINT_CLASS_NAMES),
                 "landmark_class_names": list(INDEPENDENT_CLASS_NAMES),
                 "sticker_class_names": list(STICKER_KEYPOINT_CLASS_NAMES),
@@ -9859,6 +9877,9 @@ def generate_dataset(
         "val: images\n"
         + "pose: pose\n"
         + "kpt_shape: [1, 3]\n"
+        + f"image_size: {DEFAULT_IMAGE_SIZE}\n"
+        + "available_image_sizes: [144, 288]\n"
+        + "model: RF-DETRKeypointPreview\n"
         + "pose_label_mode: combined_keypoints\n"
         + "names:\n"
         + "".join(
