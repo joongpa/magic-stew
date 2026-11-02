@@ -11,8 +11,8 @@ Assumptions:
 - Cubies are 1 meter wide, so cubie origins sit on the -1/0/1 grid.
 - Cubie objects use quaternion rotation mode.
 - Cubie object pass_index values identify physical cubies.
-- Segmentation labels contain two YOLO polygon classes: one whole-cube instance
-  and one instance for every visible sticker.
+- Pose labels contain one YOLO keypoint instance per qualifying sticker center,
+  with six sticker-color classes.
 - Blender axes are X=right, Z=up, and Y=front/back. Change FRONT_AXIS if needed.
 """
 
@@ -195,6 +195,30 @@ BACKGROUND_BLEND_ASSET_FAMILY_WEIGHTS = {
 STICKER_COLOR_MATERIAL_NAMES = ("White", "Yellow", "Red", "Orange", "Blue", "Green")
 STICKER_OBJECT_NAME_PREFIX = "StickerlessMaterialRadialPart."
 SEGMENTATION_CLASS_NAMES = ("cube", "sticker")
+STICKER_KEYPOINT_CLASS_NAMES = ("white", "yellow", "orange", "red", "blue", "green")
+STICKER_KEYPOINT_CLASS_ID_BY_MATERIAL = {
+    "White": 0,
+    "Yellow": 1,
+    "Orange": 2,
+    "Red": 3,
+    "Blue": 4,
+    "Green": 5,
+}
+STICKER_KEYPOINT_MIN_VISIBLE_AREA_RATIO = 0.10
+# Sticker faces within this many degrees of edge-on have too little visual
+# evidence to produce a useful center keypoint. This uses the same convention
+# as point_faces_camera: 0 degrees is exactly edge-on and 90 degrees is
+# face-on.
+STICKER_KEYPOINT_MIN_PLANE_ANGLE_DEGREES = 5.0
+STICKER_KEYPOINT_MASK_COLORS = {
+    # OpenCV uses BGR ordering; these correspond to the sticker colors.
+    0: (255, 255, 255),  # white
+    1: (0, 238, 245),    # yellow
+    2: (0, 146, 242),    # orange
+    3: (1, 32, 231),     # red
+    4: (227, 177, 101),  # blue
+    5: (1, 227, 80),     # green
+}
 MIN_VISIBLE_STICKER_AREA_PX_AT_128 = 8.0
 POSE_LABEL_DIRECTORY = "pose"
 POSE_LABEL_MODE_INDEPENDENT = "independent"
@@ -494,6 +518,14 @@ INDEPENDENT_CLASS_MASK_POINT_COLORS = {
     CORNER_CLASS_ID: (255, 255, 255),
     CORNER_EDGE_CLASS_ID: (0, 255, 255),
     CORNER_EDGE_CENTER_CLASS_ID: (255, 120, 255),
+}
+COMBINED_KEYPOINT_CLASS_NAMES = tuple(INDEPENDENT_CLASS_NAMES) + tuple(
+    STICKER_KEYPOINT_CLASS_NAMES
+)
+STICKER_KEYPOINT_DATASET_CLASS_ID_OFFSET = len(INDEPENDENT_CLASS_NAMES)
+STICKER_KEYPOINT_DATASET_CLASS_ID_BY_MATERIAL = {
+    material_name: STICKER_KEYPOINT_DATASET_CLASS_ID_OFFSET + class_id
+    for material_name, class_id in STICKER_KEYPOINT_CLASS_ID_BY_MATERIAL.items()
 }
 CUBE_KEYPOINT_NAMES = (
     "UBL", "UBR", "UFR", "UFL",
@@ -5628,6 +5660,7 @@ def render_visibility_class_map(
     hand_roots: list[bpy.types.Object],
     width: int,
     height: int,
+    sticker_face_keys: dict[tuple[str, int], str] | None = None,
 ) -> tuple[object, dict[str, object]]:
     """Ray-cast visible ownership and a separate visible-sticker map.
 
@@ -5665,9 +5698,14 @@ def render_visibility_class_map(
         if obj.type == "MESH" and obj.name.startswith(SECONDARY_CUBE_OBJECT_PREFIX)
     }
     visibility = np.zeros((height, width), dtype=np.uint8)
+    sticker_mask_keys = (
+        sorted(set(sticker_face_keys.values()))
+        if sticker_face_keys is not None
+        else sorted(sticker_names)
+    )
     sticker_masks = {
         name: np.zeros((height, width), dtype=np.uint8)
-        for name in sorted(sticker_names)
+        for name in sticker_mask_keys
     }
     tracked_names = main_cube_names | hand_names | secondary_cube_names
     tracked_objects = {
@@ -5718,7 +5756,13 @@ def render_visibility_class_map(
                 object_name = hit_object.name
                 if object_name in main_cube_names:
                     visibility[y, x] = 1
-                    sticker_key = object_name if object_name in sticker_masks else None
+                    sticker_key = None
+                    if sticker_face_keys is not None:
+                        sticker_key = sticker_face_keys.get(
+                            (object_name, int(_polygon_index))
+                        )
+                    elif object_name in sticker_masks:
+                        sticker_key = object_name
                     if sticker_key is None:
                         # Older cube files keep sticker faces as material slots
                         # on cubies. When detached sticker objects also exist,
@@ -5793,6 +5837,500 @@ def filter_visible_sticker_masks(
         if cv2.contourArea(hull) >= minimum_area:
             filtered[name] = mask
     return filtered
+
+
+def sticker_material_name(obj: bpy.types.Object) -> str | None:
+    for material in getattr(getattr(obj, "data", None), "materials", ()):
+        if material is not None and material.name in STICKER_KEYPOINT_CLASS_ID_BY_MATERIAL:
+            return material.name
+    return None
+
+
+def sticker_polygon_face_groups(
+    obj: bpy.types.Object,
+    polygons: list[object],
+) -> list[tuple[str, list[object]]]:
+    """Split a sticker mesh into its distinct axis-aligned sticker faces."""
+    groups = []
+    for axis_index, axis_name in enumerate(("x", "y", "z")):
+        for sign in (-1, 1):
+            axis = axis_vector(axis_index, float(sign))
+            selected = [
+                polygon
+                for polygon in polygons
+                if polygon.normal.length > 1e-6
+                and polygon.normal.normalized().dot(axis) > 0.92
+            ]
+            if sum(float(getattr(polygon, "area", 0.0)) for polygon in selected) < 0.05:
+                continue
+            groups.append((f"{axis_name}{'p' if sign > 0 else 'n'}", selected))
+    return groups
+
+
+def sticker_surface_spec(
+    obj: bpy.types.Object,
+    material_name: str,
+    polygons: list[object],
+    mask_key: str,
+) -> dict[str, object] | None:
+    """Build one physical-sticker center and projected-area source."""
+    if not polygons:
+        return None
+    transform = obj.matrix_world
+    world_vertices = []
+    world_polygons = []
+    normal = Vector((0.0, 0.0, 0.0))
+    for polygon in polygons:
+        polygon_vertices = [
+            transform @ obj.data.vertices[int(vertex_index)].co
+            for vertex_index in polygon.vertices
+        ]
+        if len(polygon_vertices) < 3:
+            continue
+        world_vertices.extend(polygon_vertices)
+        world_polygons.append(polygon_vertices)
+        weight = max(float(getattr(polygon, "area", 0.0)), 1e-6)
+        transformed_normal = transform.to_3x3() @ polygon.normal
+        if transformed_normal.length > 1e-6:
+            normal += transformed_normal.normalized() * weight
+    if not world_vertices:
+        return None
+    # Blender's MeshPolygon.center can be badly biased for the concave ngons
+    # used by the radial sticker meshes. Use the midpoint of the face's
+    # tangential vertex bounds instead, retaining the face depth separately.
+    anchor_polygon = max(
+        polygons,
+        key=lambda polygon: max(float(getattr(polygon, "area", 0.0)), 1e-6),
+    )
+    center_local = anchor_polygon.center.copy()
+    local_normal = anchor_polygon.normal.normalized()
+    normal_axis = max(range(3), key=lambda axis_index: abs(local_normal[axis_index]))
+    for axis_index in range(3):
+        if axis_index == normal_axis:
+            continue
+        coordinates = [
+            float(obj.data.vertices[int(vertex_index)].co[axis_index])
+            for polygon in polygons
+            for vertex_index in polygon.vertices
+        ]
+        if coordinates:
+            center_local[axis_index] = (min(coordinates) + max(coordinates)) * 0.5
+    center = transform @ center_local
+    if normal.length <= 1e-6:
+        normal = (world_vertices[1] - world_vertices[0]).cross(
+            world_vertices[2] - world_vertices[0]
+        )
+    if normal.length <= 1e-6:
+        return None
+    # Detached sticker meshes have a small bevel/thickness. Their volume
+    # centroid is therefore inside the cubie, which would make an otherwise
+    # visible center look occluded by its own cubie. Use the outward-facing
+    # front polygon center instead.
+    if obj.name.startswith(STICKER_OBJECT_NAME_PREFIX):
+        parent_center = (
+            obj.parent.matrix_world.translation.copy()
+            if obj.parent is not None
+            else center.copy()
+        )
+        outward_hint = center - parent_center
+        if outward_hint.length > 1e-6:
+            front_polygon = max(
+                polygons,
+                key=lambda polygon: (
+                    max(float(getattr(polygon, "area", 0.0)), 1e-6)
+                    * max(
+                        0.0,
+                        (transform.to_3x3() @ polygon.normal).normalized().dot(
+                            outward_hint.normalized()
+                        ),
+                    )
+                ),
+            )
+            center_local = front_polygon.center.copy()
+            local_normal = front_polygon.normal.normalized()
+            normal_axis = max(
+                range(3),
+                key=lambda axis_index: abs(local_normal[axis_index]),
+            )
+            for axis_index in range(3):
+                if axis_index == normal_axis:
+                    continue
+                coordinates = [
+                    float(obj.data.vertices[int(vertex_index)].co[axis_index])
+                    for polygon in polygons
+                    for vertex_index in polygon.vertices
+                ]
+                if coordinates:
+                    center_local[axis_index] = (min(coordinates) + max(coordinates)) * 0.5
+            center = transform @ center_local
+            normal = transform.to_3x3() @ front_polygon.normal
+            if normal.dot(outward_hint) < 0.0:
+                normal.negate()
+            center += normal.normalized() * 0.003
+    return {
+        "name": mask_key,
+        "mask_key": mask_key,
+        "source_object": obj.name,
+        "material_name": material_name,
+        "class_id": STICKER_KEYPOINT_CLASS_ID_BY_MATERIAL[material_name],
+        "class": STICKER_KEYPOINT_CLASS_NAMES[
+            STICKER_KEYPOINT_CLASS_ID_BY_MATERIAL[material_name]
+        ],
+        "point": center,
+        "normal": normal.normalized(),
+        "world_polygons": world_polygons,
+        "polygon_indices": [int(polygon.index) for polygon in polygons],
+    }
+
+
+def sticker_keypoint_specs(main_cube_roots: list[bpy.types.Object]) -> list[dict[str, object]]:
+    """Return one center spec for every physical sticker in the cube."""
+    specs = []
+    covered_parent_materials: set[tuple[str, str]] = set()
+    sticker_names = sticker_render_mesh_names(main_cube_roots)
+    for sticker_name in sorted(sticker_names):
+        obj = bpy.data.objects.get(sticker_name)
+        if obj is None or not sticker_name.startswith(STICKER_OBJECT_NAME_PREFIX):
+            continue
+        material_name = sticker_material_name(obj)
+        if material_name is None:
+            continue
+        if obj.parent is not None:
+            covered_parent_materials.add((obj.parent.name, material_name))
+        polygons = list(getattr(getattr(obj, "data", None), "polygons", ()))
+        face_candidates = []
+        for face_name, face_polygons in sticker_polygon_face_groups(obj, polygons):
+            candidate = sticker_surface_spec(
+                obj,
+                material_name,
+                face_polygons,
+                f"{obj.name}:face:{face_name}",
+            )
+            if candidate is not None:
+                face_candidates.append(candidate)
+        if face_candidates:
+            spec = dict(face_candidates[0])
+            spec["name"] = obj.name
+            spec["mask_key"] = obj.name
+            spec["face_candidates"] = face_candidates
+            spec["polygon_indices"] = [
+                int(polygon.index)
+                for candidate in face_candidates
+                for polygon_index in candidate["polygon_indices"]
+                for polygon in polygons
+                if int(polygon.index) == int(polygon_index)
+            ]
+            specs.append(spec)
+
+    # Support older cube assets whose sticker faces are material slots on the
+    # cubie instead of detached sticker objects.
+    for obj in main_cube_roots:
+        if obj.type != "MESH":
+            continue
+        materials = getattr(obj.data, "materials", ())
+        for material_name in STICKER_COLOR_MATERIAL_NAMES:
+            if (obj.name, material_name) in covered_parent_materials:
+                continue
+            material_indices = {
+                index
+                for index, material in enumerate(materials)
+                if material is not None and material.name == material_name
+            }
+            material_polygons = [
+                polygon
+                for polygon in getattr(obj.data, "polygons", ())
+                if polygon.material_index in material_indices
+            ]
+            face_candidates = []
+            for face_name, face_polygons in sticker_polygon_face_groups(
+                obj,
+                material_polygons,
+            ):
+                candidate = sticker_surface_spec(
+                    obj,
+                    material_name,
+                    face_polygons,
+                    f"{obj.name}:{material_name}:face:{face_name}",
+                )
+                if candidate is not None:
+                    face_candidates.append(candidate)
+            if face_candidates:
+                spec = dict(face_candidates[0])
+                spec["name"] = f"{obj.name}:{material_name}"
+                spec["mask_key"] = f"{obj.name}:{material_name}"
+                spec["face_candidates"] = face_candidates
+                spec["polygon_indices"] = [
+                    int(polygon.index)
+                    for candidate in face_candidates
+                    for polygon_index in candidate["polygon_indices"]
+                    for polygon in material_polygons
+                    if int(polygon.index) == int(polygon_index)
+                ]
+                specs.append(spec)
+    return specs
+
+
+def projected_sticker_area_mask(
+    spec: dict[str, object],
+    width: int,
+    height: int,
+) -> object:
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        raise RuntimeError("OpenCV and NumPy are required for sticker keypoint labels.") from None
+
+    mask = np.zeros((height, width), dtype=np.uint8)
+    camera = get_camera()
+    scene = bpy.context.scene
+    for world_polygon in spec.get("world_polygons", []):
+        projected = [
+            project_world_point_unclipped(point, camera, scene)
+            for point in world_polygon
+        ]
+        if any(point is None for point in projected) or len(projected) < 3:
+            continue
+        points = np.round(np.asarray(projected, dtype=np.float32)).astype(np.int32)
+        cv2.fillPoly(mask, [points], 1)
+    return mask
+
+
+def select_sticker_face_spec(
+    spec: dict[str, object],
+    visible_mask: object,
+    width: int,
+    height: int,
+) -> dict[str, object]:
+    """Choose the physical face whose projection owns this sticker's pixels."""
+    try:
+        import numpy as np
+    except ImportError:
+        raise RuntimeError("NumPy is required for sticker keypoint labels.") from None
+    candidates = spec.get("face_candidates", [])
+    if not isinstance(candidates, list) or not candidates:
+        return spec
+    if not isinstance(visible_mask, np.ndarray) or not np.any(visible_mask):
+        return {**spec, **candidates[0], "name": spec["name"], "mask_key": spec["mask_key"]}
+    best_candidate = candidates[0]
+    best_overlap = -1
+    for candidate in candidates:
+        candidate_mask = projected_sticker_area_mask(candidate, width, height)
+        overlap = int(np.count_nonzero((candidate_mask != 0) & (visible_mask != 0)))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_candidate = candidate
+    return {
+        **spec,
+        **best_candidate,
+        "name": spec["name"],
+        "mask_key": spec["mask_key"],
+        "face_candidates": candidates,
+    }
+
+
+def sticker_keypoint_bbox(
+    visible_mask: object,
+    point: tuple[float, float],
+    width: int,
+    height: int,
+) -> tuple[float, float, float, float]:
+    try:
+        import numpy as np
+    except ImportError:
+        raise RuntimeError("NumPy is required for sticker keypoint labels.") from None
+    if isinstance(visible_mask, np.ndarray):
+        ys, xs = np.where(visible_mask != 0)
+        if len(xs) > 0:
+            x_min = float(xs.min())
+            x_max = float(xs.max() + 1)
+            y_min = float(ys.min())
+            y_max = float(ys.max() + 1)
+            return (
+                (x_min + x_max) / 2.0,
+                (y_min + y_max) / 2.0,
+                max(1.0, x_max - x_min),
+                max(1.0, y_max - y_min),
+            )
+    radius = max(2.0, float(scaled_annotation_size(4, width, height)))
+    x, y = point
+    return x, y, min(width, radius * 2.0), min(height, radius * 2.0)
+
+
+def render_sticker_keypoints(
+    label_path: Path,
+    mask_path: Path,
+    image_path: Path,
+    main_cube_roots: list[bpy.types.Object],
+    hand_roots: list[bpy.types.Object],
+    width: int,
+    height: int,
+    landmark_lines: list[str] | None = None,
+    landmark_pose_objects: list[dict[str, object]] | None = None,
+) -> tuple[list[str], dict[str, object]]:
+    """Write combined landmark and sticker-center YOLO pose instances."""
+    try:
+        import numpy as np
+    except ImportError:
+        raise RuntimeError("NumPy is required for sticker keypoint labels.") from None
+
+    specs = sticker_keypoint_specs(main_cube_roots)
+    _visibility, sticker_masks = render_visibility_class_map(
+        main_cube_roots,
+        hand_roots,
+        width,
+        height,
+    )
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    camera = get_camera()
+    scene = bpy.context.scene
+    lines = []
+    keypoints = []
+    counts = {
+        "visible": 0,
+        "occluded": 0,
+        "excluded": 0,
+        "out_of_frame": 0,
+        "angle_filtered": 0,
+    }
+    for base_spec in specs:
+        visible_mask = sticker_masks.get(base_spec["mask_key"])
+        spec = select_sticker_face_spec(base_spec, visible_mask, width, height)
+        point = spec["point"]
+        projected = project_world_point(point, camera, scene)
+        projected_mask = projected_sticker_area_mask(spec, width, height)
+        projected_area = int(np.count_nonzero(projected_mask))
+        visible_area = (
+            int(np.count_nonzero(visible_mask))
+            if isinstance(visible_mask, np.ndarray)
+            else 0
+        )
+        area_ratio = visible_area / projected_area if projected_area > 0 else 0.0
+        if projected is None:
+            counts["out_of_frame"] += 1
+            counts["excluded"] += 1
+            continue
+        if not point_faces_camera(
+            point,
+            [spec["normal"]],
+            camera.location,
+            min_plane_angle_degrees=STICKER_KEYPOINT_MIN_PLANE_ANGLE_DEGREES,
+        ):
+            counts["angle_filtered"] += 1
+            counts["excluded"] += 1
+            continue
+        occluded_by = object_occluding_point(point, depsgraph)
+        is_occluded = occluded_by is not None
+        if not is_occluded:
+            visibility = POINT_VISIBILITY_VISIBLE
+            counts["visible"] += 1
+        elif area_ratio > STICKER_KEYPOINT_MIN_VISIBLE_AREA_RATIO:
+            visibility = POINT_VISIBILITY_LABELED_OCCLUDED
+            counts["occluded"] += 1
+        else:
+            counts["excluded"] += 1
+            continue
+        bbox = sticker_keypoint_bbox(visible_mask, projected, width, height)
+        line = yolo_pose_line(
+            STICKER_KEYPOINT_DATASET_CLASS_ID_OFFSET + int(spec["class_id"]),
+            bbox[0],
+            bbox[1],
+            bbox[2],
+            bbox[3],
+            [(projected[0], projected[1], visibility)],
+            width,
+            height,
+        )
+        lines.append(line)
+        keypoints.append({
+            "name": spec["name"],
+            "source_object": spec["source_object"],
+            "material": spec["material_name"],
+            "class": spec["class"],
+            "class_id": STICKER_KEYPOINT_DATASET_CLASS_ID_OFFSET + int(spec["class_id"]),
+            "sticker_class_id": int(spec["class_id"]),
+            "pixel_point": [projected[0], projected[1]],
+            "normalized_point": list(normalize_point(projected[0], projected[1], width, height)),
+            "visibility": visibility,
+            "occluded": is_occluded,
+            "occluded_by": occluded_by,
+            "visible_area_pixels": visible_area,
+            "projected_area_pixels": projected_area,
+            "visible_area_ratio": area_ratio,
+        })
+
+    combined_lines = [*(landmark_lines or []), *lines]
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+    label_path.write_text(
+        "\n".join(combined_lines) + ("\n" if combined_lines else ""),
+        encoding="utf-8",
+    )
+    write_sticker_keypoint_mask(
+        mask_path,
+        image_path,
+        keypoints,
+        width,
+        height,
+        landmark_pose_objects=landmark_pose_objects,
+    )
+    return combined_lines, {
+        "format": "YOLO pose combined landmark and sticker-center keypoints",
+        "class_names": list(COMBINED_KEYPOINT_CLASS_NAMES),
+        "landmark_class_names": list(INDEPENDENT_CLASS_NAMES),
+        "sticker_class_names": list(STICKER_KEYPOINT_CLASS_NAMES),
+        "keypoint_shape": [1, 3],
+        "min_face_plane_angle_degrees": STICKER_KEYPOINT_MIN_PLANE_ANGLE_DEGREES,
+        "min_visible_area_ratio_for_occluded": STICKER_KEYPOINT_MIN_VISIBLE_AREA_RATIO,
+        "keypoints": keypoints,
+        "landmark_keypoints": [
+            keypoint
+            for pose_object in (landmark_pose_objects or [])
+            for keypoint in pose_object.get("keypoints", [])
+        ],
+        "landmark_pose_objects": landmark_pose_objects or [],
+        "counts": counts,
+        "candidate_count": len(specs),
+    }
+
+
+def write_sticker_keypoint_mask(
+    path: Path,
+    image_path: Path,
+    keypoints: list[dict[str, object]],
+    width: int,
+    height: int,
+    landmark_pose_objects: list[dict[str, object]] | None = None,
+) -> None:
+    try:
+        import cv2
+    except ImportError:
+        raise RuntimeError("OpenCV is required for sticker keypoint masks.") from None
+    if landmark_pose_objects:
+        write_pose_keypoint_mask(
+            path,
+            landmark_pose_objects,
+            width,
+            height,
+            image_path=image_path,
+        )
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    else:
+        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None or image.shape[:2] != (height, width):
+        raise RuntimeError(f"Could not read rendered image for sticker keypoint mask: {image_path}")
+    output = image.copy()
+    point_radius = scaled_annotation_size(POSE_POINT_BASE_RADIUS + 1, width, height)
+    outline_radius = point_radius + max(1, POSE_POINT_OUTLINE_WIDTH)
+    for keypoint in keypoints:
+        class_id = int(keypoint["sticker_class_id"])
+        color = STICKER_KEYPOINT_MASK_COLORS[class_id]
+        x, y = keypoint["pixel_point"]
+        center = (round(float(x)), round(float(y)))
+        cv2.circle(output, center, outline_radius, (0, 0, 0), thickness=-1, lineType=cv2.LINE_AA)
+        cv2.circle(output, center, point_radius, color, thickness=-1, lineType=cv2.LINE_AA)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), output):
+        raise RuntimeError(f"Could not write sticker keypoint mask: {path}")
 
 
 def segmentation_lines_from_mask(
@@ -8366,6 +8904,7 @@ def render_pose_keypoints(
     layer_state: dict[str, object] | None = None,
     cube_pose: dict[str, object] | None = None,
     visibility_class_map: object | None = None,
+    include_partial_turn_intersections: bool = False,
 ) -> tuple[list[str], list[dict[str, object]], dict[str, object]]:
     scene = bpy.context.scene
     camera = get_camera()
@@ -8390,6 +8929,12 @@ def render_pose_keypoints(
         layer_state=layer_state,
         cube_pose=cube_pose,
     )
+    if not include_partial_turn_intersections:
+        keypoint_specs = [
+            spec
+            for spec in keypoint_specs
+            if spec.get("intersection_source") != "partial_turn_seam"
+        ]
     candidate_counts = {
         "projected": 0,
         "out_of_frame": 0,
@@ -8519,7 +9064,11 @@ def render_pose_keypoints(
         "partial_turn_intersection_keypoints": sum(
             1 for spec in keypoint_specs if spec.get("intersection_source") == "partial_turn_seam"
         ),
-        "partial_turn_seam_keypoints_enabled": PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED,
+        "partial_turn_seam_keypoints_enabled": (
+            PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED
+            and include_partial_turn_intersections
+        ),
+        "partial_turn_intersections_included": include_partial_turn_intersections,
         "visible_hands": sorted(visible_hand_names),
         "candidates": len(keypoint_specs),
         "min_face_plane_angle_degrees": min_plane_angle_degrees,
@@ -8859,35 +9408,59 @@ def generate_dataset(
     max_cube_rotational_blur_degrees: float,
     cube_rotational_blur_samples: int,
     degrade_probability: float,
-    render_segmentations: bool,
-    mask_mode: str = MASK_MODE_SEGMENTATION,
     hard_case: str = DEFAULT_HARD_CASE,
-    render_pose_labels: bool = True,
-    pose_label_mode: str = POSE_LABEL_MODE_INDEPENDENT,
-    min_face_plane_angle_degrees: float = FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
-    include_occluded_independent_keypoints: bool = INDEPENDENT_INCLUDE_OCCLUDED_KEYPOINTS,
     nvidia_gpu: bool = False,
 ) -> None:
-    if mask_mode not in MASK_MODES:
-        raise ValueError(f"Unsupported mask mode {mask_mode!r}; choose from {MASK_MODES}")
-    if pose_label_mode not in POSE_LABEL_MODES:
-        raise ValueError(
-            f"Unsupported pose label mode {pose_label_mode!r}; choose from {POSE_LABEL_MODES}"
-        )
-    if not 0.0 <= min_face_plane_angle_degrees < 90.0:
-        raise ValueError("min_face_plane_angle_degrees must be in [0, 90).")
     if nvidia_gpu:
         configure_nvidia_gpu()
     images_dir = output_dir / "images"
-    masks_dir = output_dir / "masks" if mask_mode != MASK_MODE_NONE else None
-    labels_dir = output_dir / "labels"
-    pose_dir = output_dir / POSE_LABEL_DIRECTORY if render_pose_labels else None
+    masks_dir = output_dir / "masks"
+    pose_dir = output_dir / POSE_LABEL_DIRECTORY
     images_dir.mkdir(parents=True, exist_ok=True)
-    if masks_dir is not None:
-        masks_dir.mkdir(parents=True, exist_ok=True)
-    labels_dir.mkdir(parents=True, exist_ok=True)
-    if pose_dir is not None:
-        pose_dir.mkdir(parents=True, exist_ok=True)
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    pose_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(
+        output_dir / "sticker_keypoint_manifest.json",
+        json.dumps(
+            {
+                "format": "combined_landmark_and_sticker_keypoints_v1",
+                "class_names": list(COMBINED_KEYPOINT_CLASS_NAMES),
+                "landmark_class_names": list(INDEPENDENT_CLASS_NAMES),
+                "sticker_class_names": list(STICKER_KEYPOINT_CLASS_NAMES),
+                "material_class_ids": STICKER_KEYPOINT_DATASET_CLASS_ID_BY_MATERIAL,
+                "keypoint_shape": [1, 3],
+                "keypoints_per_sticker": 1,
+                "landmark_keypoint_classes": {
+                    "corner": CORNER_CLASS_ID,
+                    "corner-edge": CORNER_EDGE_CLASS_ID,
+                    "corner-edge-center": CORNER_EDGE_CENTER_CLASS_ID,
+                },
+                "partial_turn_seam_keypoints_included": False,
+                "sticker_min_face_plane_angle_degrees": STICKER_KEYPOINT_MIN_PLANE_ANGLE_DEGREES,
+                "visibility": {
+                    "visible": POINT_VISIBILITY_VISIBLE,
+                    "occluded": POINT_VISIBILITY_LABELED_OCCLUDED,
+                    "excluded": POINT_VISIBILITY_UNLABELED,
+                },
+                "occluded_min_visible_sticker_area_ratio": STICKER_KEYPOINT_MIN_VISIBLE_AREA_RATIO,
+                "mask_output": (
+                    "Rendered image with landmark keypoints and color-coded "
+                    "sticker-center keypoints."
+                ),
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+    # Kept only to make the legacy manifest branch below inert while older
+    # helper definitions remain available to existing imports.
+    pose_label_mode = "combined_keypoints"
+    min_face_plane_angle_degrees = 0.0
+    include_occluded_independent_keypoints = False
+    labels_dir = output_dir / "labels"
+    # The old ordered/independent cube-pose manifests and segmentation class
+    # manifest are intentionally not written for this sticker-keypoint format.
+    if False:
         if pose_label_mode == POSE_LABEL_MODE_ORDERED:
             symmetry_manifest = output_dir / "ordered_keypoint_symmetries.json"
             atomic_write_text(
@@ -8948,7 +9521,7 @@ def generate_dataset(
                 )
                 + "\n",
             )
-    if render_segmentations:
+    if False:
         atomic_write_text(
             labels_dir / "classes.json",
             json.dumps(
@@ -9047,9 +9620,8 @@ def generate_dataset(
         sample_index = next_sample_index + index
         stem = f"{sample_index:06d}"
         image_path = images_dir / f"{stem}.png"
-        mask_path = masks_dir / f"{stem}.png" if masks_dir is not None else None
-        label_path = labels_dir / f"{stem}.txt" if render_segmentations else None
-        pose_label_path = pose_dir / f"{stem}.txt" if pose_dir is not None else None
+        mask_path = masks_dir / f"{stem}.png"
+        pose_label_path = pose_dir / f"{stem}.txt"
 
         hands = hand_objects()
         hand_rigs = hand_rig_objects()
@@ -9193,110 +9765,32 @@ def generate_dataset(
                 image_path,
                 probability=degrade_probability,
             )
-            segmentations = {}
-            segmentation_roots = list(objects) + core_objects
-            visibility_class_map = None
-            if render_segmentations:
-                visibility_class_map, sticker_masks = render_visibility_class_map(
-                    segmentation_roots,
+            sticker_roots = list(objects) + core_objects
+            cube_visibility_states = set_mesh_objects_render_visible(sticker_roots)
+            try:
+                landmark_lines, landmark_pose_objects, landmark_metadata = render_pose_keypoints(
+                    path=None,
+                    image_path=None,
+                    include_occluded_keypoints=False,
+                    layer_state=layer_state,
+                    cube_pose=cube_pose,
+                    include_partial_turn_intersections=False,
+                )
+                sticker_lines, sticker_keypoint_metadata = render_sticker_keypoints(
+                    pose_label_path,
+                    mask_path,
+                    image_path,
+                    sticker_roots,
                     list(hand_rigs.values()),
                     width,
                     height,
+                    landmark_lines=landmark_lines,
+                    landmark_pose_objects=landmark_pose_objects,
                 )
-                sticker_masks = filter_visible_sticker_masks(
-                    sticker_masks,
-                    width,
-                    height,
-                )
-                cube_mask = (visibility_class_map == 1).astype("uint8")
-                segmentation_count = write_yolo_cube_sticker_segmentation_label(
-                    cube_mask,
-                    sticker_masks,
-                    label_path,
-                )
-                sticker_component_count = sum(
-                    1
-                    for line in label_path.read_text(encoding="utf-8").splitlines()
-                    if line.split(maxsplit=1)[0] == "1"
-                )
-                if mask_mode == MASK_MODE_SEGMENTATION and mask_path is not None:
-                    write_segmentation_mask(mask_path, cube_mask, sticker_masks)
-                segmentations["target"] = {
-                    "path": str(label_path),
-                    "classes": {
-                        str(class_id): name
-                        for class_id, name in enumerate(SEGMENTATION_CLASS_NAMES)
-                    },
-                    "format": "YOLO polygon segmentation",
-                    "segments": segmentation_count,
-                    "sticker_instances": sum(
-                        1
-                        for sticker_mask in sticker_masks.values()
-                        if getattr(sticker_mask, "any", lambda: False)()
-                    ),
-                    "sticker_components": sticker_component_count,
-                    "mask": str(mask_path) if mask_path is not None else None,
-                }
-            if visibility_class_map is None and (
-                pose_label_path is not None or mask_mode == MASK_MODE_KEYPOINTS
-            ):
-                visibility_class_map, _ = render_visibility_class_map(
-                    segmentation_roots,
-                    list(hand_rigs.values()),
-                    width,
-                    height,
-                )
-            ordered_pose_metadata = None
-            independent_pose_metadata = None
-            pose_label_valid = None
-            if pose_label_path is not None or mask_mode == MASK_MODE_KEYPOINTS:
-                cube_visibility_states = set_mesh_objects_render_visible(
-                    segmentation_roots,
-                )
-                try:
-                    pose_label_valid = True
-                    if pose_label_mode == POSE_LABEL_MODE_ORDERED:
-                        ordered_pose_line, ordered_pose_metadata = render_ordered_keypoint_label(
-                            cube_pose,
-                            width,
-                            height,
-                            layer_state=layer_state,
-                            min_plane_angle_degrees=min_face_plane_angle_degrees,
-                            visibility_class_map=visibility_class_map,
-                        )
-                        if ordered_pose_line is None:
-                            raise RuntimeError(f"Could not project ordered keypoints for {image_path}")
-                        if pose_label_path is not None:
-                            write_yolo_pose(pose_label_path, [ordered_pose_line])
-                    else:
-                        independent_lines, independent_objects, independent_geometry = render_pose_keypoints(
-                            mask_path if mask_mode == MASK_MODE_KEYPOINTS else None,
-                            image_path=image_path if mask_mode == MASK_MODE_KEYPOINTS else None,
-                            min_plane_angle_degrees=min_face_plane_angle_degrees,
-                            include_occluded_keypoints=include_occluded_independent_keypoints,
-                            layer_state=layer_state,
-                            cube_pose=cube_pose,
-                            visibility_class_map=visibility_class_map,
-                        )
-                        if pose_label_path is not None:
-                            write_yolo_pose(pose_label_path, independent_lines)
-                        independent_pose_metadata = {
-                            **independent_geometry,
-                            "objects": independent_objects,
-                        }
-                finally:
-                    restore_mesh_object_visibility(cube_visibility_states)
-            if mask_mode == MASK_MODE_KEYPOINTS and mask_path is not None:
-                if pose_label_mode == POSE_LABEL_MODE_ORDERED:
-                    if ordered_pose_metadata is None:
-                        raise RuntimeError("Keypoint mask mode did not produce ordered keypoint metadata")
-                    write_ordered_keypoint_overlay(
-                        mask_path,
-                        image_path,
-                        ordered_pose_metadata,
-                        width,
-                        height,
-                    )
+                sticker_keypoint_metadata["landmark_metadata"] = landmark_metadata
+                pose_label_valid = True
+            finally:
+                restore_mesh_object_visibility(cube_visibility_states)
         finally:
             restore_hand_objects(hands, hand_states)
 
@@ -9315,19 +9809,14 @@ def generate_dataset(
                 "height": height,
                 "variant": "high" if use_high_resolution else "base",
             },
-            "mask": str(mask_path) if mask_path is not None else None,
-            "label": str(label_path),
-            "pose_label": str(pose_label_path) if pose_label_path is not None else None,
+            "mask": str(mask_path),
+            "pose_label": str(pose_label_path),
             "pose_label_valid": pose_label_valid,
-            "pose_label_mode": pose_label_mode,
-            "ordered_keypoints": ordered_pose_metadata,
-            "independent_keypoints": independent_pose_metadata,
-            "segmentations": segmentations,
+            "sticker_keypoints": sticker_keypoint_metadata,
             "move_mode": scene_move_mode(cube_solved),
             "partial_turn_augmentation_enabled": CUBE_MISALIGNMENT_ENABLED,
             "partial_turn_probability": PARTIAL_TURN_APPLIED_PROBABILITY,
             "partial_turn_applied": layer_state.get("mode", "none") != "none",
-            "partial_turn_seam_keypoints_enabled": PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED,
             "moves": moves,
             "layer_state": layer_state,
             "cubie_labels": {obj.name: obj.pass_index for obj in objects},
@@ -9341,23 +9830,22 @@ def generate_dataset(
             "camera_degradation": camera_degradation,
             "hands": hand_randomization,
             "hand_attempts": hand_attempts,
-            "objects": sum(
-                int(item.get("segments", 0))
-                for item in segmentations.values()
-                if isinstance(item, dict)
+            "objects": (
+                len(sticker_keypoint_metadata.get("keypoints", []))
+                + len(sticker_keypoint_metadata.get("landmark_keypoints", []))
             ),
         }
         metadata_records.append(metadata_entry)
         atomic_write_json(metadata_path, metadata_records)
         if (index + 1) % MEMORY_CLEANUP_INTERVAL == 0:
             cleanup_blender_memory()
-        mask_message = f", {mask_path}" if mask_path is not None else ""
+        mask_message = f", {mask_path}"
         blend_asset_count = background_randomization.get("blend_asset_count", 0)
         blend_asset_sources = background_randomization.get("blend_asset_sources", [])
         print(
             f"Wrote {image_path}{mask_message}, "
-            f"and {label_path if label_path is not None else 'no labels'} "
-            f"with {metadata_entry['objects']} cube/sticker segments, "
+            f"and {pose_label_path} "
+            f"with {metadata_entry['objects']} combined keypoints, "
             f"{blend_asset_count} blend background assets {blend_asset_sources}, "
             f"{'with' if rotational_blur else 'without'} rotational blur "
             f"and {'with' if camera_degradation else 'without'} camera degradation"
@@ -9369,20 +9857,14 @@ def generate_dataset(
         "path: " + str(output_dir.resolve()) + "\n"
         "train: images\n"
         "val: images\n"
-        + ("pose: pose\n" if pose_dir is not None else "")
-        + (
-            f"kpt_shape: [{ORDERED_KEYPOINT_COUNT if pose_label_mode == POSE_LABEL_MODE_ORDERED else POSE_KEYPOINT_COUNT}, 3]\n"
-            if pose_dir is not None
-            else ""
-        )
-        + (
-            "kpt_symmetry_file: ordered_keypoint_symmetries.json\n"
-            if pose_dir is not None and pose_label_mode == POSE_LABEL_MODE_ORDERED
-            else ""
-        )
-        + (f"pose_label_mode: {pose_label_mode}\n" if pose_dir is not None else "")
+        + "pose: pose\n"
+        + "kpt_shape: [1, 3]\n"
+        + "pose_label_mode: combined_keypoints\n"
         + "names:\n"
-        + "".join(f"  {index}: {name}\n" for index, name in enumerate(SEGMENTATION_CLASS_NAMES)),
+        + "".join(
+            f"  {index}: {name}\n"
+            for index, name in enumerate(COMBINED_KEYPOINT_CLASS_NAMES)
+        ),
     )
 
 
@@ -9430,68 +9912,6 @@ def cli_args() -> argparse.Namespace:
         help="Probability of applying post-render blur, noise, rescale softness, and video codec artifacts.",
     )
     parser.add_argument(
-        "--mask-mode",
-        choices=MASK_MODES,
-        default=MASK_MODE_SEGMENTATION,
-        help=(
-            "Mask visualization to write under masks/: segmentation (default), "
-            "keypoint visualization (independent or ordered, depending on "
-            "--pose-label-mode), or none."
-        ),
-    )
-    parser.add_argument(
-        "--no-masks",
-        action="store_true",
-        help="Compatibility alias for --mask-mode none.",
-    )
-    parser.add_argument(
-        "--no-segmentations",
-        action="store_true",
-        help="Skip writing cube/sticker YOLO segmentation labels.",
-    )
-    parser.add_argument(
-        "--no-pose-labels",
-        action="store_true",
-        help="Skip writing YOLO pose labels.",
-    )
-    parser.add_argument(
-        "--pose-label-mode",
-        choices=POSE_LABEL_MODES,
-        default=POSE_LABEL_MODE_INDEPENDENT,
-        help=(
-            "Pose target to write under pose/: independent corner, corner-edge, and "
-            "corner-edge-center points (default), or the ordered 26-point target."
-        ),
-    )
-    parser.add_argument(
-        "--min-face-plane-angle-degrees",
-        type=float,
-        default=FACE_VISIBILITY_MIN_PLANE_ANGLE_DEGREES,
-        help=(
-            "Do not label keypoints whose supporting face is within this many "
-            "degrees of edge-on to the camera (default: 10; corners: 5)."
-        ),
-    )
-    parser.add_argument(
-        "--include-occluded-independent-keypoints",
-        action=argparse.BooleanOptionalAction,
-        default=INDEPENDENT_INCLUDE_OCCLUDED_KEYPOINTS,
-        help=(
-            "Keep independent keypoints hidden by another object as visibility=1 "
-            "targets. Disabled by default because they lack direct visual evidence."
-        ),
-    )
-    parser.add_argument(
-        "--partial-turn-seam-keypoints",
-        dest="partial_turn_seam_keypoints",
-        action=argparse.BooleanOptionalAction,
-        default=PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED,
-        help=(
-            "Include extra edge/center keypoints generated at partial-turn seams "
-            "(default: enabled). Use --no-partial-turn-seam-keypoints for an ablation."
-        ),
-    )
-    parser.add_argument(
         "--enable-mid-turns",
         "--enable-moves",
         dest="enable_mid_turns",
@@ -9520,11 +9940,9 @@ def cli_args() -> argparse.Namespace:
 
 def main() -> None:
     global ACTIVE_RANDOM_SEED, CUBE_MISALIGNMENT_ENABLED, SCRAMBLES_ENABLED
-    global PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED
     args = cli_args()
     CUBE_MISALIGNMENT_ENABLED = bool(args.enable_mid_turns)
     SCRAMBLES_ENABLED = not args.no_scrambles
-    PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED = bool(args.partial_turn_seam_keypoints)
     if args.seed is not None:
         ACTIVE_RANDOM_SEED = args.seed
     else:
@@ -9543,13 +9961,7 @@ def main() -> None:
         max_cube_rotational_blur_degrees=args.max_cube_rotational_blur_degrees,
         cube_rotational_blur_samples=args.cube_rotational_blur_samples,
         degrade_probability=args.degrade_probability,
-        render_segmentations=not args.no_segmentations,
-        mask_mode=MASK_MODE_NONE if args.no_masks else args.mask_mode,
         hard_case=DEFAULT_HARD_CASE,
-        render_pose_labels=not args.no_pose_labels,
-        pose_label_mode=args.pose_label_mode,
-        min_face_plane_angle_degrees=args.min_face_plane_angle_degrees,
-        include_occluded_independent_keypoints=args.include_occluded_independent_keypoints,
         nvidia_gpu=args.gpu,
     )
 
