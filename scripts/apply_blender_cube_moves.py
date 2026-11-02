@@ -77,6 +77,11 @@ CAMERA_VIEWPOINT_WEIGHTS = (
     ("overhead", 0.12),
 )
 CAMERA_ROI_LENS_RANGE = (42.0, 49.0)
+# Keep close cubes at their existing framing, but progressively zoom farther
+# for distant cameras so those cubes still dominate the frame. The target
+# jitter and sensor shifts below still allow off-center and cropped examples.
+CAMERA_CUBE_ZOOM_SCALE_RANGE = (1.0, 1.45)
+CAMERA_CUBE_ZOOM_DISTANCE_RANGE_FEET = (6.0, 15.0)
 CAMERA_ROI_SHIFT_X_RANGE = (-0.09, 0.09)
 CAMERA_ROI_SHIFT_Y_RANGE = (-0.07, 0.07)
 CAMERA_ROLL_DEGREES_RANGE = (-45.0, 45.0)
@@ -293,23 +298,31 @@ STICKER_IMPERFECTION_SCRATCH_SCALE_RANGE = (28.0, 70.0)
 STICKER_IMPERFECTION_BUMP_STRENGTH_RANGE = (0.012, 0.035)
 STICKER_IMPERFECTION_BUMP_DISTANCE_RANGE = (0.008, 0.022)
 CORE_FILL_OBJECT_NAMES = ("StickerlessBlackCoreFill", "StickerlessBlackCoreSphereFill")
-LAYER_RENDER_STATE_WEIGHTS = (
-    ("none", 0.30),
+# Keep discrete scrambles enabled for varied cube states. Generate partial
+# layer turns by default so ordered-keypoint datasets contain examples of
+# layer misalignment. The CLI still exposes an explicit opt-out for legacy
+# rigid-cube datasets.
+CUBE_MISALIGNMENT_ENABLED = True
+SCRAMBLES_ENABLED = True
+PARTIAL_TURN_APPLIED_PROBABILITY = 0.70
+SPECIAL_PARTIAL_TURN_PROBABILITY = 0.30
+# Preserve the former relative mix among ordinary partial states. Corner cuts
+# are deliberately kept out of slice and simultaneous-turn states.
+SINGLE_PARTIAL_STATE_WEIGHTS = (
     ("mid_turn", 0.50),
     ("corner_cut", 0.20),
 )
-# Keep discrete scrambles enabled for varied cube states. Generate partial
-# layer turns by default so ordered-keypoint datasets contain
-# examples of layer misalignment.  The CLI still exposes an explicit opt-out
-# for legacy rigid-cube datasets.
-CUBE_MISALIGNMENT_ENABLED = True
-SCRAMBLES_ENABLED = True
+SLICE_MOVES = ("M", "E", "S")
+OPPOSITE_FACE_PAIRS = (("R", "L"), ("U", "D"), ("F", "B"))
 MID_TURN_DEGREES_RANGE = (-45.0, 45.0)
 CORNER_CUT_SMALL_DEGREES_RANGE = (0.0, 10.0)
 CORNER_CUT_ADJACENT_DEGREES_RANGE = (5.0, 45.0)
 # Seam counterparts are only visually useful once the layer has moved beyond
 # the small alignment tolerance used for corner-cut samples.
 PARTIAL_TURN_INTERSECTION_MIN_DEGREES = 10.0
+# Keep seam counterparts enabled by default, but expose a single switch for
+# dataset ablations. Base keypoint labels are unaffected when this is False.
+PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED = True
 # Preserve the small boundary tolerance used by the distance-based keypoint
 # visibility test. It only covers numerical/render-boundary differences around
 # the mathematical point; it does not exempt turn seams or any cube piece.
@@ -596,8 +609,8 @@ def random_cube_pose_rotation(floating: bool) -> tuple[Quaternion, dict[str, flo
         roll_degrees = random.uniform(*CUBE_FLOAT_TILT_DEGREES)
     else:
         # A tabletop cube may spin around the table normal, but it must not
-        # pitch or roll.  Otherwise the later clearance correction can leave a
-        # raised corner that looks like a floating cube.
+        # pitch or roll. Whole-cube x/y/z orientation moves are applied
+        # separately for solved samples before this scene-level pose.
         pitch_degrees = 0.0
         roll_degrees = 0.0
     rotation = (
@@ -764,14 +777,48 @@ def objects_on_face(objects: list[bpy.types.Object], axis: Vector) -> list[bpy.t
     return [obj for obj in objects if round(obj.location.dot(axis)) == 1]
 
 
+def partial_turn_axis(move: str) -> Vector:
+    """Return the signed axis used by an outer-face or slice turn."""
+    axes = face_specs()
+    if move in axes:
+        return axes[move]
+    # Singmaster slice directions follow their neighboring face turns:
+    # M like L, E like D, and S like F. The direction is randomized below,
+    # but retaining this convention keeps metadata and geometry consistent.
+    slice_axes = {
+        "M": axes["L"],
+        "E": axes["D"],
+        "S": axes["F"],
+    }
+    try:
+        return slice_axes[move]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported partial-turn move {move!r}.") from exc
+
+
+def partial_turn_layer_coordinate(move: str) -> int:
+    """Return the cubie-layer coordinate selected by a partial-turn move."""
+    return 0 if move in SLICE_MOVES else 1
+
+
+def objects_on_partial_turn_layer(
+    objects: list[bpy.types.Object],
+    move: str,
+) -> list[bpy.types.Object]:
+    axis = partial_turn_axis(move)
+    coordinate = partial_turn_layer_coordinate(move)
+    return [obj for obj in objects if round(obj.location.dot(axis)) == coordinate]
+
+
 def snap_to_cube_grid(location: Vector) -> Vector:
     return Vector((round(location.x), round(location.y), round(location.z)))
 
 
 # Include both face turns and whole-cube quarter-turns in generated scrambles.
-# The whole-cube helpers and wireframe bookkeeping support x/y/z directly, so
-# generated scenes should exercise the same move vocabulary as legacy labels.
+# Solved samples use the same move application path in orientation-only mode,
+# restricted to x/y/z whole-cube turns.
 SCRAMBLE_MOVE_NAMES = tuple("RLUDBFxyz")
+ORIENTATION_ONLY_MOVE_NAMES = tuple("xyz")
 
 
 def whole_cube_move_axis(move: str) -> Vector:
@@ -828,16 +875,27 @@ def apply_scramble_move(objects: list[bpy.types.Object], move: str) -> None:
         raise ValueError(f"Unsupported scramble move {move!r}.")
 
 
-def random_scramble_moves(length: int) -> list[str]:
+def random_move_sequence(length: int, move_names: tuple[str, ...]) -> list[str]:
     moves = []
     for _ in range(length):
         choices = [
             move
-            for move in SCRAMBLE_MOVE_NAMES
+            for move in move_names
             if not moves or move != moves[-1]
         ]
         moves.append(random.choice(choices))
     return moves
+
+
+def random_scramble_moves(length: int) -> list[str]:
+    return random_move_sequence(length, SCRAMBLE_MOVE_NAMES)
+
+
+def random_orientation_moves(length: int) -> list[str]:
+    # Keep at least one orientation move even when callers request a zero
+    # scramble length, since solved samples still need a randomized cube
+    # orientation.
+    return random_move_sequence(max(1, length), ORIENTATION_ONLY_MOVE_NAMES)
 
 
 def adjacent_faces(face: str) -> list[str]:
@@ -856,11 +914,13 @@ def rotate_face_continuous(
     angle_degrees: float,
     direction: int,
 ) -> list[str]:
-    if move not in "RLUDBF":
-        raise ValueError(f"Unsupported move {move!r}; only R L U D B F are supported.")
+    if move not in (*face_specs(), *SLICE_MOVES):
+        raise ValueError(
+            f"Unsupported move {move!r}; expected an outer face or one of M, E, S."
+        )
 
-    axis = face_specs()[move]
-    moving = objects_on_face(objects, axis)
+    axis = partial_turn_axis(move)
+    moving = objects_on_partial_turn_layer(objects, move)
     if not moving:
         raise ValueError(f"Move {move} matched no cubie objects.")
 
@@ -878,26 +938,63 @@ def randomize_layer_render_state(objects: list[bpy.types.Object]) -> dict[str, o
     if not CUBE_MISALIGNMENT_ENABLED:
         return {"mode": "none"}
 
-    state = random.choices(
-        [mode for mode, _weight in LAYER_RENDER_STATE_WEIGHTS],
-        weights=[weight for _mode, weight in LAYER_RENDER_STATE_WEIGHTS],
-        k=1,
-    )[0]
-    if state == "none":
+    if random.random() >= PARTIAL_TURN_APPLIED_PROBABILITY:
         return {"mode": "none"}
 
-    face = random.choice(list("RLUDBF"))
-    if state == "mid_turn":
+    def apply_operation(move: str) -> dict[str, object]:
         angle_degrees = random.uniform(*MID_TURN_DEGREES_RANGE)
         direction = random_turn_direction()
-        moving = rotate_face_continuous(objects, face, angle_degrees, direction)
+        moving = rotate_face_continuous(objects, move, angle_degrees, direction)
         return {
-            "mode": "mid_turn",
-            "face": face,
+            "move": move,
             "angle_degrees": angle_degrees,
             "direction": direction,
             "objects": moving,
         }
+
+    def state_from_operations(
+        mode: str,
+        operations: list[dict[str, object]],
+    ) -> dict[str, object]:
+        state: dict[str, object] = {
+            "mode": mode,
+            "operations": operations,
+            "moves": [operation["move"] for operation in operations],
+        }
+        # Retain the original top-level fields for single-turn consumers and
+        # for metadata readers that predate the generalized operation list.
+        if len(operations) == 1:
+            operation = operations[0]
+            state.update({
+                "face": operation["move"],
+                "angle_degrees": operation["angle_degrees"],
+                "direction": operation["direction"],
+                "objects": operation["objects"],
+            })
+        return state
+
+    if random.random() < SPECIAL_PARTIAL_TURN_PROBABILITY:
+        if random.random() < 0.5:
+            move = random.choice(SLICE_MOVES)
+            return state_from_operations("slice_turn", [apply_operation(move)])
+
+        # Full simultaneous misalignments are limited to opposite layers.
+        # Independent angles make examples such as U=33 and D=25 possible.
+        moves = list(random.choice(OPPOSITE_FACE_PAIRS))
+        random.shuffle(moves)
+        return state_from_operations(
+            "simultaneous_turn",
+            [apply_operation(move) for move in moves],
+        )
+
+    state = random.choices(
+        [mode for mode, _weight in SINGLE_PARTIAL_STATE_WEIGHTS],
+        weights=[weight for _mode, weight in SINGLE_PARTIAL_STATE_WEIGHTS],
+        k=1,
+    )[0]
+    face = random.choice(list("RLUDBF"))
+    if state == "mid_turn":
+        return state_from_operations("mid_turn", [apply_operation(face)])
 
     small_angle_degrees = random.uniform(*CORNER_CUT_SMALL_DEGREES_RANGE)
     small_direction = random_turn_direction()
@@ -914,6 +1011,21 @@ def randomize_layer_render_state(objects: list[bpy.types.Object]) -> dict[str, o
     )
     return {
         "mode": "corner_cut",
+        "operations": [
+            {
+                "move": face,
+                "angle_degrees": small_angle_degrees,
+                "direction": small_direction,
+                "objects": small_objects,
+            },
+            {
+                "move": adjacent_face,
+                "angle_degrees": adjacent_angle_degrees,
+                "direction": adjacent_direction,
+                "objects": adjacent_objects,
+            },
+        ],
+        "moves": [face, adjacent_face],
         "face": face,
         "angle_degrees": small_angle_degrees,
         "direction": small_direction,
@@ -927,10 +1039,18 @@ def randomize_layer_render_state(objects: list[bpy.types.Object]) -> dict[str, o
 
 
 def scene_scramble_moves(scramble_length: int, solved: bool) -> list[str]:
-    """Return discrete scramble moves unless the scene is solved or disabled."""
-    if solved or not SCRAMBLES_ENABLED:
+    """Return scramble-mode or orientation-only cube moves for a scene."""
+    if not SCRAMBLES_ENABLED:
         return []
+    if solved:
+        return random_orientation_moves(scramble_length)
     return random_scramble_moves(scramble_length)
+
+
+def scene_move_mode(solved: bool) -> str:
+    if not SCRAMBLES_ENABLED:
+        return "none"
+    return "orientation_only" if solved else "scramble"
 
 
 def scene_layer_render_state(objects: list[bpy.types.Object]) -> dict[str, object]:
@@ -980,6 +1100,16 @@ def random_camera_distance(
     )[0]
     distance_feet = random.uniform(*distance_range)
     return bucket_name, distance_feet, distance_feet * CAMERA_SCENE_UNITS_PER_FOOT
+
+
+def camera_zoom_scale_for_distance(distance_feet: float) -> float:
+    near_feet, far_feet = CAMERA_CUBE_ZOOM_DISTANCE_RANGE_FEET
+    minimum_scale, maximum_scale = CAMERA_CUBE_ZOOM_SCALE_RANGE
+    if far_feet <= near_feet:
+        return maximum_scale
+    distance_fraction = (distance_feet - near_feet) / (far_feet - near_feet)
+    distance_fraction = max(0.0, min(1.0, distance_fraction))
+    return minimum_scale + (maximum_scale - minimum_scale) * distance_fraction
 
 
 def randomize_camera(
@@ -1037,7 +1167,8 @@ def randomize_camera(
     ))
     camera.data.type = "PERSP"
     framing_lens = random.uniform(*CAMERA_ROI_LENS_RANGE)
-    camera.data.lens = framing_lens * distance / reference_distance
+    zoom_scale = camera_zoom_scale_for_distance(distance_feet)
+    camera.data.lens = framing_lens * distance / reference_distance * zoom_scale
     camera.data.shift_x = random.uniform(*CAMERA_ROI_SHIFT_X_RANGE)
     camera.data.shift_y = random.uniform(*CAMERA_ROI_SHIFT_Y_RANGE)
     target = random_target()
@@ -1059,6 +1190,7 @@ def randomize_camera(
         "roll_degrees": roll_degrees,
         "lens_mm": camera.data.lens,
         "framing_lens_mm": framing_lens,
+        "cube_zoom_scale": zoom_scale,
         "roi_crop": {
             "method": "camera_lens_and_sensor_shift",
             "shift_x": camera.data.shift_x,
@@ -4123,22 +4255,12 @@ def apply_partial_turn_to_hands(
 
     The hand placement is authored independently from the cube scramble. A
     transient R turn moves the right hand with the R layer, and an L turn
-    moves the left hand with the L layer. U/D/F/B partial turns leave both
-    hands in place. Corner-cut states can contain two components; apply the
-    same rule independently to each component.
+    moves the left hand with the L layer. U/D/F/B, slice, and other partial
+    turns leave both hands in place. Simultaneous and corner-cut states can
+    contain multiple components; apply the same rule independently to each.
     """
-    if layer_state.get("mode") not in {"mid_turn", "corner_cut"}:
-        return []
-
-    components = [("face", "angle_degrees", "direction")]
-    if layer_state.get("mode") == "corner_cut":
-        components.append(("adjacent_face", "adjacent_angle_degrees", "adjacent_direction"))
-
     moved_hands: list[str] = []
-    for face_key, angle_key, direction_key in components:
-        face = layer_state.get(face_key)
-        angle = layer_state.get(angle_key)
-        direction = layer_state.get(direction_key)
+    for face, angle, direction, _object_names in _partial_turn_layers(layer_state):
         if face not in {"R", "L"}:
             continue
         if not isinstance(angle, (int, float)):
@@ -4150,7 +4272,7 @@ def apply_partial_turn_to_hands(
         rig = hand_rigs.get(hand_name)
         if rig is None:
             continue
-        face_axis = face_specs()[face]
+        face_axis = partial_turn_axis(face)
         turn = Quaternion(
             face_axis,
             float(direction) * math.radians(float(angle)),
@@ -4647,7 +4769,10 @@ def build_solid_background_patch_case(
     ))
     look_at(camera, camera_target)
     camera.data.type = "PERSP"
-    camera.data.lens = random.uniform(34.0, 42.0)
+    zoom_scale = camera_zoom_scale_for_distance(
+        distance / CAMERA_SCENE_UNITS_PER_FOOT
+    )
+    camera.data.lens = random.uniform(34.0, 42.0) * zoom_scale
     camera.data.shift_x = 0.0
     camera.data.shift_y = 0.0
     camera_roll_degrees = random.uniform(*CAMERA_ROLL_DEGREES_RANGE)
@@ -4750,6 +4875,7 @@ def build_solid_background_patch_case(
         "roll_degrees": camera_roll_degrees,
         "lens_mm": camera.data.lens,
         "framing_lens_mm": camera.data.lens,
+        "cube_zoom_scale": zoom_scale,
         "roi_crop": {
             "method": "hard_case_controlled_camera",
             "shift_x": camera.data.shift_x,
@@ -4983,7 +5109,10 @@ def build_controlled_cube_case(
     ))
     look_at(camera, camera_target)
     camera.data.type = "PERSP"
-    camera.data.lens = (
+    zoom_scale = camera_zoom_scale_for_distance(
+        distance / CAMERA_SCENE_UNITS_PER_FOOT
+    )
+    camera.data.lens = zoom_scale * (
         random.uniform(34.0, 42.0)
         if camera_mode == "behind_palm"
         else random.uniform(41.0, 49.0)
@@ -5111,9 +5240,12 @@ def build_controlled_cube_case(
         pitch_degrees = random.uniform(-5.0, 5.0)
         cube_roll_degrees = random.uniform(-4.0, 4.0)
     elif solved:
-        yaw_degrees = random.uniform(-24.0, 24.0)
-        pitch_degrees = random.uniform(-8.0, 8.0)
-        cube_roll_degrees = random.uniform(-7.0, 7.0)
+        # Solved samples still need clearly varied cube orientation. Use the
+        # same full three-axis ranges as ordinary solved poses rather than a
+        # nearly upright special-case range.
+        yaw_degrees = random.uniform(*CUBE_POSE_ROTATION_DEGREES)
+        pitch_degrees = random.uniform(*CUBE_FLOAT_TILT_DEGREES)
+        cube_roll_degrees = random.uniform(*CUBE_FLOAT_TILT_DEGREES)
     else:
         yaw_degrees = random.uniform(-26.0, 26.0)
         pitch_degrees = random.uniform(-10.0, 10.0)
@@ -5218,6 +5350,7 @@ def build_controlled_cube_case(
         "roll_degrees": camera_roll_degrees,
         "lens_mm": camera.data.lens,
         "framing_lens_mm": camera.data.lens,
+        "cube_zoom_scale": zoom_scale,
         "roi_crop": {
             "method": "hard_case_controlled_camera",
             "shift_x": camera.data.shift_x,
@@ -5878,10 +6011,11 @@ def layer_turn_blur_object_axes(
 ) -> dict[str, tuple[Vector, float]]:
     """Return world-space blur axes for objects participating in layer motion.
 
-    A corner cut can contain two simultaneous layer turns. Objects shared by
-    both layers use the axis of the larger turn. Only the hand corresponding
-    to an R/L component receives localized blur, matching the actual hand
-    transform; U/D/F/B components do not move either hand.
+    A corner cut or simultaneous turn can contain multiple layer turns.
+    Objects shared by multiple layers use the axis of the larger turn. Only
+    the hand corresponding to an R/L component receives localized blur,
+    matching the actual hand transform; U/D/F/B and slice components do not
+    move either hand.
     """
     mode = layer_state.get("mode")
     if mode == "none":
@@ -5891,37 +6025,19 @@ def layer_turn_blur_object_axes(
     if not isinstance(transform_rows, list):
         raise ValueError("Cube pose is missing its shared transform matrix.")
     world_rotation = matrix_from_rows(transform_rows).to_3x3()
-    layer_specs: list[tuple[object, object, object]] = []
-    if mode == "mid_turn":
-        layer_specs.append(("objects", "face", "angle_degrees"))
-    elif mode == "corner_cut":
-        layer_specs.extend((
-            ("objects", "face", "angle_degrees"),
-            ("adjacent_objects", "adjacent_face", "adjacent_angle_degrees"),
-        ))
-    else:
+    if mode not in {"mid_turn", "corner_cut", "slice_turn", "simultaneous_turn"}:
         return {}
 
     object_axes: dict[str, tuple[float, Vector]] = {}
     hand_axes: dict[str, Vector] = {}
-    for object_key, face_key, angle_key in layer_specs:
-        face = layer_state.get(face_key)
-        angle = layer_state.get(angle_key)
-        direction = layer_state.get(
-            "direction" if face_key == "face" else "adjacent_direction"
-        )
-        object_names = layer_state.get(object_key, [])
-        if not isinstance(face, str) or face not in face_specs():
-            continue
+    for face, angle, direction, object_names in _partial_turn_layers(layer_state):
         if not isinstance(angle, (int, float)):
             continue
         if not isinstance(direction, (int, float)):
             direction = 1.0
-        if not isinstance(object_names, list):
-            continue
 
         magnitude = abs(float(angle))
-        axis = (world_rotation @ face_specs()[face]).normalized()
+        axis = (world_rotation @ partial_turn_axis(face)).normalized()
         if float(direction) < 0.0:
             axis = -axis
         if face in {"R", "L"}:
@@ -6669,30 +6785,62 @@ def _partial_turn_layers(
 ) -> list[tuple[str, float, float, set[str]]]:
     """Return the partial-turn operations recorded in a layer state.
 
-    The object lists are captured after each turn is applied.  Keeping the
+    The object lists are captured after each turn is applied. Keeping the
     operations in application order lets the intersection-label helper undo
-    them in reverse order, including for the two overlapping layers in a
-    corner-cut sample.
+    them in reverse order, including for corner cuts and simultaneous turns.
     """
     if not isinstance(layer_state, dict):
         return []
-    if layer_state.get("mode") not in {"mid_turn", "corner_cut"}:
+    if layer_state.get("mode") not in {
+        "mid_turn",
+        "corner_cut",
+        "slice_turn",
+        "simultaneous_turn",
+    }:
         return []
 
     operations: list[tuple[str, float, float, set[str]]] = []
-    raw_operations = [
-        ("face", "angle_degrees", "direction", "objects"),
-    ]
+    raw_operations = layer_state.get("operations")
+    if isinstance(raw_operations, list):
+        for raw_operation in raw_operations:
+            if not isinstance(raw_operation, dict):
+                continue
+            move = raw_operation.get("move", raw_operation.get("face"))
+            angle = raw_operation.get("angle_degrees")
+            direction = raw_operation.get("direction", 1.0)
+            object_names = raw_operation.get("objects")
+            if not isinstance(move, str) or move not in (*face_specs(), *SLICE_MOVES):
+                continue
+            if not isinstance(angle, (int, float)):
+                continue
+            if not isinstance(direction, (int, float)):
+                direction = 1.0
+            if not isinstance(object_names, list):
+                continue
+            operations.append(
+                (
+                    move,
+                    float(angle),
+                    float(direction),
+                    {name for name in object_names if isinstance(name, str)},
+                )
+            )
+        if operations:
+            return operations
+
+    # Read the legacy fields as a fallback for hand-authored hard cases or
+    # metadata produced before the generalized operation list was introduced.
+    raw_operations = [("face", "angle_degrees", "direction", "objects")]
     if layer_state.get("mode") == "corner_cut":
         raw_operations.append(
             ("adjacent_face", "adjacent_angle_degrees", "adjacent_direction", "adjacent_objects")
         )
-    for face_key, angle_key, direction_key, objects_key in raw_operations:
-        face = layer_state.get(face_key)
+    for move_key, angle_key, direction_key, objects_key in raw_operations:
+        move = layer_state.get(move_key)
         angle = layer_state.get(angle_key)
         direction = layer_state.get(direction_key, 1.0)
         object_names = layer_state.get(objects_key)
-        if not isinstance(face, str) or face not in face_specs():
+        if not isinstance(move, str) or move not in (*face_specs(), *SLICE_MOVES):
             continue
         if not isinstance(angle, (int, float)):
             continue
@@ -6702,7 +6850,7 @@ def _partial_turn_layers(
             continue
         operations.append(
             (
-                face,
+                move,
                 float(angle),
                 float(direction),
                 {name for name in object_names if isinstance(name, str)},
@@ -6722,7 +6870,7 @@ def _rotate_partial_turn_geometry(
 ) -> tuple[Vector, list[Vector]]:
     """Rotate a point and its face normals around the cube's turn axis."""
     pivot = cube_to_world.translation.copy()
-    axis = (cube_to_world.to_3x3() @ face_specs()[face]).normalized()
+    axis = (cube_to_world.to_3x3() @ partial_turn_axis(face)).normalized()
     signed_angle = -direction * angle if inverse else direction * angle
     rotation = Quaternion(axis, math.radians(signed_angle))
     return (
@@ -6733,18 +6881,19 @@ def _rotate_partial_turn_geometry(
 
 def _point_on_partial_turn_seam(
     point: Vector,
-    face: str,
+    move: str,
     cube_to_local: Matrix,
     tolerance: float = 1e-4,
 ) -> bool:
-    """Return whether a point lies on the inner boundary of a turned layer."""
+    """Return whether a point lies on an inner boundary of a turned layer."""
     local_point = cube_to_local @ point
-    turn_axis = face_specs()[face]
-    # ``face_specs`` stores signed unit normals.  The boundary is always 0.5
-    # in the outward-normal direction, so use the signed dot product directly.
-    expected_coordinate = 0.5
+    turn_axis = partial_turn_axis(move)
+    expected_coordinates = (0.5,) if move not in SLICE_MOVES else (-0.5, 0.5)
     signed_coordinate = local_point.dot(turn_axis)
-    return abs(signed_coordinate - expected_coordinate) <= tolerance
+    return any(
+        abs(signed_coordinate - expected_coordinate) <= tolerance
+        for expected_coordinate in expected_coordinates
+    )
 
 
 def add_partial_turn_intersection_specs(
@@ -6761,6 +6910,8 @@ def add_partial_turn_intersection_specs(
     non-corner points remain singletons.  The ordinary aligned path retains
     its original 56 candidates.
     """
+    if not PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED:
+        return specs
     operations = _partial_turn_layers(layer_state)
     if not operations or not isinstance(cube_pose, dict):
         return specs
@@ -7180,26 +7331,26 @@ def dimension_cube_box_specs(
     layer_state: dict[str, object] | None = None,
 ) -> list[tuple[Vector, Matrix, Vector]]:
     """Return oriented boxes for the idealized cube or a partial turn."""
-    if layer_state is None:
+    if layer_state is None or layer_state.get("mode") == "none":
         return [
             (Vector((0.0, 0.0, 0.0)), Matrix.Identity(3), Vector((1.5, 1.5, 1.5)))
         ]
 
-    if layer_state.get("mode") == "corner_cut":
+    operations = _partial_turn_layers(layer_state)
+    if layer_state.get("mode") != "mid_turn" or len(operations) != 1:
         return [
             (center, rotation, Vector((0.5, 0.5, 0.5)))
             for _initial_center, center, rotation in dimension_cubie_transforms(layer_state)
         ]
 
-    face = layer_state.get("face")
-    angle_degrees = layer_state.get("angle_degrees")
-    direction = layer_state.get("direction")
-    if not isinstance(face, str) or not isinstance(angle_degrees, (int, float)):
-        raise ValueError("A partial-turn cube needs a face and angle.")
-    if not isinstance(direction, (int, float)):
-        raise ValueError("A partial-turn cube needs a direction.")
+    move, angle_degrees, direction, _object_names = operations[0]
+    if move in SLICE_MOVES:
+        return [
+            (center, rotation, Vector((0.5, 0.5, 0.5)))
+            for _initial_center, center, rotation in dimension_cubie_transforms(layer_state)
+        ]
 
-    face_axis = face_specs()[face]
+    face_axis = partial_turn_axis(move)
     axis_index = max(range(3), key=lambda index: abs(face_axis[index]))
     face_axis_sign = int(round(face_axis[axis_index]))
     turn = Quaternion(
@@ -7222,47 +7373,28 @@ def dimension_cube_box_specs(
 def dimension_cubie_transforms(
     layer_state: dict[str, object],
 ) -> list[tuple[Vector, Vector, Matrix]]:
-    """Transform dimension-defined cubies through one or two layer turns."""
-    face = layer_state.get("face")
-    angle_degrees = layer_state.get("angle_degrees")
-    direction = layer_state.get("direction")
-    if not isinstance(face, str) or not isinstance(angle_degrees, (int, float)):
-        raise ValueError("A layer turn needs a face and angle.")
-    if not isinstance(direction, (int, float)):
-        raise ValueError("A layer turn needs a direction.")
-
-    primary_axis = face_specs()[face]
-    primary_turn = Quaternion(
-        primary_axis,
-        math.radians(float(direction) * float(angle_degrees)),
-    ).to_matrix()
-    second_face = layer_state.get("adjacent_face")
-    second_angle = layer_state.get("adjacent_angle_degrees")
-    second_direction = layer_state.get("adjacent_direction")
-    second_axis = None
-    second_turn = Matrix.Identity(3)
-    if layer_state.get("mode") == "corner_cut":
-        if not isinstance(second_face, str) or not isinstance(second_angle, (int, float)):
-            raise ValueError("A corner cut needs an adjacent face and angle.")
-        if not isinstance(second_direction, (int, float)):
-            raise ValueError("A corner cut needs an adjacent direction.")
-        second_axis = face_specs()[second_face]
-        second_turn = Quaternion(
-            second_axis,
-            math.radians(float(second_direction) * float(second_angle)),
-        ).to_matrix()
+    """Transform dimension-defined cubies through all recorded layer turns."""
+    operations = _partial_turn_layers(layer_state)
+    if not operations:
+        raise ValueError("A layer turn needs at least one valid operation.")
 
     transforms = []
     for x in (-1.0, 0.0, 1.0):
         for y in (-1.0, 0.0, 1.0):
             for z in (-1.0, 0.0, 1.0):
                 initial_center = Vector((x, y, z))
-                primary_selected = round(initial_center.dot(primary_axis)) == 1
-                center = primary_turn @ initial_center if primary_selected else initial_center.copy()
-                rotation = primary_turn if primary_selected else Matrix.Identity(3)
-                if second_axis is not None and round(center.dot(second_axis)) == 1:
-                    center = second_turn @ center
-                    rotation = second_turn @ rotation
+                center = initial_center.copy()
+                rotation = Matrix.Identity(3)
+                for move, angle, direction, _object_names in operations:
+                    axis = partial_turn_axis(move)
+                    if round(center.dot(axis)) != partial_turn_layer_coordinate(move):
+                        continue
+                    turn = Quaternion(
+                        axis,
+                        math.radians(float(direction) * float(angle)),
+                    ).to_matrix()
+                    center = turn @ center
+                    rotation = turn @ rotation
                 transforms.append((initial_center, center, rotation))
     return transforms
 
@@ -7476,6 +7608,12 @@ def partial_turn_wireframe_line_specs(
     layer_state: dict[str, object],
 ) -> list[dict[str, object]]:
     """Build dimension-defined surface grids for a partially turned layer."""
+    if layer_state.get("mode") in {"corner_cut", "slice_turn", "simultaneous_turn"}:
+        # The cubie-based path handles both slice seams and two opposite
+        # layers, while the slab path below is retained for the common single
+        # outer-face turn.
+        return corner_cut_wireframe_line_specs(layer_state)
+
     face = layer_state.get("face")
     angle_degrees = layer_state.get("angle_degrees")
     direction = layer_state.get("direction")
@@ -7887,6 +8025,8 @@ def partial_turn_interior_seam_point(
     seam reconstruction used for partial-turn intersection labels, including
     undoing later operations before checking the seam plane.
     """
+    if not PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED:
+        return False
     if spec.get("source_piece_type") != "edge":
         return False
     if not isinstance(layer_state, dict) or not isinstance(cube_pose, dict):
@@ -8342,6 +8482,8 @@ def render_pose_keypoints(
             "source_object": spec.get("source_object"),
             "source_piece_type": spec.get("source_piece_type"),
             "relative_point": spec.get("relative_point"),
+            "intersection_source": spec.get("intersection_source"),
+            "intersection_face": spec.get("intersection_face"),
             "world_point": [point.x, point.y, point.z],
             "pixel_point": [x, y],
             "normalized_point": list(normalize_point(x, y, width, height)),
@@ -8375,8 +8517,9 @@ def render_pose_keypoints(
         "source_keypoints": len(keypoint_specs),
         "base_source_keypoints": 56,
         "partial_turn_intersection_keypoints": sum(
-            1 for spec in keypoint_specs if spec.get("intersection_source") == "pre_partial_turn"
+            1 for spec in keypoint_specs if spec.get("intersection_source") == "partial_turn_seam"
         ),
+        "partial_turn_seam_keypoints_enabled": PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED,
         "visible_hands": sorted(visible_hand_names),
         "candidates": len(keypoint_specs),
         "min_face_plane_angle_degrees": min_plane_angle_degrees,
@@ -8781,8 +8924,9 @@ def generate_dataset(
                         "corner_edge_source": "edge_cubies",
                         "corner_edge_center_source": "center_cubies",
                         "base_source_keypoint_count": 56,
+                        "partial_turn_seam_keypoints_enabled": PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED,
                         "partial_turn_intersections": (
-                            "For mid-turn and corner-cut samples, only edge and "
+                            "For mid-turn, slice, simultaneous, and corner-cut samples, only edge and "
                             "center-sticker intersections on the layer seam receive a "
                             "turned-side counterpart once the turn exceeds "
                             f"{PARTIAL_TURN_INTERSECTION_MIN_DEGREES:g} degrees; "
@@ -9179,6 +9323,11 @@ def generate_dataset(
             "ordered_keypoints": ordered_pose_metadata,
             "independent_keypoints": independent_pose_metadata,
             "segmentations": segmentations,
+            "move_mode": scene_move_mode(cube_solved),
+            "partial_turn_augmentation_enabled": CUBE_MISALIGNMENT_ENABLED,
+            "partial_turn_probability": PARTIAL_TURN_APPLIED_PROBABILITY,
+            "partial_turn_applied": layer_state.get("mode", "none") != "none",
+            "partial_turn_seam_keypoints_enabled": PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED,
             "moves": moves,
             "layer_state": layer_state,
             "cubie_labels": {obj.name: obj.pass_index for obj in objects},
@@ -9333,6 +9482,16 @@ def cli_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--partial-turn-seam-keypoints",
+        dest="partial_turn_seam_keypoints",
+        action=argparse.BooleanOptionalAction,
+        default=PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED,
+        help=(
+            "Include extra edge/center keypoints generated at partial-turn seams "
+            "(default: enabled). Use --no-partial-turn-seam-keypoints for an ablation."
+        ),
+    )
+    parser.add_argument(
         "--enable-mid-turns",
         "--enable-moves",
         dest="enable_mid_turns",
@@ -9361,9 +9520,11 @@ def cli_args() -> argparse.Namespace:
 
 def main() -> None:
     global ACTIVE_RANDOM_SEED, CUBE_MISALIGNMENT_ENABLED, SCRAMBLES_ENABLED
+    global PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED
     args = cli_args()
     CUBE_MISALIGNMENT_ENABLED = bool(args.enable_mid_turns)
     SCRAMBLES_ENABLED = not args.no_scrambles
+    PARTIAL_TURN_SEAM_KEYPOINTS_ENABLED = bool(args.partial_turn_seam_keypoints)
     if args.seed is not None:
         ACTIVE_RANDOM_SEED = args.seed
     else:
