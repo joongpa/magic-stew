@@ -171,7 +171,17 @@ def pose_for_candidate(
         if isinstance(selected_pose, dict):
             return selected_pose
     search_pose = record.get("search_pose")
-    return search_pose if isinstance(search_pose, dict) else None
+    if not isinstance(search_pose, dict):
+        return None
+    candidates = review_candidates(record)
+    symmetry = (candidates[candidate_index].get('orientation_symmetry')
+                if 0 <= candidate_index < len(candidates) else None)
+    if symmetry is not None:
+        rotation = cv2.Rodrigues(np.asarray(search_pose['rvec'], dtype=np.float64))[0]
+        return dict(search_pose, rvec=cv2.Rodrigues(
+            rotation @ np.asarray(symmetry, dtype=np.float64).T,
+        )[0].tolist())
+    return search_pose
 
 
 def rotation_matrix_for_layer(rotation: dict[str, object]) -> tuple[np.ndarray, np.ndarray]:
@@ -692,7 +702,7 @@ label { display:flex; gap:5px; align-items:center; }
     <p id="searchPathNote" class="muted"></p>
     <div id="searchSteps" class="search-table"></div>
     <details id="searchDepthPanel"><summary>Search expansion and pruning at each frame</summary>
-      <p class="muted">Counts describe path expansions. Adaptive search keeps the best hold and top color-ranked changes per parent, merges prefixes by frame and cube state, and uses bounds to prune the shortlisted paths. GPU batch size is not a state cutoff. Older logs may use beam or history restrictions. Future choices are forecasts from this frame.</p>
+      <p class="muted">Counts describe path expansions. Adaptive search keeps the best hold and top changes per parent using the logged shortlist metric, merges prefixes by frame and cube state, and uses bounds to prune the shortlisted paths. GPU batch size is not a state cutoff. Older logs may use beam or history restrictions. Future choices are forecasts from this frame.</p>
       <div id="searchDepths" class="search-table"></div>
     </details>
     <details id="searchGeometryPanel"><summary>Stage 1: retained geometric fits</summary>
@@ -863,7 +873,7 @@ function scoreText(value) {
   return typeof value==='number' && Number.isFinite(value) ? value.toFixed(4) : '—';
 }
 function moveText(trial) { return (trial?.state_moves||[]).join(' ') || 'hold'; }
-const searchStatusLabels={invalid_color:'invalid: nonfinite color fit', budget_unfinished:'unfinished: state budget reached', color_ceiling:'rejected: absolute color ceiling', color_pruned:'excluded: color shortlist', complete:'complete path found', bound_pruned:'pruned: cannot beat complete solution', survived:'survived', immediate_undo:'pruned: immediate undo',
+const searchStatusLabels={invalid_color:'invalid: nonfinite color fit', budget_unfinished:'unfinished: state budget reached', color_ceiling:'rejected: absolute color ceiling', color_pruned:'excluded: color shortlist', shortlist_pruned:'excluded: geometry + color shortlist', complete:'complete path found', bound_pruned:'pruned: cannot beat complete solution', survived:'survived', immediate_undo:'pruned: immediate undo',
   root_return:'pruned: returned to window-start state',
   state_revisit:'pruned: earlier cube state revisited',
   invalid_score:'pruned: invalid fit', merged:'merged into a cheaper equivalent path',
@@ -913,12 +923,17 @@ function renderSearchDiagnostics(search,candidate) {
     $('searchSummary').textContent='No lookahead trace in this record. Cached video recognition with --turn-candidate-log records forecasts and pruning.';
     $('searchComparison').textContent='Frame-level candidates from older logs and live searches remain available.';return;
   }
+  if(search.status==='forced_static' && search.reason==='turning_start_frame'){
+    $('searchSummary').textContent=`Static hold forced through frame ${search.turning_start_frame}, inclusive (--turning-start-frame).`;
+    $('searchComparison').textContent='Move search skipped: no layer offsets or cube-state changes.';return;
+  }
   const elapsed=typeof search.elapsed_ms==='number'?`${search.elapsed_ms.toFixed(1)} ms`:'timing unavailable';
   const skipped=search.skipped_frames?.length?` · skipped ${search.skipped_frames.join(', ')}`:'';
   const adaptive=search.algorithm==='adaptive_branch_and_bound';
-  const method=adaptive?`adaptive · ${search.state_change_limit!=null?`top ${search.state_change_limit} changes per parent + hold`:'all state changes'} · GPU batch ${search.state_batch_size??'—'} · no beam cutoff`:`beam ${search.beam_width??'—'}`;
+  const shortlistMetric=search.shortlist_rank==='geometry_plus_color'?'geometry + color':'color';
+  const method=adaptive?`adaptive · ${search.state_change_limit!=null?`top ${search.state_change_limit} ${shortlistMetric} changes per parent + hold`:'all state changes'} · GPU batch ${search.state_batch_size??'—'} · no beam cutoff`:`beam ${search.beam_width??'—'}`;
   $('searchSummary').textContent=`Previous move: ${search.previous_move||'none'} · ${method} · ${Math.max(0,(search.frames?.length||1)-1)} future frames · ${elapsed}${skipped}`;
-  if(adaptive)$('searchSummary').textContent+=` · ${search.optimality==='proven'?'optimal for scored options':search.optimality==='proven_within_shortlist'?'optimal within color shortlist':search.optimality||'search incomplete'} · peak queue ${search.peak_queued_paths??'—'}`;
+  if(adaptive)$('searchSummary').textContent+=` · ${search.optimality==='proven'?'optimal for scored options':search.optimality==='proven_within_shortlist'?`optimal within ${shortlistMetric} shortlist`:search.optimality||'search incomplete'} · peak queue ${search.peak_queued_paths??'—'}`;
   if(search.state_evaluation_budget!=null)$('searchSummary').textContent+=` · state budget ${search.decision_evaluated_states??search.evaluated_states??'—'}/${search.state_evaluation_budget}`;
   if(search.budget_exhausted)$('searchSummary').textContent+=search.selected_path?' · budget reached; best complete forecast, optimality not proven':' · budget reached before finding a complete forecast';
   if(search.optimality_gap!=null)$('searchSummary').textContent+=` · bound gap ${scoreText(search.optimality_gap)}`;
@@ -950,9 +965,9 @@ function renderSearchDiagnostics(search,candidate) {
   if(candidate?.search_status && !finals.some(path=>path.trial_id===candidate.trial_id))
     $('searchPathNote').textContent=`Inspected candidate: ${searchStatusLabels[candidate.search_status]||candidate.search_status}. No saved finalist forecast for it. `+$('searchPathNote').textContent;
   if(adaptive) {
-    appendSearchTable($('searchDepths'),['Frame','Parents expanded','States scored','Trials','Collapsed holds','Root returns pruned','Color excluded',search.version>=10?'Nonfinite color':'Ceiling rejected','Unreliable states','Merged prefixes','Bound pruned','Completed','Queued','Future lower bound'],
+    appendSearchTable($('searchDepths'),['Frame','Parents expanded','States scored','Trials','Collapsed holds','Root returns pruned','Shortlist excluded',search.version>=10?'Nonfinite color':'Ceiling rejected','Unreliable states','Merged prefixes','Bound pruned','Completed','Queued','Future lower bound'],
       (search.depths||[]).map(depth=>[depth.frame_index,depth.input_paths,depth.scored_states,depth.attempted_trials,
-        depth.collapsed_holds,depth.root_return??0,depth.color_pruned_paths??0,depth.invalid_color??depth.color_ceiling_rejected??0,depth.unreliable_color_states??0,depth.merged_paths,depth.bound_pruned_paths,depth.completed_paths,depth.queued_paths,scoreText(depth.remaining_lower_bound)]));
+        depth.collapsed_holds,depth.root_return??0,depth.shortlist_pruned_paths??depth.color_pruned_paths??0,depth.invalid_color??depth.color_ceiling_rejected??0,depth.unreliable_color_states??0,depth.merged_paths,depth.bound_pruned_paths,depth.completed_paths,depth.queued_paths,scoreText(depth.remaining_lower_bound)]));
   } else {
     appendSearchTable($('searchDepths'),['Frame','Input paths','States evaluated','Trials','Undo','State revisit','Invalid','Unavailable','Merged','Beam pruned','Kept','Distinct states','No-turn extra'],
       (search.depths||[]).map(depth=>[depth.frame_index,depth.input_paths,depth.scored_states,depth.attempted_trials,
@@ -1030,6 +1045,7 @@ async function loadFrame() {
         if(c.pruning_counts?.invalid_color)state.textContent+=` · ${c.pruning_counts.invalid_color} nonfinite color fits`;
         if(c.color_error_ceiling_rejected)state.textContent+=' · above color ceiling';
         if(c.pruning_counts?.color_ceiling_rejected)state.textContent+=` · ${c.pruning_counts.color_ceiling_rejected} candidates rejected by color ceiling`;
+        if(c.pruning_counts?.shortlist_pruned_paths)state.textContent+=` · ${c.pruning_counts.shortlist_pruned_paths} changes excluded by geometry + color shortlist`;
         if(c.pruning_counts?.color_pruned_paths)state.textContent+=` · ${c.pruning_counts.color_pruned_paths} changes excluded by color shortlist`;
         if(c.pruning_counts?.bound_pruned_paths)state.textContent+=` · ${c.pruning_counts.bound_pruned_paths} prefixes excluded by bounds`;
         if(c.pruning_examples?.length){const example=c.pruning_examples[0];

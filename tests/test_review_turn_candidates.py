@@ -208,3 +208,18 @@ def test_frame_navigation_decodes_by_index_without_random_seeking(monkeypatch, t
     for index in (0, 1, 4, 4, 2, 5):
         assert np.all(state.frame(index) == index)
     assert len(captures) == 1
+
+
+def test_pose_for_candidate_applies_rescued_orientation_only_to_unselected_trials():
+    symmetry = np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
+    pose = dict(rvec=[[.1], [.2], [-.1]], tvec=[[0.], [0.], [300.]])
+    finalized = dict(pose, rvec=[[.2], [.3], [.4]])
+    record = dict(search_pose=pose, selected_pose=finalized, selected_trial_id='chosen',
+                  candidates=[dict(trial_id='chosen', orientation_symmetry=symmetry.tolist()),
+                              dict(trial_id='alternative', orientation_symmetry=symmetry.tolist())])
+    assert review_script.pose_for_candidate(record, 0) is finalized
+    alternative = review_script.pose_for_candidate(record, 1)
+    expected = cv2.Rodrigues(np.array(pose['rvec']))[0] @ symmetry.T
+    np.testing.assert_allclose(cv2.Rodrigues(np.array(alternative['rvec']))[0], expected, atol=1e-12)
+    assert alternative['tvec'] == pose['tvec']
+    assert record['search_pose'] is pose

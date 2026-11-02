@@ -1,0 +1,61 @@
+{
+  "frame_index": 207,
+  "source_fps": 23.976023976023978,
+  "reference_frame_index": 206,
+  "reference_rvec": [
+    [
+      -2.3134224897832394
+    ],
+    [
+      -1.529144158973264
+    ],
+    [
+      0.1454997330240246
+    ]
+  ],
+  "input_rvec": [
+    [
+      0.1797096610967301
+    ],
+    [
+      -0.10367730914926597
+    ],
+    [
+      3.011809931562594
+    ]
+  ],
+  "color_scores": [
+    2.651976268553281,
+    2.363309699094154,
+    2.9479104367254347,
+    2.4742004828373356,
+    5.084741769074168,
+    2.8114932073343826,
+    2.302333255346081,
+    1.7066594074170522,
+    2.436548272769615,
+    2.693044426227679,
+    1.77295685383991,
+    2.2012877840890406,
+    2.0019355880037355,
+    2.140161139006662,
+    2.539957675920376,
+    2.9009159616040137,
+    3.6368949947437996,
+    2.7453966152343297,
+    2.212686862678848,
+    1.7197276683132467,
+    7.335354484979079,
+    4.783868738142766,
+    4.149748718615433,
+    2.2446333053452254
+  ],
+  "expected_symmetry": 5,
+  "previous_weight_symmetry": 7,
+  "expected_camera_view": {
+    "top": "yellow",
+    "front": "orange"
+  },
+  "ground_truth_source": "User confirmed yellow top and orange front at frame 207. Symmetry indices use the original continuity frame.",
+  "score_source": "Frozen inspection-labeled profiles and sequential weight-0.2 appearance history replay on original saved RGB observations."
+}

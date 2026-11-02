@@ -407,22 +407,28 @@ when logging is enabled; future steps are forecasts, not committed moves.
 Stable trial IDs distinguish sticker offsets that share identical geometry.
 Annotated candidate images are saved unless `--turn-candidate-images` points
 elsewhere.
-With `--recognize-moves`, pose refinement and geometric turn search run on
-every processed frame with a usable pose. The turn search is not throttled by
+With `--recognize-moves`, pose refinement runs on every processed frame with a
+usable pose; geometric turn search skips only the forced-static prefix. The turn search is not throttled by
 frame interval, and it remains enabled even when pose drawing is disabled.
-During the turn search, stationary observations are grouped by their known
-initial sticker colors and used to refine the global color profiles. After a
-committed move, calibration pauses for 20 video frames; if subsequent moves
-restore the prior cube state within that window, calibration resumes. Otherwise,
-the samples collected before that move are used to refine the profiles for
-later frames. Frames during partial turns and while awaiting a reversal are
-excluded. If no lasting move is committed, all accepted stationary initial-state
-observations are used; colors with too little evidence keep their original
-profiles.
+Unsupervised color regressions use observations from the entire video,
+including turns. Ground-truth labels are a separate inspection-only sample
+bank; adding them never replaces the full-video regression fits or their
+sample counts. With `--turning-start-frame N`, accepted stationary samples
+through frame N are eligible for labels, and calibration is finalized before
+the first frame after N is processed for moves. Later holds and reversals
+cannot add labels or reopen calibration. Without an explicit boundary, the
+first committed move closes the inferred inspection interval permanently;
+the moving frame and all later frames are excluded. If no move occurs,
+accepted stationary observations from the clip are eligible. Partial turns
+and unreliable fits are excluded from labeling.
 After calibration, color likelihoods combine the regression distance with the
 distance to up to three nearby labeled samples. Sample distance contributes
 at most 30%, tapering with weak or distant sample coverage; the regression
 remains the fallback for colors without suitable labeled samples.
+Once calibration closes, solve-time orientation continuity is rescored with
+these same labeled profiles before future move-search projections are built.
+Inspection poses remain fixed. With an inferred inspection boundary, the
+first committed move also remains fixed and only subsequent poses are rescored.
 Without `--recognize-moves`, the default pose-symmetry option uses the same
 closest-color-profile orientation recovery as the original pose pipeline. It
 evaluates the 24 proper cube symmetries and uses profile likelihood plus pose
@@ -431,23 +437,53 @@ The outright reprojection threshold and the two-sided 40 mm translation
 rejection are temporarily disabled. Reprojection and translation still
 contribute to pose selection, and invalid geometry remains ineligible.
 
-Move recognition first fits partial geometry for each single/double layer
-choice over `-45°` through `45°` in 6° increments, also testing zero. It then
-scores the `-90°`, zero, and `90°` sticker offsets against the current cube
-state. Keypoint reprojection, sticker-mask-centroid fit, and available color
+Move recognition retains every partial-angle fit for each single/double layer
+choice over `-45°` through `45°` in 6° increments, also testing zero. It scores
+the `-90°`, zero, and `90°` sticker offsets against each candidate cube state
+before selecting an angle. For each layer and offset, the best combined
+geometry-plus-color angle survives to state search. This prevents a slightly
+better geometry-only fit from discarding the correct partial angle before
+color evidence is considered. Keypoint reprojection, sticker-mask-centroid fit, and available color
 likelihoods each contribute with weight one; an impossible color fit is invalid.
+For each frame/state pair, the inherited orientation is evaluated first. If
+its best combined turn fit has color error **greater than 5**, move search
+also evaluates the other 23 cube orientations against that physical state.
+Each orientation includes the same full partial-angle and color-offset search.
+The best pose/angle for each physical move survives before the usual top-10
+shortlist. Geometry projections are shared across orientations; the physical
+state stays in its existing coordinates, and pose corrections do not count as
+cube moves. At color error 5 or below, orientation is unchanged. This fallback
+also applies to future lookahead states and single-frame move fitting. Logs
+record the inherited color error, tested orientation count, and selected pose
+symmetry; the reviewer uses that symmetry when projecting alternative trials.
 The cached video search uses adaptive branch-and-bound over the next ten
-frames, with no beam width. It first scores a complete no-turn continuation.
+frames at 30 FPS, scaled linearly with the source rate (20 frames at 60 FPS),
+with no beam width. It first scores a complete no-turn continuation.
+Use the optional `--turning-start-frame 380` to force frames **0 through 380,
+inclusive**, to static holds with no partial layer angles, color offsets, or
+committed moves. Move search starts at frame 381. The boundary uses original
+zero-based frame indices, including frames with no usable pose. Omitting the
+flag leaves move recognition unrestricted. The restriction also applies to
+live frame processing, and logs/reviewer identify these frames as forced static.
 Each parent then keeps one best hold fit plus the top 10 state changes ranked
-by current color error (`PNP_TURN_LOOKAHEAD_STATE_CHANGE_LIMIT`). This cutoff
+by combined geometry-plus-color fit (`state_score`, controlled by
+`PNP_TURN_LOOKAHEAD_STATE_CHANGE_LIMIT`). This cutoff
 applies at every depth; equivalent hold geometries are collapsed before expansion.
 Promising prefixes are scheduled by optimistic full-window cost, with current
-color score guiding exploration. At every depth, a committed move that returns
+combined current fit breaking ties. Warm-start and greedy seeds use the same
+combined-fit shortlist. At every depth, a committed move that returns
 to the state at the start of the current window is pruned before shortlisting.
 Holds and partial geometric offsets remain allowed. Intermediate-state revisits
 and returns to states from earlier windows remain eligible. Prefixes reaching
-the same cube state at the same frame have identical future options, so a
-cheaper prefix dominates.
+the same cube state at the same frame with the same last-update frame have
+identical future options, so a cheaper prefix dominates. State-changing frames
+use a source-FPS-scaled 30-per-second spacing policy:
+`ceil(source_fps / 30)` frames. At 24 or 30 FPS, different-layer moves can
+occur on adjacent frames; at 60 FPS, an intervening frame is required. The one exception is a
+single consecutive same-layer, same-direction continuation, which represents
+the second quarter-turn of a double turn. The rule applies within a lookahead
+window and across adjacent windows; holds and partial turns remain available
+on the intervening frames.
 
 For each future frame, an optimistic color fit lets every observation use its
 best possible sticker identity while retaining the actual geometry, coverage
@@ -457,7 +493,7 @@ Among eligible transitions, a prefix is pruned only if dominated or if its
 accumulated cost plus the remaining lower bound cannot beat the best complete solution. Unknown bounds
 disable that pruning rather than assuming zero. Finishing the search proves the best sequence within the per-parent color
 shortlists. Lower-ranked changes can therefore be missed. Runtime varies
-with ambiguity. A default **1024 frame/state evaluation budget per decision**
+with ambiguity. A default **4096 frame/state evaluation budget per decision**
 limits exploration, including the current state, complete-path seeds and cache hits. Configure it with `--turn-search-state-budget 512`,
 or use `--turn-search-state-budget unlimited` for exhaustive search within the
 shortlists. A budget stop returns the best **complete** forecast found, rather
@@ -492,8 +528,20 @@ failure invalidates its path instead of triggering evidence omission and retry;
 only unavailable geometry is skipped. Nonfinite fits remain invalid, and an unusable current
 frame holds without training color models. Runtime is controlled separately by
 `--turn-search-state-budget`.
-There is no angular speed limit. Physical sticker projection and color
-sampling include the selected quarter-turn offset on the current frame.
+There is no angular speed limit on partial layer geometry. Discrete state
+updates follow the 30-per-second frame-spacing cap described above. Physical
+sticker projection and color sampling include the selected quarter-turn offset
+on the current frame.
+Move search stops automatically when the accepted current-frame state has six
+uniform faces and the fitted layers are aligned. This uses the known initial
+sticker colors and committed moves, and accepts any whole-cube orientation.
+A solved current-frame fit skips future rollout; a solved state found only
+in a future forecast does not stop the current search. The final solving move
+is retained. Later frames continue rendering with the solved state and no
+further move search. Logs mark the terminal decision with `stop_reason:
+"cube_solved"` and `solved_frame_index`; later posed frames use search status
+`stopped_solved` with zero search evaluations. Partial turns, rejected poses,
+unreliable color fits and incomplete color states cannot trigger the stop.
 Mask centroids use closest projected sticker faces so the accelerator can
 score the complete batch without Hungarian matching.
 The live output also shows the accumulated standard moves in the fixed
@@ -532,9 +580,37 @@ individual color evidence behind the aggregate score. The rendered cube also
 shows the matched likelihood beside each visible sticker identity when those
 values are available.
 
-The renderer refines pose continuity, fits one global color profile set from
-the collected samples, and matches the required initial scramble to the
-observed colors to establish the cube orientation. Move search then uses the
+New JSONL records also contain `pose_continuity` for diagnosing whole-cube
+orientation jumps. It records the input pose, previous accepted frame and
+rotation, all 24 symmetry matrices and resulting rotation vectors, their
+angular distances in degrees, the selected symmetry, and its runner-up margin.
+A small angular margin indicates an ambiguous geometry-only choice. Alternatives
+also record `angular_score`, `color_score` and `combined_score`; `selected_score`
+and `runner_up_margin` describe the combined decision. The first pose after
+a tracker reset uses identity with null reference distances. These diagnostics
+identify their frame with `coordinate_frame`; the initial pass runs before
+color orientation recovery, while calibrated solve continuity uses the
+scramble-anchored frame. Calibrated records include
+`color_profile_source: "inspection_labeled"`, `color_calibration_generation`
+and the frozen prefix boundary in `frozen_prefix_frame`.
+`selected_pose` records the later final pose. Diagnostics are also logged
+before `--turning-start-frame`, when turn search is held static. Existing logs
+need a new recognition run to populate this field.
+
+The renderer first fits one global color profile set from segmentation-mask
+RGB samples across the full video, without poses, sticker identities or viewing
+angle weights. It then refines static geometry and scores all 24 equivalent
+orientations using temporal color likelihood plus a soft angular-change cost:
+`score = 0.2 * mean color NLL + angle_degrees / (90 * 30 * elapsed_seconds)`.
+The color weight balances the confirmed Xuanyi orientations at inspection frame
+148 and solve frame 212; the replay preserves inspection through frame 198.
+Colors are compared with the latest accepted appearance of each location in
+the continuity frame, with uniform priors for unseen locations. Rejected
+frames cannot update this history, and appearance measurements are replaced
+rather than accumulated indefinitely so layer turns can change local colors.
+Without color evidence, selection falls back to angular distance. This score
+has no hard rotation-speed limit. It then matches the required initial scramble
+to the observed colors to establish the cube orientation. Move search uses the
 same profiles and updates the cube state. The independent color debug view
 remains available with `--debug-independent-color-posteriors`.
 

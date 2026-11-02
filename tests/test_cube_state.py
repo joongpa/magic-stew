@@ -10,6 +10,17 @@ def test_solved_state_uses_white_top_and_green_front():
     assert all(list(state.colors.values()).count(color) == 9 for color in FACE_COLORS.values())
 
 
+def test_solved_detection_accepts_rotations_and_rejects_unsolved_or_incomplete_states():
+    for moves in ((), ("x",), ("y", "z'"), ("R", "R'"), ("Rw", "Rw'")):
+        assert CubeState.from_scramble(moves).is_solved()
+    for moves in (("R",), ("Rw",), ("R", "U2", "F'")):
+        assert not CubeState.from_scramble(moves).is_solved()
+    partial = CubeState.solved()
+    partial.colors.pop(next(iter(partial.colors)))
+    assert not partial.is_solved()
+    assert not CubeState({key: "white" for key in FACELET_KEYS}).is_solved()
+
+
 def test_face_turn_and_inverse_restore_the_state():
     state = CubeState.from_scramble(("R", "U2", "F'", "F", "U2", "R'"))
 

@@ -276,6 +276,20 @@ class CubeState:
     def color_at(self, key: FaceletKey) -> str:
         return self.colors[key]
 
+    def is_solved(self) -> bool:
+        """Return whether all six complete faces are uniform, in any orientation."""
+
+        if self.colors.keys() != FACELET_KEYS_BY_GEOMETRY.keys():
+            return False
+        face_colors: dict[tuple[int, int], str] = {}
+        for (_position, axis, side), color in self.colors.items():
+            if color not in FACE_COLORS.values():
+                return False
+            normal = (axis, side)
+            if face_colors.setdefault(normal, color) != color:
+                return False
+        return len(set(face_colors.values())) == 6
+
     def reoriented_to_standard_centers(self) -> "CubeState":
         """Rotate the state so its center colors use the standard face frame."""
 
