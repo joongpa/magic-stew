@@ -138,7 +138,8 @@ def write_dataset(
         images = sorted(p for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS)
         if not images:
             raise ValueError(f"No images found: {images_dir}")
-        for image_path in images:
+        print(f"Validating {len(images):,} pose labels from {source_dir}", flush=True)
+        for image_index, image_path in enumerate(images, 1):
             label_path = labels_dir / f"{image_path.stem}.txt"
             if not label_path.is_file():
                 raise FileNotFoundError(f"Missing pose label: {label_path}")
@@ -146,9 +147,12 @@ def write_dataset(
             if image_path.resolve() not in seen_images:
                 samples.append((image_path, label_path, counts))
                 seen_images.add(image_path.resolve())
+            if image_index % 1000 == 0 or image_index == len(images):
+                print(f"  Validated {image_index:,}/{len(images):,} labels", flush=True)
     if extra_negative_dir is not None:
         if not extra_negative_dir.is_dir():
             raise FileNotFoundError(f"Missing extra-negative image directory: {extra_negative_dir}")
+        print(f"Collecting negative images from {extra_negative_dir}", flush=True)
         for image_path in sorted(extra_negative_dir.iterdir()):
             if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXTENSIONS:
                 if image_path.resolve() in seen_images:
@@ -176,6 +180,7 @@ def write_dataset(
 
     # No output is replaced until every source label and directory is valid.
     if dataset_dir.exists():
+        print(f"Replacing prepared dataset: {dataset_dir}", flush=True)
         shutil.rmtree(dataset_dir)
     manifest, summary = [], {}
     for split, split_samples in splits.items():
@@ -184,6 +189,7 @@ def write_dataset(
         images_dir.mkdir(parents=True)
         labels_dir.mkdir(parents=True)
         class_counts: Counter[int] = Counter()
+        print(f"Preparing {split} split: {len(split_samples):,} images", flush=True)
         for index, (image_path, label_path, counts) in enumerate(split_samples):
             stem = f"{split}_{index:06d}"
             target_image = images_dir / f"{stem}{image_path.suffix.lower()}"
@@ -205,6 +211,9 @@ def write_dataset(
                     "negative": not bool(counts),
                 }
             )
+            copied = index + 1
+            if copied % 1000 == 0 or copied == len(split_samples):
+                print(f"  Copied {copied:,}/{len(split_samples):,} {split} images", flush=True)
         summary[split] = {
             "images": len(split_samples),
             "negative_images": sum(not bool(sample[2]) for sample in split_samples),
@@ -231,7 +240,7 @@ def write_dataset(
         encoding="utf-8",
     )
     print("Dataset summary:")
-    print(json.dumps(summary, indent=2))
+    print(json.dumps(summary, indent=2), flush=True)
     return data_yaml
 
 
@@ -260,6 +269,7 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
         model_kwargs["pretrain_weights"] = str(args.model)
     if args.device is not None:
         model_kwargs["device"] = args.device
+    print("Initializing RF-DETR Keypoint Preview (may download pretrained weights)...", flush=True)
     model = RFDETRKeypointPreview(**model_kwargs)
 
     output_dir = runs_dir / args.name
@@ -285,6 +295,7 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
         "run_test": False,
         "use_ema": args.ema,
         "tensorboard": args.tensorboard,
+        "progress_bar": "tqdm",
         # Synthetic data already supplies camera/lighting diversity. Keep the
         # fixed input size and physical handedness; don't shift hue/color labels.
         "multi_scale": False,
@@ -295,6 +306,12 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
     }
     if args.device is not None:
         train_kwargs["device"] = args.device
+    print(
+        f"Starting training: {args.epochs} epochs, {args.imgsz}x{args.imgsz}, "
+        f"batch {args.batch}, device {args.device or 'auto'}\n"
+        f"Output directory: {output_dir.resolve()}",
+        flush=True,
+    )
     model.train(**train_kwargs)
     best_model_path = output_dir / "checkpoint_best_total.pth"
     if not best_model_path.is_file():

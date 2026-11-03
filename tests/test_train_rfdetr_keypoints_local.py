@@ -188,6 +188,7 @@ def test_training_routes_schema_and_options_to_rfdetr(training, tmp_path, monkey
     assert options["dataset_file"] == "yolo"
     assert options["class_names"] == names
     assert options["batch_size"] == 2
+    assert options["progress_bar"] == "tqdm"
     assert options["skip_best_epochs"] == 1
     assert options["use_ema"] is False
     assert options["early_stopping"] is False

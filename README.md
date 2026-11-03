@@ -261,6 +261,9 @@ pose labels. `--pose-subdir` defaults to `pose`. The trainer validates labels
 before replacing its own prepared dataset, keeps labeled images in both splits
 when possible, and records source paths and negatives in
 `conversion_manifest.json` alongside `dataset_summary.json`.
+Preparation prints validation and copy counts every 1,000 images and at the end
+of each source/split. Training enables RF-DETR's live batch/epoch progress bar
+by default and prints the selected settings and output directory before fitting.
 
 The default `--imgsz 288` can be changed with `--imgsz` or `--resolution` to a
 positive multiple of 24, including 144 or 264. The fixed-size training defaults
