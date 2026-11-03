@@ -21,6 +21,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+rfdetr = [
+  "rfdetr[train]>=1.11.2,<2",
+  "PyYAML>=6.0",
+]
 dev = [
   "pytest>=8.0",
   "ruff>=0.5",

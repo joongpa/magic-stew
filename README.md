@@ -229,6 +229,57 @@ lighting, hand visibility, layer state, and background family. The miner only
 selects from the generator's existing physically plausible variations; it does
 not create arbitrary adversarial images.
 
+## RF-DETR landmark and sticker keypoint training
+
+`scripts/train_rfdetr_keypoints_local.py` fine-tunes RF-DETR Keypoint Preview
+on the same independent one-keypoint YOLO pose rows. It reads class order from
+the generator's `sticker_keypoint_manifest.json` (combined landmarks and six
+sticker colors), or `independent_keypoint_manifest.json` (legacy three-class
+landmarks). Without a manifest it reads `data.yaml`, falling back to the three
+landmark classes when no metadata exists. Multiple sources must have matching
+class orders. `--class-names` can explicitly supply a comma-separated class
+order for custom datasets; label IDs must already match that order.
+
+Install the optional training dependencies in the environment you will use:
+
+```bash
+python -m pip install -e ".[rfdetr]"
+```
+
+Prepare and validate without importing RF-DETR or downloading model weights:
+
+```bash
+.venv/bin/python scripts/train_rfdetr_keypoints_local.py \
+  --source-dirs data/synthetic_cube_dataset \
+  --extra-negative-dir data/youtube_solve_frames_hd/cropped-negatives \
+  --prepare-only
+```
+
+Remove `--prepare-only` to train. `--extra-negative-dir` is optional and has
+the same meaning as in the YOLO trainer: cube-free images are copied with empty
+pose labels. `--pose-subdir` defaults to `pose`. The trainer validates labels
+before replacing its own prepared dataset, keeps labeled images in both splits
+when possible, and records source paths and negatives in
+`conversion_manifest.json` alongside `dataset_summary.json`.
+
+The default `--imgsz 288` can be changed with `--imgsz` or `--resolution` to a
+positive multiple of 24, including 144 or 264. The fixed-size training defaults
+disable multi-scale resizing, crop jitter, and optional augmentation, preserving
+the generator's physical handedness and color labels. Dataset image sizes do
+not have to match the model input size. `--device` accepts `cpu`, `mps`, `cuda`,
+`cuda:N`, or a GPU index such as `0`; omission uses RF-DETR's automatic choice.
+Start with `--batch 4 --grad-accum-steps 4`, lowering the physical batch if needed.
+Other controls include `--epochs`, `--lr`, `--lr-encoder`, `--workers`,
+`--patience` (0 disables early stopping), `--no-ema`, and an optional pretrained
+checkpoint override with `--model`. To enable `--tensorboard`, install
+`tensorboard` separately.
+
+Prepared data goes to `runs/rfdetr_keypoints_local/dataset`; training outputs go
+to `runs/rfdetr_keypoints_local/runs/cube_keypoints_rfdetr` with numbered names
+for subsequent runs. Override these with `--workdir` and `--name`. The final
+message reports `checkpoint_best_total.pth`, containing the best validation
+checkpoint. No mask labels or uncertainty ellipse annotations are required.
+
 ## Independent cube intersection-point pose labels
 
 The Blender generator writes independent one-keypoint pose objects by default
