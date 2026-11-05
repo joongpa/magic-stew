@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Render RF-DETR keypoint predictions inside the shared cube ROI.
+"""Render RF-DETR or YOLO pose predictions inside the shared cube ROI.
 
 The input flow matches the live pipeline used by the other renderers:
 
 1. Detect the cube with the trained YOLO bounding-box model.
 2. Expand that box into a padded square ROI.
-3. Run RF-DETR Keypoint Preview on the square crop.
+3. Run the selected pose model on the square crop.
 4. Project the predicted keypoints back onto the full frame.
 
 The three independent keypoint classes use the same colors as the Blender
@@ -27,6 +27,15 @@ Examples:
         --device cuda:0 \
         --save runs/rfdetr_keypoint_try.png \
         --no-display
+
+    .venv/bin/python scripts/render_rfdetr_keypoints.py \
+        --source data/keypoints_only_dataset/images/000000.png \
+        --model runs/yolo11n_keypoints_local/runs/cube_keypoints_yolo11n_pose/weights/best.pt \
+        --no-display
+
+The model type is inferred from the checkpoint: ``.pth`` is treated as
+RF-DETR and ``.pt`` as Ultralytics YOLO. Use ``--model-type`` to override
+that inference when a checkpoint uses a nonstandard extension.
 """
 
 from __future__ import annotations
@@ -47,10 +56,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from live_recognition.detectors import YOLOCubeDetector  # noqa: E402
-from live_recognition.roi_tracking import (  # noqa: E402
-    RoiTracker,
-    roi_for_frame,
-)
+from live_recognition.roi_tracking import (RoiTracker,  # noqa: E402
+                                           roi_for_frame)
 
 # This checkpoint was trained from data/keypoints_only_dataset, whose combined
 # landmark/sticker manifest contains three geometric landmark classes followed
@@ -65,6 +72,17 @@ CLASS_NAMES = (
     "red",
     "blue",
     "green",
+)
+CLASS_LABELS = (
+    "C",
+    "CE",
+    "CEC",
+    "W",
+    "Y",
+    "O",
+    "R",
+    "B",
+    "G",
 )
 LANDMARK_CLASS_COUNT = 3
 # OpenCV uses BGR colors. The first three match the independent-keypoint
@@ -84,37 +102,58 @@ CLASS_COLORS_BGR = (
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".avi", ".mkv"}
-DEFAULT_CHECKPOINT = Path("runs/pose/runs/rfdetr")
+DEFAULT_CHECKPOINT = Path("runs/pose/runs/rfdetr/checkpoint_best_total.pth")
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 
 
 def resolve_checkpoint(path: Path) -> Path:
     """Resolve a checkpoint file or a training output directory.
 
-    RF-DETR training writes several checkpoints. Prefer the aggregate best
-    checkpoint, then the other conventional best checkpoints, and finally the
-    newest remaining ``.pth`` file.
+    RF-DETR and YOLO training write different checkpoint extensions and names.
+    Prefer conventional best checkpoints, then the newest remaining weight.
     """
 
     if path.is_file():
         return path
     if not path.is_dir():
-        raise FileNotFoundError(f"RF-DETR checkpoint path not found: {path}")
+        raise FileNotFoundError(f"Pose checkpoint path not found: {path}")
 
-    candidates = [candidate for candidate in path.rglob("*.pth") if candidate.is_file()]
+    candidates = [
+        candidate
+        for candidate in path.rglob("*")
+        if candidate.is_file() and candidate.suffix.lower() in {".pth", ".pt"}
+    ]
     if not candidates:
-        raise FileNotFoundError(f"No RF-DETR .pth checkpoint found under: {path}")
+        raise FileNotFoundError(f"No .pth or .pt checkpoint found under: {path}")
 
     preferred_names = (
         "checkpoint_best_total.pth",
         "checkpoint_best_ema.pth",
         "checkpoint_best_regular.pth",
+        "best.pt",
+        "last.pt",
     )
     for name in preferred_names:
         preferred = [candidate for candidate in candidates if candidate.name == name]
         if preferred:
             return max(preferred, key=lambda candidate: candidate.stat().st_mtime)
     return max(candidates, key=lambda candidate: candidate.stat().st_mtime)
+
+
+def infer_model_type(checkpoint: Path, requested: str) -> str:
+    """Infer the pose backend from the checkpoint extension when requested."""
+
+    if requested != "auto":
+        return requested
+    suffix = checkpoint.suffix.lower()
+    if suffix == ".pth":
+        return "rfdetr"
+    if suffix == ".pt":
+        return "yolo"
+    raise SystemExit(
+        f"Cannot infer model type from checkpoint extension: {checkpoint}. "
+        "Use --model-type rfdetr or --model-type yolo."
+    )
 
 
 def parse_source(source: str) -> int | Path:
@@ -150,7 +189,7 @@ def prediction_field(predictions: Any, *names: str) -> Any:
     return None
 
 
-def extract_predictions(
+def extract_rfdetr_predictions(
     predictions: Any,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Extract one local point per RF-DETR detection.
@@ -212,6 +251,71 @@ def extract_predictions(
     return points, class_ids, predicted_class_names, detection_confidences, keypoint_confidences
 
 
+def extract_yolo_predictions(
+    predictions: Any,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Extract one local point per detection from an Ultralytics YOLO pose result."""
+
+    if isinstance(predictions, (list, tuple)):
+        if not predictions:
+            return empty_predictions()
+        predictions = predictions[0]
+
+    keypoints = getattr(predictions, "keypoints", None)
+    xy = as_numpy(getattr(keypoints, "xy", None))
+    if xy is None or xy.size == 0:
+        return empty_predictions()
+    if xy.ndim == 2 and xy.shape[-1] == 2:
+        xy = xy[:, None, :]
+    if xy.ndim != 3 or xy.shape[-1] != 2:
+        raise ValueError(f"Unexpected YOLO keypoint shape: {xy.shape}")
+
+    count = xy.shape[0]
+    points = xy[:, 0, :]
+    boxes = getattr(predictions, "boxes", None)
+    class_ids = as_numpy(getattr(boxes, "cls", None), np.int32)
+    if class_ids is None:
+        class_ids = np.zeros(count, dtype=np.int32)
+    class_ids = class_ids.reshape(-1)[:count]
+
+    box_confidences = as_numpy(getattr(boxes, "conf", None))
+    if box_confidences is None:
+        box_confidences = np.zeros(count, dtype=np.float32)
+    box_confidences = box_confidences.reshape(-1)[:count]
+
+    keypoint_confidences = as_numpy(getattr(keypoints, "conf", None))
+    if keypoint_confidences is None:
+        keypoint_confidences = np.ones(count, dtype=np.float32)
+    if keypoint_confidences.ndim == 2:
+        keypoint_confidences = keypoint_confidences[:, 0]
+    keypoint_confidences = keypoint_confidences.reshape(-1)[:count]
+
+    names = getattr(predictions, "names", {})
+    if isinstance(names, (list, tuple)):
+        predicted_class_names = np.asarray(
+            [names[int(class_id)] if 0 <= int(class_id) < len(names) else "" for class_id in class_ids],
+            dtype=object,
+        )
+    elif isinstance(names, dict):
+        predicted_class_names = np.asarray(
+            [names.get(int(class_id), "") for class_id in class_ids],
+            dtype=object,
+        )
+    else:
+        predicted_class_names = np.full(count, "", dtype=object)
+
+    return points, class_ids, predicted_class_names, box_confidences, keypoint_confidences
+
+
+def extract_predictions(
+    predictions: Any,
+    model_type: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if model_type == "yolo":
+        return extract_yolo_predictions(predictions)
+    return extract_rfdetr_predictions(predictions)
+
+
 def empty_predictions() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     return (
         np.empty((0, 2), dtype=np.float32),
@@ -255,6 +359,37 @@ def draw_label(
     cv2.putText(image, text, (text_x, text_y), font, scale, color, thickness, cv2.LINE_AA)
 
 
+def draw_sticker_letter(
+    image: np.ndarray,
+    text: str,
+    x: int,
+    y: int,
+    color: tuple[int, int, int],
+) -> None:
+    """Draw a centered, colored sticker class letter with a black border."""
+
+    height, width = image.shape[:2]
+    scale = min(1.25, max(0.55, min(width, height) / 600.0))
+    thickness = max(1, round(scale * 2.0))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (text_width, text_height), baseline = cv2.getTextSize(text, font, scale, thickness)
+    origin = (
+        x - text_width // 2,
+        y + (text_height - baseline) // 2,
+    )
+    cv2.putText(
+        image,
+        text,
+        origin,
+        font,
+        scale,
+        (0, 0, 0),
+        thickness + 3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(image, text, origin, font, scale, color, thickness, cv2.LINE_AA)
+
+
 def render_frame(
     frame: np.ndarray,
     bbox_detector: YOLOCubeDetector,
@@ -286,18 +421,28 @@ def render_frame(
     roi = frame[y1:y2, x1:x2]
     if roi.size == 0:
         return output, 0, roi_source
-    # OpenCV frames are BGR, while RF-DETR's documented inference path uses
-    # RGB images. Keeping this conversion here is especially important for
-    # the sticker-color classes; geometry-only landmarks can look reasonable
-    # even when the color channels are reversed.
-    model_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-
-    try:
-        predictions = pose_model.predict(model_roi, threshold=args.pose_conf)
-    except TypeError:
-        # Older RF-DETR builds accept the image positionally but not the
-        # threshold keyword; filter the returned object below instead.
-        predictions = pose_model.predict(model_roi)
+    if args.model_type == "yolo":
+        # Ultralytics accepts OpenCV's native BGR ndarray input and performs
+        # its usual preprocessing internally.
+        predict_kwargs: dict[str, Any] = {
+            "conf": args.pose_conf,
+            "imgsz": args.resolution,
+            "verbose": False,
+        }
+        if args.device is not None:
+            predict_kwargs["device"] = args.device
+        predictions = pose_model.predict(roi, **predict_kwargs)
+    else:
+        # RF-DETR's documented inference path expects RGB images. This is
+        # especially important for the sticker-color classes; geometry-only
+        # landmarks can look reasonable when channels are reversed.
+        model_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+        try:
+            predictions = pose_model.predict(model_roi, threshold=args.pose_conf)
+        except TypeError:
+            # Older RF-DETR builds accept the image positionally but not the
+            # threshold keyword; filter the returned object below instead.
+            predictions = pose_model.predict(model_roi)
 
     (
         local_points,
@@ -305,7 +450,7 @@ def render_frame(
         predicted_class_names,
         box_confidences,
         keypoint_confidences,
-    ) = extract_predictions(predictions)
+    ) = extract_predictions(predictions, args.model_type)
     rendered = 0
     tracking_points: list[tuple[float, float]] = []
     class_index_by_name = {name: index for index, name in enumerate(CLASS_NAMES)}
@@ -362,13 +507,11 @@ def render_frame(
             cv2.fillPoly(output, [outline], (0, 0, 0), lineType=cv2.LINE_AA)
             cv2.fillPoly(output, [diamond], color, lineType=cv2.LINE_AA)
         else:
-            radius = max(4, round(min(output.shape[:2]) / 160.0))
-            cv2.circle(output, (point_x, point_y), radius + 2, (0, 0, 0), -1, cv2.LINE_AA)
-            cv2.circle(output, (point_x, point_y), radius, color, -1, cv2.LINE_AA)
+            draw_sticker_letter(output, CLASS_LABELS[class_index], point_x, point_y, color)
         if args.show_labels:
             draw_label(
                 output,
-                f"{CLASS_NAMES[class_index]} {float(box_confidence):.2f}/{float(keypoint_confidence):.2f}",
+                f"{CLASS_LABELS[class_index]} {float(box_confidence):.2f}",
                 point_x,
                 point_y,
                 color,
@@ -425,7 +568,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         type=Path,
         default=DEFAULT_CHECKPOINT,
-        help="RF-DETR checkpoint file or training directory.",
+        help="RF-DETR .pth or YOLO .pt checkpoint, or a training directory.",
+    )
+    parser.add_argument(
+        "--model-type",
+        choices=("auto", "rfdetr", "yolo"),
+        default="auto",
+        help="Pose backend; auto infers .pth as RF-DETR and .pt as YOLO.",
     )
     parser.add_argument(
         "--bbox-model",
@@ -442,7 +591,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--resolution",
         type=int,
         default=288,
-        help="RF-DETR inference resolution; use the resolution used for training.",
+        help="Pose inference resolution; use the resolution used for training.",
     )
     parser.add_argument(
         "--pose-conf",
@@ -451,7 +600,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="pose_conf",
         type=float,
         default=0.25,
-        help="RF-DETR detection confidence threshold (default: 0.25).",
+        help="Pose detection confidence threshold (default: 0.25).",
     )
     parser.add_argument("--keypoint-conf", type=float, default=0.05)
     parser.add_argument("--device", default=None, help="RF-DETR/YOLO device, e.g. cuda:0 or cpu.")
@@ -501,7 +650,7 @@ def run_image(
     else:
         print(f"Rendered {point_count} points (ROI from {roi_source})")
     if args.display:
-        cv2.imshow("RF-DETR keypoints", output)
+        cv2.imshow("Pose keypoints", output)
         cv2.waitKey(0)
     return point_count
 
@@ -547,7 +696,7 @@ def run_stream(
             if writer is not None:
                 writer.write(output)
             if args.display:
-                cv2.imshow("RF-DETR keypoints", output)
+                cv2.imshow("Pose keypoints", output)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):
                     break
@@ -564,6 +713,42 @@ def run_stream(
     return total_points
 
 
+def load_pose_model(checkpoint: Path, args: argparse.Namespace) -> tuple[Any, str]:
+    """Load RF-DETR or Ultralytics YOLO pose weights."""
+
+    model_type = infer_model_type(checkpoint, args.model_type)
+    if model_type == "rfdetr":
+        try:
+            from rfdetr import RFDETRKeypointPreview
+        except ImportError as exc:
+            raise SystemExit(
+                'RF-DETR inference requires: python -m pip install "rfdetr[train]"'
+            ) from exc
+
+        model_kwargs: dict[str, Any] = {
+            "pretrain_weights": str(checkpoint),
+            "resolution": args.resolution,
+        }
+        if args.device is not None:
+            model_kwargs["device"] = args.device
+        return RFDETRKeypointPreview(**model_kwargs), model_type
+
+    try:
+        from ultralytics import YOLO
+    except ImportError as exc:
+        raise SystemExit(
+            "YOLO inference requires: python -m pip install ultralytics"
+        ) from exc
+
+    model = YOLO(str(checkpoint))
+    task = getattr(model, "task", None)
+    if task is not None and task != "pose":
+        raise SystemExit(
+            f"The YOLO checkpoint is a {task!r} model, not a pose model: {checkpoint}"
+        )
+    return model, model_type
+
+
 def main() -> int:
     args = build_parser().parse_args()
     validate_args(args)
@@ -571,27 +756,15 @@ def main() -> int:
     if not args.bbox_model.is_file():
         raise SystemExit(f"YOLO bbox model not found: {args.bbox_model}")
 
-    try:
-        from rfdetr import RFDETRKeypointPreview
-    except ImportError as exc:
-        raise SystemExit(
-            'RF-DETR inference requires: python -m pip install "rfdetr[train]"'
-        ) from exc
-
-    model_kwargs: dict[str, Any] = {
-        "pretrain_weights": str(checkpoint),
-        "resolution": args.resolution,
-    }
-    if args.device is not None:
-        model_kwargs["device"] = args.device
-    pose_model = RFDETRKeypointPreview(**model_kwargs)
+    pose_model, args.model_type = load_pose_model(checkpoint, args)
     bbox_detector = YOLOCubeDetector(
         model_name=str(args.bbox_model),
         confidence_threshold=args.bbox_conf,
         image_size=args.bbox_imgsz,
         device=args.device,
     )
-    print(f"RF-DETR checkpoint: {checkpoint}")
+    print(f"Pose model type: {args.model_type}")
+    print(f"Pose checkpoint: {checkpoint}")
     print(f"BBox checkpoint: {args.bbox_model}")
 
     source = parse_source(args.source)
