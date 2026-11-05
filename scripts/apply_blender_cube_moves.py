@@ -331,7 +331,7 @@ CORE_FILL_OBJECT_NAMES = ("StickerlessBlackCoreFill", "StickerlessBlackCoreSpher
 # Keep discrete scrambles enabled for varied cube states. Generate partial
 # layer turns by default so ordered-keypoint datasets contain examples of
 # layer misalignment. The CLI still exposes an explicit opt-out for legacy
-# rigid-cube datasets.
+# rigid-cube datasets; solved cubes retain orientation-only x/y/z moves.
 CUBE_MISALIGNMENT_ENABLED = True
 SCRAMBLES_ENABLED = True
 PARTIAL_TURN_APPLIED_PROBABILITY = 0.70
@@ -1085,17 +1085,19 @@ def randomize_layer_render_state(objects: list[bpy.types.Object]) -> dict[str, o
 
 def scene_scramble_moves(scramble_length: int, solved: bool) -> list[str]:
     """Return scramble-mode or orientation-only cube moves for a scene."""
+    if solved:
+        # A solved state still needs random whole-cube orientation, even when
+        # ordinary face scrambles are disabled by the CLI or a preset.
+        return random_orientation_moves(scramble_length)
     if not SCRAMBLES_ENABLED:
         return []
-    if solved:
-        return random_orientation_moves(scramble_length)
     return random_scramble_moves(scramble_length)
 
 
 def scene_move_mode(solved: bool) -> str:
-    if not SCRAMBLES_ENABLED:
-        return "none"
-    return "orientation_only" if solved else "scramble"
+    if solved:
+        return "orientation_only"
+    return "scramble" if SCRAMBLES_ENABLED else "none"
 
 
 def scene_layer_render_state(objects: list[bpy.types.Object]) -> dict[str, object]:
