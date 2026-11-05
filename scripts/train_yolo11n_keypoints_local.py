@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a YOLO11n pose baseline on the nine-class sticker/keypoint dataset.
+"""Train a YOLO pose model on the nine-class sticker/keypoint dataset.
 
 Expected source layout:
 
@@ -19,6 +19,8 @@ augmentation.
 Example:
 
     .venv/bin/python scripts/train_yolo11n_keypoints_local.py \
+        --model-family yolo26 \
+        --model-size small \
         --source-dir data/keypoints_only_dataset \
         --device 0 \
         --batch 12 \
@@ -39,6 +41,22 @@ KEYPOINT_SHAPE = [1, 3]
 LABEL_FIELD_COUNT = 1 + 4 + KEYPOINT_SHAPE[0] * KEYPOINT_SHAPE[1]
 VISIBILITY_VALUES = {0, 1, 2}
 DEFAULT_CLASS_NAMES = ["corner", "corner-edge", "corner-edge-center"]
+YOLO_POSE_MODEL_FAMILIES = {
+    "yolo11": {
+        "nano": "yolo11n-pose.pt",
+        "small": "yolo11s-pose.pt",
+        "medium": "yolo11m-pose.pt",
+        "large": "yolo11l-pose.pt",
+        "xlarge": "yolo11x-pose.pt",
+    },
+    "yolo26": {
+        "nano": "yolo26n-pose.pt",
+        "small": "yolo26s-pose.pt",
+        "medium": "yolo26m-pose.pt",
+        "large": "yolo26l-pose.pt",
+        "xlarge": "yolo26x-pose.pt",
+    },
+}
 
 
 def parse_class_names(value: str) -> list[str]:
@@ -223,7 +241,9 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
     except ImportError as error:
         raise RuntimeError("YOLO training requires: python -m pip install ultralytics") from error
 
-    model = YOLO(args.model)
+    model_name = args.model or YOLO_POSE_MODEL_FAMILIES[args.model_family][args.model_size]
+    print(f"YOLO pose model: {model_name}")
+    model = YOLO(model_name)
     model.train(
         data=str(data_yaml),
         epochs=args.epochs,
@@ -269,7 +289,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workdir", type=Path, default=Path("runs/yolo11n_keypoints_local"))
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--model", default="yolo11n-pose.pt")
+    parser.add_argument(
+        "--model-family",
+        "--family",
+        choices=tuple(YOLO_POSE_MODEL_FAMILIES),
+        default="yolo11",
+        help="YOLO pose model family; ignored when --model is supplied.",
+    )
+    parser.add_argument(
+        "--model-size",
+        choices=tuple(next(iter(YOLO_POSE_MODEL_FAMILIES.values()))),
+        default="nano",
+        help="YOLO pose model size; ignored when --model is supplied.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Explicit YOLO pose checkpoint override, such as a custom .pt file.",
+    )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", "--resolution", type=int, default=288)
     parser.add_argument("--batch", type=int, default=-1, help="Batch size; -1 lets Ultralytics auto-select.")
@@ -285,8 +322,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    if args.imgsz <= 0 or args.imgsz % 32 != 0:
-        parser.error("--imgsz must be a positive multiple of 32 for YOLO11n")
+    if args.imgsz <= 0:
+        parser.error("--imgsz must be positive")
     if args.epochs <= 0 or args.workers < 0 or args.patience < 0:
         parser.error("--epochs must be positive; --workers and --patience must be nonnegative")
     if args.batch == 0 or args.batch < -1:
