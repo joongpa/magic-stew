@@ -7,13 +7,13 @@ resume the least costly deferred continuation with exactly the allowance its
 rolling score requires. The next frame returns to the normal threshold.
 The rolling score is the mean of the lowest three costs in the last four frames.
 The goal tests physical sticker colors, starting with the supplied scramble.
-Poses, geometry options and likelihoods stay fixed.
+Poses, geometry options and categorical color matches stay fixed.
 """
 from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import importlib.util
 import json
@@ -511,13 +511,150 @@ def load_renderer():
     return module
 
 
+def add_nine_class_input_arguments(parser):
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--log", type=Path, help="A nine-class turn/observation JSONL log, or its directory.")
+    source.add_argument("--source", type=Path, help="Video to process with the landmark/color pose model.")
+    parser.add_argument("--model", type=Path,
+                        default=ROOT / "runs/pose/runs/yoloPoseMedium/weights/best.pt")
+    parser.add_argument("--bbox-model", type=Path, default=ROOT / "runs/500ExamplesWeights.pt")
+    parser.add_argument("--pose-class-conf", help="Per-class detection thresholds, e.g. red=0.35.")
+    parser.add_argument("--keypoint-conf", type=float, default=.05,
+                        help="Landmark visibility threshold; sticker color keypoints keep the 0.25 floor.")
+    parser.add_argument("--roi-padding", type=float, default=.4,
+                        help="Padding ratio around the pose-model ROI (default: 0.4).")
+    parser.add_argument("--turning-start-frame", type=int,
+                        help="Last static source frame, inclusive; no turn search occurs through this frame.")
+
+
+def initial_sticker_colors(renderer, scramble):
+    cube = renderer.CubeState.from_scramble(scramble)
+    return {label: cube.colors[position]
+            for position, label in renderer.CubeGeometryState.identity().facelets.items()}
+
+
+def prepare_nine_class_video(args, renderer):
+    """Cache nine-class observations and all geometric options, without local move rollout."""
+    import torch
+    from ultralytics import YOLO
+
+    if not args.source.is_file():
+        raise ValueError(f"Source video not found: {args.source}")
+    if not args.model.is_file() or not args.bbox_model.is_file():
+        raise ValueError("Both the nine-class pose checkpoint and bbox checkpoint must exist")
+    if not 0 <= args.keypoint_conf <= 1:
+        raise ValueError("--keypoint-conf must be in [0, 1]")
+    if not math.isfinite(args.roi_padding) or args.roi_padding < 0:
+        raise ValueError("--roi-padding must be finite and nonnegative")
+    if args.turning_start_frame is not None and args.turning_start_frame < 0:
+        raise ValueError("--turning-start-frame must be nonnegative")
+    output = args.output_dir / "observations.jsonl"
+    if output.exists():
+        raise ValueError("Observation cache already exists; choose a fresh output directory")
+    options = ["--source", str(args.source), "--initial-scramble", args.initial_scramble,
+               "--model", str(args.model), "--bbox-model", str(args.bbox_model),
+               "--keypoint-conf", str(args.keypoint_conf), "--roi-padding", str(args.roi_padding),
+               "--no-display", "--no-show-fps"]
+    if args.pose_class_conf:
+        options += ["--pose-class-conf", args.pose_class_conf]
+    render_args = renderer.build_parser().parse_args(options)
+    model = YOLO(str(args.model))
+    if not set(renderer.CLASS_NAMES).issubset(set(model.names.values())):
+        raise ValueError("Pose checkpoint must predict three landmarks and six sticker colors")
+    detector = renderer.YOLOCubeDetector(
+        model_name=str(args.bbox_model), confidence_threshold=render_args.bbox_conf,
+        image_size=render_args.bbox_imgsz, device="cpu")
+    print(f"Preparing nine-class observations with {args.model}", flush=True)
+    cache, count, _completed, fps = renderer.run_neural_video_pass(
+        str(args.source), detector, model, render_args)
+    colors = initial_sticker_colors(renderer, args.initial_scramble)
+    renderer.process_cached_poses(cache, render_args, colors, source_fps=fps)
+    output.touch(exist_ok=False)
+    device = torch.device(args.device)
+    search_announced = False
+    for index, record in enumerate(cache, start=1):
+        candidate = record.pose_candidate
+        static = renderer._frame_forces_static_hold(record.frame_index, args.turning_start_frame)
+        renderer.print_headless_progress("static holds" if static else "preparing search observations", index, count)
+        if candidate is not None:
+            if static:
+                candidate = renderer._hold_before_turning_start(
+                    candidate, record.frame_index, args.turning_start_frame)
+            else:
+                if not search_announced:
+                    print(f"\nPreparing turn geometry from frame {record.frame_index}.", flush=True)
+                    search_announced = True
+                geometry = renderer._build_turn_geometry_frame(candidate,
+                    renderer.PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * renderer.projected_cube_diameter(candidate), device)
+                diagnostics = dict(status="unavailable_geometry", evaluated_states=0,
+                                   turning_start_frame=args.turning_start_frame)
+                if geometry is not None:
+                    diagnostics.update(status="prepared_full_search", geometry=dict(
+                        scoring_version=renderer.PNP_TURN_GEOMETRY_SCORE_VERSION,
+                        scope="whole_cube",
+                        options=[renderer.turn_trial_log_payload(option) for option in geometry["options"]]))
+                candidate = replace(candidate,
+                    turn_color_matches=renderer.turn_color_match_matrix(candidate, expected_color_by_label=colors),
+                    turn_search_diagnostics=diagnostics,
+                    turn_fit_search_rvec=candidate.rvec.copy(), turn_fit_search_tvec=candidate.tvec.copy())
+        renderer.append_turn_candidate_log(output, candidate, record.frame_index)
+    if cache:
+        print()
+    metadata = dict(source=str(args.source.resolve()), pose_model=str(args.model.resolve()),
+        pose_model_sha256=hashlib.sha256(args.model.read_bytes()).hexdigest(),
+        class_names=list(renderer.CLASS_NAMES), class_confidences=render_args.pose_class_conf,
+        landmark_keypoint_confidence=args.keypoint_conf,
+        roi_padding=render_args.roi_padding,
+        geometry_scoring_version=renderer.PNP_TURN_GEOMETRY_SCORE_VERSION,
+        sticker_keypoint_min_confidence=renderer.STICKER_KEYPOINT_MIN_CONFIDENCE,
+        initial_scramble=args.initial_scramble, fps=fps, video_frame_count=count,
+        turning_start_frame=args.turning_start_frame, color_scoring="direct_match_fraction",
+        segmentation_used=False, pixel_color_sampling_used=False, local_move_rollout_used=False,
+        orientation_policy="fixed poses matched directly against the supplied scramble")
+    output.with_suffix(".meta.json").write_text(json.dumps(metadata, indent=2))
+    return output, metadata
+
+
+def load_nine_class_records(args, renderer):
+    if args.source is not None:
+        args.log, metadata = prepare_nine_class_video(args, renderer)
+    else:
+        if args.log.is_dir():
+            directory = args.log
+            args.log = next((directory / name for name in ("observations.jsonl", "turn_candidate_scores.jsonl")
+                             if (directory / name).is_file()), directory / "observations.jsonl")
+        metadata_path = args.log.with_suffix(".meta.json")
+        metadata = json.loads(metadata_path.read_text()) if metadata_path.is_file() else {}
+    records = {}
+    for line_number, line in enumerate(args.log.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        frame = record["frame_index"]
+        if frame in records:
+            raise ValueError(f"Duplicate source frame {frame} on log line {line_number}")
+        records[frame] = record
+    if not records:
+        raise ValueError("Source log contains no frames")
+    if args.fps is None:
+        args.fps = float(metadata.get("fps") or 60.)
+    if args.video_frame_count is None and metadata.get("video_frame_count") is not None:
+        args.video_frame_count = metadata["video_frame_count"]
+    return records, metadata
+
+
 class ReplayScorer:
-    def __init__(self, renderer, records, device, cache_size=4096):
+    def __init__(self, renderer, records, device, cache_size=4096, *, initial_colors=None,
+                 turning_start_frame=None, balance_geometry_color=False, minimum_color_accuracy=None):
         import numpy as np
         self.np = np
         self.m = renderer
         self.records = records
         self.device = device
+        self.initial_colors = initial_colors
+        self.turning_start_frame = turning_start_frame
+        self.balance_geometry_color = balance_geometry_color
+        self.minimum_color_accuracy = minimum_color_accuracy
         self.cache_size = cache_size  # Eviction only; never prunes search branches.
         self.cache = OrderedDict()
         self.prepared = OrderedDict()
@@ -537,17 +674,42 @@ class ReplayScorer:
     def solved_predicate(self, sticker_colors):
         return lambda state: state.is_solved(sticker_colors)
 
+    def hold_reason(self, frame):
+        if frame not in self.records:
+            raise ValueError(f"Source log is missing frame {frame}")
+        record = self.records[frame]
+        if self.m._frame_forces_static_hold(frame, self.turning_start_frame):
+            return "turning_start_frame"
+        status = (record.get("search") or {}).get("status")
+        if status == "forced_static":
+            return "turning_start_frame"
+        if record.get("has_pose") is False or status == "unavailable_geometry":
+            return "unavailable_geometry"
+        return None
+
+    def hold_transition(self, frame, state):
+        return (Transition(state, 0., (0.,), dict(
+            state_moves=(), state_score=0., observation_status=self.hold_reason(frame),
+            color_observed_count=0), None),)
+
     def prepare(self, frame):
         if frame in self.prepared:
             self.prepared.move_to_end(frame)
             return self.prepared[frame]
+        if self.hold_reason(frame) is not None:
+            return None
         r = self.records[frame]
         p = r.get("search_pose") or {}
         if p.get("rvec") is None:
             p = r.get("selected_pose") or {}
         options = ((r.get("search") or {}).get("geometry") or {}).get("options")
-        if p.get("rvec") is None or not options or r.get("turn_color_likelihoods") is None:
-            raise ValueError(f"Missing replay inputs at frame {frame}")
+        if p.get("rvec") is None or not options:
+            raise ValueError(f"Missing replay pose/geometry at frame {frame}; regenerate nine-class observations")
+        if p.get("assignment_image_points") and any(
+                o.get("keypoint_mean_error") == 0. and o.get("keypoint_inlier_count") == 0
+                for o in options):
+            raise ValueError(f"Frame {frame} contains cached zero-keypoint fallback geometry; "
+                             "regenerate observations with whole-cube scoring")
         np, m = self.np, self.m
         candidate = m.StickerPnPCandidate(sticker_type=p["sticker_type"], sticker_average_confidence=1,
             image_points=np.zeros((4, 2)), object_points=np.zeros((4, 3)), projected_sticker_points=np.zeros((4, 2)),
@@ -555,14 +717,33 @@ class ReplayScorer:
             rvec=np.array(p["rvec"]), tvec=np.array(p["tvec"]), reprojection_error=0,
             sticker_mask_centers=tuple(np.array(x) for x in p["sticker_mask_centers"]),
             sticker_mask_center_uncertainties=tuple(p["sticker_mask_center_uncertainties"]),
-            sticker_mask_colors=tuple(np.zeros(3) for _ in p["sticker_mask_centers"]), image_size=tuple(p["image_size"]))
-        geometry = tuple(dict(o, combined_mean_error=o["keypoint_mean_error"]+o["heatmap_mean_error"],
-            keypoint_error=o["keypoint_mean_error"], sticker_error=o["heatmap_mean_error"],
-            p90_error=o["keypoint_p90_error"],
-            layer_rotations=tuple(m.CubeLayerRotation(**rotation) for rotation in o["layer_rotations"]),
-            assignment_projected_points=None, assignment_object_points=None,
-            assignment_projected_class_ids=None) for o in options)
-        result = (candidate, geometry, np.array(r["turn_color_likelihoods"]),
+            sticker_color_names=tuple(p.get("sticker_color_names") or r.get("turn_color_observation_names") or ()),
+            image_size=tuple(p["image_size"]))
+        matrix = (m.turn_color_match_matrix(candidate, expected_color_by_label=self.initial_colors)
+                  if self.initial_colors and candidate.sticker_color_names else r.get("turn_color_matches"))
+        if matrix is None:
+            raise ValueError(f"Frame {frame} has no nine-class color matches; regenerate the old probability log")
+        matrix = np.asarray(matrix, dtype=np.float64)
+        if (matrix.shape != (54, len(candidate.sticker_mask_centers))
+                or not np.isfinite(matrix).all() or not np.isin(matrix, (0., 1.)).all()):
+            raise ValueError(f"Frame {frame} must contain a binary 54-by-observation color match matrix")
+        def metric(value):
+            # JSON represents nonfinite geometry as null. Keep it invalid
+            # through replay instead of dropping it or interpreting it as zero.
+            return float(value) if value is not None else float("inf")
+
+        geometry = []
+        for option in options:
+            keypoint, sticker = metric(option["keypoint_mean_error"]), metric(option["heatmap_mean_error"])
+            robust = option.get("global_robust_error", option.get("robust_error", keypoint+sticker))
+            geometry.append(dict(option, combined_mean_error=keypoint+sticker,
+                keypoint_error=keypoint, sticker_error=sticker, robust_error=metric(robust),
+                p90_error=metric(option["keypoint_p90_error"]),
+                layer_rotations=tuple(m.CubeLayerRotation(**rotation) for rotation in option["layer_rotations"]),
+                assignment_projected_points=None, assignment_object_points=None,
+                assignment_projected_class_ids=None))
+        geometry = tuple(geometry)
+        result = (candidate, geometry, matrix,
                   m.PNP_FINAL_ASSIGNMENT_ERROR_FRACTION*m.projected_cube_diameter(candidate), {})
         self.prepared[frame] = result
         if len(self.prepared) > 32:
@@ -570,16 +751,19 @@ class ReplayScorer:
         return result
 
     def __call__(self, frame, state):
+        if self.hold_reason(frame) is not None:
+            return self.hold_transition(frame, state)
         cache_key = (frame, self.key(state))
         if cache_key in self.cache:
             self.cache_hits += 1
             self.cache.move_to_end(cache_key)
             return self.cache[cache_key]
         m = self.m
-        c, geometry, likelihoods, limit, projections = self.prepare(frame)
+        c, geometry, color_matches, limit, projections = self.prepare(frame)
         self.scoring_calls += 1
-        batches = m._score_turn_color_offsets_for_states_on_gpu(c, geometry, limit, self.device,
-            likelihoods, (state,), projection_cache=projections)
+        batches = m._score_turn_color_offsets_with_orientation_rescue(c, geometry, limit, self.device,
+            color_matches, (state,), projection_cache=projections,
+            balance_geometry_color=self.balance_geometry_color, minimum_color_accuracy=self.minimum_color_accuracy)
         if batches is None:
             raise RuntimeError(f"Scoring failed at frame {frame}")
         unique = {}
@@ -605,17 +789,20 @@ class PreparedReplayScorer(ReplayScorer):
     """Compile fixed frame observations once; score states by identity gathers.
 
     All source geometry options and discrete offsets are retained. The compact
-    frame cache stores observation assignments and weights, not projection
+    frame cache stores observation assignments and matches, not projection
     tensors. Floating point reductions can differ from the legacy CPU scorer
     at roundoff scale; no scores are rounded for search or dominance keys.
     Production search keeps states as 54-byte position-to-identity permutations.
     The update-context hook filters illegal moves before color work or children.
     """
 
-    def __init__(self, renderer, records, device, cache_size=4096):
+    def __init__(self, renderer, records, device, cache_size=4096, *, initial_colors=None,
+                 turning_start_frame=None, balance_geometry_color=False, minimum_color_accuracy=None):
         if str(device) != "cpu":
             raise ValueError("Prepared replay scoring currently requires CPU")
-        super().__init__(renderer, records, device, cache_size)
+        super().__init__(renderer, records, device, cache_size,
+                         initial_colors=initial_colors, turning_start_frame=turning_start_frame,
+                         balance_geometry_color=balance_geometry_color, minimum_color_accuracy=minimum_color_accuracy)
         self.compiled_frames = {}
         identities = renderer.canonical_sticker_identities()
         canonical_indices = renderer._turn_gpu_static_geometry()[-1]
@@ -627,6 +814,12 @@ class PreparedReplayScorer(ReplayScorer):
         canonical_by_label = {identity.label: index for index, identity in enumerate(identities)}
         self.canonical_from_encoded = self.np.asarray([
             canonical_by_label[label] for label in sorted(self.identity_indices)], dtype=self.np.intp)
+        orientation_sources = []
+        for symmetry in renderer.CUBE_SYMMETRY_MATRICES:
+            source_by_target = dict(renderer._geometry_symmetry_permutation(
+                tuple(int(v) for v in symmetry.T.ravel())))
+            orientation_sources.append([position_indices[source_by_target[position]] for position in self.positions])
+        self.orientation_sources = self.np.asarray(orientation_sources, dtype=self.np.intp)
         self.move_permutations = {}
         self.face_groups = tuple(tuple(index for index, position in enumerate(self.positions)
                                       if position[1:] == (axis, side))
@@ -673,8 +866,10 @@ class PreparedReplayScorer(ReplayScorer):
     def prepare(self, frame):
         if frame in self.compiled_frames:
             return self.compiled_frames[frame]
+        if self.hold_reason(frame) is not None:
+            return None
         np, m = self.np, self.m
-        candidate, geometry, likelihoods, limit, projections = super().prepare(frame)
+        candidate, geometry, color_matches, limit, projections = super().prepare(frame)
         # A quarter turn permutes sticker positions without changing the surface.
         # Project only the base partial angles; offsets are state permutations.
         # Collapse the identical static poses across the twelve layer labels too.
@@ -689,7 +884,7 @@ class PreparedReplayScorer(ReplayScorer):
                 projected_geometry.append(option)
             projection_indices.append(projected_keys[key])
         batches = m._score_turn_color_offsets_for_states_on_gpu(
-            candidate, tuple(projected_geometry), limit, self.device, likelihoods,
+            candidate, tuple(projected_geometry), limit, self.device, color_matches,
             (m.CubeGeometryState.identity(),), projection_cache=projections, color_offsets=(0.,))
         if batches is None:
             raise RuntimeError(f"Scoring preparation failed at frame {frame}")
@@ -731,37 +926,40 @@ class PreparedReplayScorer(ReplayScorer):
                 payload = m.turn_trial_log_payload(trial)
                 templates.append((payload, m.state_update_layer_direction(trial),
                                   float(option.get("robust_error", float("inf")))))
-                geometry_scores.append(float(option["combined_mean_error"]))
+                geometry_score = float(option["combined_mean_error"])
+                if self.balance_geometry_color and math.isfinite(geometry_score):
+                    geometry_score = float(m.balanced_geometry_cost(option["keypoint_error"], option["sticker_error"]))
+                geometry_scores.append(geometry_score)
                 inliers.append(trial["inlier_count"])
                 p90s.append(trial["p90_error"])
                 layer_inliers.append(trial["layer_inlier_count"])
         assignments = projections.get("assignments", {}).get("value")
         if assignments is None:
-            nearest = weights = nll = denominator = has_weight = None
+            nearest = weights = match_matrix = denominator = has_weight = None
             matches = np.zeros(len(templates), dtype=np.int32)
         else:
-            import torch
-            nearest_t, weights_t, matches_t = assignments
+            nearest_t, valid_t, _totals_t = assignments
             rows = np.asarray(projection_rows)
             nearest_base = nearest_t.cpu().numpy()
             nearest = np.take_along_axis(np.asarray(source_permutations), nearest_base[rows], axis=1).astype(np.uint8)
-            weights = weights_t.cpu().numpy()[rows].copy()
+            weights = valid_t.cpu().numpy()[rows].copy()
             count = nearest.shape[1]
-            # Match the original likelihood clipping and log implementation.
-            nll = -torch.log(torch.clamp(torch.as_tensor(
-                likelihoods[:, :count], dtype=weights_t.dtype), min=1e-30)).numpy()
-            total_weight = weights.sum(axis=1)
-            denominator = np.maximum(total_weight, 1e-12)
-            has_weight = total_weight > 0
-            matches = matches_t.cpu().numpy()[rows].copy()
-        result = dict(nearest=nearest, weights=weights, nll=nll, denominator=denominator,
-            has_weight=has_weight,
+            match_matrix = np.asarray(color_matches[:, :count], dtype=np.float64)
+            occupied = np.zeros((len(templates), 54), dtype=bool)
+            np.logical_or.at(occupied, (np.arange(len(templates))[:, None], nearest), weights)
+            matches = occupied.sum(axis=1).astype(np.int32)
+            denominator = np.maximum(matches, 1)
+            has_weight = matches > 0
+        result = dict(nearest=nearest, weights=weights, match_matrix=match_matrix,
+            denominator=denominator, has_weight=has_weight,
             observation_indices=None if nearest is None else np.arange(nearest.shape[1])[None, :],
             matches=matches, geometry_scores=np.asarray(geometry_scores),
             inliers=np.asarray(inliers), p90s=np.asarray(p90s),
             layer_inliers=np.asarray(layer_inliers), group_ids=np.asarray(group_ids),
             templates=templates, projection_count=len(projected_geometry),
             source_geometry_count=len(geometry), configuration_count=len(templates))
+        result["static_row"] = next((index for index, (template, _direction, _robust) in enumerate(templates)
+                                     if template["is_baseline"] and not template["state_moves"]), None)
         self.compiled_frames[frame] = result
         result["selections"] = {}
         self.prepared.pop(frame, None)
@@ -771,13 +969,70 @@ class PreparedReplayScorer(ReplayScorer):
         return self._evaluate(frame, state, None)
 
     def for_update_context(self, frame, state, update, min_update_gap):
+        if self.hold_reason(frame) is not None:
+            return self.hold_transition(frame, state), 0
         last, direction, streak = update
         restriction = None
         if min_update_gap > 1 and last is not None and frame - last < min_update_gap:
             restriction = direction if frame-last == 1 and streak < 2 and direction is not None else False
         prepared = self.prepare(frame)
-        selection = self._selection(prepared, restriction)
+        _encoded, symmetry_index, _diagnostic = self._orientation_for_state(prepared, self.key(state))
+        selection = self._selection(prepared, self._orientation_restriction(restriction, symmetry_index))
         return self._evaluate(frame, state, restriction), selection["skipped_moves"]
+
+    def _orientation_for_state(self, prepared, encoded):
+        """Check the unchanged state, using only its static sticker projection."""
+        np, m = self.np, self.m
+        row = prepared["static_row"]
+        if row is None or prepared["nearest"] is None or prepared["matches"][row] == 0:
+            return encoded, None, None
+        nearest = prepared["nearest"][row]
+        weights = prepared["weights"][row]
+        observed = np.arange(len(nearest))[None, :]
+
+        def errors(states):
+            identities = self.canonical_from_encoded[states[:, self.geometry_positions]]
+            matches = weights[None, :] * prepared["match_matrix"][identities[:, nearest], observed]
+            faces = np.zeros((len(states), 54), dtype=np.float64)
+            np.add.at(faces, (np.arange(len(states))[:, None], nearest[None, :]), matches)
+            return 1.0 - np.minimum(faces, 1.0).sum(axis=1) / prepared["matches"][row]
+
+        state = np.frombuffer(encoded, dtype=np.uint8)
+        inherited = float(errors(state[None, :])[0])
+        if inherited <= m.PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR:
+            return encoded, None, None
+        alternatives = state[self.orientation_sources]
+        color_errors = errors(alternatives)
+        best_error, selected = inherited, None
+        for index, symmetry in enumerate(m.CUBE_SYMMETRY_MATRICES):
+            if not np.array_equal(symmetry, np.eye(3)) and color_errors[index] < best_error:
+                best_error, selected = float(color_errors[index]), index
+        diagnostic = m._orientation_rescue_diagnostic(inherited, best_error, len(color_errors))
+        return (encoded if selected is None else alternatives[selected].tobytes()), selected, diagnostic
+
+    def _orientation_restriction(self, restriction, symmetry_index):
+        if symmetry_index is None or not restriction or restriction[0] != "layer":
+            return restriction
+        m = self.m
+        layer = m.transform_layer_rotation_by_symmetry(
+            m.CubeLayerRotation(restriction[1], restriction[2], 0., restriction[3]),
+            m.CUBE_SYMMETRY_MATRICES[symmetry_index].T,
+        )
+        return ("layer", layer.axis, layer.side, layer.layer_count, restriction[4])
+
+    def _oriented_template(self, template, direction, symmetry_index, diagnostic):
+        if symmetry_index is not None:
+            m = self.m
+            template = m._turn_trial_under_pose_symmetry(
+                dict(template, layer_rotations=tuple(m.CubeLayerRotation(**r) for r in template["layer_rotations"])),
+                m.CUBE_SYMMETRY_MATRICES[symmetry_index], symmetry_index,
+            )
+            template["layer_rotations"] = [dict(axis=r.axis, side=r.side, angle_degrees=r.angle_degrees,
+                                                layer_count=r.layer_count) for r in template["layer_rotations"]]
+            direction = m.state_update_layer_direction(template)
+        if diagnostic is not None:
+            template = dict(template, orientation_rescue=diagnostic)
+        return template, direction
 
     def _selection(self, prepared, restriction):
         if restriction in prepared["selections"]:
@@ -797,6 +1052,8 @@ class PreparedReplayScorer(ReplayScorer):
         return result
 
     def _evaluate(self, frame, state, restriction):
+        if self.hold_reason(frame) is not None:
+            return self.hold_transition(frame, state)
         np, m = self.np, self.m
         encoded = self.key(state)
         # The same physical state can have different legal next moves depending
@@ -807,29 +1064,42 @@ class PreparedReplayScorer(ReplayScorer):
             self.cache.move_to_end(cache_key)
             return self.cache[cache_key]
         prepared = self.prepare(frame)
-        selection = self._selection(prepared, restriction)
+        oriented, symmetry_index, diagnostic = self._orientation_for_state(prepared, encoded)
+        selection = self._selection(prepared, self._orientation_restriction(restriction, symmetry_index))
         self.scoring_calls += 1
         self.color_configurations_scored += len(selection["rows"])
         if selection["nearest"] is None:
             errors = np.zeros(len(selection["rows"]))
         else:
             indices = self.canonical_from_encoded[
-                np.frombuffer(encoded, dtype=np.uint8)[self.geometry_positions]]
-            errors = (selection["weights"] * prepared["nll"][
-                indices[selection["nearest"]], prepared["observation_indices"]]).sum(axis=1)
+                np.frombuffer(oriented, dtype=np.uint8)[self.geometry_positions]]
+            observation_matches = selection["weights"] * prepared["match_matrix"][
+                indices[selection["nearest"]], prepared["observation_indices"]]
+            face_matches = np.zeros((len(selection["rows"]), 54), dtype=np.float64)
+            np.add.at(face_matches, (np.arange(len(selection["rows"]))[:, None],
+                                    selection["nearest"]), observation_matches)
+            correct = np.minimum(face_matches, 1.0).sum(axis=1)
             errors = np.where(selection["has_weight"],
-                              errors / selection["denominator"], float("inf"))
+                              1.0 - correct / selection["denominator"], float("inf"))
         costs = selection["geometry_scores"] + m.PNP_TURN_COLOR_WEIGHT * errors
-        order = np.lexsort((-selection["layer_inliers"], selection["p90s"],
-                           -selection["inliers"], costs, selection["group_ids"]))
+        if self.balance_geometry_color:
+            costs = .5 * selection["geometry_scores"] + .5 * errors
+        if self.minimum_color_accuracy is not None:
+            costs = np.where(errors <= 1. - self.minimum_color_accuracy, costs, float("inf"))
+        eligible = (np.flatnonzero(np.isfinite(costs)) if self.minimum_color_accuracy is not None
+                    else np.arange(len(costs)))
+        order = eligible[np.lexsort((-selection["layer_inliers"][eligible], selection["p90s"][eligible],
+                                     -selection["inliers"][eligible], costs[eligible], selection["group_ids"][eligible]))]
         ordered_groups = selection["group_ids"][order]
-        best = np.sort(order[np.r_[True, ordered_groups[1:] != ordered_groups[:-1]]])
+        best = (np.sort(order[np.r_[True, ordered_groups[1:] != ordered_groups[:-1]]])
+                if len(order) else np.empty(0, dtype=np.intp))
         unique, moved = {}, {(): (state, encoded)}
         for index in best:
             score, color_error = float(costs[index]), float(errors[index])
             if not math.isfinite(score) or not math.isfinite(color_error):
                 continue
             template, direction, robust = prepared["templates"][selection["rows"][index]]
+            template, direction = self._oriented_template(template, direction, symmetry_index, diagnostic)
             moves = template["state_moves"]
             if moves not in moved:
                 after = self.apply_moves(state, moves)
@@ -842,8 +1112,12 @@ class PreparedReplayScorer(ReplayScorer):
             prior = unique.get(key)
             if prior is None or rank < prior.rank:
                 payload = dict(template, state_score=score, global_mean_error=score,
-                    global_robust_error=robust + m.PNP_TURN_COLOR_WEIGHT * color_error,
+                    global_robust_error=(float(m.balanced_robust_cost(robust, color_error)) if self.balance_geometry_color else
+                                         robust + m.PNP_TURN_COLOR_WEIGHT * color_error),
                     color_error=color_error, color_match_count=int(selection["matches"][index]))
+                if self.balance_geometry_color:
+                    payload["score_components"] = dict(geometry=float(selection["geometry_scores"][index]),
+                                                       color=color_error, geometry_weight=.5, color_weight=.5)
                 unique[key] = Transition(after, score, rank, payload, direction)
         result = tuple(sorted(unique.values(), key=lambda t: t.rank))
         self.cache[cache_key] = result
@@ -926,7 +1200,8 @@ def main():
         state_update_gap_policy="FPS-scaled" if args.min_state_update_gap is None else "explicit override",
         consecutive_update_exception="only the second quarter-turn of the same layer, width, and direction",
         geometry_scope="all retained options in the source log, all discrete color offsets",
-        orientation_policy="recorded pose; no new orientation rescue or calibration",
+        orientation_policy="24-way state-color rescue below 2/3 accuracy before move search",
+        orientation_rescue_minimum_color_accuracy=2./3.,
         goal="physical cube colors solved in any whole-cube orientation",
         reference_solution_used=False,
         threshold_policy="fixed_rejection" if args.fixed_threshold else "defer_then_retry_minimum_required_one_window",

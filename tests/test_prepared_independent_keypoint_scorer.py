@@ -37,7 +37,7 @@ def observation_record(m, kind="normal"):
         centers = [[-10000., -10000.]] * len(centers)
     elif kind == "empty":
         centers = []
-    likelihoods = np.random.default_rng(86).uniform(.001, .99, (54, len(centers)))
+    likelihoods = np.random.default_rng(86).integers(0, 2, (54, len(centers))).astype(float)
     if kind == "zero":
         likelihoods[::2] = 0.
     options = []
@@ -59,7 +59,7 @@ def observation_record(m, kind="normal"):
         tvec=candidate.tvec.tolist(), sticker_mask_centers=centers,
         sticker_mask_center_uncertainties=[1. + i % 3 for i in range(len(centers))],
         image_size=[256, 256]),
-        search=dict(geometry=dict(options=options)), turn_color_likelihoods=likelihoods.tolist())
+        search=dict(geometry=dict(options=options)), turn_color_matches=likelihoods.tolist())
 
 
 @pytest.mark.parametrize("kind", ["normal", "zero", "outside", "empty"])
@@ -72,7 +72,8 @@ def test_base_pose_projection_and_move_permutations_match_legacy(renderer, kind)
     for state in (initial, initial.apply_moves(("R", "U", "F'")),
                   initial.apply_moves(("Rw'", "Uw", "Bw", "Lw", "Dw'", "Fw"))):
         old, new = legacy(7, state), prepared(7, state)
-        key = lambda t: (legacy.key(t.state), t.update_key)
+        def key(t):
+            return legacy.key(t.state), t.update_key
         a, b = {key(t): t for t in old}, {key(t): t for t in new}
         assert a.keys() == b.keys()
         if kind == "normal":
@@ -116,6 +117,102 @@ def test_prepared_frames_survive_revisiting_beyond_legacy_lru(renderer, monkeypa
     assert scorer.cache_hits == 1
     assert scorer.scoring_calls == 2
     assert len(scorer.compiled_frames) == 35
+
+
+def test_state_orientation_rescue_matches_legacy_and_preserves_physical_move_context(renderer):
+    import torch
+    m = renderer
+    record = observation_record(m)
+    pose = record["search_pose"]
+    initial = m.CubeGeometryState.identity()
+    scrambled = m.CubeState.from_scramble("R U F2 D L' B")
+    colors = {label: scrambled.color_at(position) for position, label in initial.facelets.items()}
+    candidate = m.StickerPnPCandidate(
+        sticker_type="corner", sticker_average_confidence=1., image_points=np.zeros((4, 2)),
+        object_points=m.canonical_sticker_object_points("corner"), projected_sticker_points=np.zeros((4, 2)),
+        camera_matrix=np.array(pose["camera_matrix"]), dist_coeffs=np.array(pose["dist_coeffs"]),
+        rvec=np.array(pose["rvec"]), tvec=np.array(pose["tvec"]), reprojection_error=0.,
+    )
+    faces = m.projected_sticker_faces(candidate, candidate.rvec, candidate.tvec)
+    observed_colors = tuple(colors[identity.label] for identity, _depth, _polygon in faces)
+    candidate = m.attach_color_keypoints(candidate, np.array([polygon.mean(axis=0) for _, _, polygon in faces]), observed_colors)
+    symmetry = next(s for s in m.CUBE_SYMMETRY_MATRICES if not np.array_equal(s, np.eye(3))
+                    and abs(s[0, 2]) == 1)
+    wrong = m.transform_candidate_by_symmetry(candidate, symmetry)
+    pose.update(rvec=wrong.rvec.tolist(), sticker_mask_center_uncertainties=[1.] * len(faces),
+                sticker_mask_centers=[point.tolist() for point in candidate.sticker_mask_centers],
+                sticker_color_names=list(observed_colors))
+    record["turn_color_matches"] = m.turn_color_match_matrix(candidate, expected_color_by_label=colors).tolist()
+    legacy = search.ReplayScorer(m, {7: record}, torch.device("cpu"), initial_colors=colors)
+    prepared = search.PreparedReplayScorer(m, {7: record}, torch.device("cpu"), initial_colors=colors)
+    compact = prepared.key(initial)
+    old, new = legacy(7, initial), prepared(7, compact)
+    def keyed(choices):
+        return {(legacy.key(t.state) if not isinstance(t.state, bytes) else t.state, t.update_key): t
+                for t in choices}
+    a, b = keyed(old), keyed(new)
+    assert a.keys() == b.keys()
+    for key in a:
+        assert a[key].score == pytest.approx(b[key].score, abs=1e-10)
+        assert a[key].payload["orientation_symmetry_index"] == b[key].payload["orientation_symmetry_index"]
+    hold = next(t for t in new if not t.payload["state_moves"])
+    assert hold.state == compact
+    assert hold.payload["color_error"] == pytest.approx(0.)
+    assert hold.payload["orientation_rescue"]["inherited_color_error"] > 1. - 2./3.
+    assert hold.payload["orientation_rescue"]["phase"] == "before_move_search"
+    r = next(t for t in new if t.payload["state_moves"] == ("R",))
+    restricted, _skipped = prepared.for_update_context(7, compact, (6, r.update_key, 1), 2)
+    assert {tuple(t.payload["state_moves"]) for t in restricted} == {(), ("R",)}
+    for transition in restricted:
+        expected = b[(transition.state, transition.update_key)]
+        assert transition.score == expected.score
+        assert transition.payload == expected.payload
+
+
+@pytest.mark.parametrize("correct,rescue", [(1, True), (2, False), (3, False)])
+def test_prepared_state_orientation_check_uses_strict_two_thirds_boundary(renderer, correct, rescue):
+    record = observation_record(renderer)
+    record["search_pose"]["sticker_mask_centers"] = record["search_pose"]["sticker_mask_centers"][:3]
+    record["search_pose"]["sticker_mask_center_uncertainties"] = [1.] * 3
+    record["turn_color_matches"] = np.tile([1.] * correct + [0.] * (3-correct), (54, 1)).tolist()
+    scorer = search.PreparedReplayScorer(renderer, {7: record}, "cpu")
+    state = scorer.key(renderer.CubeGeometryState.identity())
+    oriented, symmetry, diagnostic = scorer._orientation_for_state(scorer.prepare(7), state)
+    assert oriented == state and symmetry is None  # Equal-error alternatives preserve the inherited pose.
+    assert (diagnostic is not None) is rescue
+    if rescue:
+        assert diagnostic["phase"] == "before_move_search"
+        assert diagnostic["tested_orientations"] == 24
+    assert scorer.child_states_built == 0
+
+
+@pytest.mark.parametrize("cutoff", [None, 2./3.])
+def test_balanced_scoring_and_color_cutoff_match_legacy(renderer, cutoff):
+    record = observation_record(renderer)
+    args = dict(balance_geometry_color=True, minimum_color_accuracy=cutoff)
+    legacy = search.ReplayScorer(renderer, {7: record}, "cpu", **args)
+    prepared = search.PreparedReplayScorer(renderer, {7: record}, "cpu", **args)
+    for state in (renderer.CubeGeometryState.identity(), renderer.CubeGeometryState.identity().apply_move("Rw")):
+        expected = {(legacy.key(t.state), t.update_key): t for t in legacy(7, state)}
+        actual = {(t.state, t.update_key): t for t in prepared(7, prepared.key(state))}
+        assert expected.keys() == actual.keys()
+        for key, t in actual.items():
+            assert t.score == pytest.approx(expected[key].score, abs=1e-10)
+            c = t.payload["score_components"]
+            assert 0. <= c["geometry"] <= 1.
+            assert t.score == pytest.approx(.5*c["geometry"] + .5*c["color"])
+            if cutoff is not None:
+                assert t.payload["color_error"] <= 1. - cutoff
+
+
+def test_geometry_normalization_assigns_equal_bounded_budgets(renderer):
+    f = renderer.balanced_geometry_cost
+    assert f(0., 0.) == 0.
+    assert f(.05, 0.) == .5
+    assert f(0., .05) == .5
+    assert f(.05, .05) == 1.
+    assert f(50., 0.) == .5
+    assert np.isinf(f(float("inf"), 0.))
 
 
 def test_prepared_scorer_requires_cpu(renderer):
@@ -185,3 +282,23 @@ def test_early_filter_skips_color_work_and_keeps_cache_histories_separate(render
         expected = by_key[(t.state, t.update_key)]
         assert t.rank == expected.rank
         assert t.payload == expected.payload
+
+
+@pytest.mark.parametrize('cls', [search.ReplayScorer, search.PreparedReplayScorer])
+def test_replay_rejects_cached_zero_keypoint_fallback_geometry(renderer, cls):
+    record = observation_record(renderer)
+    record['search_pose']['assignment_image_points'] = [[1., 1.], [2., 2.], [3., 3.]]
+    record['search']['geometry']['options'][0].update(
+        keypoint_mean_error=0., keypoint_inlier_count=0)
+    scorer = cls(renderer, {7: record}, 'cpu')
+    with pytest.raises(ValueError, match='zero-keypoint fallback.*regenerate'):
+        scorer.prepare(7)
+
+
+@pytest.mark.parametrize('cls', [search.ReplayScorer, search.PreparedReplayScorer])
+def test_replay_preserves_nonfinite_geometry_serialized_as_null(renderer, cls):
+    record = observation_record(renderer)
+    for option in record['search']['geometry']['options']:
+        option.update(keypoint_mean_error=None, keypoint_p90_error=None, global_robust_error=None)
+    scorer = cls(renderer, {7: record}, 'cpu', balance_geometry_color=True, minimum_color_accuracy=2/3)
+    assert scorer(7, renderer.CubeGeometryState.identity()) == ()

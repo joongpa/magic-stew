@@ -381,326 +381,245 @@ make confident guesses. To reproduce the older occluded-target behavior, pass
 `--include-occluded-independent-keypoints` when generating the dataset. These
 changes affect labels only, so the model must be retrained on regenerated data.
 
-Render independent-keypoint model predictions with the same bbox -> padded
-square ROI -> pose -> ROI-tracking flow used by the live pipeline:
-
-```bash
-.venv/bin/python scripts/render_yolo11n_independent_keypoints.py \
-  --source data/independent_keypoints_dataset_v2/images/000000.png \
-  --initial-scramble "" \
-  --model runs/pose/runs/independent_keypoint_pose_v2/runs/cube_piece_keypoint_yolo11n_pose/weights/best.pt \
-  --save runs/independent_keypoints_render.png \
-  --no-display
-```
-
-The renderer filters detections using per-class `boxes.conf` thresholds. The
-defaults are `corner=0.25`, `corner-edge=0.30`, and
-`corner-edge-center=0.25`; override them with, for example,
-`--pose-class-conf corner=0.30,corner-edge=0.40,corner-edge-center=0.30`.
-`--min-keypoint-conf` remains an optional point-visibility filter, and
-`--track-conf` controls the minimum point-visibility score for ROI tracking.
-
-To collect grouped sticker colors from a video, add `--rgb-html-plot` and use
-the combined cube/sticker segmentation model. The renderer projects all 54
-canonical stickers from the tracked pose, intersects each projected sticker
-with the predicted sticker/cube mask, averages up to 128 reliable pixels per
-sticker per frame, and omits stickers with no sampleable pixels. The plot has
-stable center (`C`), edge (`E`), and corner (`K`) traces, plus a normalized RGB
-companion file:
+Render independent-keypoint predictions with the bbox → padded square ROI →
+pose → ROI-tracking flow. The default checkpoint is the YOLO medium model in
+`runs/pose/runs/yoloPoseMedium/weights/best.pt`. It predicts three geometric
+landmark classes (`corner`, `corner-edge`, `corner-edge-center`) and six sticker
+color classes (`white`, `yellow`, `orange`, `red`, `blue`, `green`) in one pass.
+Class IDs are resolved from the checkpoint's class names. No segmentation model
+or image-pixel color sampling is used.
 
 ```bash
 .venv/bin/python scripts/render_yolo11n_independent_keypoints.py \
   --source /path/to/solve.mp4 \
   --initial-scramble "R U2 F'" \
-  --model runs/pose/runs/independent_keypoints_v3_weights.pt \
-  --combined-seg-model runs/segment/runs/combinedSegmentWeights.pt \
-  --rgb-html-plot runs/sticker_colors.html \
+  --recognize-moves \
+  --save-final-video runs/recognized_solve.mp4 \
+  --turn-candidate-log runs/recognized_solve_log \
   --no-display
 ```
 
-Use `--color-samples-per-sticker` and `--color-min-samples-per-sticker` to
-control the per-frame averaging and the minimum reliable mask area. Use
-`--sticker-mask-erosion N` to shrink each predicted sticker mask by `N` ROI
-pixels before rendering and color sampling, which avoids sampling near sticker
-boundaries.
-When `--show-sticker-mask` is enabled, the final output displays the
-transparent red distance-transform heatmap used to visualize sticker-mask
-peaks instead of the binary mask fill and boundary overlay.
-Use `--show-colored-masks` to replace that heatmap in the final replay with
-color predictions drawn on each projected sticker's intersection with the
-sticker/cube segmentation. Each intersection is classified independently
-from its pixels using the global profiles, without sticker identity or move
-history priors. With `--recognize-moves`, these include the labeled-sample
-calibration; otherwise the initial global profiles are used. A usable pose and
-enough reliable pixels are needed for an intersection to be colored. Add
-`--no-show-pnp` to hide the pose drawing while retaining the pose calculation.
-That same peak-to-centroid confidence tempers mask-center influence during pose
-refinement, so irregular or merged masks cannot pull the solve as strongly as
-clean, centered masks.
-Before pose fitting and display, sticker detections are filtered so a mask
-with at least 90% of its area covered by the union of larger retained sticker
-masks is removed; identical masks keep the first detection. This check uses
-the raw predicted masks before `--sticker-mask-erosion`.
-By default the renderer is in static-pose mode: it selects a sticker, refines
-the full-cube pose from the independent keypoint assignment, and keeps the
-cube symmetry continuous across video frames. A projected red/green/blue XYZ
-gizmo is shown at the cube center; use `--no-show-orientation-axes` to hide it
-or `--orientation-axis-length MM` to resize it. Pose recovery can use the
-color-profile symmetry recovery for whole-cube orientation, followed by the
-layer-turn search when move recognition is enabled.
-When recovery is enabled, `--turn-candidate-log OUTPUT_DIR` writes one
-JSONL record per video frame. Each record includes the complete set of tested
-turn configurations, their global mean and robust scores, keypoint/heatmap
-components, inlier counts, trigger diagnostics, and the selected result. It
-also includes the search-time camera/pose inputs, observed keypoints/classes,
-fixed assignments, and heatmap centers needed to reproject every logged pose.
-New logs include a search trace: the last committed move, current-frame winner
-versus sequence winner, retained geometric options, cache/batch counts, and
-per-depth counts for collapsed holds, states scored, equivalent-prefix merging,
-bound pruning, completed paths and queued work. Logs include future lower
-bounds, incumbent updates, optimality status and examples of pruned bounds.
-Inverse and state-revisit pruning are disabled; older logs may record beam or
-history restrictions. Every starting candidate has a recorded fate. Up to eight best
-forecasts for distinct starting candidates, plus static-first and complete
-no-turn comparisons when needed, include the predicted move, actual video frame index, score components,
-and weighted contribution at each step. These diagnostics are collected only
-when logging is enabled; future steps are forecasts, not committed moves.
-Stable trial IDs distinguish sticker offsets that share identical geometry.
-Annotated candidate images are saved unless `--turn-candidate-images` points
-elsewhere.
-With `--recognize-moves`, pose refinement runs on every processed frame with a
-usable pose; geometric turn search skips only the forced-static prefix. The turn search is not throttled by
-frame interval, and it remains enabled even when pose drawing is disabled.
-Unsupervised color regressions use observations from the entire video,
-including turns. Ground-truth labels are a separate inspection-only sample
-bank; adding them never replaces the full-video regression fits or their
-sample counts. With `--turning-start-frame N`, accepted stationary samples
-through frame N are eligible for labels, and calibration is finalized before
-the first frame after N is processed for moves. Later holds and reversals
-cannot add labels or reopen calibration. Without an explicit boundary, the
-first committed move closes the inferred inspection interval permanently;
-the moving frame and all later frames are excluded. If no move occurs,
-accepted stationary observations from the clip are eligible. Partial turns
-and unreliable fits are excluded from labeling.
-After calibration, color likelihoods combine the regression distance with the
-distance to up to three nearby labeled samples. Sample distance contributes
-at most 30%, tapering with weak or distant sample coverage; the regression
-remains the fallback for colors without suitable labeled samples.
-Once calibration closes, solve-time orientation continuity is rescored with
-these same labeled profiles before future move-search projections are built.
-Inspection poses remain fixed. With an inferred inspection boundary, the
-first committed move also remains fixed and only subsequent poses are rescored.
-Without `--recognize-moves`, the default pose-symmetry option uses the same
-closest-color-profile orientation recovery as the original pose pipeline. It
-evaluates the 24 proper cube symmetries and uses profile likelihood plus pose
-continuity to select the closest orientation before rendering.
-The outright reprojection threshold and the two-sided 40 mm translation
-rejection are temporarily disabled. Reprojection and translation still
-contribute to pose selection, and invalid geometry remains ineligible.
+Use `--initial-scramble ""` for a solved cube. Scrambles accept standard face
+turns, wide turns (`Rw`, `Uw2`, `Fw'`, or lowercase aliases), and whole-cube
+rotations (`x/y/z`), in the white-top/U, green-front/F frame. `--known-scramble`
+is an alias. Use `--model PATH` to override the checkpoint; it must predict the
+three landmark classes and six colors.
 
-Move recognition retains every partial-angle fit for each single/double layer
-choice over `-45°` through `45°` in 6° increments, also testing zero. It scores
-the `-90°`, zero, and `90°` sticker offsets against each candidate cube state
-before selecting an angle. For each layer and offset, the best combined
-geometry-plus-color angle survives to state search. This prevents a slightly
-better geometry-only fit from discarding the correct partial angle before
-color evidence is considered. Keypoint reprojection, sticker-mask-centroid fit, and available color
-likelihoods each contribute with weight one; an impossible color fit is invalid.
-For each frame/state pair, the inherited orientation is evaluated first. If
-its best combined turn fit has color error **greater than 5**, move search
-also evaluates the other 23 cube orientations against that physical state.
-Each orientation includes the same full partial-angle and color-offset search.
-The best pose/angle for each physical move survives before the usual top-10
-shortlist. Geometry projections are shared across orientations; the physical
-state stays in its existing coordinates, and pose corrections do not count as
-cube moves. At color error 5 or below, orientation is unchanged. This fallback
-also applies to future lookahead states and single-frame move fitting. Logs
-record the inherited color error, tested orientation count, and selected pose
-symmetry; the reviewer uses that symmetry when projecting alternative trials.
-The cached video search uses adaptive branch-and-bound over the next ten
-frames at 30 FPS, scaled linearly with the source rate (20 frames at 60 FPS),
-with no beam width. It first scores a complete no-turn continuation.
-Use the optional `--turning-start-frame 380` to force frames **0 through 380,
-inclusive**, to static holds with no partial layer angles, color offsets, or
-committed moves. Move search starts at frame 381. The boundary uses original
-zero-based frame indices, including frames with no usable pose. Omitting the
-flag leaves move recognition unrestricted. The restriction also applies to
-live frame processing, and logs/reviewer identify these frames as forced static.
-Each parent then keeps one best hold fit plus the top 10 state changes ranked
-by combined geometry-plus-color fit (`state_score`, controlled by
-`PNP_TURN_LOOKAHEAD_STATE_CHANGE_LIMIT`). This cutoff
-applies at every depth; equivalent hold geometries are collapsed before expansion.
-Promising prefixes are scheduled by optimistic full-window cost, with current
-combined current fit breaking ties. Warm-start and greedy seeds use the same
-combined-fit shortlist. At every depth, a committed move that returns
-to the state at the start of the current window is pruned before shortlisting.
-Holds and partial geometric offsets remain allowed. Intermediate-state revisits
-and returns to states from earlier windows remain eligible. Prefixes reaching
-the same cube state at the same frame with the same last-update frame have
-identical future options, so a cheaper prefix dominates. State-changing frames
-use a source-FPS-scaled 30-per-second spacing policy:
-`ceil(source_fps / 30)` frames. At 24 or 30 FPS, different-layer moves can
-occur on adjacent frames; at 60 FPS, an intervening frame is required. The one exception is a
-single consecutive same-layer, same-direction continuation, which represents
-the second quarter-turn of a double turn. The rule applies within a lookahead
-window and across adjacent windows; holds and partial turns remain available
-on the intervening frames.
+Detections are filtered by `boxes.conf` and keypoint confidence. Defaults are
+`corner=0.25`, `corner-edge=0.40`, `corner-edge-center=0.25`, and `0.25` for each
+color. Override any class with `--pose-class-conf red=0.35,corner-edge=0.45`.
+`--min-keypoint-conf` filters point visibility (default `0.05` for landmarks);
+sticker color keypoints have a minimum of `0.25` for scoring, drawing, and ROI
+tracking. `--track-conf` controls ROI tracking. Neural inference runs on CPU. Move recognition uses Apple MPS and
+requires an available MPS device.
 
-For each future frame, an optimistic color fit lets every observation use its
-best possible sticker identity while retaining the actual geometry, coverage
-and uncertainty weighting. This relaxes physical sticker constraints and
-bounds every feasible state from below, including negative color errors.
-Among eligible transitions, a prefix is pruned only if dominated or if its
-accumulated cost plus the remaining lower bound cannot beat the best complete solution. Unknown bounds
-disable that pruning rather than assuming zero. Finishing the search proves the best sequence within the per-parent color
-shortlists. Lower-ranked changes can therefore be missed. Runtime varies
-with ambiguity. A default **4096 frame/state evaluation budget per decision**
-limits exploration, including the current state, complete-path seeds and cache hits. Configure it with `--turn-search-state-budget 512`,
-or use `--turn-search-state-budget unlimited` for exhaustive search within the
-shortlists. A budget stop returns the best **complete** forecast found, rather
-than comparing unfinished prefixes. It is approximate; logs and the reviewer
-show `budget_exhausted`, evaluations used, the remaining lower bound and its
-gap from the winning score. Unknown bounds leave the gap unavailable.
+Each sticker color keypoint finds its closest class-valid three- and four-landmark
+groups by expanding the nearest-landmark neighborhood. Cyclic classes must match
+a corner, edge, or center sticker profile. For four points, the seed score is the
+RMS distance from the color point to the two diagonal midpoints. For three points,
+every class-consistent parallelogram completion is checked and the best center
+alignment is retained. Errors are in pixels, without division by candidate size.
+Concave, degenerate, non-enclosing groups, and any quadrilateral containing
+another sticker color point are rejected (including the inferred fourth corner
+for three-point groups). Landmark pairs whose triangle with the seed already
+encloses another sticker are pruned before enumerating combinations. Three distinct groups
+are tried in center-error order, with four observations preferred on ties and
+confidence breaking remaining ties; repeated color detections do not consume
+extra seed slots. Failed PnP groups are skipped. Inferred fourth corners only rank
+seeds; PnP uses the three actual measurements and their selected correspondence.
+Three-point seeds retain the deduplicated union of SQPnP, P3P, and AP3P pose
+roots, so all-landmark scoring can select branches that SQPnP alone misses.
+Color points are excluded
+from lattice assignments and used instead of segmentation centroids for the
+existing center-assisted pose refinement and geometric turn fitting.
 
-Alongside the complete no-turn challenger, the search re-scores and extends the
-previous decision's winning forecast, provided its expected state matches the
-actual current state. A greedy full-window rollout supplies another starting
-solution. Seeds obey the same root-return restriction, per-parent shortlist
-and finite-score checks, and are re-evaluated when color profiles change. They improve the incumbent before
-branch-and-bound exploration; they do not force later decisions.
+Lattice visibility uses the direction from each surface point to the actual
+camera, including cubes far from the image center, on both CPU and GPU.
+Static refinement first tries up to six PnP/rematching iterations with all
+landmark observations and fixed sticker anchors. It accepts a better global
+fit only when every observation lies inside the existing 5% cube-size gate;
+otherwise the inlier-based refinement handles turns and outliers as before.
+This condition only accepts the optional rigid proposal. Mid-turn frames remain
+eligible with landmarks outside the fitting gate, and those landmarks still
+contribute to the full-observation score.
+The three-seed limit and translation-based tracking selector are unchanged.
 
-Projection and observation-to-face assignments are cached per frame across
-state batches and lower-bound scoring. Changing pose, layer geometry, observation
-centers, uncertainty weights or the assignment threshold invalidates the relevant
-cache. Color likelihood changes reuse only the geometry/assignments and recompute
-color costs. Past-frame caches are evicted as the window advances.
+Whole-cube orientation is chosen directly among the 24 proper cube symmetries
+by maximizing the number of matching observed sticker colors against the known
+scramble, or the committed state during move recognition. All available sticker
+colors participate, including edges and corners. There is no temporal angular
+continuity score or orientation continuity gate. Translation-based pose
+hypothesis selection and the existing geometric refinement remain available.
+Before move alternatives are evaluated, an unchanged state with less than 2/3
+correct observed sticker colors triggers an orientation rescue. All 24 cube
+orientations are compared using that state's colors; moves are then scored in
+the best orientation using the combined geometry and color cost. Exactly 2/3
+does not trigger rescue. An orientation correction does not commit a cube move.
+No RGB regressions, unsupervised color grouping, calibration sample banks, or
+ground-truth color-distance checks are performed. The former segmentation and
+RGB plotting CLI options have been removed.
 
-Uncached states at the same depth share GPU calls. The scheduling batch size
-`PNP_TURN_LOOKAHEAD_STATE_BATCH_SIZE` (32) limits work per call, not which
-states can survive. Scores use two uniform blocks: the front half contributes
-30% total and the back half 70%. For an odd window, the back half contains the
-extra frame. The sequence objective adds `PNP_TURN_LOOKAHEAD_MOVE_COST`
-(0.01) per turn outside those temporal weights. Strong future evidence can
-therefore justify a worse current fit without relative inlier/color acceptance
-gates. Static-first and complete no-turn comparisons are logged separately.
-Color error remains a finite observation cost with no absolute cutoff. Large
-errors stay in both candidate forecasts and the no-turn comparison. A future scoring
-failure invalidates its path instead of triggering evidence omission and retry;
-only unavailable geometry is skipped. Nonfinite fits remain invalid, and an unusable current
-frame holds without training color models. Runtime is controlled separately by
-`--turn-search-state-budget`.
-There is no angular speed limit on partial layer geometry. Discrete state
-updates follow the 30-per-second frame-spacing cap described above. Physical
-sticker projection and color sampling include the selected quarter-turn offset
-on the current frame.
-Move search stops automatically when the accepted current-frame state has six
-uniform faces and the fitted layers are aligned. This uses the known initial
-sticker colors and committed moves, and accepts any whole-cube orientation.
-A solved current-frame fit skips future rollout; a solved state found only
-in a future forecast does not stop the current search. The final solving move
-is retained. Later frames continue rendering with the solved state and no
-further move search. Logs mark the terminal decision with `stop_reason:
-"cube_solved"` and `solved_frame_index`; later posed frames use search status
-`stopped_solved` with zero search evaluations. Partial turns, rejected poses,
-unreliable color fits and incomplete color states cannot trigger the stop.
-Mask centroids use closest projected sticker faces so the accelerator can
-score the complete batch without Hungarian matching.
-The live output also shows the accumulated standard moves in the fixed
-white-top/U and green-front/F frame.
-Neural inference runs on CPU with segmentation and pose calls in parallel.
-Move search runs on Apple MPS; requesting move recognition without an
-available MPS device produces an error.
+Color scoring for each move/state is:
 
-To review the logged alternatives interactively, run the standalone browser
-reviewer against the same source video and log directory:
+`color_score = correct / observed_stickers_inside_projected_cube`
+
+Only color points contained in visible projected stickers participate. Count
+each observed projected sticker once. If multiple color keypoints fall in one
+sticker, that sticker is correct if **any** predicted color matches its expected
+color. Points outside the projected cube and unobserved stickers do not enter
+the denominator. A point on a shared projected boundary belongs to its nearest
+containing sticker. The minimized search cost is `color_error = 1 - color_score`,
+added to the existing geometric cost. Available colors with no containing
+stickers produce an invalid fit; absent color observations are neutral.
+
+Move recognition retains partial-angle fits for each single/double layer over
+`-45°` through `45°` in 6° increments, including zero, and scores the `-90°`,
+zero, and `90°` sticker offsets before selecting an angle. Every imperfect
+color orientation can be reconsidered against the tested physical state;
+orientation corrections do not commit a cube move. Geometry projections and
+observation assignments are shared across states. They are rebuilt when pose,
+layer geometry, or observed positions change.
+
+The cached video search retains its adaptive branch-and-bound rollout over ten
+future frames at 30 FPS, scaled with source FPS. Each parent retains its best
+hold and top ten state changes. The front half of the window contributes 30%
+of the score and the back half 70%; each committed turn adds `0.01` outside
+those temporal weights. The default budget is 4096 frame/state evaluations per
+decision; use `--turn-search-state-budget N` or `unlimited` to change it. A
+budget stop returns the best complete forecast found. The existing move-spacing
+policy, state merging, root-return restriction, warm starts, and optimistic
+bounds remain in place. Color bounds relax identity constraints using binary
+matches, with the same projected-sticker denominator as actual state scores.
+
+`--turning-start-frame N` forces frames **0 through N inclusive** to static
+holds; move search begins at N+1. Without this flag, move recognition is
+unrestricted. Search stops after the accepted current-frame state is solved
+and layers are aligned, retaining the final solving move. A solved future
+forecast alone does not stop current-frame search. Subsequent frames keep
+rendering with the solved state.
+
+Use `--show-colored-masks` to color observed projected stickers from the model's
+classes. Color predictions are always available directly from the pose model;
+there is no separate color-classification or posterior-debug step.
+`--show-sticker-identities` displays physical sticker labels. The orientation
+axes point toward their center colors: X+ red, Y+ white, Z+ green, with matching
+arrow colors. They follow center stickers through wide turns and cube rotations.
+Hide them with `--no-show-orientation-axes`. `--save PATH.png` saves the
+final pose render for an image source; `--save-final-video PATH.mp4` saves the
+final cached video. QuickTime outputs
+receive a frame-counter track when `ffmpeg` is available.
+
+`--turn-candidate-log OUTPUT_DIR` writes one JSONL record per video frame,
+including camera inputs, geometric observations, retained turn options, state
+search diagnostics, and selected moves. New records use schema version 3,
+`color_scoring: "direct_match_fraction"`, and a binary `turn_color_matches`
+matrix indexed by physical sticker identity and observed color keypoint.
+The replay search scripts use this categorical schema; old probability logs
+must be regenerated before replaying with the updated scorer.
+
+Review alternatives with:
 
 ```bash
 .venv/bin/python scripts/review_turn_candidates.py \
   --video /path/to/solve.mp4 \
-  --log /path/to/turn-candidate-log
+  --log runs/recognized_solve_log
 ```
 
-Open the printed local URL. Step through frames in either direction, click a
-candidate to inspect its reprojected pose and geometry-plus-color score, and
-save `Correct`, `Uncertain`, or `No valid pose`. The
-labels are written to `turn_candidate_scores.labels.json` beside the JSONL and
-do not modify the inference log. Tested options are grouped into collapsible
-single-layer and double-layer sections for each of the six layer sides.
-The Search decision panel compares the current-frame and sequence winners.
-Choose a retained forecast to inspect its move/hold decisions and weighted
-scores; frame buttons open each frame's own recorded decision. Expand the
-search table to see collapsed holds, merges, bound pruning, and future lower bounds, or expand
-the geometric-fit table to inspect stage one. Candidate cards show their
-search fate and best retained sequence score. Older logs remain viewable,
-but need a new recognition run to populate these traces.
-Click a visible projected layer to select it, double-click for a double-layer
-turn, then use `,` and `.` to step through the logged angles. Click the center
-sticker for that face's layer or an outer row for an adjacent layer. New logs
-also include a per-identity `p(observation | prior)` table for inspecting the
-individual color evidence behind the aggregate score. The rendered cube also
-shows the matched likelihood beside each visible sticker identity when those
-values are available.
+The reviewer shows tested geometry and move forecasts and lets you save
+`Correct`, `Uncertain`, or `No valid pose` labels beside the log. Labels do not
+modify inference results. New logs include detected color names, binary color
+matches, and per-candidate correct/observed counts. The reviewer colors observed
+keypoints by their predicted class and shows the correct fraction and mismatch
+cost. Forced-static frames explicitly show that move search was skipped. Older
+probability logs remain viewable; regenerate logs to include the new color labels.
 
-New JSONL records also contain `pose_continuity` for diagnosing whole-cube
-orientation jumps. It records the input pose, previous accepted frame and
-rotation, all 24 symmetry matrices and resulting rotation vectors, their
-angular distances in degrees, the selected symmetry, and its runner-up margin.
-A small angular margin indicates an ambiguous geometry-only choice. Alternatives
-also record `angular_score`, `color_score` and `combined_score`; `selected_score`
-and `runner_up_margin` describe the combined decision. The first pose after
-a tracker reset uses identity with null reference distances. These diagnostics
-identify their frame with `coordinate_frame`; the initial pass runs before
-color orientation recovery, while calibrated solve continuity uses the
-scramble-anchored frame. Calibrated records include
-`color_profile_source: "inspection_labeled"`, `color_calibration_generation`
-and the frozen prefix boundary in `frozen_prefix_frame`.
-`selected_pose` records the later final pose. Diagnostics are also logged
-before `--turning-start-frame`, when turn search is held static. Existing logs
-need a new recognition run to populate this field.
-
-The renderer first fits one global color profile set from segmentation-mask
-RGB samples across the full video, without poses, sticker identities or viewing
-angle weights. It then refines static geometry and scores all 24 equivalent
-orientations using temporal color likelihood plus a soft angular-change cost:
-`score = 0.2 * mean color NLL + angle_degrees / (90 * 30 * elapsed_seconds)`.
-The color weight balances the confirmed Xuanyi orientations at inspection frame
-148 and solve frame 212; the replay preserves inspection through frame 198.
-Colors are compared with the latest accepted appearance of each location in
-the continuity frame, with uniform priors for unseen locations. Rejected
-frames cannot update this history, and appearance measurements are replaced
-rather than accumulated indefinitely so layer turns can change local colors.
-Without color evidence, selection falls back to angular distance. This score
-has no hard rotation-speed limit. It then matches the required initial scramble
-to the observed colors to establish the cube orientation. Move search uses the
-same profiles and updates the cube state. The independent color debug view
-remains available with `--debug-independent-color-posteriors`.
-
-Use `--show-sticker-identities` for visible projected `C##`, `E##`, and `K##`
-labels, and `--show-classified-colors` to display the known sticker colors.
-Use `--save-final-video OUTPUT.mp4` to save the final cached pass; the older
-`--save-colored-video` spelling remains an alias.
-For `.mp4`, `.m4v`, and `.mov` outputs, the script adds a QuickTime timecode
-track after rendering so QuickTime Player can enable its frame-counter display.
-This requires `ffmpeg` to be available on `PATH`.
-
-Provide the initial scramble so the color matcher uses the known sticker
-state and solves the whole-cube orientation. Use `--initial-scramble ""` for
-a solved cube:
+For a full-solve search whose next branch is the lowest **latest-frame**
+geometric + color score across the entire queue, use:
 
 ```bash
-.venv/bin/python scripts/render_yolo11n_independent_keypoints.py \
+.venv/bin/python scripts/search_independent_keypoint_frame.py \
   --source /path/to/solve.mp4 \
-  --model runs/pose/runs/independent_keypoints_v3_weights.pt \
-  --combined-seg-model runs/segment/runs/combinedSegmentWeights.pt \
-  --initial-scramble "R U2 F'"
+  --initial-scramble "R U2 F'" \
+  --turning-start-frame 380 \
+  --output-dir runs/full-solve-frame/my_solve
 ```
 
-Scrambles use standard face-turn notation (`R`, `U2`, `F'`), wide-turn
-notation (`Rw`, `Uw2`, `Fw'`, or lowercase aliases such as `r`), and whole-
-cube rotations (`x/y/z`). They are interpreted in the fixed frame
-white-on-top/U and green-on-front/F. Measured color posteriors do not
-change the known sticker colors.
-`--known-scramble` is an alias for `--initial-scramble`.
+This uses the nine-class `yoloPoseMedium` checkpoint and ROI padding `0.4` by
+default; `--model PATH` and `--roi-padding RATIO` override them. The independent
+keypoint renderer also defaults to ROI padding `0.4`. The video pass caches landmarks, sticker color classes, and all
+retained geometric options in `observations.jsonl`. It performs no local move
+rollout or color calibration. Sticker color keypoints retain the `0.25`
+visibility floor. Frames through the turning boundary are static; neither turn
+geometry nor move alternatives are evaluated there. Source FPS is inferred
+from the video, with the existing move-spacing and double-turn rules retained.
+
+The full search prioritizes only that branch's most recent frame cost:
+`0.5 * normalized_geometry + 0.5 * color_error`, where
+`color_error = 1 - correct / observed_stickers_inside_projected_cube`.
+Geometry averages two bounded costs: landmark error divided by the existing
+0.05 cube-size tolerance and sticker-position penalty divided by its 0.05
+maximum, each capped at 1. This gives landmarks 25%, sticker positions 25%,
+and color mismatch 50% of the total cost's range. Invalid fits remain invalid.
+Landmark error and validity use the whole projected cube after applying the
+candidate partial turn. Layer membership contributes diagnostic counts only;
+missing support on the proposed layer cannot erase the global landmark error.
+Nonfinite landmark costs remain invalid instead of becoming zero. Cached logs
+containing the former zero-keypoint fallback must be regenerated; replay rejects
+those stale geometry options. New observation logs record geometry scoring version 2.
+All pending branches compete globally; this is not a greedy depth-first walk.
+After orientation rescue, move outcomes below 2/3 color accuracy are pruned
+before choosing their best partial angle or adding them to the queue. Exactly
+2/3 survives. If no solution survives, the console reports that the search
+exhausted its branches and stops; it does not relax the cutoff or retry them.
+There is no past-path mean, cumulative-cost priority, forecast, combined-score threshold,
+move penalty, beam, or expansion budget. Solved branches are accepted when
+removed from the priority queue. Equal costs prefer greater depth, then
+insertion order. Equivalent frame/state/move-spacing contexts retain the lower
+latest-frame score. Disk overflow preserves queued work.
+
+The full-search replay scorers apply this rescue separately to each queued
+state before generating its move alternatives. The prepared scorer reuses
+cached static sticker assignments and cube-symmetry permutations; geometry
+does not need to be projected again for each state.
+
+Reuse cached nine-class observations with `--log /path/to/observations.jsonl`
+in place of `--source`; `--start-frame` and `--end-frame` select a consecutive
+source interval. Pose translations and projected geometry stay cached during full search, with categorical colors
+scored against each candidate state. Old RGB probability logs must be
+regenerated. The output directory contains the input provenance, `config.json`,
+`progress.jsonl`, `status.json`, `result.json`, and the SQLite search queue.
+Creating an `OUTPUT_DIR/STOP` file requests an orderly stop.
+
+Add `--save-final-video runs/my_solve.mp4` to the full-search command to render
+the accepted solution after the search finishes. `--display` opens the same
+replay interactively. The output uses the independent-keypoint renderer's
+landmarks, colored sticker keypoints, cube wireframe, moving-layer overlay,
+red/white/green axes, and accumulated moves. A colored virtual cube beside the
+camera view shows the winning state and partial turn, using the independent
+renderer's stationary side panel. The overlay includes the winning frame's combined
+score and correct/observed color count. Rendering replays the saved decisions;
+it does not run inference or select new moves. After the solved frame, the
+committed state stays fixed through the remaining video frames. An exhausted
+or interrupted search does not produce a winning-path video.
+
+To render an existing result without rerunning the search:
+
+```bash
+.venv/bin/python scripts/render_independent_keypoint_search.py \
+  --result runs/full-solve-frame/my_solve \
+  --save-final-video runs/full-solve-frame/my_solve/solution.mp4 \
+  --turn-candidate-log runs/full-solve-frame/my_solve/rendered_turn_candidate_scores.jsonl
+```
+
+The original video path comes from the cached input metadata; `--source PATH`
+overrides it (`--render-source PATH` in the search command). The automatic
+render also writes `rendered_turn_candidate_scores.jsonl` in the run directory
+for `review_turn_candidates.py`. This log contains the selected winning-path
+trial for each frame. `--no-show-keypoints` and `--no-show-orientation-axes`
+work with either render command. `--no-show-virtual-cube` hides the side panel;
+it is enabled by default for both saved output and interactive display.
+Saved videos preserve the source FPS, source
+frame indices, and QuickTime frame counter.
 
 For ground-truth overlays on the prepared dataset, use
 `scripts/render_independent_keypoints.py`:

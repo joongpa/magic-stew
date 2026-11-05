@@ -1,37 +1,27 @@
 #!/usr/bin/env python3
 """Render the independent cube-keypoint YOLO model with the live ROI flow.
 
-For video sources, this renderer uses a producer/consumer pipeline:
-
-1. The foreground pass runs the detector and neural models, displays their
-   output, and caches the raw frame/ROI/model data.
-2. A background worker consumes those cached records for cheap pose-candidate
-   generation, keeps the full candidate set, and samples colors while the
-   neural producer continues.
-3. Pose recovery refines the cached pose candidates and, when requested,
-   applies geometric layer-turn fitting; the final pass replays the recovered
-   cache for presentation without running neural inference or pose refinement.
-
-Within the foreground pass, the neural work is:
-
-1. Run the cube bbox detector when no tracked ROI exists.
-2. Build the padded square ROI using the shared live-pipeline helper.
-3. Run the combined cube/sticker segmentation and independent three-class pose models inside that ROI.
-4. Map the independent points and sticker masks back to the full frame.
-5. Update the ROI tracker from the predicted point extent.
+The foreground pass runs a cube bbox detector when needed, predicts geometric
+landmarks and sticker colors with one pose model inside the tracked ROI, and
+caches the raw predictions. A background worker seeds sticker poses from each
+color point's nearest class-valid three/four landmarks, ranked by diagonal-center
+alignment and excluding other sticker points. Cached recovery then
+refines geometry, matches all observed colors directly to the known cube state,
+and optionally searches layer moves. No segmentation or pixel color sampling
+is performed.
 
 Examples:
 
     .venv/bin/python scripts/render_yolo11n_independent_keypoints.py \
         --source data/independent_keypoints_dataset_v2/images/000000.png \
         --initial-scramble "" \
-        --model runs/pose/runs/independent_keypoint_pose_v2/runs/cube_piece_keypoint_yolo11n_pose/weights/best.pt \
+        --model runs/pose/runs/yoloPoseMedium/weights/best.pt \
         --save runs/independent_keypoints_render.png \
         --no-display
 
     .venv/bin/python scripts/render_yolo11n_independent_keypoints.py \
         --source 0 --initial-scramble "" \
-        --model runs/pose/runs/independent_keypoint_pose_v2/runs/cube_piece_keypoint_yolo11n_pose/weights/best.pt
+        --model runs/pose/runs/yoloPoseMedium/weights/best.pt
 """
 
 from __future__ import annotations
@@ -45,7 +35,6 @@ import subprocess
 import sys
 import tempfile
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from itertools import combinations, permutations, product
@@ -57,7 +46,6 @@ from typing import Callable
 
 import cv2
 import numpy as np
-from scipy.optimize import linear_sum_assignment
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -75,37 +63,24 @@ from live_recognition.independent_pose_thresholds import (  # noqa: E402
 from live_recognition.roi_tracking import RoiTracker  # noqa: E402
 from live_recognition.roi_tracking import \
     roi_for_frame as shared_roi_for_frame  # noqa: E402
-from live_recognition.visualization import _reliable_color_mask  # noqa: E402
 
 CLASS_NAMES = INDEPENDENT_POSE_CLASS_NAMES
+STICKER_KEYPOINT_MIN_CONFIDENCE = 0.25
 # OpenCV uses BGR colors. These match the independent-keypoint generator.
 CLASS_COLORS_BGR = (
     (255, 255, 255),
     (0, 255, 255),
     (255, 120, 255),
+    (255, 255, 255), (0, 255, 255), (0, 165, 255),
+    (0, 0, 255), (255, 0, 0), (0, 180, 0),
 )
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 QUICKTIME_VIDEO_EXTENSIONS = frozenset({".mp4", ".m4v", ".mov"})
 WINDOW_NAME = "independent cube keypoints"
-CPU_NEURAL_EXECUTOR = ThreadPoolExecutor(
-    max_workers=2,
-    thread_name_prefix="cpu-neural",
-)
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 DEFAULT_POSE_MODEL = (
     ROOT
-    / "runs/pose/runs/keypoints-results-20k/weights/best.pt"
-)
-DEFAULT_COMBINED_SEGMENTATION_MODEL_CANDIDATES = (
-    ROOT / "runs/segment/runs/combinedSegmentWeights.pt",
-)
-DEFAULT_COMBINED_SEGMENTATION_MODEL = next(
-    (
-        path
-        for path in DEFAULT_COMBINED_SEGMENTATION_MODEL_CANDIDATES
-        if path.exists()
-    ),
-    DEFAULT_COMBINED_SEGMENTATION_MODEL_CANDIDATES[0],
+    / "runs/pose/runs/yoloPoseMedium/weights/best.pt"
 )
 STICKER_COLORS_BGR = {
     "white": (255, 255, 255),
@@ -251,14 +226,16 @@ PNP_ASSIGNMENT_COLOR_BGR = (255, 0, 255)
 PNP_TURN_MOVING_COLOR_BGR = (0, 0, 255)
 PNP_TURN_STATIC_COLOR_BGR = (0, 0, 0)
 CLASSIFIED_CUBE_DIAGNOSTIC_DEPTH_MM = 300.0
-# OpenCV uses BGR.  These are the conventional X=red, Y=green, Z=blue
-# colors used by the orientation gizmo.
+# Display axes follow center colors; model/move coordinates remain unchanged.
+# OpenCV uses BGR: X+ red, Y+ white, Z+ green.
 ORIENTATION_AXIS_COLORS_BGR = (
     (0, 0, 255),
+    (255, 255, 255),
     (0, 200, 0),
-    (255, 0, 0),
 )
-ORIENTATION_AXIS_NAMES = ("X", "Y", "Z")
+ORIENTATION_AXIS_NAMES = ("X+", "Y+", "Z+")
+ORIENTATION_AXIS_CENTER_COLORS = ("red", "white", "green")
+ORIENTATION_AXIS_DEFAULT_FACES = ("R", "U", "F")
 MAX_STICKER_PNP_CANDIDATES = 3
 # Full-cube assignment mode. ``class-aware`` treats known keypoint classes as
 # hard constraints; ``closest`` remains an explicit geometric-only escape hatch
@@ -288,17 +265,18 @@ PNP_MASK_CENTER_SOLVE_WEIGHT = 0.50
 # Suppress duplicate/partial sticker detections mostly covered by a larger
 # sticker mask, before erosion and before the masks are used by any pass.
 STICKER_MASK_CONTAINMENT_THRESHOLD = 0.90
-# Turn ranking uses all segmentation-derived center observations. Its bounded
+# Turn ranking uses all pose-model sticker color points. Its bounded
 # coverage penalty is converted to cube-normalized distance units before it is
 # combined with keypoint reprojection error.
 PNP_TURN_MASK_CENTER_WEIGHT = 1.0
 # Color contributes the same weight as each geometric term in the final turn
-# ranking. Geometry is keypoint error plus the sticker-centroid term, while
-# color is the negative log predictive likelihood p(observation | prior).
+# ranking. Geometry is landmark error plus the sticker-point term; color is
+# one minus the fraction of observed projected stickers with matching colors.
 PNP_TURN_COLOR_WEIGHT = 1.0
-# Reconsider the inherited pose only when its best joint turn fit has poor
-# color agreement. This is a rescue trigger, never a color rejection gate.
-PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR = 5.0
+PNP_TURN_GEOMETRY_SCORE_VERSION = 2  # Whole-cube validity; invalid landmark costs remain invalid.
+# Check the unchanged state's colors before generating move alternatives.
+# Subtraction matches the categorical scorer exactly at the 2/3 boundary.
+PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR = 1.0 - 2.0 / 3.0
 MIN_TURN_LAYER_OBSERVATIONS = 3
 # A turn is eligible against static when it has more unified inliers or its
 # predictive color error is at least 2x better than the matching baseline.
@@ -349,12 +327,6 @@ PNP_FINAL_ASSIGNMENT_ERROR_FRACTION = 0.05
 # threshold, including when selecting among temporal hypotheses.
 PNP_POSE_REPROJECTION_ERROR_THRESHOLD = 0.1
 PNP_POSE_REPROJECTION_ERROR_REJECTION_ENABLED = False
-# A quarter turn per reference frame adds one to the score. This is a
-# soft preference, scaled by elapsed time; colors may favor a larger rotation.
-POSE_CONTINUITY_REFERENCE_FPS = 30.0
-POSE_CONTINUITY_ANGULAR_SCALE_DEGREES = 90.0
-# Xuanyi replay balances the inspection-148 and solve-212 margins near 0.2.
-POSE_CONTINUITY_COLOR_WEIGHT = 0.2
 PNP_LAYER_MISALIGNMENT_MIN_DEGREES = -90.0
 PNP_LAYER_MISALIGNMENT_MAX_DEGREES = 90.0
 PNP_LAYER_MISALIGNMENT_STEP_DEGREES = 6.0
@@ -365,22 +337,19 @@ POSE_TWO_SIDED_MOTION_REJECTION_ENABLED = False
 # layer faces; the value no longer limits the face search.
 PNP_TURN_DEBUG_CANDIDATE_COUNT = 6
 PNP_TURN_OVERLAY_CANDIDATE_COUNT = 6
-# The final cached pass scores all 24 equivalent labelings using the complete
-# sticker-color history. The initial pose pass deliberately does not spend
-# time canonicalizing pose symmetry.
-POSE_SYMMETRY_RECOVERY_MIN_OBSERVATIONS = 4
-POSE_SYMMETRY_RECOVERY_LOW_PREDICTIVE_PROBABILITY = 0.10
-
-
 @dataclass(frozen=True)
 class StickerKeypointMatch:
-    """One segmentation mask and its nearby ordered pose keypoints."""
+    """One sticker color point and its nearby ordered geometric landmarks."""
 
     mask_index: int
     keypoint_indices: tuple[int, ...]
     sticker_type: str
     average_confidence: float
     shape_error: float = float("inf")
+    center_error: float | None = None
+    # Restrict three-point PnP to the completion used for center ranking.
+    # Symmetric cyclic starts for that same completion remain valid roots.
+    object_index_sequences: tuple[tuple[int, ...], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -398,42 +367,18 @@ class StickerIdentity:
 
 @dataclass
 class StickerColorTrace:
-    """Per-sticker frame-averaged RGB observations for one video."""
-
+    """Per-frame categorical color observations grouped by physical sticker."""
     identities: tuple[StickerIdentity, ...]
-    observations: dict[str, list[tuple[int, np.ndarray]]]
-    observation_weights: dict[str, list[float]]
+    color_observations: dict[int, dict[str, tuple[str, ...]]] = field(default_factory=dict)
     frames_seen: int = 0
 
     @classmethod
     def create(cls) -> "StickerColorTrace":
-        identities = canonical_sticker_identities()
-        return cls(
-            identities=identities,
-            observations={identity.label: [] for identity in identities},
-            observation_weights={identity.label: [] for identity in identities},
-        )
+        return cls(identities=canonical_sticker_identities())
 
-    def observe(
-        self,
-        frame_index: int,
-        observations: dict[str, np.ndarray],
-        observation_weights: dict[str, float] | None = None,
-    ) -> None:
+    def observe_colors(self, frame_index: int, observations: dict[str, tuple[str, ...]]) -> None:
         self.frames_seen += 1
-        for identity in self.identities:
-            rgb = observations.get(identity.label)
-            if rgb is None:
-                continue
-            value = np.asarray(rgb, dtype=np.uint8).reshape(3).copy()
-            self.observations[identity.label].append((int(frame_index), value))
-            weight = 1.0 if observation_weights is None else observation_weights.get(
-                identity.label,
-                1.0,
-            )
-            self.observation_weights[identity.label].append(
-                float(np.clip(weight, 0.0, 1.0))
-            )
+        self.color_observations[int(frame_index)] = dict(observations)
 
 
 @dataclass
@@ -474,47 +419,7 @@ def copy_sticker_masks(
     )
 
 
-@dataclass(frozen=True)
-class StickerColorProfile:
-    """A fitted two-segment black-to-color-to-white RGB trajectory."""
-
-    polyline_rgb: np.ndarray
-    polyline_oklab: np.ndarray
-    residual: float
-    sample_count: int
-
-
 GLOBAL_COLOR_NAMES = tuple(PURE_COLOR_RGB)
-# Use a finite RGB profile kernel so nearby color regressions retain
-# meaningful likelihood instead of being treated as hard assignments.
-COLOR_LIKELIHOOD_SIGMA = 0.08
-STICKER_VIEW_WEIGHT_FLOOR = 0.0
-# Global profiles are estimated without trusting any sticker's color label.
-# These settings make that estimate a small, regularized EM fit: ambiguous
-# samples contribute softly, while the pure-color profiles remain weak anchors.
-GLOBAL_PROFILE_EM_ITERATIONS = 6
-GLOBAL_PROFILE_EM_TEMPERATURE = 0.025
-GLOBAL_PROFILE_PRIOR_WEIGHT = 6.0
-GLOBAL_PROFILE_MIN_EFFECTIVE_WEIGHT = 0.5
-LABELED_SAMPLE_MAX_POINTS = 256
-LABELED_SAMPLE_NEIGHBORS = 10
-# At full sample coverage, blend 30% regression with 70% nearest-sample distance.
-LABELED_SAMPLE_DISTANCE_WEIGHT = 0.7
-LABELED_SAMPLE_COVERAGE_SCALE = 0.15
-
-
-@dataclass(frozen=True)
-class GlobalColorProfile:
-    """A diagnostic color group initialized from the pure-color priors."""
-
-    color_name: str
-    prior: StickerColorProfile | None
-    fitted: StickerColorProfile | None
-    sample_count: int
-    labeled_samples: tuple[tuple[float, float, float], ...] = ()
-    labeled_sample_weights: tuple[float, ...] = ()
-
-
 @dataclass(frozen=True)
 class StickerPnPCandidate:
     """A cube pose obtained from one canonical sticker correspondence."""
@@ -551,6 +456,8 @@ class StickerPnPCandidate:
     # Per-mask RGB observations used by the color-assisted turn scorer.
     # Entries follow ``sticker_mask_centers`` ordering.
     sticker_mask_colors: tuple[np.ndarray, ...] = ()
+    # Direct pose-model color classes, aligned with sticker_mask_centers.
+    sticker_color_names: tuple[str, ...] = ()
     mask_fit_error: float = float("inf")
     mask_boundary_sample_count: int = 0
     mask_center_fit_error: float = float("inf")
@@ -581,9 +488,8 @@ class StickerPnPCandidate:
     turn_fit_sticker_score: float = float("inf")
     turn_fit_color_score: float = float("inf")
     turn_color_unreliable: bool = False
-    # Per-observation p(observation | prior), indexed as
-    # [canonical sticker identity, observed mask].
-    turn_color_likelihoods: np.ndarray | None = None
+    # Binary class equality [canonical sticker identity, observed color point].
+    turn_color_matches: np.ndarray | None = None
     turn_fit_unexplained_keypoints: int = 0
     turn_fit_evaluated: bool = False
     turn_fit_static_scores: tuple[float, float, float] | None = None
@@ -615,6 +521,9 @@ class StickerPnPCandidate:
     # layer rotation is applied.  This is part of fitting, not display-only
     # metadata, and is copied into every candidate entering turn search.
     cube_geometry_state: "CubeGeometryState | None" = None
+    # Persistent center identities for display X+/Y+/Z+, including a rotated
+    # initial scramble's color layout. These do not change solver coordinates.
+    orientation_axis_center_labels: tuple[str, str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -658,7 +567,6 @@ class PoseHypothesisBuffer:
             for frame in list(self._frames)[:-1]
             for candidate in frame.candidates
         )
-
 
 
 @dataclass(frozen=True)
@@ -936,6 +844,7 @@ def turn_trial_log_payload(trial: dict[str, object]) -> dict[str, object]:
         'color_error', 'color_match_count', 'inlier_count', 'layer_inlier_count',
         'keypoint_inlier_count', 'keypoint_layer_inlier_count',
         'orientation_symmetry_index', 'orientation_symmetry', 'orientation_rescue',
+        'score_components',
     )
     result = {name: trial[name] for name in names if name in trial}
     for output, source in (
@@ -1060,8 +969,7 @@ def search_move_lookahead_paths(
     bounds = tuple(frame_score_lower_bounds) if frame_score_lower_bounds is not None else (-float('inf'),) * count
     if len(bounds) != count or any(np.isnan(value) for value in bounds):
         raise ValueError('Provide one non-NaN lower bound per search frame')
-    # Treat unsupported/nonfinite bounds as unknown, rather than assuming
-    # zero: predictive likelihood densities can produce negative NLLs.
+    # Treat unsupported/nonfinite bounds as unknown rather than assuming zero.
     suffix = [0.0] * (count + 1)
     for depth in range(count - 1, -1, -1):
         suffix[depth] = (weights[depth] * bounds[depth] + suffix[depth + 1]
@@ -1330,7 +1238,6 @@ def search_move_lookahead_paths(
         if depth == count - 1:
             complete(path)
             return
-        signature = path.state.signature()
         rank = prefix_rank(path)
         frontier_key = path_frontier_key(path)
         previous = seen[depth].get(frontier_key)
@@ -1972,6 +1879,12 @@ def pose_predictions(result: object) -> tuple[np.ndarray, np.ndarray, np.ndarray
         box_confidence = np.asarray(box_confidence, dtype=np.float32).reshape(-1)
 
     count = min(len(points), len(point_confidence), len(class_ids), len(box_confidence))
+    names = getattr(result, "names", None)
+    if names is not None:
+        class_ids = np.asarray([
+            CLASS_NAMES.index(name) if (name := class_name(names, int(cid))) in CLASS_NAMES else -1
+            for cid in class_ids
+        ], dtype=np.int32)
     return points[:count], point_confidence[:count], class_ids[:count], box_confidence[:count]
 
 
@@ -2203,34 +2116,54 @@ def sticker_shape_error(
     points: np.ndarray,
     indices: list[int] | tuple[int, ...],
 ) -> float:
-    """Return a cheap, scale-normalized shape error for a sticker candidate."""
+    """Rank rhombus-like quads by compactness plus parallelogram error.
+
+    Perimeter squared / (16 * area) penalizes thin or stretched groups, with
+    a square at zero after subtracting one. The normalized distance between
+    diagonal midpoints measures failure to form a parallelogram. Both terms
+    are invariant to translation, rotation and image scale.
+    """
 
     selected = np.asarray(points, dtype=np.float64).reshape(-1, 2)[list(indices)]
-    if len(selected) == 4:
-        edges = np.roll(selected, -1, axis=0) - selected
-        scale = max(float(np.mean(np.linalg.norm(edges, axis=1))), 1e-6)
-        diagonal_midpoint_error = 0.5 * float(
-            np.linalg.norm(selected[0] + selected[2] - selected[1] - selected[3])
-        ) / scale
-        opposite_edge_error = 0.5 * float(
-            np.linalg.norm(edges[0] - edges[2])
-            + np.linalg.norm(edges[1] - edges[3])
-        ) / scale
-        return diagonal_midpoint_error + opposite_edge_error
-    return float("inf")
+    if len(selected) != 4 or not np.isfinite(selected).all():
+        return float("inf")
+    edges = np.roll(selected, -1, axis=0) - selected
+    scale = float(np.mean(np.linalg.norm(edges, axis=1)))
+    if not np.isfinite(scale) or scale <= np.finfo(np.float64).eps:
+        return float("inf")
+    quad = (selected - selected.mean(axis=0)) / scale
+    if not cv2.isContourConvex(quad.astype(np.float32)):
+        return float("inf")
+    following = np.roll(quad, -1, axis=0)
+    area = 0.5 * abs(float(np.sum(quad[:, 0] * following[:, 1] - quad[:, 1] * following[:, 0])))
+    if area <= 1e-10:
+        return float("inf")
+    # Normalization makes the mean side length one and perimeter four.
+    compactness_error = max(0.0, 1.0 / area - 1.0)
+    parallelogram_error = 0.5 * float(np.linalg.norm(quad[0] + quad[2] - quad[1] - quad[3]))
+    return compactness_error + parallelogram_error
 
 
-def sticker_match_priority_key(match: StickerKeypointMatch) -> tuple[float, float, int]:
+def sticker_match_priority_key(match: StickerKeypointMatch) -> tuple[float, int, float, int]:
     """Prefer geometrically plausible stickers, then use confidence as a tie-breaker."""
 
+    if match.center_error is not None:
+        return (
+            float(match.center_error),
+            -len(match.keypoint_indices),
+            -float(match.average_confidence),
+            int(match.mask_index),
+        )
     if len(match.keypoint_indices) != 4:
         return (
             0.0,
+            -len(match.keypoint_indices),
             -float(match.average_confidence),
             int(match.mask_index),
         )
     return (
         float(match.shape_error),
+        -len(match.keypoint_indices),
         -float(match.average_confidence),
         int(match.mask_index),
     )
@@ -2369,6 +2302,234 @@ def sticker_keypoint_matches_for_masks(
     return tuple(matches)
 
 
+def pose_keypoint_confidence_threshold(class_id: int, point_threshold: float) -> float:
+    """Keep a separate confidence floor for the six sticker color classes."""
+    return max(point_threshold, STICKER_KEYPOINT_MIN_CONFIDENCE) if class_id >= 3 else point_threshold
+
+
+def usable_pose_points(
+    points: np.ndarray, point_confidences: np.ndarray, class_ids: np.ndarray,
+    box_confidences: np.ndarray, point_threshold: float,
+    class_confidences: dict[str, float],
+) -> np.ndarray:
+    """Apply the same confidence and finite-coordinate checks to every class."""
+    return np.asarray([
+        np.isfinite(point).all() and np.isfinite(pc) and np.isfinite(bc)
+        and 0 <= int(cid) < len(CLASS_NAMES)
+        and pc >= pose_keypoint_confidence_threshold(int(cid), point_threshold)
+        and bc >= independent_pose_class_threshold(CLASS_NAMES[int(cid)], class_confidences)
+        for point, pc, cid, bc in zip(
+            points, point_confidences, class_ids, box_confidences, strict=True,
+        )
+    ], dtype=bool)
+
+
+def sticker_keypoint_matches_for_colors(
+    landmark_points: np.ndarray, landmark_confidences: np.ndarray,
+    landmark_class_ids: np.ndarray, sticker_points: np.ndarray,
+) -> tuple[StickerKeypointMatch, ...]:
+    """Find each color point's nearest class-valid three/four-landmark groups.
+
+    Grow the nearest-landmark neighborhood only until a valid group exists,
+    then prefer its smallest total distance. Rank groups by the RMS distance
+    from the color point to both diagonal midpoints, in unnormalized pixels.
+    For three observations, test every class-consistent parallelogram
+    completion and keep the best center alignment. Never add the inferred
+    point to the measurements passed to PnP. Other sticker points must stay
+    outside the full real/inferred quadrilateral.
+    """
+    points = np.asarray(landmark_points, dtype=np.float64).reshape(-1, 2)
+    confidences = np.asarray(landmark_confidences)
+    classes = np.asarray(landmark_class_ids)
+    sticker_points = np.asarray(sticker_points, dtype=np.float64).reshape(-1, 2)
+    matches: dict[tuple[tuple[int, ...], str], StickerKeypointMatch] = {}
+    for sticker_index, center in enumerate(sticker_points):
+        if not np.isfinite(center).all():
+            continue
+        other_stickers = sticker_points[(np.arange(len(sticker_points)) != sticker_index)
+                                       & np.isfinite(sticker_points).all(axis=1)]
+        blocked_pairs = sticker_blocked_landmark_pairs(points, center, other_stickers)
+        distances = np.linalg.norm(points - center, axis=1)
+        nearest = np.argsort(distances, kind="stable")
+        nearest = [int(i) for i in nearest if np.isfinite(points[i]).all() and 0 <= classes[i] < 3]
+        for count in (4, 3):
+            for size in range(count, len(nearest) + 1):
+                groups = []
+                # Only new combinations containing the newly added point.
+                compatible_nearby = [i for i in nearest[:size - 1]
+                                     if not blocked_pairs[i, nearest[size - 1]]]
+                for preceding in combinations(compatible_nearby, count - 1):
+                    indices = (*preceding, nearest[size - 1])
+                    if any(blocked_pairs[i, j] for i, j in combinations(preceding, 2)):
+                        continue
+                    if sticker_type_from_keypoint_classes(classes[list(indices)].tolist()) == "unknown":
+                        continue
+                    group = sticker_center_alignment_matches(
+                        points, classes, confidences, indices, center, sticker_index, other_stickers,
+                    )
+                    if group:
+                        groups.append((float(np.sum(distances[list(indices)])), group))
+                if not groups:
+                    continue
+                _, group = min(groups, key=lambda item: (
+                    item[0], sticker_match_priority_key(item[1][0]),
+                ))
+                for match in group:
+                    # Repeated color detections must not use multiple seed slots.
+                    key = (tuple(sorted(match.keypoint_indices)), match.sticker_type)
+                    previous = matches.get(key)
+                    if previous is None or sticker_match_priority_key(match) < sticker_match_priority_key(previous):
+                        matches[key] = match
+                break
+    return tuple(sorted(matches.values(), key=sticker_match_priority_key))
+
+
+def sticker_blocked_landmark_pairs(
+    points: np.ndarray, center: np.ndarray, other_stickers: np.ndarray,
+) -> np.ndarray:
+    """Prune pairs whose triangle with the seed contains another sticker.
+
+    Every enclosing convex sticker using that pair contains this triangle,
+    so no third/fourth landmark can rescue it. Batch all tests before the
+    combination search, rather than repeatedly building invalid quads.
+    """
+    blocked = np.zeros((len(points), len(points)), dtype=bool)
+    if len(other_stickers) == 0:
+        return blocked
+    first, second = np.triu_indices(len(points), k=1)
+    a, b = points[first] - center, points[second] - center
+    q = other_stickers - center
+
+    def cross(u: np.ndarray, v: np.ndarray) -> np.ndarray:
+        return u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0]
+
+    area = cross(a, b)
+    sides = np.stack((
+        cross(a[:, None], q[None]),
+        cross((b - a)[:, None], q[None] - a[:, None]),
+        cross(-b[:, None], q[None] - b[:, None]),
+    ), axis=-1)
+    inside = np.all(sides >= 0.0, axis=-1) | np.all(sides <= 0.0, axis=-1)
+    invalid = np.any(inside, axis=1) & (np.abs(area) > 1e-6)
+    blocked[first, second] = invalid
+    blocked[second, first] = invalid
+    return blocked
+
+
+def sticker_center_alignment_matches(
+    points: np.ndarray, class_ids: np.ndarray, confidences: np.ndarray,
+    indices: tuple[int, ...], center: np.ndarray, sticker_index: int,
+    other_stickers: np.ndarray | None = None,
+) -> tuple[StickerKeypointMatch, ...]:
+    """Validate cyclic profiles and score real/inferred diagonal centers."""
+    selected = points[list(indices)]
+    if not np.isfinite(selected).all():
+        return ()
+    centroid = selected.mean(axis=0)
+    order = np.argsort(np.arctan2(selected[:, 1] - centroid[1], selected[:, 0] - centroid[0]), kind="stable")
+    indices = tuple(indices[int(i)] for i in order)
+    selected = points[list(indices)]
+    contour = selected.astype(np.float32)
+    if not cv2.isContourConvex(contour) or abs(cv2.contourArea(contour)) <= 1e-6:
+        return ()
+    observed_classes = class_ids[list(indices)].tolist()
+    options = []
+    for sticker_type in STICKER_TYPE_CLASS_IDS:
+        sequences = sticker_correspondence_object_indices(sticker_type, observed_classes)
+        completions: dict[tuple[int, int] | None, list[tuple[int, ...]]] = {}
+        for sequence in sequences:
+            # A three-point sequence has exactly one observed opposite pair.
+            opposite = (next((i, j) for i, j in combinations(range(3), 2)
+                             if (sequence[i] - sequence[j]) % 4 == 2)
+                        if len(indices) == 3 else None)
+            completions.setdefault(opposite, []).append(sequence)
+        for opposite, compatible in completions.items():
+            if opposite is None:
+                quad = selected
+            else:
+                i, j = opposite
+                other = 3 - i - j
+                inferred = selected[i] + selected[j] - selected[other]
+                quad = np.empty((4, 2), dtype=np.float64)
+                quad[list(compatible[0])] = selected
+                missing = next(i for i in range(4) if i not in compatible[0])
+                quad[missing] = inferred
+            # Keep local enclosing stickers, never a remote extrapolation.
+            if cv2.pointPolygonTest(quad.astype(np.float32), tuple(float(v) for v in center), False) < 0:
+                continue
+            if other_stickers is not None and any(
+                cv2.pointPolygonTest(quad.astype(np.float32), tuple(float(v) for v in point), False) >= 0
+                for point in other_stickers
+            ):
+                continue
+            midpoints = (quad + np.roll(quad, -2, axis=0))[:2] / 2.0
+            error = float(np.sqrt(np.mean(np.sum((midpoints - center) ** 2, axis=1))))
+            options.append(StickerKeypointMatch(
+                sticker_index, indices, sticker_type,
+                float(np.mean(confidences[list(indices)])),
+                center_error=error, object_index_sequences=tuple(compatible),
+            ))
+    if not options:
+        return ()
+    best_error = min(float(match.center_error) for match in options)
+    # Keep ambiguous physical sticker types only for the same best completion.
+    return tuple(match for match in options if abs(float(match.center_error) - best_error) <= 1e-9)
+
+
+def attach_color_keypoints(
+    candidate: StickerPnPCandidate, centers: np.ndarray, colors: tuple[str, ...],
+) -> StickerPnPCandidate:
+    """Use pose color points as the center observations for existing geometry fits."""
+    return replace(
+        candidate, sticker_mask_centers=tuple(np.asarray(center).copy() for center in centers),
+        sticker_mask_center_uncertainties=(1.0,) * len(centers),
+        sticker_color_names=colors, sticker_mask_colors=(),
+        sticker_contour=None, sticker_contours=(), sticker_boundary_samples=(),
+    )
+
+
+def projected_color_observations(candidate: StickerPnPCandidate) -> dict[str, tuple[str, ...]]:
+    """Group color predictions by containing projected sticker, excluding the background.
+
+    Each point belongs to its nearest containing sticker if projections share
+    a boundary. Preserve all colors in a group so a duplicate can still match.
+    """
+    faces = projected_sticker_faces(candidate, candidate.rvec, candidate.tvec)
+    groups: dict[str, set[str]] = {}
+    for point, color in zip(candidate.sticker_mask_centers, candidate.sticker_color_names, strict=True):
+        containing = [face for face in faces if cv2.pointPolygonTest(
+            np.asarray(face[2], dtype=np.float32), tuple(float(v) for v in point), False,
+        ) >= 0]
+        if not containing:
+            continue
+        face = min(containing, key=lambda face: float(np.linalg.norm(np.mean(face[2], axis=0) - point)))
+        groups.setdefault(face[0].label, set()).add(color)
+    return {label: tuple(sorted(colors)) for label, colors in groups.items()}
+
+
+def match_orientation_to_colors(
+    candidate: StickerPnPCandidate, expected_colors: dict[str, str],
+) -> StickerPnPCandidate:
+    """Choose among all cube symmetries by direct sticker-color agreement only."""
+    best = candidate
+    best_score = (-1, -1, False)
+    for symmetry in CUBE_SYMMETRY_MATRICES:
+        transformed = transform_candidate_by_symmetry(candidate, symmetry)
+        observations = projected_color_observations(transformed)
+        correct = sum(expected_colors.get(label) in colors for label, colors in observations.items())
+        score = (correct, len(observations), bool(np.array_equal(symmetry, np.eye(3))))
+        if score > best_score:
+            best, best_score = transformed, score
+    center_by_color = {
+        expected_colors[identity.label]: identity.label
+        for identity in canonical_sticker_identities()
+        if identity.category == "center" and identity.label in expected_colors
+    }
+    axis_centers = (tuple(center_by_color[color] for color in ORIENTATION_AXIS_CENTER_COLORS)
+                    if all(color in center_by_color for color in ORIENTATION_AXIS_CENTER_COLORS) else None)
+    return replace(best, pose_continuity_diagnostics=None, orientation_axis_center_labels=axis_centers)
+
+
 def cube_lattice_point_mm(coord: tuple[int, int, int]) -> tuple[float, float, float]:
     """Convert a 4x4x4 surface-lattice coordinate to cube millimetres."""
 
@@ -2457,676 +2618,6 @@ def canonical_sticker_identities() -> tuple[StickerIdentity, ...]:
     return tuple(identities)
 
 
-def _srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
-    normalized = np.asarray(rgb, dtype=np.float64) / 255.0
-    return np.where(
-        normalized <= 0.04045,
-        normalized / 12.92,
-        ((normalized + 0.055) / 1.055) ** 2.4,
-    )
-
-
-def rgb_to_oklab(rgb: np.ndarray) -> np.ndarray:
-    """Convert one or more sRGB colors to OKLab."""
-
-    linear = _srgb_to_linear(np.asarray(rgb, dtype=np.float64))
-    lms = linear @ np.asarray(
-        (
-            (0.4122214708, 0.5363325363, 0.0514459929),
-            (0.2119034982, 0.6806995451, 0.1073969566),
-            (0.0883024619, 0.2817188376, 0.6299787005),
-        ),
-        dtype=np.float64,
-    ).T
-    lms_cbrt = np.cbrt(np.maximum(lms, 0.0))
-    return lms_cbrt @ np.asarray(
-        (
-            (0.2104542553, 0.7936177850, -0.0040720468),
-            (1.9779984951, -2.4285922050, 0.4505937099),
-            (0.0259040371, 0.7827717662, -0.8086757660),
-        ),
-        dtype=np.float64,
-    ).T
-
-
-def _oklab_point_to_segment_distances(
-    points: np.ndarray,
-    start: np.ndarray,
-    end: np.ndarray,
-) -> np.ndarray:
-    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
-    start = np.asarray(start, dtype=np.float64).reshape(3)
-    end = np.asarray(end, dtype=np.float64).reshape(3)
-    direction = end - start
-    denominator = float(np.dot(direction, direction))
-    if denominator <= 1e-12:
-        return np.linalg.norm(points - start, axis=1)
-    projection = np.clip(
-        ((points - start) @ direction) / denominator,
-        0.0,
-        1.0,
-    )
-    closest = start + projection[:, None] * direction
-    return np.linalg.norm(points - closest, axis=1)
-
-
-def _piecewise_profile_distances(
-    points: np.ndarray,
-    polyline_oklab: np.ndarray,
-) -> np.ndarray:
-    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
-    polyline = np.asarray(polyline_oklab, dtype=np.float64).reshape(-1, 3)
-    if len(polyline) < 2:
-        return np.linalg.norm(points - polyline[0], axis=1)
-    return np.min(
-        np.asarray(
-            [
-                _oklab_point_to_segment_distances(points, start, end)
-                for start, end in zip(polyline[:-1], polyline[1:], strict=True)
-            ]
-        ),
-        axis=0,
-    )
-
-
-def _piecewise_rgb_profile_distances(
-    points_rgb: np.ndarray,
-    polyline_rgb: np.ndarray,
-) -> np.ndarray:
-    """Return profile distances in RGB coordinates scaled to 0..1."""
-
-    return _piecewise_profile_distances(
-        np.asarray(points_rgb, dtype=np.float64).reshape(-1, 3) / 255.0,
-        np.asarray(polyline_rgb, dtype=np.float64).reshape(-1, 3) / 255.0,
-    )
-
-
-def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
-    """Return a finite weighted median for one-dimensional samples."""
-
-    values = np.asarray(values, dtype=np.float64).reshape(-1)
-    weights = np.asarray(weights, dtype=np.float64).reshape(-1)
-    valid = np.isfinite(values) & np.isfinite(weights) & (weights > 0.0)
-    if not np.any(valid):
-        return float(np.median(values)) if len(values) else 0.0
-    values = values[valid]
-    weights = weights[valid]
-    order = np.argsort(values)
-    values = values[order]
-    weights = weights[order]
-    return float(values[np.searchsorted(np.cumsum(weights), 0.5 * np.sum(weights))])
-
-
-def _fit_rgb_inflection_point(
-    rgb_points: np.ndarray,
-    weights: np.ndarray | None = None,
-) -> np.ndarray:
-    """Fit the RGB point where the first segment reaches one channel at 255."""
-
-    points = np.asarray(rgb_points, dtype=np.float64).reshape(-1, 3)
-    if weights is None:
-        point_weights = np.ones(len(points), dtype=np.float64)
-    else:
-        point_weights = np.asarray(weights, dtype=np.float64).reshape(-1)
-        if len(point_weights) != len(points):
-            raise ValueError("RGB point weights must match the point count.")
-    valid = (
-        np.all(np.isfinite(points), axis=1)
-        & np.isfinite(point_weights)
-        & (point_weights > 0.0)
-    )
-    points = points[valid]
-    point_weights = point_weights[valid]
-    if len(points) == 0 or float(np.sum(point_weights)) <= 1e-12:
-        return np.full(3, 255.0, dtype=np.float64)
-    black = np.zeros(3, dtype=np.float64)
-    white = np.full(3, 255.0, dtype=np.float64)
-    candidates: list[tuple[int, np.ndarray]] = []
-    dominant_channels = np.argmax(points, axis=1)
-    for channel in range(3):
-        channel_mask = dominant_channels == channel
-        channel_points = points[channel_mask]
-        channel_weights = point_weights[channel_mask]
-        channel_points = channel_points[channel_points[:, channel] > 1e-6]
-        channel_weights = channel_weights[points[channel_mask][:, channel] > 1e-6]
-        if len(channel_points) == 0:
-            continue
-        scaled = channel_points * (255.0 / channel_points[:, channel, None])
-        scaled = np.clip(scaled, 0.0, 255.0)
-        for pivot in scaled[:: max(1, len(scaled) // 8)]:
-            pivot = pivot.copy()
-            pivot[channel] = 255.0
-            candidates.append((channel, pivot))
-        median_pivot = np.asarray(
-            [
-                _weighted_median(scaled[:, dimension], channel_weights)
-                for dimension in range(3)
-            ],
-            dtype=np.float64,
-        )
-        median_pivot[channel] = 255.0
-        candidates.append((channel, median_pivot))
-    if not candidates:
-        return white
-
-    def score(pivot: np.ndarray) -> float:
-        polyline = np.asarray((black, pivot, white), dtype=np.float64)
-        distances = _piecewise_profile_distances(points, polyline) ** 2
-        return float(np.average(distances, weights=point_weights))
-
-    best_channel, best_pivot = min(candidates, key=lambda item: score(item[1]))
-    best_score = score(best_pivot)
-    other_channels = tuple(index for index in range(3) if index != best_channel)
-    for step in (32.0, 16.0, 8.0, 4.0, 2.0, 1.0):
-        improved = True
-        while improved:
-            improved = False
-            for channel in other_channels:
-                for delta in (-step, step):
-                    candidate = best_pivot.copy()
-                    candidate[channel] = np.clip(candidate[channel] + delta, 0.0, 255.0)
-                    candidate[best_channel] = 255.0
-                    candidate_score = score(candidate)
-                    if candidate_score < best_score:
-                        best_pivot = candidate
-                        best_score = candidate_score
-                        improved = True
-    return best_pivot
-
-
-def fit_sticker_color_profile(
-    trace: StickerColorTrace,
-    sticker_label: str,
-) -> StickerColorProfile | None:
-    """Fit a two-segment RGB profile with a one-channel-255 inflection."""
-
-    entries = trace.observations.get(sticker_label, ())
-    if not entries:
-        return None
-    rgb_points = np.asarray(
-        [value for _frame, value in entries],
-        dtype=np.float64,
-    ).reshape(-1, 3)
-    return fit_rgb_color_profile(rgb_points)
-
-
-def fit_rgb_color_profile(
-    rgb_points: np.ndarray,
-    weights: np.ndarray | None = None,
-    *,
-    sample_count: int | None = None,
-) -> StickerColorProfile | None:
-    """Fit the constrained two-segment model to RGB observations.
-
-    ``weights`` is used by the global-profile estimator. The ordinary
-    per-sticker fit remains unchanged when weights are omitted.
-    """
-
-    rgb_points = np.asarray(rgb_points, dtype=np.float64).reshape(-1, 3)
-    if len(rgb_points) == 0:
-        return None
-    if weights is None:
-        point_weights = np.ones(len(rgb_points), dtype=np.float64)
-    else:
-        point_weights = np.asarray(weights, dtype=np.float64).reshape(-1)
-        if len(point_weights) != len(rgb_points):
-            raise ValueError("RGB point weights must match the point count.")
-    point_weights = np.where(np.isfinite(point_weights), point_weights, 0.0)
-    point_weights = np.clip(point_weights, 0.0, None)
-    if float(np.sum(point_weights)) <= 1e-12:
-        return None
-    inflection = _fit_rgb_inflection_point(rgb_points, point_weights)
-    polyline_rgb = np.asarray(
-        ((0.0, 0.0, 0.0), inflection, (255.0, 255.0, 255.0)),
-        dtype=np.float32,
-    )
-    polyline_oklab = rgb_to_oklab(polyline_rgb).astype(np.float32)
-    residual = float(
-        np.sqrt(
-            np.average(
-                _piecewise_rgb_profile_distances(rgb_points, polyline_rgb) ** 2,
-                weights=point_weights,
-            )
-        )
-    )
-    return StickerColorProfile(
-        polyline_rgb,
-        polyline_oklab,
-        residual,
-        len(rgb_points) if sample_count is None else int(sample_count),
-    )
-
-
-def pure_rgb_color_profile(color_name: str) -> StickerColorProfile:
-    """Build a weak diagnostic prior from one pure RGB color."""
-
-    if color_name not in PURE_COLOR_RGB:
-        raise KeyError(color_name)
-    polyline_rgb = np.asarray(
-        (
-            (0.0, 0.0, 0.0),
-            PURE_COLOR_RGB[color_name],
-            (255.0, 255.0, 255.0),
-        ),
-        dtype=np.float32,
-    )
-    return StickerColorProfile(
-        polyline_rgb=polyline_rgb,
-        polyline_oklab=rgb_to_oklab(polyline_rgb).astype(np.float32),
-        residual=0.0,
-        sample_count=0,
-    )
-
-
-def _global_profile_distance_matrix(
-    rgb_points: np.ndarray,
-    profiles: dict[str, StickerColorProfile],
-) -> np.ndarray:
-    """Return one RGB profile distance per sample and global color."""
-
-    points_rgb = np.asarray(rgb_points, dtype=np.float64).reshape(-1, 3)
-    return np.column_stack(
-        [
-            _piecewise_rgb_profile_distances(
-                points_rgb,
-                profiles[color_name].polyline_rgb,
-            )
-            for color_name in GLOBAL_COLOR_NAMES
-        ]
-    )
-
-
-def _global_profile_soft_responsibilities(distances: np.ndarray) -> np.ndarray:
-    """Convert profile distances into normalized soft color responsibilities."""
-
-    distances = np.asarray(distances, dtype=np.float64)
-    scaled = -distances / max(GLOBAL_PROFILE_EM_TEMPERATURE, 1e-6)
-    scaled -= np.max(scaled, axis=1, keepdims=True)
-    responsibilities = np.exp(scaled)
-    return responsibilities / np.maximum(
-        np.sum(responsibilities, axis=1, keepdims=True),
-        1e-12,
-    )
-
-
-def _global_profile_information_weights(
-    rgb_points: np.ndarray,
-    distances: np.ndarray,
-) -> np.ndarray:
-    """Weight samples by how much reliable hue information they contain.
-
-    Samples near black or white, and samples with little chroma, cannot
-    reliably distinguish red from orange. They remain available to the later
-    posterior pass, but should not define the shared profile hue.
-    """
-
-    rgb = np.asarray(rgb_points, dtype=np.float64).reshape(-1, 3) / 255.0
-    brightness = np.mean(rgb, axis=1)
-    chroma = (np.max(rgb, axis=1) - np.min(rgb, axis=1)) / np.maximum(
-        np.sum(rgb, axis=1),
-        1.0 / 255.0,
-    )
-    midtone = np.clip(4.0 * brightness * (1.0 - brightness), 0.0, 1.0)
-    ordered = np.sort(np.asarray(distances, dtype=np.float64), axis=1)
-    margin = np.maximum(ordered[:, 1] - ordered[:, 0], 0.0)
-    separation = 1.0 - np.exp(
-        -margin / max(GLOBAL_PROFILE_EM_TEMPERATURE, 1e-6)
-    )
-    chroma_weight = np.clip(chroma / 0.08, 0.0, 1.0)
-    return chroma_weight * (0.25 + 0.75 * midtone) * separation
-
-
-def build_global_color_profiles_from_samples(
-    entries: list[tuple[str, int, np.ndarray]],
-    source_weights: list[float] | np.ndarray | None = None,
-) -> tuple[
-    dict[str, GlobalColorProfile],
-    dict[str, list[tuple[str, int, np.ndarray]]],
-]:
-    """Build regularized global profiles from pose-free RGB samples.
-
-    The old implementation assigned every observation to the nearest pure
-    prior before fitting. That made a red/orange mistake self-reinforcing. The
-    estimator below starts from the same priors, gives every sample a soft
-    responsibility for every color, and refits each trajectory using those
-    responsibilities. A small pure-color anchor keeps the named profiles
-    from swapping or collapsing when the video is short or unbalanced.
-    """
-
-    prior_profiles = {
-        color_name: pure_rgb_color_profile(color_name)
-        for color_name in PURE_COLOR_RGB
-    }
-    entries = [
-        (label, int(frame_index), np.asarray(rgb, dtype=np.uint8).reshape(3).copy())
-        for label, frame_index, rgb in entries
-    ]
-    trace_weights = (
-        np.ones(len(entries), dtype=np.float64)
-        if source_weights is None
-        else np.asarray(source_weights, dtype=np.float64).reshape(-1)
-    )
-    if len(trace_weights) != len(entries):
-        raise ValueError("Global color sample weights must match the sample count.")
-    profiles: dict[str, GlobalColorProfile] = {
-        color_name: GlobalColorProfile(
-            color_name=color_name,
-            prior=prior_profiles[color_name],
-            fitted=None,
-            sample_count=0,
-        )
-        for color_name in GLOBAL_COLOR_NAMES
-    }
-    if not entries:
-        return profiles, {color_name: [] for color_name in GLOBAL_COLOR_NAMES}
-
-    values = np.asarray([entry[2] for entry in entries], dtype=np.float64).reshape(-1, 3)
-    source_weights = np.asarray(trace_weights, dtype=np.float64)
-    for _iteration in range(GLOBAL_PROFILE_EM_ITERATIONS):
-        references = {
-            color_name: _global_profile_reference(profiles[color_name])
-            for color_name in GLOBAL_COLOR_NAMES
-        }
-        distances = _global_profile_distance_matrix(
-            values,
-            {
-                color_name: reference
-                for color_name, reference in references.items()
-                if reference is not None
-            },
-        )
-        responsibilities = _global_profile_soft_responsibilities(distances)
-        information_weights = _global_profile_information_weights(values, distances)
-        next_profiles: dict[str, GlobalColorProfile] = {}
-        for color_index, color_name in enumerate(GLOBAL_COLOR_NAMES):
-            data_weights = (
-                source_weights
-                * information_weights
-                * responsibilities[:, color_index] ** 2
-            )
-            effective_weight = float(np.sum(data_weights))
-            fitted = None
-            if effective_weight >= GLOBAL_PROFILE_MIN_EFFECTIVE_WEIGHT:
-                prior_point = np.asarray(
-                    [PURE_COLOR_RGB[color_name]],
-                    dtype=np.float64,
-                )
-                fit_values = np.vstack((values, prior_point))
-                fit_weights = np.concatenate(
-                    (
-                        data_weights,
-                        np.asarray((GLOBAL_PROFILE_PRIOR_WEIGHT,), dtype=np.float64),
-                    )
-                )
-                fitted = fit_rgb_color_profile(
-                    fit_values,
-                    fit_weights,
-                    sample_count=int(np.count_nonzero(data_weights > 1e-6)),
-                )
-            next_profiles[color_name] = GlobalColorProfile(
-                color_name=color_name,
-                prior=prior_profiles[color_name],
-                fitted=fitted,
-                sample_count=0,
-            )
-        profiles = next_profiles
-
-    final_references = {
-        color_name: _global_profile_reference(profiles[color_name])
-        for color_name in GLOBAL_COLOR_NAMES
-    }
-    final_distances = _global_profile_distance_matrix(
-        values,
-        {
-            color_name: reference
-            for color_name, reference in final_references.items()
-            if reference is not None
-        },
-    )
-    grouped: dict[str, list[tuple[str, int, np.ndarray]]] = {
-        color_name: [] for color_name in GLOBAL_COLOR_NAMES
-    }
-    for entry, color_index in zip(
-        entries,
-        np.argmin(final_distances, axis=1),
-        strict=True,
-    ):
-        grouped[GLOBAL_COLOR_NAMES[int(color_index)]].append(entry)
-    profiles = {
-        color_name: replace(
-            profiles[color_name],
-            sample_count=len(grouped[color_name]),
-        )
-        for color_name in GLOBAL_COLOR_NAMES
-    }
-    return profiles, grouped
-
-
-def build_global_color_profiles(
-    trace: StickerColorTrace,
-) -> tuple[
-    dict[str, GlobalColorProfile],
-    dict[str, list[tuple[str, int, np.ndarray]]],
-]:
-    """Build global profiles from identity-associated samples."""
-
-    entries: list[tuple[str, int, np.ndarray]] = []
-    trace_weights: list[float] = []
-    for identity in trace.identities:
-        for observation_index, (frame_index, rgb) in enumerate(
-            trace.observations.get(identity.label, ())
-        ):
-            entries.append((identity.label, int(frame_index), rgb))
-            trace_weights.append(
-                _trace_observation_weight(
-                    trace,
-                    identity.label,
-                    observation_index,
-                )
-            )
-    return build_global_color_profiles_from_samples(entries, trace_weights)
-
-
-def refine_global_color_profiles_from_initial_state(
-    trace: StickerColorTrace,
-    known_initial_colors: dict[str, str],
-    profiles: dict[str, GlobalColorProfile],
-    first_turn_frame: int | None,
-) -> tuple[dict[str, GlobalColorProfile], dict[str, list[tuple[str, int, np.ndarray]]]]:
-    """Attach inspection labels without replacing the full-video regressions."""
-    grouped = {color: [] for color in GLOBAL_COLOR_NAMES}
-    weights = {color: [] for color in GLOBAL_COLOR_NAMES}
-    for identity in trace.identities:
-        color = known_initial_colors.get(identity.label)
-        if color not in grouped:
-            continue
-        for index, (frame, rgb) in enumerate(trace.observations.get(identity.label, ())):
-            if first_turn_frame is not None and frame >= first_turn_frame:
-                continue
-            grouped[color].append((identity.label, frame, rgb))
-            weights[color].append(_trace_observation_weight(trace, identity.label, index))
-
-    refined = dict(profiles)
-    for color in GLOBAL_COLOR_NAMES:
-        data_weights = np.asarray(weights[color], dtype=np.float64)
-        if np.sum(data_weights) < GLOBAL_PROFILE_MIN_EFFECTIVE_WEIGHT:
-            continue
-        values = np.asarray([entry[2] for entry in grouped[color]], dtype=np.float64)
-        valid = np.flatnonzero(np.isfinite(data_weights) & (data_weights > 0.0))
-        if len(valid) > LABELED_SAMPLE_MAX_POINTS:
-            valid = valid[np.linspace(0, len(valid) - 1, LABELED_SAMPLE_MAX_POINTS, dtype=int)]
-        refined[color] = replace(
-            profiles[color],
-            labeled_samples=tuple(tuple(float(component) for component in values[index]) for index in valid),
-            labeled_sample_weights=tuple(float(data_weights[index]) for index in valid),
-        )
-    return refined, grouped
-
-
-def rgb_observation_color_likelihoods(
-    rgb: np.ndarray,
-    global_profiles: dict[str, GlobalColorProfile],
-) -> dict[str, float]:
-    """Return normalized soft likelihoods for one RGB observation."""
-
-    evidence = _rgb_observation_color_evidence(rgb, global_profiles)
-    evidence /= max(float(np.sum(evidence)), 1e-12)
-    return {
-        color_name: float(likelihood)
-        for color_name, likelihood in zip(GLOBAL_COLOR_NAMES, evidence, strict=True)
-    }
-
-
-def _rgb_observation_color_evidence(
-    rgb: np.ndarray,
-    global_profiles: dict[str, GlobalColorProfile],
-) -> np.ndarray:
-    """Return unnormalized p(observation|color) values for one RGB sample."""
-
-    point_rgb = np.asarray(rgb, dtype=np.float64).reshape(1, 3)
-    distances = np.asarray(
-        [
-            _piecewise_rgb_profile_distances(
-                point_rgb,
-                _global_profile_reference(global_profiles[color_name]).polyline_rgb,
-            )[0]
-            for color_name in GLOBAL_COLOR_NAMES
-        ],
-        dtype=np.float64,
-    )
-    for index, color_name in enumerate(GLOBAL_COLOR_NAMES):
-        profile = global_profiles[color_name]
-        if not profile.labeled_samples:
-            continue
-        samples = np.asarray(profile.labeled_samples, dtype=np.float64).reshape(-1, 3)
-        weights = np.asarray(profile.labeled_sample_weights, dtype=np.float64)
-        sample_distances = np.linalg.norm((samples - point_rgb) / 255.0, axis=1)
-        count = min(LABELED_SAMPLE_NEIGHBORS, len(sample_distances))
-        nearest = np.argpartition(sample_distances, count - 1)[:count]
-        neighbor_weights = weights[nearest]
-        total_weight = float(np.sum(neighbor_weights))
-        if total_weight <= 1e-12:
-            continue
-        sample_distance = float(np.average(sample_distances[nearest], weights=neighbor_weights))
-        coverage = min(total_weight / LABELED_SAMPLE_NEIGHBORS, 1.0) * np.exp(
-            -(sample_distance / LABELED_SAMPLE_COVERAGE_SCALE) ** 2
-        )
-        blend = LABELED_SAMPLE_DISTANCE_WEIGHT * coverage
-        distances[index] = (1.0 - blend) * distances[index] + blend * sample_distance
-    return np.exp(-0.5 * (distances / COLOR_LIKELIHOOD_SIGMA) ** 2)
-
-
-def _apply_observation_weight(
-    evidence: np.ndarray,
-    weight: float,
-) -> np.ndarray:
-    """Temper one observation's likelihood without changing its color shape."""
-
-    clipped_weight = float(np.clip(weight, 0.0, 1.0))
-    safe_evidence = np.clip(np.asarray(evidence, dtype=np.float64), 1e-300, None)
-    return np.exp(clipped_weight * np.log(safe_evidence))
-
-
-def _trace_observation_weight(
-    trace: StickerColorTrace,
-    label: str,
-    observation_index: int,
-) -> float:
-    weights = trace.observation_weights.get(label, ())
-    if observation_index >= len(weights):
-        return 1.0
-    return float(np.clip(weights[observation_index], 0.0, 1.0))
-
-
-def build_sticker_global_profile_likelihoods(
-    trace: StickerColorTrace,
-    global_profiles: dict[str, GlobalColorProfile] | None = None,
-) -> dict[int, dict[str, dict[str, float]]]:
-    """Build independent per-frame probabilities from global profiles only.
-
-    Each observation is normalized independently. There is deliberately no
-    temporal prior, trajectory grouping, or cube-inventory constraint, so the
-    probabilities match the nearest-global-profile debug classification.
-    """
-
-    if global_profiles is None:
-        global_profiles, _global_observations = build_global_color_profiles(trace)
-    likelihoods_by_frame: dict[int, dict[str, dict[str, float]]] = {}
-    for identity in trace.identities:
-        for frame_index, rgb in trace.observations.get(identity.label, ()):
-            likelihoods_by_frame.setdefault(int(frame_index), {})[identity.label] = (
-                rgb_observation_color_likelihoods(rgb, global_profiles)
-            )
-    return likelihoods_by_frame
-
-
-def classify_sticker_colors_by_frame_global_profile(
-    trace: StickerColorTrace,
-    global_profiles: dict[str, GlobalColorProfile],
-) -> dict[int, dict[str, str]]:
-    """Assign each observed sticker to its nearest global profile per frame.
-
-    Unlike posterior replay, this intentionally has no temporal prior or
-    trajectory grouping: every RGB sample is classified independently using
-    only its distance to the fitted global profiles.
-    """
-
-    names_by_frame: dict[int, dict[str, str]] = {}
-    profile_references = {
-        color_name: _global_profile_reference(global_profiles[color_name])
-        for color_name in GLOBAL_COLOR_NAMES
-    }
-    for identity in trace.identities:
-        for frame_index, rgb in trace.observations.get(identity.label, ()):
-            point_distances = _global_profile_distance_matrix(
-                np.asarray([rgb], dtype=np.float64),
-                {
-                    color_name: reference
-                    for color_name, reference in profile_references.items()
-                    if reference is not None
-                },
-            )[0]
-            closest_color = GLOBAL_COLOR_NAMES[int(np.argmin(point_distances))]
-            names_by_frame.setdefault(int(frame_index), {})[identity.label] = (
-                closest_color
-            )
-    return names_by_frame
-
-
-def _trace_observations_by_frame(
-    trace: StickerColorTrace,
-) -> dict[int, dict[str, np.ndarray]]:
-    """Index the raw trace without changing its original sticker labels."""
-
-    observations_by_frame: dict[int, dict[str, np.ndarray]] = {}
-    for identity in trace.identities:
-        for frame_index, rgb in trace.observations.get(identity.label, ()):
-            observations_by_frame.setdefault(int(frame_index), {})[
-                identity.label
-            ] = np.asarray(rgb, dtype=np.uint8).reshape(3).copy()
-    return observations_by_frame
-
-
-def _trace_observation_weights_by_frame(
-    trace: StickerColorTrace,
-) -> dict[int, dict[str, float]]:
-    """Index per-observation reliability weights using the same frame keys."""
-
-    weights_by_frame: dict[int, dict[str, float]] = {}
-    for identity in trace.identities:
-        for observation_index, (frame_index, _rgb) in enumerate(
-            trace.observations.get(identity.label, ())
-        ):
-            weights_by_frame.setdefault(int(frame_index), {})[
-                identity.label
-            ] = _trace_observation_weight(
-                trace,
-                identity.label,
-                observation_index,
-            )
-    return weights_by_frame
-
-
 def sticker_identity_label_under_symmetry(
     identity: StickerIdentity,
     symmetry: np.ndarray,
@@ -3193,208 +2684,10 @@ def _symmetry_observation_permutations(
     )
 
 
-def _update_sticker_color_posteriors(
-    priors: dict[str, np.ndarray],
-    observations: dict[str, np.ndarray],
-    global_profiles: dict[str, GlobalColorProfile],
-    observation_weights: dict[str, float] | None = None,
-) -> None:
-    """Update identity color posteriors from one corrected frame."""
-
-    for label, rgb in observations.items():
-        prior = priors.get(label)
-        if prior is None:
-            continue
-        evidence = _rgb_observation_color_evidence(rgb, global_profiles)
-        weight = 1.0 if observation_weights is None else observation_weights.get(label, 1.0)
-        posterior = prior * _apply_observation_weight(evidence, weight)
-        posterior_sum = float(np.sum(posterior))
-        if posterior_sum > 1e-12 and np.isfinite(posterior_sum):
-            priors[label] = posterior / posterior_sum
-
-
-def _score_symmetry_observations(
-    raw_observations: dict[str, np.ndarray],
-    permutation: dict[str, str],
-    priors: dict[str, np.ndarray],
-    global_profiles: dict[str, GlobalColorProfile],
-    raw_observation_weights: dict[str, float] | None = None,
-    expected_color_by_label: dict[str, str] | None = None,
-) -> tuple[float, int, int, dict[str, np.ndarray], dict[str, float]]:
-    """Return weighted likelihood scores, observations, and their weights.
-
-    When ``expected_color_by_label`` is supplied, score each candidate against
-    the known color at that canonical sticker location instead of a learned
-    per-sticker prior.  This is used only to anchor the initial orientation
-    from a known scramble.
-    """
-
-    log_likelihoods: list[float] = []
-    low_probability_count = 0
-    remapped: dict[str, np.ndarray] = {}
-    remapped_weights: dict[str, float] = {}
-    for target_label, source_label in permutation.items():
-        rgb = raw_observations.get(source_label)
-        if rgb is None:
-            continue
-        prior = priors[target_label]
-        evidence = _rgb_observation_color_evidence(rgb, global_profiles)
-        weight = (
-            1.0
-            if raw_observation_weights is None
-            else raw_observation_weights.get(source_label, 1.0)
-        )
-        weighted_evidence = _apply_observation_weight(evidence, weight)
-        if expected_color_by_label is None:
-            predictive_probability = float(np.dot(prior, weighted_evidence))
-        else:
-            expected_color = expected_color_by_label.get(target_label)
-            if expected_color not in GLOBAL_COLOR_NAMES:
-                raise ValueError(
-                    f"Unknown expected color {expected_color!r} for {target_label}"
-                )
-            expected_index = GLOBAL_COLOR_NAMES.index(expected_color)
-            predictive_probability = float(
-                weighted_evidence[expected_index]
-                / max(float(np.sum(weighted_evidence)), 1e-12)
-            )
-        log_likelihoods.append(np.log(max(predictive_probability, 1e-12)))
-        if (
-            predictive_probability
-            < POSE_SYMMETRY_RECOVERY_LOW_PREDICTIVE_PROBABILITY
-        ):
-            low_probability_count += 1
-        remapped[target_label] = np.asarray(rgb, dtype=np.uint8).copy()
-        remapped_weights[target_label] = float(np.clip(weight, 0.0, 1.0))
-    if not log_likelihoods:
-        return float("-inf"), 0, 0, remapped, remapped_weights
-    return (
-        float(np.mean(log_likelihoods)),
-        len(log_likelihoods),
-        low_probability_count,
-        remapped,
-        remapped_weights,
-    )
-
-
-def pose_continuity_color_scores(
-    observations: dict[str, np.ndarray],
-    observation_weights: dict[str, float],
-    priors: dict[str, np.ndarray],
-    global_profiles: dict[str, GlobalColorProfile],
-    permutations: tuple[tuple[np.ndarray, dict[str, str]], ...],
-) -> tuple[float, ...] | None:
-    """Compare all symmetries with colors last seen on accepted frames.
-
-    Every option scores the same observations, including unseen identities
-    with a uniform prior. Color evidence is evaluated once per RGB sample.
-    """
-    if not observations or not global_profiles:
-        return None
-    evidence = {
-        label: _apply_observation_weight(
-            _rgb_observation_color_evidence(rgb, global_profiles),
-            observation_weights.get(label, 1.0),
-        )
-        for label, rgb in observations.items()
-    }
-    uniform = np.full(len(GLOBAL_COLOR_NAMES), 1.0 / len(GLOBAL_COLOR_NAMES))
-    scores = []
-    for _symmetry, permutation in permutations:
-        probabilities = [
-            float(np.dot(priors.get(target, uniform), evidence[source]))
-            for target, source in permutation.items() if source in evidence
-        ]
-        scores.append(-float(np.mean(np.log(np.clip(probabilities, 1e-12, None)))))
-    return tuple(scores)
-
-
-def recover_calibrated_solve_continuity(
-    cache: list[NeuralFrameData],
-    observations_by_frame: dict[int, dict[str, np.ndarray]],
-    weights_by_frame: dict[int, dict[str, float]],
-    global_profiles: dict[str, GlobalColorProfile],
-    frozen_prefix_frame: int,
-    *,
-    source_fps: float,
-    sticker_mask_erosion: int = 0,
-    color_samples_per_sticker: int = 128,
-    color_min_samples_per_sticker: int = 4,
-    calibration_generation: int = 1,
-) -> None:
-    """Rescore solve poses with frozen inspection-labeled color evidence.
-
-    Inspection poses retain their existing orientation. Their RGB observations
-    seed temporal appearance in the scramble-anchored coordinate frame; only
-    later poses are reconsidered. No inferred solve state supplies color labels.
-    """
-    identities = canonical_sticker_identities()
-    permutations = _symmetry_observation_permutations(identities)
-    tracker = CubeSymmetryTracker()
-    priors: dict[str, np.ndarray] = {}
-    for record in cache:
-        candidate = record.pose_candidate
-        if not isinstance(candidate, StickerPnPCandidate):
-            continue
-        observations = observations_by_frame.get(record.frame_index, {})
-        weights = weights_by_frame.get(record.frame_index, {})
-        if record.frame_index > frozen_prefix_frame:
-            # Sample against the cached static pose before any move search.
-            # Without masks, keep the pose and use its existing RGB trace.
-            if (getattr(record, "sticker_masks", None) is not None
-                    and getattr(record, "roi_xyxy", None) is not None):
-                observations = sample_projected_sticker_colors(
-                    record.frame, record.roi_xyxy, record.sticker_masks, candidate,
-                    max_samples_per_sticker=color_samples_per_sticker,
-                    min_samples_per_sticker=color_min_samples_per_sticker,
-                    sticker_mask_erosion=sticker_mask_erosion,
-                )
-                rotation = cv2.Rodrigues(candidate.rvec)[0]
-                weights = {
-                    identity.label: sticker_view_reliability_weight(candidate, identity, rotation)
-                    for identity in identities if identity.label in observations
-                }
-                color_scores = pose_continuity_color_scores(
-                    observations, weights, priors, global_profiles, permutations,
-                )
-                if color_scores is not None:
-                    original = candidate
-                    candidate = canonicalize_pose_symmetry(
-                        candidate, tracker, color_scores=color_scores,
-                        frame_index=record.frame_index, source_fps=source_fps,
-                    )
-                    diagnostics = candidate.pose_continuity_diagnostics
-                    diagnostics.update(
-                        coordinate_frame="scramble_anchored_after_color_orientation",
-                        color_profile_source="inspection_labeled",
-                        color_calibration_generation=calibration_generation,
-                        frozen_prefix_frame=frozen_prefix_frame,
-                    )
-                    permutation = permutations[diagnostics["selected_symmetry_index"]][1]
-                    observations = {target: observations[source] for target, source in permutation.items()
-                                    if source in observations}
-                    weights = {target: weights[source] for target, source in permutation.items()
-                               if source in weights}
-                    record.pose_candidate = candidate
-                    record.pose_candidates = tuple(
-                        candidate if hypothesis is original else hypothesis
-                        for hypothesis in getattr(record, "pose_candidates", ())
-                    ) or (candidate,)
-                    observations_by_frame[record.frame_index] = observations
-                    weights_by_frame[record.frame_index] = weights
-        tracker.observe(candidate.rvec, record.frame_index)
-        for label, rgb in observations.items():
-            evidence = _apply_observation_weight(
-                _rgb_observation_color_evidence(rgb, global_profiles), weights.get(label, 1.0),
-            )
-            priors[label] = evidence / max(float(evidence.sum()), 1e-300)
-
-
 def recover_cached_pose_symmetries(
     cache: list[NeuralFrameData],
     trace: StickerColorTrace,
     *,
-    debug: bool = False,
     progress: bool = False,
     refine_pose: bool = False,
     recover_orientation: bool = True,
@@ -3403,159 +2696,39 @@ def recover_cached_pose_symmetries(
     turning_start_frame: int | None = None,
     record_all_turn_candidates: bool = False,
     turn_candidate_log: Path | None = None,
-    global_profiles: dict[str, GlobalColorProfile] | None = None,
-    sticker_mask_erosion: int = 0,
     known_initial_colors: dict[str, str] | None = None,
     pose_prepared: bool = False,
-    require_orientation: bool = False,
-    color_samples_per_sticker: int = 128,
-    color_min_samples_per_sticker: int = 4,
-    calibrate_initial_colors: bool = False,
-    calibration_observations: dict[str, list[tuple[str, int, np.ndarray]]] | None = None,
-    use_calibrated_solve_continuity: bool = False,
 ) -> StickerColorTrace:
-    """Recover cached pose candidates and optionally fit layer turns.
+    """Refine geometry, match categorical colors, and replay the existing move rollout.
 
-    The neural pass and its initial pose/color samples are already complete
-    when this runs. With ``refine_pose``, static geometry is refined first;
-    supplied global profiles let continuity combine angular change with the
-    last accepted color measurements. Without profiles it uses angular change
-    alone. This does not assign known scramble identities. When
-    ``recover_orientation`` is true, it applies
-    the separate color-based symmetry recovery to an already-fitted trace.
-    When move recognition is enabled, each frame first caches geometric
-    partial-turn options. Color offsets then drive an FPS-scaled state search
-    with adaptive branch-and-bound; static pose refinement remains keypoint-first.
+    Orientation is selected independently from observed color classes. No RGB
+    sampling, learned color profiles, or temporal orientation gate is involved.
     """
-
     if turning_start_frame is not None and turning_start_frame < 0:
-        raise ValueError('Turning start frame must be nonnegative or None')
+        raise ValueError("Turning start frame must be nonnegative or None")
     lookahead_frames = turn_lookahead_frame_count(source_fps)
     state_update_gap_frames = turn_state_update_gap_frames(source_fps)
-    if (recover_orientation or recognize_moves) and global_profiles is None:
-        global_profiles, _global_observations = build_global_color_profiles(trace)
-    identities = trace.identities
-    continuity_uses_color = bool(refine_pose and global_profiles)
-    continuity_permutations = (
-        _symmetry_observation_permutations(identities) if continuity_uses_color else ()
-    )
-    # These are temporal appearance measurements in the continuity frame,
-    # separate from known scramble colors and the later orientation lock.
-    continuity_color_priors: dict[str, np.ndarray] = {}
-    if recover_orientation:
-        permutations = _symmetry_observation_permutations(identities)
-        identity_permutation = next(
-            permutation
-            for symmetry, permutation in permutations
-            if np.array_equal(symmetry, np.eye(3, dtype=np.float64))
-        )
-        identity_symmetry_index = next(
-            index
-            for index, (symmetry, _permutation) in enumerate(permutations)
-            if np.array_equal(symmetry, np.eye(3, dtype=np.float64))
-        )
-        priors = {
-            identity.label: np.full(
-                len(GLOBAL_COLOR_NAMES),
-                1.0 / len(GLOBAL_COLOR_NAMES),
-                dtype=np.float64,
-            )
-            for identity in identities
-        }
-    else:
-        permutations = ()
-        identity_permutation = None
-        identity_symmetry_index = -1
-        priors = {}
     turn_color_priors = {
-        identity.label: (
-            np.eye(len(GLOBAL_COLOR_NAMES), dtype=np.float64)[
-                GLOBAL_COLOR_NAMES.index(known_initial_colors[identity.label])
-            ]
-            if known_initial_colors is not None
-            and known_initial_colors.get(identity.label) in GLOBAL_COLOR_NAMES
-            else np.full(
-                len(GLOBAL_COLOR_NAMES),
-                1.0 / len(GLOBAL_COLOR_NAMES),
-                dtype=np.float64,
-            )
-        )
-        for identity in identities
+        label: np.eye(len(GLOBAL_COLOR_NAMES))[GLOBAL_COLOR_NAMES.index(color)]
+        for label, color in (known_initial_colors or {}).items() if color in GLOBAL_COLOR_NAMES
     }
-    raw_by_frame = _trace_observations_by_frame(trace)
-    raw_weights_by_frame = _trace_observation_weights_by_frame(trace)
     corrected_trace = StickerColorTrace.create()
-    initial_calibration_trace = StickerColorTrace.create()
-    calibration_done = False
-    calibration_generation = 0
-    accepted_initial_pose = False
-
-    def calibrate_initial_profiles(first_move_frame: int | None = None) -> None:
-        nonlocal calibration_done, calibration_generation
-        if not calibrate_initial_colors or calibration_done:
-            return
-        boundary = (f"inspection through frame {turning_start_frame}"
-                    if turning_start_frame is not None else
-                    f"first committed move at frame {first_move_frame}"
-                    if first_move_frame is not None else "end of input without a committed move")
-        if not accepted_initial_pose:
-            print(f"Color calibration stopped: {boundary}; no stationary samples available.", flush=True)
-            calibration_done = True
-            return
-        refined, grouped = refine_global_color_profiles_from_initial_state(
-            initial_calibration_trace, known_initial_colors or {}, global_profiles,
-            turning_start_frame + 1 if turning_start_frame is not None else first_move_frame,
-        )
-        if any(refined[color] is not global_profiles.get(color) for color in refined):
-            calibration_generation += 1
-        global_profiles.update(refined)
-        # With an inferred boundary, the first move has already committed;
-        # retain that frame and reconsider only the remaining static poses.
-        sample_boundary = turning_start_frame if turning_start_frame is not None else first_move_frame
-        if use_calibrated_solve_continuity and sample_boundary is not None:
-            print("Rescoring solve orientation with inspection-labeled color profiles...", flush=True)
-            recover_calibrated_solve_continuity(
-                cache, raw_by_frame, raw_weights_by_frame, global_profiles, sample_boundary,
-                source_fps=source_fps, sticker_mask_erosion=sticker_mask_erosion,
-                color_samples_per_sticker=color_samples_per_sticker,
-                color_min_samples_per_sticker=color_min_samples_per_sticker,
-                calibration_generation=calibration_generation,
-            )
-            # Every future projection depends on the newly selected poses.
-            lookahead_geometry_cache.clear()
-            lookahead_forecast.clear()
-        # Future frames may already have been scored with the old profiles.
-        lookahead_color_trial_cache.clear()
-        lookahead_frame_lower_bound_cache.clear()
-        if calibration_observations is not None and any(grouped.values()):
-            calibration_observations.clear()
-            calibration_observations.update(grouped)
-        sample_count = sum(len(entries) for entries in grouped.values())
-        print(f"Color calibration stopped: {boundary}; {sample_count} labeled samples collected.", flush=True)
-        calibration_done = True
-    previous_continuity_candidate: StickerPnPCandidate | None = None
-    continuity_symmetry_tracker = CubeSymmetryTracker()
     cube_geometry_state = CubeGeometryState.identity()
-    solved_frame_index: int | None = None
-    last_committed_move: str | None = None
-    last_committed_state_update_frame: int | None = None
-    last_committed_state_update_key: tuple | None = None
+    solved_frame_index = None
+    last_committed_move = None
+    last_committed_state_update_frame = None
+    last_committed_state_update_key = None
     last_committed_state_update_streak = 0
-    committed_state_history: list[tuple[int, tuple]] = []
-    locked_orientation_symmetry: np.ndarray | None = None
-    locked_orientation_permutation: dict[str, str] | None = None
-    lookahead_frame_lower_bound_cache: dict[int, float] = {}
-    lookahead_geometry_cache: dict[
-        int,
-        tuple[StickerPnPCandidate, dict[str, object]] | None,
-    ] = {}
-    lookahead_color_trial_cache: dict[
-        tuple[int, tuple],
-        tuple[StickerPnPCandidate, tuple[dict[str, object], ...]] | None,
-    ] = {}
+    committed_state_history = []
+    lookahead_frame_lower_bound_cache = {}
+    lookahead_geometry_cache = {}
+    lookahead_color_trial_cache = {}
     lookahead_scoring_device = _turn_torch_scoring_device("mps")
-    lookahead_forecast: dict[int, tuple[str, ...]] = {}
-    lookahead_forecast_expected_state: tuple | None = None
+    lookahead_forecast = {}
+    lookahead_forecast_expected_state = None
+    total_records = len(cache)
+    previous_candidate = None
+    move_search_started = False
 
     def prepare_lookahead_geometry(
         cache_index: int,
@@ -3563,14 +2736,24 @@ def recover_cached_pose_symmetries(
     ) -> tuple[StickerPnPCandidate, dict[str, object]] | None:
         """Prepare one frame's geometry once, independent of cube state."""
 
+        if cache_index < 0 or cache_index >= total_records:
+            return None
+        if _frame_forces_static_hold(cache[cache_index].frame_index, turning_start_frame):
+            return None
         if cache_index in lookahead_geometry_cache:
             cached = lookahead_geometry_cache[cache_index]
             if candidate_override is None:
                 return cached
-            if cached is not None:
+            if (cached is not None
+                    and np.allclose(cached[0].rvec, candidate_override.rvec, rtol=0, atol=1e-9)
+                    and np.allclose(cached[0].tvec, candidate_override.tvec, rtol=0, atol=1e-9)):
                 return candidate_override, cached[1]
-        if cache_index < 0 or cache_index >= total_records:
-            return None
+            # Color matching can change this frame's cube axes after it was
+            # visited by a prior lookahead. Its geometry must follow that pose.
+            lookahead_frame_lower_bound_cache.pop(cache_index, None)
+            for key in tuple(lookahead_color_trial_cache):
+                if key[0] == cache_index:
+                    del lookahead_color_trial_cache[key]
         record = cache[cache_index]
         frame_candidate = candidate_override
         if frame_candidate is None:
@@ -3578,32 +2761,6 @@ def recover_cached_pose_symmetries(
             if not isinstance(frame_candidate, StickerPnPCandidate):
                 lookahead_geometry_cache[cache_index] = None
                 return None
-            if recover_orientation:
-                if locked_orientation_symmetry is None:
-                    return None
-                frame_candidate = transform_candidate_by_symmetry(
-                    frame_candidate,
-                    locked_orientation_symmetry,
-                )
-        if not isinstance(frame_candidate, StickerPnPCandidate):
-            return None
-        if (
-            not getattr(frame_candidate, "sticker_mask_colors", ())
-            and getattr(record, "sticker_masks", None) is not None
-            and getattr(record, "roi_xyxy", None) is not None
-        ):
-            mask_color_entries = sticker_mask_rgb_observations(
-                record.frame,
-                record.roi_xyxy,
-                record.sticker_masks,
-                sticker_mask_erosion,
-            )
-            frame_candidate = replace(
-                frame_candidate,
-                sticker_mask_colors=tuple(
-                    rgb for _mask_index, rgb in mask_color_entries
-                ),
-            )
         if lookahead_scoring_device is None:
             return None
         frame_candidate = replace(
@@ -3649,16 +2806,13 @@ def recover_cached_pose_symmetries(
             sticker_layer_rotations=None,
             turn_state_moves=None,
         )
-        color_likelihoods = turn_color_predictive_likelihoods(
-            state_candidate,
-            turn_color_priors,
-            global_profiles,
-            None,
+        color_matches = turn_color_match_matrix(
+            state_candidate, turn_color_priors,
         )
-        if color_likelihoods is None:
-            color_likelihoods = getattr(
+        if color_matches is None:
+            color_matches = getattr(
                 state_candidate,
-                "turn_color_likelihoods",
+                "turn_color_matches",
                 None,
             )
         assignment_error_limit = (
@@ -3670,7 +2824,7 @@ def recover_cached_pose_symmetries(
             tuple(geometry_frame["options"]),
             assignment_error_limit,
             lookahead_scoring_device,
-            color_likelihoods,
+            color_matches,
             projection_cache=geometry_frame.setdefault("color_projection_cache", {}),
         )
         if not trials:
@@ -3699,15 +2853,15 @@ def recover_cached_pose_symmetries(
             if (cache_index, state.signature()) not in lookahead_color_trial_cache
         )
         if missing:
-            color_likelihoods = turn_color_predictive_likelihoods(
-                frame_candidate, turn_color_priors, global_profiles, None,
+            color_matches = turn_color_match_matrix(
+                frame_candidate, turn_color_priors,
             )
-            if color_likelihoods is None:
-                color_likelihoods = getattr(frame_candidate, "turn_color_likelihoods", None)
+            if color_matches is None:
+                color_matches = getattr(frame_candidate, "turn_color_matches", None)
             trials_by_state = _score_turn_color_offsets_with_orientation_rescue(
                 frame_candidate, tuple(geometry_frame["options"]),
                 PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * projected_cube_diameter(frame_candidate),
-                lookahead_scoring_device, color_likelihoods, missing,
+                lookahead_scoring_device, color_matches, missing,
                 projection_cache=geometry_frame.setdefault("color_projection_cache", {}),
             )
             for index, state in enumerate(missing):
@@ -3727,11 +2881,11 @@ def recover_cached_pose_symmetries(
             if prepared is None or lookahead_scoring_device is None:
                 return -float('inf')
             frame_candidate, geometry_frame = prepared
-            likelihoods = turn_color_predictive_likelihoods(
-                frame_candidate, turn_color_priors, global_profiles, None,
+            likelihoods = turn_color_match_matrix(
+                frame_candidate, turn_color_priors,
             )
             if likelihoods is None:
-                likelihoods = getattr(frame_candidate, 'turn_color_likelihoods', None)
+                likelihoods = getattr(frame_candidate, 'turn_color_matches', None)
             lookahead_frame_lower_bound_cache[cache_index] = _turn_color_frame_score_lower_bound(
                 frame_candidate, tuple(geometry_frame['options']),
                 PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * projected_cube_diameter(frame_candidate),
@@ -3756,8 +2910,6 @@ def recover_cached_pose_symmetries(
             dict(version=15, algorithm="adaptive_branch_and_bound", status="not_started",
                  orientation_rescue_color_threshold=PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR,
                  turning_start_frame=turning_start_frame,
-                 color_calibration_generation=calibration_generation,
-                 inspection_calibration_complete=calibration_done,
                  previous_move=last_committed_move, beam_width=None,
                  state_batch_size=PNP_TURN_LOOKAHEAD_STATE_BATCH_SIZE,
                  state_change_limit=PNP_TURN_LOOKAHEAD_STATE_CHANGE_LIMIT,
@@ -3878,8 +3030,7 @@ def recover_cached_pose_symmetries(
                                       color_configurations=sum(item.get('configuration_count', 0) for item in projection_caches),
                                       assignment_builds=sum(item.get('assignments', {}).get('builds', 0) for item in projection_caches),
                                       assignment_hits=sum(item.get('assignments', {}).get('hits', 0) for item in projection_caches),
-                                      likelihood_builds=sum(item.get('likelihoods', {}).get('builds', 0) for item in projection_caches),
-                                      likelihood_hits=sum(item.get('likelihoods', {}).get('hits', 0) for item in projection_caches)),
+                                      ),
                 frames=list(frames),
                 weights=dict(schedule='front_back_uniform', front=0.30, back=0.70,
                              normalized=list(move_lookahead_weights(len(frames)))),
@@ -3966,48 +3117,18 @@ def recover_cached_pose_symmetries(
             turn_fit_lookahead_rejected=False,
         )
 
-    # Choose the initial offset before replaying any turns. This also applies
-    # the same offset to earlier frames with too few visible color samples.
-    if pose_prepared and recover_orientation and known_initial_colors is not None:
-        for record in cache:
-            observations = raw_by_frame.get(record.frame_index, {})
-            weights = raw_weights_by_frame.get(record.frame_index, {})
-            if not isinstance(record.pose_candidate, StickerPnPCandidate) or len(observations) < POSE_SYMMETRY_RECOVERY_MIN_OBSERVATIONS:
-                continue
-            scores = []
-            for index, (symmetry, permutation) in enumerate(permutations):
-                score, count, _, _, _ = _score_symmetry_observations(
-                    observations, permutation, priors, global_profiles, weights,
-                    expected_color_by_label=known_initial_colors,
-                )
-                if count == len(observations):
-                    scores.append((score, index == identity_symmetry_index, index))
-            if scores:
-                best_score = max(item[0] for item in scores)
-                tied = [item for item in scores if best_score - item[0] <= 1e-9]
-                _, _, index = max(tied, key=lambda item: item[1])
-                locked_orientation_symmetry = np.asarray(permutations[index][0], dtype=np.float64).copy()
-                locked_orientation_permutation = dict(permutations[index][1])
-                break
-        if require_orientation and locked_orientation_symmetry is None and any(
-            isinstance(record.pose_candidate, StickerPnPCandidate) for record in cache
-        ):
-            raise RuntimeError("Cannot recognize moves: too few color observations to determine the initial cube orientation")
-
-    progress_label = (
-        "pose refinement and continuity" if refine_pose
-        else "orientation matching" if recover_orientation
-        else "move search" if recognize_moves
-        else "pose recovery"
-    )
-    total_records = len(cache)
+    label = "pose refinement" if refine_pose else "move search" if recognize_moves else "orientation matching"
     for record_index, record in enumerate(cache, start=1):
-        committed_state_history[:] = [
-            entry for entry in committed_state_history
-            if record_index - 1 - entry[0] <= lookahead_frames
-        ]
-        # Adaptive search visits many states. Retain only frames that a future
-        # decision can reuse, rather than growing these caches with clip length.
+        if progress:
+            frame_label = label
+            if recognize_moves:
+                if _frame_forces_static_hold(record.frame_index, turning_start_frame):
+                    frame_label = "static holds"
+                elif solved_frame_index is not None:
+                    frame_label = "solved replay"
+            print_headless_progress(frame_label, record_index, total_records)
+        committed_state_history[:] = [entry for entry in committed_state_history
+                                      if record_index - 1 - entry[0] <= lookahead_frames]
         for past_index in tuple(lookahead_geometry_cache):
             if past_index < record_index - 1:
                 del lookahead_geometry_cache[past_index]
@@ -4015,638 +3136,120 @@ def recover_cached_pose_symmetries(
         for key in tuple(lookahead_color_trial_cache):
             if key[0] < record_index - 1:
                 del lookahead_color_trial_cache[key]
-        if turning_start_frame is not None and record.frame_index > turning_start_frame:
-            # Close inspection before any allowed move search, including when
-            # the boundary or first moving frame has no usable pose.
-            calibrate_initial_profiles()
-        if progress:
-            print_headless_progress(
-                progress_label,
-                record_index,
-                total_records,
-            )
-        raw_observations = raw_by_frame.get(record.frame_index, {})
-        raw_observation_weights = raw_weights_by_frame.get(record.frame_index, {})
         candidate = record.pose_candidate
         if not isinstance(candidate, StickerPnPCandidate):
-            corrected_trace.observe(record.frame_index, {})
+            corrected_trace.observe_colors(record.frame_index, {})
             if turn_candidate_log is not None and recognize_moves:
                 append_turn_candidate_log(turn_candidate_log, None, record.frame_index)
             continue
-        candidate_hypotheses = tuple(getattr(record, "pose_candidates", ()))
-        if not candidate_hypotheses:
-            candidate_hypotheses = (candidate,)
-        selected_candidate_index = next(
-            (
-                index
-                for index, hypothesis in enumerate(candidate_hypotheses)
-                if hypothesis is candidate
-            ),
-            0,
-        )
+        hypotheses = tuple(getattr(record, "pose_candidates", ())) or (candidate,)
         if refine_pose:
-            local_masks = (
-                getattr(record, "sticker_masks")[0]
-                if getattr(record, "sticker_masks", None) is not None
-                else None
+            hypotheses = tuple(solve_pnp_from_low_error_assignments(
+                hypothesis, recover_layer_turns=False,
+                record_all_turn_candidates=record_all_turn_candidates,
+            ) for hypothesis in hypotheses)
+        if refine_pose or not pose_prepared:
+            candidate = select_pose_hypothesis(
+                hypotheses, None, (previous_candidate,) if previous_candidate is not None else (),
             )
-            mask_geometry = sticker_mask_pose_geometry(
-                local_masks,
-                getattr(record, "roi_xyxy", None),
-                sticker_mask_erosion,
+            if candidate is None:
+                record.pose_diagnostic_candidate = min(hypotheses, key=pose_hypothesis_visual_score)
+                record.pose_candidate = None
+                record.pose_candidates = ()
+                corrected_trace.observe_colors(record.frame_index, {})
+                continue
+        motion_rejected = False
+        next_candidate = cache[record_index].pose_candidate if record_index < total_records else None
+        if (not pose_prepared and POSE_TWO_SIDED_MOTION_REJECTION_ENABLED
+                and previous_candidate is not None and isinstance(next_candidate, StickerPnPCandidate)):
+            current = np.asarray(candidate.tvec).reshape(3)
+            motion_rejected = (
+                np.linalg.norm(current - np.asarray(previous_candidate.tvec).reshape(3))
+                > POSE_MOTION_DISPLACEMENT_TOLERANCE_MM
+                and np.linalg.norm(np.asarray(next_candidate.tvec).reshape(3) - current)
+                > POSE_MOTION_DISPLACEMENT_TOLERANCE_MM
             )
-            candidate_hypotheses = tuple(
-                restore_sticker_mask_pose_geometry(
-                    hypothesis,
-                    local_masks,
-                    getattr(record, "roi_xyxy", None),
-                    sticker_mask_erosion,
-                    geometry=mask_geometry,
-                )
-                for hypothesis in candidate_hypotheses
-            )
-            candidate = candidate_hypotheses[selected_candidate_index]
-
-        def refine_hypotheses(
-            hypotheses: tuple[StickerPnPCandidate, ...],
-        ) -> tuple[StickerPnPCandidate, ...]:
-            refined_hypotheses: list[StickerPnPCandidate] = []
-            for hypothesis in hypotheses:
-                refined_hypotheses.append(
-                    solve_pnp_from_low_error_assignments(
-                        hypothesis,
-                        # Keep pose recovery purely static.  A layer-turn
-                        # search is applied only after the final static
-                        # candidate has been selected below.
-                        recover_layer_turns=False,
-                        record_all_turn_candidates=record_all_turn_candidates,
-                    )
-                )
-            return tuple(refined_hypotheses)
-
-        if recover_orientation:
-            (
-                current_log_likelihood,
-                observation_count,
-                low_probability_count,
-                current_observations,
-                current_observation_weights,
-            ) = (
-                _score_symmetry_observations(
-                    raw_observations,
-                    identity_permutation,
-                    priors,
-                    global_profiles,
-                    raw_observation_weights,
-                    expected_color_by_label=(
-                        known_initial_colors
-                        if known_initial_colors is not None
-                        else None
-                    ),
-                )
-            )
-        else:
-            current_log_likelihood = float("-inf")
-            observation_count = len(raw_observations)
-            low_probability_count = 0
-            current_observations = {
-                label: np.asarray(rgb, dtype=np.uint8).copy()
-                for label, rgb in raw_observations.items()
-            }
-            current_observation_weights = {
-                label: float(np.clip(weight, 0.0, 1.0))
-                for label, weight in raw_observation_weights.items()
-            }
-        if debug and observation_count:
-            print(
-                "pose symmetry frame "
-                f"{record.frame_index}: obs={observation_count} "
-                f"current_logp={current_log_likelihood:.4f} "
-                f"low_probability_count={low_probability_count}",
-                flush=True,
-            )
-
-        selected_candidate = candidate
-        selected_hypotheses = candidate_hypotheses
-        selected_observations = current_observations
-        selected_observation_weights = current_observation_weights
-        selected_log_likelihood = current_log_likelihood
-        continuity_observations: dict[str, np.ndarray] = {}
-        continuity_observation_weights: dict[str, float] = {}
-        if refine_pose:
-            selected_hypotheses = refine_hypotheses(selected_hypotheses)
-            selected_candidate = selected_hypotheses[selected_candidate_index]
-
-        if pose_prepared:
-            motion_rejected = False
-            continuity_reference_candidate = selected_candidate
-        else:
-            # Preserve the existing symmetry and refinement order. Continuity is
-            # applied only after the best pose has been selected and refined.
-            continuity_candidate = select_pose_hypothesis(
-                selected_hypotheses, None,
-                (previous_continuity_candidate,) if previous_continuity_candidate is not None else (),
-            )
-            if continuity_candidate is not None:
-                selected_candidate = continuity_candidate
-                selected_candidate_index = next(
-                    index for index, hypothesis in enumerate(selected_hypotheses)
-                    if hypothesis is continuity_candidate
-                )
-            next_candidate = cache[record_index].pose_candidate if record_index < total_records else None
-            motion_rejected = False
-            if (POSE_TWO_SIDED_MOTION_REJECTION_ENABLED
-                    and previous_continuity_candidate is not None
-                    and isinstance(next_candidate, StickerPnPCandidate)):
-                current = np.asarray(selected_candidate.tvec, dtype=np.float64).reshape(3)
-                previous = np.asarray(previous_continuity_candidate.tvec, dtype=np.float64).reshape(3)
-                following = np.asarray(next_candidate.tvec, dtype=np.float64).reshape(3)
-                motion_rejected = (
-                    np.linalg.norm(current - previous) > POSE_MOTION_DISPLACEMENT_TOLERANCE_MM
-                    and np.linalg.norm(following - current) > POSE_MOTION_DISPLACEMENT_TOLERANCE_MM
-                )
-
-            # Keep the pose in one continuous cube coordinate frame before color
-            # recovery changes that frame.  The cached path must use the same
-            # symmetry canonicalization as the live path: the PnP roots can be
-            # physically equivalent while assigning the cube axes differently.
-            # Color recovery is then applied to this already-continuous pose and
-            # its fixed mapping is reused on later frames.
-            color_scores = None
-            if (continuity_uses_color and getattr(record, "sticker_masks", None) is not None
-                    and getattr(record, "roi_xyxy", None) is not None):
-                continuity_observations = sample_projected_sticker_colors(
-                    record.frame, record.roi_xyxy, record.sticker_masks, selected_candidate,
-                    max_samples_per_sticker=color_samples_per_sticker,
-                    min_samples_per_sticker=color_min_samples_per_sticker,
-                    sticker_mask_erosion=sticker_mask_erosion,
-                )
-                rotation = cv2.Rodrigues(selected_candidate.rvec)[0]
-                continuity_observation_weights = {
-                    identity.label: sticker_view_reliability_weight(
-                        selected_candidate, identity, rotation,
-                    ) for identity in identities if identity.label in continuity_observations
-                }
-                color_scores = pose_continuity_color_scores(
-                    continuity_observations, continuity_observation_weights,
-                    continuity_color_priors, global_profiles, continuity_permutations,
-                )
-            if not continuity_uses_color:
-                selected_candidate = canonicalize_pose_symmetry(
-                    selected_candidate, continuity_symmetry_tracker,
-                )
-            else:
-                selected_candidate = canonicalize_pose_symmetry(
-                    selected_candidate, continuity_symmetry_tracker,
-                    color_scores=color_scores, frame_index=record.frame_index,
-                    source_fps=source_fps,
-                )
-            if color_scores is not None:
-                symmetry_index = selected_candidate.pose_continuity_diagnostics["selected_symmetry_index"]
-                permutation = continuity_permutations[symmetry_index][1]
-                continuity_observations = {
-                    target: continuity_observations[source]
-                    for target, source in permutation.items() if source in continuity_observations
-                }
-                continuity_observation_weights = {
-                    target: continuity_observation_weights[source]
-                    for target, source in permutation.items() if source in continuity_observation_weights
-                }
-            selected_hypotheses = tuple(
-                selected_candidate if index == selected_candidate_index else hypothesis
-                for index, hypothesis in enumerate(selected_hypotheses)
-            )
-            # This is the continuity state for the next frame. Keep it before
-            # color orientation recovery and move fitting so neither display
-            # operation can change root matching on the next frame.
-            continuity_reference_candidate = selected_candidate
-
-        if refine_pose and not motion_rejected and getattr(record, "sticker_masks", None) is not None and getattr(record, "roi_xyxy", None) is not None:
-            selected_observations = sample_projected_sticker_colors(
-                record.frame, record.roi_xyxy, record.sticker_masks, selected_candidate,
-                max_samples_per_sticker=color_samples_per_sticker,
-                min_samples_per_sticker=color_min_samples_per_sticker,
-                sticker_mask_erosion=sticker_mask_erosion,
-            )
-            rotation, _ = cv2.Rodrigues(np.asarray(selected_candidate.rvec, dtype=np.float64).reshape(3, 1))
-            selected_observation_weights = {
-                identity.label: sticker_view_reliability_weight(selected_candidate, identity, rotation)
-                for identity in identities if identity.label in selected_observations
-            }
-
-        # Orientation recovery is deliberately the final pose operation. The
-        # candidate root, temporal continuity choice, motion rejection, and
-        # displacement checks must finish before cube symmetries are
-        # applied to the accepted pose. Color matching establishes this
-        # whole-cube frame once; later frames reuse the same center-to-axis
-        # mapping and never re-rank the 24 symmetries.
-        scored = []
-        if (
-            recover_orientation
-            and locked_orientation_symmetry is None
-            and observation_count >= POSE_SYMMETRY_RECOVERY_MIN_OBSERVATIONS
-        ):
-            for symmetry_index, (symmetry, permutation) in enumerate(permutations):
-                (
-                    log_likelihood,
-                    count,
-                    _low_count,
-                    remapped_observations,
-                    remapped_observation_weights,
-                ) = _score_symmetry_observations(
-                    raw_observations,
-                    permutation,
-                    priors,
-                    global_profiles,
-                    raw_observation_weights,
-                    expected_color_by_label=(
-                        known_initial_colors
-                        if known_initial_colors is not None
-                        else None
-                    ),
-                )
-                if count != observation_count:
-                    continue
-                transformed_candidate = transform_candidate_by_symmetry(
-                    selected_candidate,
-                    symmetry,
-                )
-                continuity_distance = (
-                    pose_hypothesis_distance(
-                        transformed_candidate,
-                        (
-                            previous_continuity_candidate.rvec,
-                            previous_continuity_candidate.tvec,
-                        ),
-                    )
-                    if previous_continuity_candidate is not None
-                    else 0.0
-                )
-                scored.append(
-                    (
-                        symmetry_index,
-                        log_likelihood,
-                        -continuity_distance,
-                        transformed_candidate,
-                        remapped_observations,
-                        remapped_observation_weights,
-                    )
-                )
-            if scored:
-                # Candidate/root continuity has already been resolved above.
-                # Color matching chooses the initial whole-cube frame exactly
-                # once; it is never re-ranked on later frames.
-                best_log_likelihood = max(item[1] for item in scored)
-                color_ties = [
-                    item
-                    for item in scored
-                    if best_log_likelihood - item[1] <= 1e-9
-                ]
-                (
-                    best_symmetry_index,
-                    best_symmetry_log_likelihood,
-                    _best_continuity_score,
-                    best_candidate,
-                    best_observations,
-                    best_observation_weights,
-                ) = max(
-                    color_ties,
-                    key=lambda item: int(item[0] == identity_symmetry_index),
-                )
-                locked_orientation_symmetry = np.asarray(
-                    permutations[best_symmetry_index][0],
-                    dtype=np.float64,
-                ).copy()
-                locked_orientation_permutation = dict(
-                    permutations[best_symmetry_index][1]
-                )
-                if debug:
-                    print(
-                        "  tested orientations:"
-                        f" current_logp={selected_log_likelihood:.4f}",
-                        flush=True,
-                    )
-                    for (
-                        symmetry_index,
-                        log_likelihood,
-                        continuity_score,
-                        _tested_candidate,
-                        _tested_observations,
-                        _tested_observation_weights,
-                    ) in sorted(
-                        scored,
-                        key=lambda item: (-item[2], -item[1]),
-                    ):
-                        print(
-                            f"    symmetry={symmetry_index:02d} "
-                            f"logp={log_likelihood:.4f} "
-                            f"p={np.exp(log_likelihood):.4f} "
-                            f"continuity={-continuity_score:.4f}"
-                            f"{' *best' if symmetry_index == best_symmetry_index else ''}",
-                            flush=True,
-                        )
-                selected_candidate = best_candidate
-                selected_observations = best_observations
-                selected_observation_weights = best_observation_weights
-                selected_log_likelihood = best_symmetry_log_likelihood
-                selected_hypotheses = tuple(
-                    selected_candidate if index == selected_candidate_index else hypothesis
-                    for index, hypothesis in enumerate(selected_hypotheses)
-                )
-        elif recover_orientation and locked_orientation_symmetry is not None:
-            # Keep the fixed orientation even when this frame has too few
-            # observations to participate in color matching. The permutation
-            # is reused directly, so no color likelihood is evaluated again.
-            selected_candidate = transform_candidate_by_symmetry(
-                selected_candidate,
-                locked_orientation_symmetry,
-            )
-            selected_observations = {
-                target_label: np.asarray(raw_observations[source_label], dtype=np.uint8).copy()
-                for target_label, source_label in (
-                    locked_orientation_permutation or {}
-                ).items()
-                if source_label in raw_observations
-            }
-            selected_observation_weights = {
-                target_label: float(
-                    np.clip(raw_observation_weights.get(source_label, 1.0), 0.0, 1.0)
-                )
-                for target_label, source_label in (
-                    locked_orientation_permutation or {}
-                ).items()
-                if source_label in raw_observations
-            }
-            selected_hypotheses = tuple(
-                selected_candidate if index == selected_candidate_index else hypothesis
-                for index, hypothesis in enumerate(selected_hypotheses)
-            )
-
+        candidate = replace(candidate, cube_geometry_state=cube_geometry_state.copy())
+        if (recover_orientation or recognize_moves) and known_initial_colors:
+            candidate = match_orientation_to_colors(candidate, known_initial_colors)
         if recognize_moves:
-            # Turn fitting is incremental: the candidate's persistent sticker
-            # identities must be projected from the last committed cube model
-            # before this frame's move is tested.
-            selected_candidate = replace(
-                selected_candidate,
-                cube_geometry_state=cube_geometry_state.copy(),
-            )
-            if (
-                not getattr(selected_candidate, "sticker_mask_colors", ())
-                and getattr(record, "sticker_masks", None) is not None
-            ):
-                mask_color_entries = sticker_mask_rgb_observations(
-                    record.frame,
-                    record.roi_xyxy,
-                    record.sticker_masks,
-                    sticker_mask_erosion,
-                )
-                selected_candidate = replace(
-                    selected_candidate,
-                    sticker_mask_colors=tuple(
-                        rgb for _mask_index, rgb in mask_color_entries
-                    ),
-                )
-            static_candidate_before_turn = selected_candidate
+            static_candidate = candidate
             if solved_frame_index is not None:
-                selected_candidate = _hold_after_solved(
-                    selected_candidate, record.frame_index, solved_frame_index,
-                )
+                candidate = _hold_after_solved(candidate, record.frame_index, solved_frame_index)
             elif _frame_forces_static_hold(record.frame_index, turning_start_frame):
-                selected_candidate = _hold_before_turning_start(
-                    selected_candidate, record.frame_index, turning_start_frame,
-                )
+                candidate = _hold_before_turning_start(candidate, record.frame_index, turning_start_frame)
             else:
-                current_geometry = prepare_lookahead_geometry(
-                    record_index - 1,
-                    static_candidate_before_turn,
-                )
-                selected_candidate = solve_pnp_from_low_error_assignments(
-                    selected_candidate,
-                    recover_layer_turns=True,
+                if not move_search_started:
+                    if progress:
+                        print()
+                    print(
+                        f"Starting move search at frame {record.frame_index} "
+                        "using direct sticker-color matches...", flush=True,
+                    )
+                    move_search_started = True
+                current_geometry = prepare_lookahead_geometry(record_index - 1, candidate)
+                candidate = solve_pnp_from_low_error_assignments(
+                    candidate, recover_layer_turns=True,
+                    turn_expected_color_by_label=known_initial_colors,
                     turn_color_priors=turn_color_priors,
-                    turn_global_profiles=global_profiles,
-                    turn_expected_color_by_label=None,
                     record_all_turn_candidates=record_all_turn_candidates,
-                    turn_geometry_frame=(
-                        current_geometry[1] if current_geometry is not None else None
-                    ),
+                    turn_geometry_frame=current_geometry[1] if current_geometry is not None else None,
                     turn_previous_move=last_committed_move,
-                    turn_previous_states=tuple(signature for _index, signature in committed_state_history),
+                    turn_previous_states=tuple(signature for _, signature in committed_state_history),
                 )
-                current_state = cube_geometry_state.apply_moves(completed_candidate_moves(selected_candidate))
-                if (not motion_rejected and pose_reprojection_error_is_acceptable(selected_candidate)
-                        and not selected_candidate.turn_color_unreliable
-                        and candidate_layers_are_aligned(selected_candidate)
+                current_state = cube_geometry_state.apply_moves(completed_candidate_moves(candidate))
+                if (pose_reprojection_error_is_acceptable(candidate)
+                        and not candidate.turn_color_unreliable and candidate_layers_are_aligned(candidate)
                         and current_state.is_solved(known_initial_colors)):
-                    # A solved current-frame fit needs no future rollout. The
-                    # accepted-state block below commits its final move first.
-                    selected_candidate = _annotate_solved_search(selected_candidate, record.frame_index)
+                    candidate = _annotate_solved_search(candidate, record.frame_index)
                 else:
-                    selected_candidate = apply_move_lookahead(
-                        selected_candidate,
-                        static_candidate_before_turn,
-                        cube_geometry_state,
-                        record_index,
-                    )
-                if (not np.allclose(selected_candidate.rvec, static_candidate_before_turn.rvec,
-                                    rtol=0., atol=1e-8)
-                        and getattr(record, 'sticker_masks', None) is not None
-                        and getattr(record, 'roi_xyxy', None) is not None):
-                    # A rescued pose changes which identities supplied the
-                    # sampled colors. Do not teach calibration/the color trace
-                    # using associations from the discarded orientation.
-                    selected_observations = sample_projected_sticker_colors(
-                        record.frame, record.roi_xyxy, record.sticker_masks, selected_candidate,
-                        max_samples_per_sticker=color_samples_per_sticker,
-                        min_samples_per_sticker=color_min_samples_per_sticker,
-                        sticker_mask_erosion=sticker_mask_erosion,
-                    )
-                    selected_rotation = cv2.Rodrigues(selected_candidate.rvec)[0]
-                    selected_observation_weights = {
-                        identity.label: sticker_view_reliability_weight(
-                            selected_candidate, identity, selected_rotation,
-                        ) for identity in identities if identity.label in selected_observations
-                    }
-        selected_candidate = replace(
-            selected_candidate,
-            orientation_anchor=orientation_anchor_for_candidate(selected_candidate),
-        )
+                    candidate = apply_move_lookahead(candidate, static_candidate, cube_geometry_state, record_index)
+        candidate = replace(candidate, orientation_anchor=orientation_anchor_for_candidate(candidate),
+                            pose_continuity_diagnostics=None)
         record.pose_diagnostic_candidate = None
-        if motion_rejected or not pose_reprojection_error_is_acceptable(selected_candidate):
-            # Keep the color trace available for the independent classifier,
-            # but do not let an over-threshold geometric fit become the pose
-            # shown in the final pass.
+        if motion_rejected or not pose_reprojection_error_is_acceptable(candidate):
             record.pose_candidate = None
             record.pose_candidates = ()
-            record.pose_diagnostic_candidate = selected_candidate
-            # Preserve the last accepted pose as the continuity reference.
-            # A rejected frame must not become the starting point for the
-            # next refinement attempt.
-            corrected_trace.observe(
-                record.frame_index,
-                selected_observations,
-                observation_weights=selected_observation_weights,
-            )
-            if recover_orientation and known_initial_colors is None:
-                _update_sticker_color_posteriors(
-                    priors,
-                    selected_observations,
-                    global_profiles,
-                    selected_observation_weights,
-                )
-            if turn_candidate_log is not None and recognize_moves:
-                append_turn_candidate_log(
-                    turn_candidate_log,
-                    selected_candidate,
-                    record.frame_index,
-                )
-            continue
-        record.pose_candidate = selected_candidate
-        record.pose_candidates = selected_hypotheses
-        previous_continuity_candidate = continuity_reference_candidate
-        continuity_symmetry_tracker.observe(
-            continuity_reference_candidate.rvec, record.frame_index,
-        )
-        # Rejected frames must not teach appearance. Replace the latest
-        # measurement instead of multiplying posteriors indefinitely: layer
-        # turns can legitimately change the color at a geometric location.
-        for label, rgb in continuity_observations.items():
-            evidence = _apply_observation_weight(
-                _rgb_observation_color_evidence(rgb, global_profiles),
-                continuity_observation_weights.get(label, 1.0),
-            )
-            continuity_color_priors[label] = evidence / max(float(evidence.sum()), 1e-300)
-        if recognize_moves:
-            committed_moves = completed_candidate_moves(selected_candidate)
-            if committed_moves:
-                for move in committed_moves:
+            record.pose_diagnostic_candidate = candidate
+        else:
+            previous_candidate = candidate
+            record.pose_candidate = candidate
+            record.pose_candidates = (candidate,)
+            if recognize_moves:
+                moves = completed_candidate_moves(candidate)
+                for move in moves:
                     committed_state_history.append((record_index - 1, cube_geometry_state.signature()))
                     cube_geometry_state = cube_geometry_state.apply_move(move)
-                last_committed_move = committed_moves[-1]
-                update_key = state_update_layer_direction(selected_candidate)
-                if (
-                    last_committed_state_update_frame is not None
-                    and record.frame_index - last_committed_state_update_frame == 1
-                    and update_key == last_committed_state_update_key
-                ):
-                    last_committed_state_update_streak += 1
-                else:
-                    last_committed_state_update_streak = 1
-                last_committed_state_update_frame = record.frame_index
-                last_committed_state_update_key = update_key
-                # Without an explicit boundary, the first committed move
-                # closes the inferred inspection interval permanently.
-                calibrate_initial_profiles(record.frame_index)
-            elif (not any(abs(float(rotation.angle_degrees)) > 1e-6
-                          for rotation in selected_candidate.layer_rotations)
-                  and not selected_candidate.turn_color_unreliable):
-                # Partial turns that return to rest do not commit a move, but
-                # their moving frames are not reliable calibration samples.
-                if (calibrate_initial_colors and not calibration_done
-                        and (turning_start_frame is None or record.frame_index <= turning_start_frame)):
-                    accepted_initial_pose = True
-                    initial_calibration_trace.observe(
-                        record.frame_index, selected_observations,
-                        observation_weights=selected_observation_weights,
-                    )
-        if (recognize_moves and solved_frame_index is None
-                and not selected_candidate.turn_color_unreliable
-                and candidate_layers_are_aligned(selected_candidate)
-                and cube_geometry_state.is_solved(known_initial_colors)):
-            solved_frame_index = record.frame_index
-            lookahead_forecast.clear()
-            lookahead_forecast_expected_state = None
-            lookahead_color_trial_cache.clear()
-            lookahead_geometry_cache.clear()
-            lookahead_frame_lower_bound_cache.clear()
-            print(f"Cube solved at frame {solved_frame_index}; stopping move search.", flush=True)
-            selected_candidate = _annotate_solved_search(selected_candidate, solved_frame_index)
-            record.pose_candidate = selected_candidate
-        if (recognize_moves and global_profiles is not None and known_initial_colors is None
-                and not selected_candidate.turn_color_unreliable):
-            turn_observations = selected_observations
-            if (
-                getattr(record, "sticker_masks", None) is not None
-                and record.roi_xyxy is not None
-            ):
-                sampled_observations = sample_projected_sticker_colors(
-                    record.frame,
-                    record.roi_xyxy,
-                    record.sticker_masks,
-                    selected_candidate,
-                    sticker_mask_erosion=sticker_mask_erosion,
-                )
-                if sampled_observations:
-                    turn_observations = sampled_observations
-            turn_rotation, _ = cv2.Rodrigues(
-                np.asarray(selected_candidate.rvec, dtype=np.float64).reshape(3, 1)
-            )
-            turn_observation_weights = {
-                identity.label: sticker_view_reliability_weight(
-                    selected_candidate,
-                    identity,
-                    turn_rotation,
-                )
-                for identity in identities
-                if identity.label in turn_observations
-            }
-            _update_sticker_color_posteriors(
-                turn_color_priors,
-                turn_observations,
-                global_profiles,
-                turn_observation_weights,
-            )
-            # The frame/state key alone cannot identify scores after learning.
-            lookahead_color_trial_cache.clear()
-            lookahead_frame_lower_bound_cache.clear()
-        corrected_trace.observe(
-            record.frame_index,
-            selected_observations,
-            observation_weights=selected_observation_weights,
-        )
-        if recover_orientation and known_initial_colors is None:
-            _update_sticker_color_posteriors(
-                priors,
-                selected_observations,
-                global_profiles,
-                selected_observation_weights,
-            )
+                if moves:
+                    last_committed_move = moves[-1]
+                    update_key = state_update_layer_direction(candidate)
+                    if (last_committed_state_update_frame is not None
+                            and record.frame_index - last_committed_state_update_frame == 1
+                            and update_key == last_committed_state_update_key):
+                        last_committed_state_update_streak += 1
+                    else:
+                        last_committed_state_update_streak = 1
+                    last_committed_state_update_frame = record.frame_index
+                    last_committed_state_update_key = update_key
+                if (solved_frame_index is None and not candidate.turn_color_unreliable
+                        and candidate_layers_are_aligned(candidate)
+                        and cube_geometry_state.is_solved(known_initial_colors)):
+                    solved_frame_index = record.frame_index
+                    lookahead_forecast.clear()
+                    lookahead_forecast_expected_state = None
+                    lookahead_color_trial_cache.clear()
+                    lookahead_geometry_cache.clear()
+                    lookahead_frame_lower_bound_cache.clear()
+                    candidate = _annotate_solved_search(candidate, solved_frame_index)
+                    record.pose_candidate = candidate
+                    action = "stopping move search" if move_search_started else "move search is not needed"
+                    print(f"Cube solved at frame {solved_frame_index}; {action}.", flush=True)
+        corrected_trace.observe_colors(record.frame_index, projected_color_observations(candidate))
         if turn_candidate_log is not None and recognize_moves:
-            append_turn_candidate_log(
-                turn_candidate_log,
-                selected_candidate,
-                record.frame_index,
-            )
-    calibrate_initial_profiles()
+            append_turn_candidate_log(turn_candidate_log, candidate, record.frame_index)
     if progress:
         print()
-
     return corrected_trace
-
-
-def sample_profile_polyline(polyline_oklab: np.ndarray, count: int = 48) -> np.ndarray:
-    """Sample a polyline by arc length for profile-to-profile comparison."""
-
-    polyline = np.asarray(polyline_oklab, dtype=np.float64).reshape(-1, 3)
-    if len(polyline) < 2:
-        return polyline
-    lengths = np.linalg.norm(np.diff(polyline, axis=0), axis=1)
-    cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
-    total = float(cumulative[-1])
-    if total <= 1e-12:
-        return np.repeat(polyline[:1], max(1, int(count)), axis=0)
-    targets = np.linspace(0.0, total, max(2, int(count)))
-    segments = np.clip(np.searchsorted(cumulative, targets, side="right") - 1, 0, len(polyline) - 2)
-    fractions = (targets - cumulative[segments]) / np.maximum(lengths[segments], 1e-12)
-    return polyline[segments] + fractions[:, None] * (
-        polyline[segments + 1] - polyline[segments]
-    )
-
-
-def _global_profile_reference(profile: GlobalColorProfile) -> StickerColorProfile | None:
-    """Return the fitted global profile, falling back to its pure-color prior."""
-
-    return profile.fitted if profile.fitted is not None else profile.prior
 
 
 def scramble_from_classified_sticker_colors(
@@ -4682,52 +3285,6 @@ def scramble_from_classified_sticker_colors(
         return None
 
 
-def report_classified_scramble(
-    trace: StickerColorTrace | None,
-    sticker_color_names: dict[str, str],
-    *,
-    normalize_centers: bool = True,
-) -> None:
-    """Print the recognized scramble or explain why it is unavailable."""
-
-    if trace is None:
-        print(
-            "Recognized scramble unavailable: no sticker color trace was collected.",
-            flush=True,
-        )
-        return
-    classified_count = len(sticker_color_names)
-    total_count = len(trace.identities)
-    if classified_count < total_count:
-        print(
-            "Recognized scramble unavailable: "
-            f"{classified_count}/{total_count} stickers classified; all 54 are required.",
-            flush=True,
-        )
-        return
-    diagnostic: list[str] = []
-    recognized_scramble = scramble_from_classified_sticker_colors(
-        trace,
-        sticker_color_names,
-        diagnostic=diagnostic,
-        normalize_centers=normalize_centers,
-    )
-    if recognized_scramble is None:
-        message = (
-            "Recognized scramble unavailable: classified colors do not form a "
-            "valid Kociemba cube state."
-        )
-        if diagnostic:
-            message += f" Kociemba: {diagnostic[0]}"
-        print(message, flush=True)
-        return
-    print(
-        "Recognized scramble: "
-        + (recognized_scramble or "(solved)"),
-        flush=True,
-    )
-
-
 def visible_cube_lattice_points(
     rvec: np.ndarray,
     tvec: np.ndarray,
@@ -4738,13 +3295,11 @@ def visible_cube_lattice_points(
         -rotation.T @ np.asarray(tvec, dtype=np.float64).reshape(3, 1)
     ).reshape(3)
 
-    camera_normals_z = np.einsum(
-        "ij,nfj->nfi",
-        rotation,
-        CUBE_LATTICE_BOUNDARY_NORMALS,
-    )[..., 2]
+    # Facing depends on the ray to this off-axis cube, not the optical axis.
+    toward_camera = camera_origin[None, :] - np.asarray(object_points, dtype=np.float64)
+    face_dot = np.einsum("nfj,nj->nf", CUBE_LATTICE_BOUNDARY_NORMALS, toward_camera)
     front_facing = np.any(
-        CUBE_LATTICE_BOUNDARY_FACE_MASK & (camera_normals_z < 0.0),
+        CUBE_LATTICE_BOUNDARY_FACE_MASK & (face_dot > 0.0),
         axis=1,
     )
 
@@ -5565,6 +4120,49 @@ def sticker_correspondence_object_indices(
     return tuple(candidates)
 
 
+def three_point_sticker_pose_roots(
+    object_points: np.ndarray, image_points: np.ndarray,
+    camera_matrix: np.ndarray, dist_coeffs: np.ndarray,
+) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
+    """Union SQPnP and perspective-three-point solutions without duplicates.
+
+    SQPnP can return only one of the exact three-point solutions. P3P/AP3P
+    expose the other branches so the full observation set can rank them.
+    Solver failures are independent; an unstable solver cannot discard the
+    valid roots from the others. Deduplicate within one correspondence only.
+    """
+    roots: list[tuple[np.ndarray, np.ndarray]] = []
+    rotations: list[np.ndarray] = []
+    for flag in (cv2.SOLVEPNP_SQPNP, cv2.SOLVEPNP_P3P, cv2.SOLVEPNP_AP3P):
+        try:
+            if flag == cv2.SOLVEPNP_SQPNP:
+                ok, rvecs, tvecs, _ = cv2.solvePnPGeneric(
+                    object_points, image_points, camera_matrix, dist_coeffs, flags=flag,
+                )
+            else:
+                ok, rvecs, tvecs = cv2.solveP3P(
+                    object_points, image_points, camera_matrix, dist_coeffs, flags=flag,
+                )
+        except cv2.error:
+            continue
+        if not ok:
+            continue
+        for rvec, tvec in zip(rvecs, tvecs, strict=True):
+            rvec = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+            tvec = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
+            if not np.isfinite(rvec).all() or not np.isfinite(tvec).all():
+                continue
+            rotation, _ = cv2.Rodrigues(rvec)
+            # Merge numerical copies, preserving distinct physical branches.
+            if any(np.linalg.norm(rotation - previous_rotation) <= 1e-5
+                   and np.linalg.norm(tvec - previous_tvec) <= 1e-4
+                   for previous_rotation, (_, previous_tvec) in zip(rotations, roots, strict=True)):
+                continue
+            roots.append((rvec.copy(), tvec.copy()))
+            rotations.append(rotation)
+    return tuple(roots)
+
+
 def solve_sticker_pnp_candidates(
     frame_points: np.ndarray,
     point_class_ids: np.ndarray,
@@ -5586,7 +4184,7 @@ def solve_sticker_pnp_candidates(
         return tuple()
     observed_points = np.asarray(frame_points[observed_indices], dtype=np.float32)
     observed_class_ids = [int(point_class_ids[index]) for index in observed_indices]
-    index_sequences = sticker_correspondence_object_indices(
+    index_sequences = match.object_index_sequences if match.object_index_sequences is not None else sticker_correspondence_object_indices(
         match.sticker_type,
         observed_class_ids,
         observed_points,
@@ -5664,16 +4262,13 @@ def solve_sticker_pnp_candidates(
                     flags=cv2.SOLVEPNP_IPPE,
                 )
             else:
-                # Three-point hypotheses are coplanar and can have multiple
-                # valid camera poses. Preserve every SQPNP root, including in
-                # the initial pass where contour geometry is unavailable.
-                ok, rvecs, tvecs, _ = cv2.solvePnPGeneric(
-                    object_points,
-                    observed_points,
-                    camera_matrix,
-                    dist_coeffs,
-                    flags=cv2.SOLVEPNP_SQPNP,
+                roots = three_point_sticker_pose_roots(
+                    object_points, observed_points, camera_matrix, dist_coeffs,
                 )
+                if not roots:
+                    continue
+                rvecs, tvecs = zip(*roots, strict=True)
+                ok = True
         except cv2.error:
             continue
         if not ok or not rvecs or not tvecs:
@@ -6047,14 +4642,15 @@ def refresh_candidate_pose_projection(
     projected_sticker_points = candidate.projected_sticker_points
     projected_assignment_points = candidate.assignment_projected_points
     try:
-        projected_sticker_points, _ = cv2.projectPoints(
-            candidate.object_points,
-            rvec,
-            tvec,
-            candidate.camera_matrix,
-            candidate.dist_coeffs,
-        )
-        projected_sticker_points = projected_sticker_points.reshape(-1, 2)
+        if len(candidate.object_points):
+            projected_sticker_points, _ = cv2.projectPoints(
+                candidate.object_points,
+                rvec,
+                tvec,
+                candidate.camera_matrix,
+                candidate.dist_coeffs,
+            )
+            projected_sticker_points = projected_sticker_points.reshape(-1, 2)
         if candidate.assignment_object_points is not None:
             projected_assignment_points, _ = cv2.projectPoints(
                 candidate.assignment_object_points,
@@ -6169,115 +4765,6 @@ def transform_candidate_by_symmetry(
         transformed.rvec,
         transformed.tvec,
     )
-
-
-def canonicalize_pose_symmetry(
-    candidate: StickerPnPCandidate,
-    symmetry_tracker: CubeSymmetryTracker,
-    *,
-    color_scores: tuple[float, ...] | None = None,
-    frame_index: int | None = None,
-    source_fps: float = POSE_CONTINUITY_REFERENCE_FPS,
-) -> StickerPnPCandidate:
-    """Select a symmetry using angular change and optional temporal color NLL."""
-
-    reference_rotation = symmetry_tracker.rotation
-    reference_rvec = (
-        None if reference_rotation is None else cv2.Rodrigues(reference_rotation)[0]
-    )
-    alternatives = []
-    distances_radians = []
-    if color_scores is not None and len(color_scores) != len(CUBE_SYMMETRY_MATRICES):
-        raise ValueError("Continuity color scores must cover all cube symmetries")
-    use_colors = color_scores is not None and np.isfinite(color_scores).all()
-    fps = float(source_fps)
-    if not np.isfinite(fps) or fps <= 0.0:
-        fps = POSE_CONTINUITY_REFERENCE_FPS
-    elapsed_frames = (
-        max(frame_index - symmetry_tracker.frame_index, 1)
-        if frame_index is not None and symmetry_tracker.frame_index is not None else 1
-    )
-    elapsed_seconds = elapsed_frames / fps
-    angular_scale = (
-        POSE_CONTINUITY_ANGULAR_SCALE_DEGREES
-        * POSE_CONTINUITY_REFERENCE_FPS * elapsed_seconds
-    )
-    for index, matrix in enumerate(CUBE_SYMMETRY_MATRICES):
-        rvec = transform_rvec_by_symmetry(candidate.rvec, matrix)
-        distance = (
-            None if reference_rvec is None else rotation_symmetry_distance(rvec, reference_rvec)
-        )
-        distances_radians.append(distance)
-        angle_score = 0.0 if distance is None else float(np.degrees(distance)) / angular_scale
-        color_score = float(color_scores[index]) if use_colors else None
-        alternatives.append({
-            "symmetry_index": index,
-            "symmetry_matrix": np.asarray(matrix).copy(),
-            "rvec": rvec.copy(),
-            "distance_degrees": (
-                None if distance is None else float(np.degrees(distance))
-            ),
-            "angular_score": angle_score,
-            "color_score": color_score,
-            "combined_score": angle_score + (
-                POSE_CONTINUITY_COLOR_WEIGHT * color_score if use_colors else 0.0
-            ),
-        })
-    # Preserve the existing deterministic identity choice without a reference,
-    # and the original symmetry order for ties when a reference is available.
-    selected = (
-        alternatives[0] if reference_rvec is None else alternatives[min(
-            range(len(alternatives)), key=(
-                (lambda index: alternatives[index]["combined_score"])
-                if use_colors else (lambda index: distances_radians[index])
-            ),
-        )]
-    )
-    transformed = transform_candidate_by_symmetry(
-        candidate, CUBE_SYMMETRY_MATRICES[selected["symmetry_index"]],
-    )
-    distances = sorted(
-        item["distance_degrees"] for item in alternatives
-        if item["distance_degrees"] is not None
-    )
-    combined_scores = sorted(item["combined_score"] for item in alternatives)
-    return replace(transformed, pose_continuity_diagnostics={
-        "version": 2,
-        "coordinate_frame": "continuity_before_color_orientation",
-        "reference_frame_index": symmetry_tracker.frame_index,
-        "reference_rvec": reference_rvec,
-        "input_rvec": np.asarray(candidate.rvec).copy(),
-        "input_tvec": np.asarray(candidate.tvec).copy(),
-        "input_distance_degrees": (
-            None if reference_rvec is None else float(np.degrees(
-                rotation_symmetry_distance(candidate.rvec, reference_rvec)
-            ))
-        ),
-        "selected_symmetry_index": selected["symmetry_index"],
-        "selected_symmetry_matrix": selected["symmetry_matrix"],
-        "output_rvec": np.asarray(transformed.rvec).copy(),
-        "selected_distance_degrees": selected["distance_degrees"],
-        "angular_winner_symmetry_index": (
-            None if reference_rvec is None else min(
-                alternatives, key=lambda item: item["distance_degrees"],
-            )["symmetry_index"]
-        ),
-        "color_weight": POSE_CONTINUITY_COLOR_WEIGHT if use_colors else 0.0,
-        "angular_scale_degrees": angular_scale,
-        "reference_interval_seconds": None if reference_rvec is None else elapsed_seconds,
-        "selected_score": selected["combined_score"],
-        "runner_up_margin": (
-            None if reference_rvec is None else combined_scores[1] - combined_scores[0]
-        ),
-        "runner_up_margin_degrees": (
-            distances[1] - distances[0] if len(distances) > 1 else None
-        ),
-        "selection_reason": (
-            "no_reference_identity" if reference_rvec is None else
-            "angular_and_color" if use_colors else "closest_reference"
-        ),
-        "alternatives": alternatives,
-    })
 
 
 def layer_face_debug_label(axis: int, side: int) -> str:
@@ -6686,164 +5173,86 @@ def _gpu_sticker_center_fit_metrics(
 
 
 def _gpu_sticker_color_fit_metrics(
-    candidate: StickerPnPCandidate,
-    torch_module: object,
-    projected_face_centers: object,
-    projected_face_polygons: object,
-    visible_faces: object,
-    sticker_identity_indices: np.ndarray,
-    scale: float,
-    max_error: float,
-    color_likelihoods: np.ndarray | None,
-    *,
-    return_tensors: bool = False,
+    candidate: StickerPnPCandidate, torch_module: object,
+    projected_face_centers: object, projected_face_polygons: object, visible_faces: object,
+    sticker_identity_indices: np.ndarray, scale: float, max_error: float,
+    color_matches: np.ndarray | None, *, return_tensors: bool = False,
     assignment_cache: dict | None = None,
     configuration_mapping: tuple[np.ndarray, np.ndarray] | None = None,
-    likelihood_cache: dict | None = None,
 ) -> tuple[object, object]:
-    """Score mask colors against moving physical sticker identities on-device."""
+    """Batch exact class matches, with one vote per observed projected sticker.
 
+    Background points are excluded. Multiple color points assigned to the same
+    sticker contribute its best match, independently for each tested state.
+    """
     torch = torch_module
-    colors = tuple(getattr(candidate, "sticker_mask_colors", ()))
     centers = tuple(getattr(candidate, "sticker_mask_centers", ()))
-    if color_likelihoods is None or not colors or not centers:
-        count = (len(configuration_mapping[0]) if configuration_mapping is not None
-                 else int(projected_face_centers.shape[0]))
-        if return_tensors:
-            zero = projected_face_centers.new_zeros(count)
-            return zero, zero.to(dtype=torch.int32)
-        return np.zeros(count, dtype=np.float64), np.zeros(count, dtype=np.int32)
-    count = min(len(colors), len(centers), int(color_likelihoods.shape[1]))
-    if count <= 0:
-        batch = (len(configuration_mapping[0]) if configuration_mapping is not None
-                 else int(projected_face_centers.shape[0]))
-        if return_tensors:
-            zero = projected_face_centers.new_zeros(batch)
-            return zero, zero.to(dtype=torch.int32)
-        return np.zeros(batch, dtype=np.float64), np.zeros(batch, dtype=np.int32)
-    assignment_key = (count, float(max_error),
-                      np.asarray(centers[:count], dtype=np.float64).tobytes(),
-                      np.asarray(getattr(candidate, 'sticker_mask_center_uncertainties', ()), dtype=np.float64).tobytes())
-    cached = assignment_cache.get('value') if assignment_cache is not None and assignment_cache.get('key') == assignment_key else None
-    if cached is None:
+    batch = (len(configuration_mapping[0]) if configuration_mapping is not None
+             else int(projected_face_centers.shape[0]))
+    if color_matches is None or not centers:
+        errors = projected_face_centers.new_zeros(batch)
+        counts = errors.to(dtype=torch.int32)
+    else:
+        count = min(len(centers), color_matches.shape[1])
         observed = np.asarray(centers[:count], dtype=np.float64).reshape(-1, 2)
-        uncertainties = np.asarray(
-            getattr(candidate, "sticker_mask_center_uncertainties", ()),
-            dtype=np.float64,
-        ).reshape(-1)
-        if len(uncertainties) != count or not np.isfinite(uncertainties[:count]).all():
-            uncertainties = np.ones(count, dtype=np.float64)
+        key = (observed.tobytes(), count)
+        cached = assignment_cache.get("value") if assignment_cache is not None and assignment_cache.get("key") == key else None
+        if cached is None:
+            observed_t = torch.as_tensor(observed, dtype=projected_face_centers.dtype,
+                                         device=projected_face_centers.device)
+            polygons = projected_face_polygons
+            edges = torch.roll(polygons, shifts=-1, dims=2) - polygons
+            relative = observed_t[None, None, :, None, :] - polygons[:, :, None, :, :]
+            cross = (edges[:, :, None, :, 0] * relative[..., 1]
+                     - edges[:, :, None, :, 1] * relative[..., 0])
+            inside = (torch.all(cross >= -1e-4, dim=3)
+                      | torch.all(cross <= 1e-4, dim=3)).permute(0, 2, 1)
+            distances = torch.linalg.vector_norm(
+                observed_t[None, :, None, :] - projected_face_centers[:, None, :, :], dim=-1,
+            )
+            distances = torch.where(inside & visible_faces[:, None, :], distances,
+                                    torch.full_like(distances, float("inf")))
+            nearest_distance, nearest = torch.min(distances, dim=2)
+            valid = torch.isfinite(nearest_distance)
+            if configuration_mapping is not None:
+                rows, sources = configuration_mapping
+                rows_t = torch.as_tensor(rows, dtype=torch.long, device=nearest.device)
+                sources_t = torch.as_tensor(sources, dtype=torch.long, device=nearest.device)
+                nearest = torch.gather(sources_t, 1, nearest[rows_t])
+                valid = valid[rows_t]
+            per_face = projected_face_centers.new_zeros((batch, projected_face_centers.shape[1]))
+            per_face = per_face.scatter_add(1, nearest, valid.to(dtype=per_face.dtype))
+            occupied = per_face > 0
+            totals = torch.count_nonzero(occupied, dim=1)
+            cached = (nearest, valid, totals)
+            if assignment_cache is not None:
+                assignment_cache.update(key=key, value=cached, builds=assignment_cache.get("builds", 0) + 1)
+        elif assignment_cache is not None:
+            assignment_cache["hits"] = assignment_cache.get("hits", 0) + 1
+        nearest, valid, totals = cached
+        identities = torch.as_tensor(sticker_identity_indices, dtype=torch.long,
+                                      device=projected_face_centers.device)
+        matrix = torch.as_tensor(color_matches[:, :count], dtype=projected_face_centers.dtype,
+                                 device=projected_face_centers.device)
+        indices = identities[nearest] if identities.ndim == 1 else identities[:, nearest]
+        observations = torch.arange(count, device=matrix.device)
+        matches = matrix[indices, observations] * valid
+        if identities.ndim == 1:
+            face_matches = projected_face_centers.new_zeros((batch, projected_face_centers.shape[1]))
+            face_matches = face_matches.scatter_add(1, nearest, matches)
+            correct = torch.sum(torch.clamp(face_matches, max=1), dim=-1)
+            counts = totals
         else:
-            uncertainties = np.maximum(uncertainties[:count], 1.0)
-        weights = 1.0 / np.square(uncertainties)
-        observed_t = torch.as_tensor(
-            observed,
-            dtype=projected_face_centers.dtype,
-            device=projected_face_centers.device,
-        )
-        distances = torch.linalg.vector_norm(
-            observed_t[None, :, None, :] - projected_face_centers[:, None, :, :],
-            dim=-1,
-        )
-        polygons = projected_face_polygons
-        edges = torch.roll(polygons, shifts=-1, dims=2) - polygons
-        relative = observed_t[None, None, :, None, :] - polygons[:, :, None, :, :]
-        cross = (
-            edges[:, :, None, :, 0] * relative[:, :, :, :, 1]
-            - edges[:, :, None, :, 1] * relative[:, :, :, :, 0]
-        )
-        polygon_tolerance = torch.as_tensor(
-            1e-4,
-            dtype=polygons.dtype,
-            device=polygons.device,
-        )
-        inside_positive = torch.all(cross >= -polygon_tolerance, dim=3)
-        inside_negative = torch.all(cross <= polygon_tolerance, dim=3)
-        inside = (inside_positive | inside_negative).permute(0, 2, 1)
-        distances = torch.where(
-            visible_faces[:, None, :] & inside,
-            distances,
-            torch.full_like(distances, float("inf")),
-        )
-        nearest_distances, nearest_faces = torch.min(distances, dim=2)
-        finite = torch.isfinite(nearest_distances)
-        safe_weights = torch.as_tensor(
-            weights,
-            dtype=projected_face_centers.dtype,
-            device=projected_face_centers.device,
-        )[None, :].expand_as(nearest_distances)
-        safe_weights = torch.where(
-            finite,
-            safe_weights,
-            torch.zeros_like(safe_weights),
-        )
-        match_counts = torch.count_nonzero(
-            finite & (nearest_distances <= max_error),
-            dim=1,
-        )
-        if configuration_mapping is not None:
-            rows, source_permutations = configuration_mapping
-            rows_t = torch.as_tensor(rows, dtype=torch.long, device=nearest_faces.device)
-            sources_t = torch.as_tensor(source_permutations, dtype=torch.long,
-                                        device=nearest_faces.device)
-            nearest_faces = torch.gather(sources_t, 1, nearest_faces[rows_t])
-            safe_weights = safe_weights[rows_t]
-            match_counts = match_counts[rows_t]
-        cached = (nearest_faces, safe_weights, match_counts)
-        if assignment_cache is not None:
-            assignment_cache.update(key=assignment_key, value=cached,
-                                    total_weight=torch.sum(safe_weights, dim=1),
-                                    builds=assignment_cache.get('builds', 0) + 1)
-    elif assignment_cache is not None:
-        assignment_cache['hits'] = assignment_cache.get('hits', 0) + 1
-    nearest_faces, safe_weights, match_counts = cached
-    identity_indices = torch.as_tensor(
-        sticker_identity_indices,
-        dtype=torch.long,
-        device=projected_face_centers.device,
-    )
-    # The frontier shares projected geometry; only the identity at each fixed face
-    # differs between states. Gather every state's likelihoods in one batch.
-    selected_identity_indices = (
-        identity_indices[nearest_faces] if identity_indices.ndim == 1
-        else identity_indices[:, nearest_faces]
-    )
-    # The observation model is shared by every frontier state and orientation.
-    # Cache logs before the identity gather instead of logging every state fit.
-    likelihood_values = np.asarray(color_likelihoods[:, :count], dtype=np.float64)
-    likelihood_key = (likelihood_values.shape, likelihood_values.tobytes())
-    log_values = (likelihood_cache.get('value') if likelihood_cache is not None
-                  and likelihood_cache.get('key') == likelihood_key else None)
-    if log_values is None:
-        likelihoods_t = torch.as_tensor(likelihood_values, dtype=projected_face_centers.dtype,
-                                        device=projected_face_centers.device)
-        log_values = torch.log(torch.clamp(likelihoods_t, min=1e-30))
-        if likelihood_cache is not None:
-            likelihood_cache.update(key=likelihood_key, value=log_values,
-                                    builds=likelihood_cache.get('builds', 0) + 1)
-    elif likelihood_cache is not None:
-        likelihood_cache['hits'] = likelihood_cache.get('hits', 0) + 1
-    observation_indices = torch.arange(count, dtype=torch.long, device=log_values.device)
-    log_likelihoods = log_values[
-        selected_identity_indices,
-        observation_indices[None, :],
-    ]
-    total_weight = (assignment_cache['total_weight'] if assignment_cache is not None
-                    else torch.sum(safe_weights, dim=1))
-    color_error = torch.where(
-        total_weight > 0.0,
-        -torch.sum(safe_weights * log_likelihoods, dim=-1)
-        / torch.clamp(total_weight, min=1e-12),
-        torch.full_like(total_weight, float("inf")),
-    )
-    if identity_indices.ndim > 1:
-        match_counts = match_counts[None, :].expand(identity_indices.shape[0], -1)
+            face_matches = projected_face_centers.new_zeros((identities.shape[0], batch, projected_face_centers.shape[1]))
+            face_matches = face_matches.scatter_add(2, nearest[None].expand_as(matches), matches)
+            correct = torch.sum(torch.clamp(face_matches, max=1), dim=-1)
+            counts = totals[None].expand(identities.shape[0], -1)
+        errors = torch.where(counts > 0, 1.0 - correct / torch.clamp(counts, min=1),
+                             torch.full_like(correct, float("inf")))
     if return_tensors:
-        return color_error, match_counts
-    return (
-        color_error.detach().cpu().numpy().astype(np.float64, copy=False),
-        match_counts.detach().cpu().numpy().astype(np.int32, copy=False),
-    )
+        return errors, counts
+    return (errors.detach().cpu().numpy().astype(np.float64, copy=False),
+            counts.detach().cpu().numpy().astype(np.int32, copy=False))
 
 
 def _gpu_keypoint_fit_metrics(
@@ -6858,7 +5267,7 @@ def _gpu_keypoint_fit_metrics(
     scale: float,
     assignment_error_limit: float,
 ) -> tuple[object, object, object, object, object, object]:
-    """Compute the existing keypoint ranking statistics for all trials."""
+    """Score whole-cube matches; layer membership affects diagnostics only."""
 
     finite = torch.isfinite(distances)
     coordinates = torch.gather(
@@ -6871,9 +5280,9 @@ def _gpu_keypoint_fit_metrics(
         coordinates <= -boundary[:, None] + 1e-4,
     )
     layer_finite = finite & layer_mask
-    valid_trial = torch.any(layer_finite, dim=1)
+    valid_trial = torch.any(finite, dim=1)
     if observed_classes is not None:
-        known = (observed_classes[None, :] >= 0) & (classes >= 0) & layer_finite
+        known = (observed_classes[None, :] >= 0) & (classes >= 0) & finite
         valid_trial = valid_trial & ~torch.any(
             known & (observed_classes[None, :] != classes), dim=1
         )
@@ -6910,7 +5319,7 @@ def _score_turn_configurations_on_gpu(
     candidate: StickerPnPCandidate,
     assignment_error_limit: float,
     scoring_device: object,
-    color_likelihoods: np.ndarray | None = None,
+    color_matches: np.ndarray | None = None,
     *,
     materialize_projections: bool = True,
     angle_values: np.ndarray | None = None,
@@ -7042,10 +5451,14 @@ def _score_turn_configurations_on_gpu(
         expanded_normals = base_normals_t[None, :, :, :].expand(count, -1, -1, -1)
         rotated_normals = torch.einsum("bij,bnfj->bnfi", rotation, expanded_normals)
         transformed_normals = torch.where(point_layer_mask[:, :, None, None], rotated_normals, expanded_normals)
+        camera_origin = -camera_rotation.transpose(0, 1) @ tvec.reshape(3, 1)
+        camera_origin = camera_origin.reshape(1, 1, 3)
+        face_dot = torch.sum(
+            transformed_normals * (camera_origin - transformed_points)[:, :, None, :], dim=3,
+        )
         front_facing = (
-            base_face_mask_t[None, :, :, None]
-            & (torch.einsum("ij,bnfj->bnfi", camera_rotation, transformed_normals)[..., 2:3] < 0.0)
-        ).any(dim=2).squeeze(-1)
+            base_face_mask_t[None, :, :] & (face_dot > 0.0)
+        ).any(dim=2)
 
         triangle_coordinates = triangle_centers_t[:, axes].T
         triangle_boundary = CUBE_HALF_SIZE_MM - layer_counts * CUBE_LAYER_SIZE_MM + CUBE_LAYER_SIZE_MM / 2.0
@@ -7065,8 +5478,6 @@ def _score_turn_configurations_on_gpu(
             rotated_triangles,
             expanded_triangles,
         )
-        camera_origin = -camera_rotation.transpose(0, 1) @ tvec.reshape(3, 1)
-        camera_origin = camera_origin.reshape(1, 1, 3)
         directions = transformed_points - camera_origin
         safe_directions = torch.where(torch.abs(directions) <= 1e-12, 1.0, directions)
         bounds_min = -CUBE_HALF_SIZE_MM
@@ -7265,7 +5676,7 @@ def _score_turn_configurations_on_gpu(
             sticker_identity_indices,
             float(scale),
             float(assignment_error_limit),
-            color_likelihoods,
+            color_matches,
             return_tensors=True,
         )
         (
@@ -7322,16 +5733,10 @@ def _score_turn_configurations_on_gpu(
             keypoint_inlier_count = int(keypoint_inlier_counts[trial_index])
             keypoint_layer_inlier_count = int(keypoint_layer_inlier_counts[trial_index])
             centroid_layer_match_count = int(sticker_layer_matches[trial_index])
-            combined_valid = bool(keypoint_valid[trial_index]) or centroid_layer_match_count > 0
-            # A missing keypoint component is allowed when centroid
-            # observations validate the same layer; the available observation
-            # terms then contribute identically to the combined score.
-            if not np.isfinite(keypoint_error):
-                keypoint_error = 0.0
-            if not np.isfinite(robust_error):
-                robust_error = 0.0
-            if not np.isfinite(p90_error):
-                p90_error = 0.0
+            # Sticker/layer support cannot turn a failed global landmark
+            # measurement into a perfect fit. Preserve nonfinite errors even
+            # when retaining all configurations for the full-search cache.
+            combined_valid = bool(keypoint_valid[trial_index])
             mean_error = keypoint_error
             inlier_count = keypoint_inlier_count + int(sticker_matches[trial_index])
             layer_inlier_count = keypoint_layer_inlier_count + centroid_layer_match_count
@@ -7417,7 +5822,7 @@ def _build_turn_geometry_frame(
         candidate,
         assignment_error_limit,
         scoring_device,
-        color_likelihoods=None,
+        color_matches=None,
         # Transfer all assignments together, rather than synchronizing once
         # for every retained angle when constructing the cached options.
         materialize_projections=True,
@@ -7466,7 +5871,7 @@ def _turn_color_frame_score_lower_bound(
     geometry_options: tuple[dict[str, object], ...],
     assignment_error_limit: float,
     scoring_device: object,
-    color_likelihoods: np.ndarray | None,
+    color_matches: np.ndarray | None,
     *, projection_cache: dict | None = None,
 ) -> float:
     """Relax sticker permutation constraints to bound every state/offset.
@@ -7476,10 +5881,10 @@ def _turn_color_frame_score_lower_bound(
     Every feasible cube assignment is at least as costly as this relaxation.
     """
 
-    if color_likelihoods is None:
+    if color_matches is None:
         return min((float(option.get('combined_mean_error', -float('inf')))
                     for option in geometry_options), default=-float('inf'))
-    likelihoods = np.asarray(color_likelihoods, dtype=np.float64)
+    likelihoods = np.asarray(color_matches, dtype=np.float64)
     if likelihoods.ndim != 2 or not likelihoods.size or not np.isfinite(likelihoods).all():
         return -float('inf')
     optimistic = np.broadcast_to(likelihoods.max(axis=0, keepdims=True), likelihoods.shape).copy()
@@ -7503,14 +5908,14 @@ def _score_turn_color_offsets_on_gpu(
     geometry_options: tuple[dict[str, object], ...],
     assignment_error_limit: float,
     scoring_device: object,
-    color_likelihoods: np.ndarray | None,
+    color_matches: np.ndarray | None,
     *, projection_cache: dict | None = None,
 ) -> list[dict[str, object]] | None:
     """Score only the -90/0/+90 color offsets for cached geometry options."""
 
     results = _score_turn_color_offsets_with_orientation_rescue(
         candidate, geometry_options, assignment_error_limit, scoring_device,
-        color_likelihoods, (getattr(candidate, "cube_geometry_state", None),), projection_cache=projection_cache,
+        color_matches, (getattr(candidate, "cube_geometry_state", None),), projection_cache=projection_cache,
     )
     return results[0] if results is not None else None
 
@@ -7565,85 +5970,110 @@ def _turn_trial_under_pose_symmetry(
     return transformed
 
 
+def _orientation_rescue_diagnostic(inherited_error: float, selected_error: float, tested: int) -> dict:
+    return dict(threshold=PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR,
+                minimum_color_accuracy=2.0 / 3.0, phase="before_move_search",
+                inherited_color_error=inherited_error, selected_color_error=selected_error,
+                tested_orientations=tested)
+
+
+def balanced_geometry_cost(keypoint_error, sticker_error):
+    """Map the two geometry components to equal halves of a 0..1 cost."""
+    keypoint = np.asarray(keypoint_error, dtype=np.float64)
+    sticker = np.asarray(sticker_error, dtype=np.float64)
+    return np.where(np.isfinite(keypoint) & np.isfinite(sticker),
+                    .5 * np.clip(keypoint / PNP_FINAL_ASSIGNMENT_ERROR_FRACTION, 0., 1.)
+                    + .5 * np.clip(sticker / PNP_TURN_CENTER_PENALTY_SCALE, 0., 1.), float("inf"))
+
+
+def balanced_robust_cost(geometry_robust_error, color_error):
+    """Normalize the aggregate robust geometry diagnostic to the same budget."""
+    geometry = np.asarray(geometry_robust_error, dtype=np.float64)
+    geometry = np.where(np.isfinite(geometry), np.clip(
+        geometry / (PNP_FINAL_ASSIGNMENT_ERROR_FRACTION + PNP_TURN_CENTER_PENALTY_SCALE), 0., 1.), float("inf"))
+    return .5 * geometry + .5 * color_error
+
+
 def _score_turn_color_offsets_with_orientation_rescue(
     candidate: StickerPnPCandidate,
     geometry_options: tuple[dict[str, object], ...],
     assignment_error_limit: float,
     scoring_device: object,
-    color_likelihoods: np.ndarray | None,
+    color_matches: np.ndarray | None,
     geometry_states: tuple[CubeGeometryState | None, ...],
-    *, projection_cache: dict | None = None,
+    *, projection_cache: dict | None = None, balance_geometry_color: bool = False,
+    minimum_color_accuracy: float | None = None,
 ) -> list[list[dict[str, object]]] | None:
-    """Condition a high-color-error frame's pose alternatives on each move state.
+    """Rescue each unchanged state's orientation before generating its moves.
 
-    Cube symmetries preserve every projected geometric fit. Reuse those
-    projections by inversely relabeling each input state, then transform the
-    resulting layer/move back into the physical state's unchanged coordinates.
-    The pose correction is not a committed cube move. Keep the best pose/angle
-    per physical transition before the usual hold collapse and top-10 shortlist.
+    Below 2/3 color accuracy, choose one of the 24 cube orientations using
+    only the unchanged state's color agreement. Then evaluate moves in that
+    orientation and map them back to the physical state's coordinates.
+    A pose correction never commits a move or changes the physical state.
     """
-
-    results = _score_turn_color_offsets_for_states_on_gpu(
-        candidate, geometry_options, assignment_error_limit, scoring_device,
-        color_likelihoods, geometry_states, projection_cache=projection_cache,
+    static_options = tuple(option for option in geometry_options
+                           if option.get("is_baseline") and not option.get("layer_rotations"))[:1]
+    if color_matches is None or not static_options:
+        return _score_turn_color_offsets_for_states_on_gpu(
+            candidate, geometry_options, assignment_error_limit, scoring_device,
+            color_matches, geometry_states, projection_cache=projection_cache,
+            balance_geometry_color=balance_geometry_color, minimum_color_accuracy=minimum_color_accuracy,
+        )
+    static = _score_turn_color_offsets_for_states_on_gpu(
+        candidate, static_options, assignment_error_limit, scoring_device,
+        color_matches, geometry_states, projection_cache=projection_cache, color_offsets=(0.,),
     )
-    if results is None or color_likelihoods is None:
-        return results
-    rescue_indices = []
-    inherited_errors = {}
-    for index, trials in enumerate(results):
-        best = min(trials, key=lambda trial: trial['rank'], default=None)
-        if best is not None:
-            color = float(best.get('color_error', 0.))
-            if color > PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR:
-                rescue_indices.append(index)
-                inherited_errors[index] = color
-    if not rescue_indices:
-        return results
-
-    def transition_key(trial):
-        return (int(trial['layer_axis']), int(trial['layer_side']),
-                int(trial['layer_count']), float(trial['color_offset']))
-
-    choices = {index: {transition_key(trial): trial for trial in results[index]}
-               for index in rescue_indices}
+    if static is None:
+        return None
+    rescue_indices, inherited_errors, best_errors, selected = [], {}, {}, {}
+    for index, trials in enumerate(static):
+        observed = next((trial for trial in trials if int(trial.get("color_match_count", 0)) > 0), None)
+        if observed is None:
+            continue
+        error = float(observed["color_error"])
+        if np.isfinite(error) and error > PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR:
+            rescue_indices.append(index)
+            inherited_errors[index] = best_errors[index] = error
     tested = 1
     for symmetry_index, symmetry in enumerate(CUBE_SYMMETRY_MATRICES):
-        if np.array_equal(symmetry, np.eye(3)):
+        if not rescue_indices or np.array_equal(symmetry, np.eye(3)):
             continue
-        relabeled_states = tuple(_geometry_state_under_symmetry(
+        relabeled = tuple(_geometry_state_under_symmetry(
             geometry_states[index] if geometry_states[index] is not None else CubeGeometryState.identity(),
             symmetry.T,
         ) for index in rescue_indices)
         alternatives = _score_turn_color_offsets_for_states_on_gpu(
-            candidate, geometry_options, assignment_error_limit, scoring_device,
-            color_likelihoods, relabeled_states, projection_cache=projection_cache,
+            candidate, static_options, assignment_error_limit, scoring_device,
+            color_matches, relabeled, projection_cache=projection_cache, color_offsets=(0.,),
         )
         if alternatives is None:
             continue
         tested += 1
-        # Most alternative fits lose. Avoid transforming their projection
-        # arrays or constructing mapped trial dictionaries at every state.
-        layers = {}
         for index, trials in zip(rescue_indices, alternatives, strict=True):
-            for trial in trials:
-                layer_key = (int(trial['layer_axis']), int(trial['layer_side']), int(trial['layer_count']))
-                if layer_key not in layers:
-                    layer = transform_layer_rotation_by_symmetry(
-                        CubeLayerRotation(layer_key[0], layer_key[1], 0., layer_key[2]), symmetry,
-                    )
-                    layers[layer_key] = (layer.axis, layer.side, layer.layer_count)
-                key = (*layers[layer_key], float(trial['color_offset']))
-                previous = choices[index].get(key)
-                if previous is None or trial['rank'] < previous['rank']:
-                    choices[index][key] = _turn_trial_under_pose_symmetry(trial, symmetry, symmetry_index)
-    results = list(results)
+            error = min((float(trial["color_error"]) for trial in trials
+                         if int(trial.get("color_match_count", 0)) > 0), default=float("inf"))
+            # Ties retain the inherited orientation and deterministic symmetry order.
+            if error < best_errors[index]:
+                best_errors[index] = error
+                selected[index] = (symmetry_index, symmetry)
+    oriented_states = list(geometry_states)
+    for index, (_symmetry_index, symmetry) in selected.items():
+        oriented_states[index] = _geometry_state_under_symmetry(
+            geometry_states[index] if geometry_states[index] is not None else CubeGeometryState.identity(), symmetry.T,
+        )
+    results = _score_turn_color_offsets_for_states_on_gpu(
+        candidate, geometry_options, assignment_error_limit, scoring_device,
+        color_matches, tuple(oriented_states), projection_cache=projection_cache,
+        balance_geometry_color=balance_geometry_color, minimum_color_accuracy=minimum_color_accuracy,
+    )
+    if results is None:
+        return None
     for index in rescue_indices:
-        diagnostic = dict(threshold=PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR,
-                          inherited_color_error=inherited_errors[index],
-                          tested_orientations=tested)
-        results[index] = [dict(trial, orientation_rescue=diagnostic)
-                          for trial in choices[index].values()]
+        diagnostic = _orientation_rescue_diagnostic(inherited_errors[index], best_errors[index], tested)
+        results[index] = [dict(
+            _turn_trial_under_pose_symmetry(trial, selected[index][1], selected[index][0])
+            if index in selected else trial, orientation_rescue=diagnostic,
+        ) for trial in results[index]]
     return results
 
 
@@ -7652,10 +6082,12 @@ def _score_turn_color_offsets_for_states_on_gpu(
     geometry_options: tuple[dict[str, object], ...],
     assignment_error_limit: float,
     scoring_device: object,
-    color_likelihoods: np.ndarray | None,
+    color_matches: np.ndarray | None,
     geometry_states: tuple[CubeGeometryState | None, ...],
     *, projection_cache: dict | None = None,
     color_offsets: tuple[float, ...] = (-90.0, 0.0, 90.0),
+    balance_geometry_color: bool = False,
+    minimum_color_accuracy: float | None = None,
 ) -> list[list[dict[str, object]]] | None:
     """Reuse partial-pose assignments and score frontier states by identity gathers."""
 
@@ -7837,7 +6269,6 @@ def _score_turn_color_offsets_for_states_on_gpu(
             projected = (projected_face_centers, projected_face_polygons, visible_faces, scale)
             if projection_cache is not None:
                 projection_cache.update(key=projection_key, projected=projected, assignments={},
-                                        likelihoods={},
                                         projection_count=projection_count, configuration_count=count,
                                         builds=projection_cache.get('builds', 0) + 1)
         elif projection_cache is not None:
@@ -7852,11 +6283,10 @@ def _score_turn_color_offsets_for_states_on_gpu(
             sticker_identity_indices,
             float(scale),
             float(assignment_error_limit),
-            color_likelihoods,
+            color_matches,
             return_tensors=True,
             assignment_cache=projection_cache.get("assignments") if projection_cache is not None else None,
             configuration_mapping=(projection_rows, source_permutations),
-            likelihood_cache=projection_cache.get("likelihoods") if projection_cache is not None else None,
         )
         color_vectors = torch.stack(
             (color_errors, color_matches.to(dtype=dtype))
@@ -7875,6 +6305,10 @@ def _score_turn_color_offsets_for_states_on_gpu(
         # through color scoring (e.g. Y--15 versus Y-+45).
         configured_options = [geometry_options[item[0]] for item in configurations]
         geometry_scores = np.asarray([float(option["combined_mean_error"]) for option in configured_options])
+        if balance_geometry_color:
+            geometry_scores = np.where(np.isfinite(geometry_scores), balanced_geometry_cost(
+                [option["keypoint_error"] for option in configured_options],
+                [option["sticker_error"] for option in configured_options]), float("inf"))
         inliers = np.asarray([int(option.get("inlier_count", 0)) for option in configured_options])
         p90s = np.asarray([float(option.get("p90_error", float("inf"))) for option in configured_options])
         layer_inliers = np.asarray([int(option.get("layer_inlier_count", 0)) for option in configured_options])
@@ -7883,7 +6317,17 @@ def _score_turn_color_offsets_for_states_on_gpu(
             results: list[dict[str, object]] = []
             errors = color_errors_np[state_index]
             costs = geometry_scores + np.where(np.isfinite(errors), PNP_TURN_COLOR_WEIGHT * errors, float("inf"))
-            order = np.lexsort((-layer_inliers, p90s, -inliers, costs, group_ids))
+            if balance_geometry_color:
+                costs = .5 * geometry_scores + .5 * errors
+            if minimum_color_accuracy is not None:
+                costs = np.where(errors <= 1. - minimum_color_accuracy, costs, float("inf"))
+            eligible = (np.flatnonzero(np.isfinite(costs)) if minimum_color_accuracy is not None
+                        else np.arange(len(costs)))
+            if not len(eligible):
+                results_by_state.append([])
+                continue
+            order = eligible[np.lexsort((-layer_inliers[eligible], p90s[eligible], -inliers[eligible],
+                                         costs[eligible], group_ids[eligible]))]
             ordered_groups = group_ids[order]
             best_indices = np.sort(order[np.r_[True, ordered_groups[1:] != ordered_groups[:-1]]])
             for index in best_indices:
@@ -7906,8 +6350,7 @@ def _score_turn_color_offsets_for_states_on_gpu(
                     if np.isfinite(color_error)
                     else float("inf")
                 )
-                geometry_score = float(option["combined_mean_error"])
-                combined_score = geometry_score + color_cost
+                combined_score = float(costs[index])
                 # Both geometry and color contribute before choosing a
                 # partial angle for this discrete state change.
                 state_score = combined_score
@@ -7942,8 +6385,12 @@ def _score_turn_color_offsets_for_states_on_gpu(
                             float(option.get("p90_error", float("inf"))),
                             -float(layer_inlier_count),
                         ),
-                        "robust_error": float(option.get("robust_error", float("inf")))
-                        + color_cost,
+                        "robust_error": (float(balanced_robust_cost(option.get("robust_error", float("inf")), color_error))
+                                         if balance_geometry_color else
+                                         float(option.get("robust_error", float("inf"))) + color_cost),
+                        **({"score_components": dict(geometry=float(geometry_scores[index]), color=color_error,
+                                                     geometry_weight=.5, color_weight=.5)}
+                           if balance_geometry_color else {}),
                         "keypoint_error": float(option.get("keypoint_error", float("inf"))),
                         "sticker_error": float(option.get("sticker_error", float("inf"))),
                         "keypoint_robust_error": float(option.get("keypoint_robust_error", float("inf"))),
@@ -8007,7 +6454,7 @@ def turn_trial_exceeds_static_baseline(
     if int(trial.get("inlier_count", 0)) > baseline_inliers:
         return True
 
-    # Otherwise compare negative-log likelihood, where lower is better: a
+    # Otherwise compare color mismatch fractions, where lower is better: a
     # ratio of 0.5 means the turn's color error is at least 2x better.
     if not isinstance(baseline, dict):
         return False
@@ -8027,7 +6474,6 @@ def recover_misaligned_cube_layers(
     assignment_error_limit: float,
     record_all_turn_candidates: bool = False,
     color_priors: dict[str, np.ndarray] | None = None,
-    global_profiles: dict[str, GlobalColorProfile] | None = None,
     expected_color_by_label: dict[str, str] | None = None,
 ) -> StickerPnPCandidate:
     """Search layer turns using the combined local fit.
@@ -8083,14 +6529,11 @@ def recover_misaligned_cube_layers(
     static_fit = pose_reprojection_fit_metric(candidate)
     search_rvec = np.asarray(candidate.rvec, dtype=np.float64).copy()
     search_tvec = np.asarray(candidate.tvec, dtype=np.float64).copy()
-    color_likelihoods = turn_color_predictive_likelihoods(
-        candidate,
-        color_priors,
-        global_profiles,
-        expected_color_by_label,
+    color_matches = turn_color_match_matrix(
+        candidate, color_priors, expected_color_by_label,
     )
-    if color_likelihoods is None:
-        color_likelihoods = getattr(candidate, "turn_color_likelihoods", None)
+    if color_matches is None:
+        color_matches = getattr(candidate, "turn_color_matches", None)
     static_sticker_fit, _static_sticker_matches = sticker_mask_center_fit_metric(
         candidate,
         candidate.rvec,
@@ -8103,7 +6546,7 @@ def recover_misaligned_cube_layers(
         candidate.tvec,
         (),
         PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * projected_cube_diameter(candidate),
-        color_likelihoods,
+        color_matches,
     )
     static_color_term = (
         PNP_TURN_COLOR_WEIGHT * static_color_fit
@@ -8115,7 +6558,7 @@ def recover_misaligned_cube_layers(
         turn_layer_scores=(),
         turn_fit_sticker_score=static_sticker_fit,
         turn_fit_color_score=static_color_fit,
-        turn_color_likelihoods=color_likelihoods,
+        turn_color_matches=color_matches,
         turn_fit_unexplained_keypoints=unexplained_count,
         turn_fit_evaluated=True,
         turn_fit_static_scores=(
@@ -8139,7 +6582,7 @@ def recover_misaligned_cube_layers(
         raise RuntimeError("Move recognition requires an available Apple MPS device")
     ranked_trials = _score_turn_configurations_on_gpu(
         candidate, assignment_error_limit, torch_device,
-        color_likelihoods=color_likelihoods,
+        color_matches=color_matches,
         materialize_projections=record_all_turn_candidates,
     )
     if ranked_trials is None:
@@ -8320,7 +6763,6 @@ def recover_misaligned_cube_layers_from_geometry(
     geometry_frame: dict[str, object],
     record_all_turn_candidates: bool = False,
     color_priors: dict[str, np.ndarray] | None = None,
-    global_profiles: dict[str, GlobalColorProfile] | None = None,
     expected_color_by_label: dict[str, str] | None = None,
     previous_move: str | None = None,
     previous_states: tuple[tuple, ...] = (),
@@ -8337,14 +6779,11 @@ def recover_misaligned_cube_layers_from_geometry(
             turn_fit_articulated_scores=None,
             turn_fit_evaluated=False,
         )
-    color_likelihoods = turn_color_predictive_likelihoods(
-        candidate,
-        color_priors,
-        global_profiles,
-        expected_color_by_label,
+    color_matches = turn_color_match_matrix(
+        candidate, color_priors, expected_color_by_label,
     )
-    if color_likelihoods is None:
-        color_likelihoods = getattr(candidate, "turn_color_likelihoods", None)
+    if color_matches is None:
+        color_matches = getattr(candidate, "turn_color_matches", None)
     scoring_device = _turn_torch_scoring_device("mps")
     if scoring_device is None:
         raise RuntimeError("Move recognition requires an available Apple MPS device")
@@ -8353,12 +6792,12 @@ def recover_misaligned_cube_layers_from_geometry(
         options,
         assignment_error_limit,
         scoring_device,
-        color_likelihoods,
+        color_matches,
     )
     if not color_trials:
         return replace(
             candidate,
-            turn_color_likelihoods=color_likelihoods,
+            turn_color_matches=color_matches,
             turn_fit_evaluated=True,
             turn_state_moves=(),
             turn_fit_articulated_scores=None,
@@ -8382,7 +6821,7 @@ def recover_misaligned_cube_layers_from_geometry(
             turn_color_unreliable=any(turn_trial_has_invalid_color(trial) for trial in color_trials),
             turn_candidate_diagnostics=tuple(dict(turn_trial_log_payload(trial),
                 invalid_color=turn_trial_has_invalid_color(trial)) for trial in color_trials),
-            turn_color_likelihoods=color_likelihoods,
+            turn_color_matches=color_matches,
             turn_fit_evaluated=True,
             turn_state_moves=(),
             turn_fit_articulated_scores=None,
@@ -8401,7 +6840,7 @@ def recover_misaligned_cube_layers_from_geometry(
     if static_trial is None:
         return replace(
             candidate,
-            turn_color_likelihoods=color_likelihoods,
+            turn_color_matches=color_matches,
             turn_fit_evaluated=True,
             turn_state_moves=(),
             turn_fit_articulated_scores=None,
@@ -8505,7 +6944,7 @@ def recover_misaligned_cube_layers_from_geometry(
         turn_candidate_diagnostics=turn_candidate_diagnostics,
         turn_fit_sticker_score=float(static_trial["sticker_error"]),
         turn_fit_color_score=float(static_trial["color_error"]),
-        turn_color_likelihoods=color_likelihoods,
+        turn_color_matches=color_matches,
         turn_fit_unexplained_keypoints=int(
             getattr(candidate, "turn_fit_unexplained_keypoints", 0)
         ),
@@ -8552,14 +6991,17 @@ def _candidate_with_turn_trial(
         rotations,
     )
     try:
-        projected_sticker_points, _ = cv2.projectPoints(
-            object_points,
-            static_candidate.rvec,
-            static_candidate.tvec,
-            static_candidate.camera_matrix,
-            static_candidate.dist_coeffs,
-        )
-        projected_sticker_points = projected_sticker_points.reshape(-1, 2)
+        if len(object_points):
+            projected_sticker_points, _ = cv2.projectPoints(
+                object_points,
+                static_candidate.rvec,
+                static_candidate.tvec,
+                static_candidate.camera_matrix,
+                static_candidate.dist_coeffs,
+            )
+            projected_sticker_points = projected_sticker_points.reshape(-1, 2)
+        else:
+            projected_sticker_points = np.empty((0, 2))
     except cv2.error:
         projected_sticker_points = static_candidate.projected_sticker_points
     articulated_scores = None if bool(trial.get("is_baseline", False)) else (
@@ -8655,7 +7097,7 @@ def _hold_without_turn_search(
         turn_color_offset_degrees=0.0, turn_selected_trial_id=None,
         turn_candidate_scores=(), turn_candidate_diagnostics=(), turn_candidate_debug=(),
         turn_layer_scores=(), turn_fit_articulated_scores=None, turn_fit_evaluated=False,
-        turn_fit_color_score=float('inf'), turn_color_likelihoods=None, turn_color_unreliable=False,
+        turn_fit_color_score=float('inf'), turn_color_matches=None, turn_color_unreliable=False,
         turn_fit_search_rvec=None, turn_fit_search_tvec=None,
         turn_fit_lookahead_action_score=float('inf'), turn_fit_lookahead_static_score=float('inf'),
         turn_fit_lookahead_action_future_scores=(), turn_fit_lookahead_static_future_scores=(),
@@ -8859,163 +7301,57 @@ def sticker_mask_center_fit_metric(
     return metric, len(distances)
 
 
-def turn_color_predictive_likelihoods(
+def turn_color_match_matrix(
     candidate: StickerPnPCandidate,
-    color_priors: dict[str, np.ndarray] | None,
-    global_profiles: dict[str, GlobalColorProfile] | None,
+    color_priors: dict[str, np.ndarray] | None = None,
     expected_color_by_label: dict[str, str] | None = None,
 ) -> np.ndarray | None:
-    """Return ``p(mask RGB | sticker identity prior)`` for turn scoring."""
+    """Return binary color equality [physical sticker, observed color point].
 
-    colors = tuple(getattr(candidate, "sticker_mask_colors", ()))
-    centers = tuple(getattr(candidate, "sticker_mask_centers", ()))
-    if not colors or not centers or global_profiles is None:
+    No probability, RGB observation, or color regression participates. Priors
+    are accepted only as the existing one-hot encoding of the known scramble.
+    """
+    colors = tuple(getattr(candidate, "sticker_color_names", ()))
+    if not colors:
         return None
-    count = min(len(colors), len(centers))
-    if count <= 0:
+    expected = dict(expected_color_by_label or {})
+    if color_priors:
+        for label, values in color_priors.items():
+            values = np.asarray(values)
+            if values.shape == (len(GLOBAL_COLOR_NAMES),) and np.count_nonzero(values == 1) == 1:
+                expected.setdefault(label, GLOBAL_COLOR_NAMES[int(np.argmax(values))])
+    if not expected:
         return None
-    evidence = np.asarray(
-        [
-            _rgb_observation_color_evidence(color, global_profiles)
-            for color in colors[:count]
-        ],
-        dtype=np.float64,
-    )
-    if not np.isfinite(evidence).all():
-        return None
-    evidence = np.clip(evidence, 1e-300, None)
-    identities = canonical_sticker_identities()
-    uniform_prior = np.full(
-        len(GLOBAL_COLOR_NAMES),
-        1.0 / len(GLOBAL_COLOR_NAMES),
-        dtype=np.float64,
-    )
-    likelihoods = np.empty((len(identities), count), dtype=np.float64)
-    for identity_index, identity in enumerate(identities):
-        if expected_color_by_label is not None:
-            expected = expected_color_by_label.get(identity.label)
-            if expected in GLOBAL_COLOR_NAMES:
-                expected_index = GLOBAL_COLOR_NAMES.index(expected)
-                likelihoods[identity_index] = evidence[:, expected_index]
-                continue
-        prior = uniform_prior
-        if color_priors is not None:
-            prior_value = np.asarray(
-                color_priors.get(identity.label, uniform_prior),
-                dtype=np.float64,
-            ).reshape(-1)
-            if len(prior_value) == len(GLOBAL_COLOR_NAMES) and np.isfinite(prior_value).all():
-                prior_total = float(np.sum(prior_value))
-                if prior_total > 1e-12:
-                    prior = prior_value / prior_total
-        likelihoods[identity_index] = evidence @ prior
-    return np.clip(likelihoods, 1e-300, None)
+    return np.asarray([
+        [expected.get(identity.label) == color for color in colors]
+        for identity in canonical_sticker_identities()
+    ], dtype=np.float64)
 
 
 def sticker_mask_color_turn_fit_metrics(
-    candidate: StickerPnPCandidate,
-    rvec: np.ndarray,
-    tvec: np.ndarray,
-    layer_rotations: tuple[CubeLayerRotation, ...],
-    max_error: float,
-    color_likelihoods: np.ndarray | None,
+    candidate: StickerPnPCandidate, rvec: np.ndarray, tvec: np.ndarray,
+    layer_rotations: tuple[CubeLayerRotation, ...], max_error: float,
+    color_matches: np.ndarray | None,
 ) -> tuple[float, int]:
-    """Score mask colors against identities carried by a tested turn."""
-
-    if color_likelihoods is None:
+    """Return 1 - correct/observed, counting each containing sticker once."""
+    if color_matches is None:
         return 0.0, 0
-    observed = tuple(getattr(candidate, "sticker_mask_centers", ()))
-    uncertainties = np.asarray(
-        getattr(candidate, "sticker_mask_center_uncertainties", ()),
-        dtype=np.float64,
-    ).reshape(-1)
-    colors = tuple(getattr(candidate, "sticker_mask_colors", ()))
-    count = min(len(observed), len(colors), len(color_likelihoods[0]))
-    if count <= 0 or not np.isfinite(max_error) or max_error <= 0.0:
-        return 0.0, 0
-    trial_candidate = replace(
-        candidate, layer_rotations=layer_rotations, sticker_layer_rotations=None,
-    )
-    try:
-        projected_faces = projected_sticker_faces(trial_candidate, rvec, tvec)
-    except (cv2.error, ValueError, FloatingPointError):
-        return float("inf"), 0
-    if not projected_faces:
-        return float("inf"), 0
-    projected_centers = np.asarray(
-        [np.mean(np.asarray(face[2], dtype=np.float64), axis=0) for face in projected_faces],
-        dtype=np.float64,
-    )
-    if not np.isfinite(projected_centers).all():
-        return float("inf"), 0
-    observed_points = np.asarray(observed[:count], dtype=np.float64).reshape(-1, 2)
-    distances = np.linalg.norm(
-        observed_points[:, None, :] - projected_centers[None, :, :],
-        axis=2,
-    )
-    containing_faces: list[list[int]] = []
-    for observed_point in observed_points:
-        containing_faces.append(
-            [
-                face_index
-                for face_index, (_identity, _depth, polygon) in enumerate(projected_faces)
-                if cv2.pointPolygonTest(
-                    np.asarray(polygon, dtype=np.float32),
-                    (float(observed_point[0]), float(observed_point[1])),
-                    False,
-                ) >= 0.0
-            ]
-        )
-    nearest_faces = np.full(count, -1, dtype=np.int32)
-    nearest_distances = np.full(count, float("inf"), dtype=np.float64)
-    for observation_index, face_indices in enumerate(containing_faces):
-        if not face_indices:
+    trial = replace(candidate, layer_rotations=layer_rotations, sticker_layer_rotations=None)
+    faces = projected_sticker_faces(trial, rvec, tvec)
+    identities = {identity.label: index for index, identity in enumerate(canonical_sticker_identities())}
+    groups = {}
+    for index, point in enumerate(candidate.sticker_mask_centers):
+        containing = [face for face in faces if cv2.pointPolygonTest(
+            np.asarray(face[2], dtype=np.float32), tuple(float(v) for v in point), False,
+        ) >= 0]
+        if not containing:
             continue
-        face_distances = distances[observation_index, face_indices]
-        selected_offset = int(np.argmin(face_distances))
-        nearest_faces[observation_index] = face_indices[selected_offset]
-        nearest_distances[observation_index] = face_distances[selected_offset]
-    finite = np.isfinite(nearest_distances) & (nearest_faces >= 0)
-    if not np.any(finite):
+        face = min(containing, key=lambda face: float(np.linalg.norm(np.mean(face[2], axis=0) - point)))
+        label = face[0].label
+        groups[label] = max(groups.get(label, 0.0), float(color_matches[identities[label], index]))
+    if not groups:
         return float("inf"), 0
-    identity_indices = {
-        (identity.cubie_index, identity.axis, identity.side): index
-        for index, identity in enumerate(canonical_sticker_identities())
-    }
-    face_identity_indices = np.asarray(
-        [
-            identity_indices[
-                (face[0].cubie_index, face[0].axis, face[0].side)
-            ]
-            for face in projected_faces
-        ],
-        dtype=np.int32,
-    )
-    selected_identity_indices = np.zeros(count, dtype=np.int32)
-    selected_identity_indices[finite] = face_identity_indices[nearest_faces[finite]]
-    likelihood_matrix = np.asarray(color_likelihoods, dtype=np.float64)
-    selected_likelihoods = np.full(count, np.nan, dtype=np.float64)
-    selected_likelihoods[finite] = likelihood_matrix[
-        selected_identity_indices[finite],
-        np.flatnonzero(finite),
-    ]
-    if len(uncertainties) != count or not np.isfinite(uncertainties[:count]).all():
-        uncertainties = np.ones(count, dtype=np.float64)
-    else:
-        uncertainties = np.maximum(uncertainties[:count], 1.0)
-    weights = 1.0 / np.square(uncertainties)
-    finite &= np.isfinite(selected_likelihoods) & (selected_likelihoods > 0.0)
-    if not np.any(finite):
-        return float("inf"), 0
-    log_likelihoods = np.log(np.clip(selected_likelihoods, 1e-300, None))
-    color_error = -float(
-        np.sum(weights[finite] * log_likelihoods[finite])
-        / max(float(np.sum(weights[finite])), 1e-12)
-    )
-    match_count = int(
-        np.count_nonzero(finite & (nearest_distances <= max_error))
-    )
-    return color_error, match_count
+    return 1.0 - sum(groups.values()) / len(groups), len(groups)
 
 
 def turn_layer_observation_count(
@@ -9108,267 +7444,6 @@ def turn_layer_observation_count(
             used_faces.add(face_index)
         centroid_count = len(used_observations)
     return keypoint_count + int(centroid_count)
-
-
-def draw_sticker_mask_heatmap(
-    image: np.ndarray,
-    roi_xyxy: tuple[int, int, int, int],
-    predicted: tuple[list[np.ndarray], object, np.ndarray, np.ndarray | None]
-    | tuple[list[np.ndarray], object, np.ndarray]
-    | None,
-    sticker_mask_erosion: int = 0,
-    show_sticker_identities: bool = True,
-    show_sticker_centroids: bool = True,
-    show_sticker_mask: bool = True,
-) -> np.ndarray:
-    """Draw a transparent red heatmap centered on each sticker-mask peak."""
-
-    output = image.copy()
-    if predicted is None:
-        return output
-    local_masks = predicted[0]
-    x1, y1, x2, y2 = (int(value) for value in roi_xyxy)
-    roi_height = y2 - y1
-    roi_width = x2 - x1
-    if roi_height <= 0 or roi_width <= 0:
-        return output
-
-    if show_sticker_mask:
-        heatmap = np.zeros((roi_height, roi_width), dtype=np.float32)
-        for mask in sticker_segmentation_masks_in_roi(
-            predicted,
-            (roi_height, roi_width),
-            sticker_mask_erosion,
-        ):
-            distance = cv2.distanceTransform(
-                np.asarray(mask, dtype=np.uint8),
-                cv2.DIST_L2,
-                5,
-            )
-            peak = float(distance.max())
-            if peak > 0.0:
-                heatmap = np.maximum(heatmap, distance / peak)
-
-        if bool(np.any(heatmap > 0.0)):
-            # Keep the boundary nearly transparent and make the deepest interior
-            # pixels visibly red. The power curve concentrates color near the
-            # distance-transform peak instead of tinting the whole mask uniformly.
-            alpha = np.square(heatmap) * 0.82
-            roi = output[y1:y2, x1:x2]
-            red = np.zeros_like(roi, dtype=np.float32)
-            red[..., 2] = 255.0
-            blended = (
-                roi.astype(np.float32) * (1.0 - alpha[..., None])
-                + red * alpha[..., None]
-            )
-            output[y1:y2, x1:x2] = np.clip(blended, 0.0, 255.0).astype(np.uint8)
-
-    if show_sticker_centroids:
-        centers = sticker_mask_centers_to_frame(
-            local_masks,
-            roi_xyxy,
-            sticker_mask_erosion,
-        )
-        for index, center in enumerate(centers):
-            x, y = np.round(center).astype(np.int32)
-            if not (0 <= x < output.shape[1] and 0 <= y < output.shape[0]):
-                continue
-            cv2.circle(output, (int(x), int(y)), 6, (0, 0, 0), -1, cv2.LINE_AA)
-            cv2.circle(
-                output,
-                (int(x), int(y)),
-                4,
-                STICKER_MASK_CENTROID_COLOR_BGR,
-                -1,
-                cv2.LINE_AA,
-            )
-            if show_sticker_identities:
-                cv2.putText(
-                    output,
-                    f"M{index}",
-                    (int(x) + 6, int(y) - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.35,
-                    STICKER_MASK_CENTROID_COLOR_BGR,
-                    1,
-                    cv2.LINE_AA,
-                )
-    return output
-
-
-def sticker_mask_rgb_observations(
-    image: np.ndarray,
-    roi_xyxy: tuple[int, int, int, int],
-    predicted: tuple[list[np.ndarray], object, np.ndarray, np.ndarray | None]
-    | tuple[list[np.ndarray], object, np.ndarray]
-    | None,
-    sticker_mask_erosion: int = 0,
-) -> list[tuple[int, np.ndarray]]:
-    """Return one robust RGB sample for each segmentation mask."""
-
-    if predicted is None:
-        return []
-    x1, y1, x2, y2 = (int(value) for value in roi_xyxy)
-    roi = image[y1:y2, x1:x2]
-    if roi.size == 0:
-        return []
-    masks = sticker_segmentation_masks_in_roi(
-        predicted,
-        roi.shape[:2],
-        sticker_mask_erosion,
-    )
-    reliable_pixels = _reliable_color_mask(roi)
-    observations: list[tuple[int, np.ndarray]] = []
-    for mask_index, mask in enumerate(masks):
-        sample_mask = mask & reliable_pixels
-        if not bool(sample_mask.any()):
-            sample_mask = mask
-        pixels = roi[sample_mask]
-        if len(pixels) == 0:
-            continue
-        rgb = np.median(pixels[:, ::-1].astype(np.float64), axis=0)
-        observations.append((mask_index, np.round(rgb).clip(0, 255).astype(np.uint8)))
-    return observations
-
-
-def draw_classified_sticker_masks(
-    image: np.ndarray,
-    roi_xyxy: tuple[int, int, int, int],
-    predicted: tuple[list[np.ndarray], object, np.ndarray, np.ndarray | None]
-    | tuple[list[np.ndarray], object, np.ndarray]
-    | None,
-    global_profiles: dict[str, GlobalColorProfile] | None = None,
-    sticker_mask_erosion: int = 0,
-    opacity: float = 0.72,
-    show_sticker_identities: bool = True,
-    show_sticker_centroids: bool = True,
-    source_image: np.ndarray | None = None,
-) -> np.ndarray:
-    """Color each segmentation mask from its own image pixels.
-
-    This intentionally does not use projected sticker identities or pose. It
-    is a diagnostic view of the segmentation masks themselves.
-    """
-
-    if predicted is None:
-        return image.copy()
-    x1, y1, x2, y2 = (int(value) for value in roi_xyxy)
-    roi = image[y1:y2, x1:x2]
-    if roi.size == 0:
-        return image.copy()
-    masks = sticker_segmentation_masks_in_roi(
-        predicted,
-        roi.shape[:2],
-        sticker_mask_erosion,
-    )
-    if not masks:
-        return image.copy()
-    if global_profiles is None:
-        global_profiles = {
-            color_name: GlobalColorProfile(
-                color_name=color_name,
-                prior=pure_rgb_color_profile(color_name),
-                fitted=None,
-                sample_count=0,
-            )
-            for color_name in GLOBAL_COLOR_NAMES
-        }
-
-    output = image.copy()
-    output_roi = output[y1:y2, x1:x2]
-    opacity = float(np.clip(opacity, 0.0, 1.0))
-    mask_observations = dict(
-        sticker_mask_rgb_observations(
-            image if source_image is None else source_image,
-            roi_xyxy,
-            predicted,
-            sticker_mask_erosion,
-        )
-    )
-    for mask_index, mask in enumerate(masks):
-        rgb = mask_observations.get(mask_index)
-        if rgb is None:
-            continue
-        probabilities = rgb_observation_color_likelihoods(rgb, global_profiles)
-        color_name = max(probabilities, key=probabilities.get)
-        color_bgr = np.asarray(PURE_COLOR_RGB[color_name][::-1], dtype=np.float32)
-        blended = (
-            output_roi.astype(np.float32) * (1.0 - opacity)
-            + color_bgr * opacity
-        ).astype(np.uint8)
-        output_roi[mask] = blended[mask]
-
-        contours, _ = cv2.findContours(
-            mask.astype(np.uint8),
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE,
-        )
-        cv2.drawContours(output_roi, contours, -1, (0, 0, 0), 2, cv2.LINE_AA)
-        if show_sticker_centroids and show_sticker_identities:
-            ys, xs = np.nonzero(mask)
-            if len(xs):
-                center = (int(round(float(xs.mean()) + x1)), int(round(float(ys.mean()) + y1)))
-                confidence = probabilities[color_name]
-                cv2.putText(
-                    output,
-                    f"M{mask_index} {color_name} {confidence:.2f}",
-                    (center[0] + 5, center[1]),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.38,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    output,
-                    f"M{mask_index} {color_name} {confidence:.2f}",
-                    (center[0] + 5, center[1]),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.38,
-                    (0, 0, 0),
-                    1,
-                    cv2.LINE_AA,
-                )
-    return output
-
-
-def draw_sticker_mask_overlay(
-    image: np.ndarray,
-    roi_xyxy: tuple[int, int, int, int],
-    predicted: tuple[list[np.ndarray], object, np.ndarray, np.ndarray | None]
-    | tuple[list[np.ndarray], object, np.ndarray]
-    | None,
-    *,
-    global_profiles: dict[str, GlobalColorProfile] | None = None,
-    debug_color_masks: bool = False,
-    sticker_mask_erosion: int = 0,
-    show_sticker_identities: bool = True,
-    show_sticker_centroids: bool = True,
-    show_sticker_mask: bool = True,
-    source_image: np.ndarray | None = None,
-) -> np.ndarray:
-    """Choose direct mask colors or the ordinary segmentation heatmap."""
-
-    if debug_color_masks:
-        return draw_classified_sticker_masks(
-            image,
-            roi_xyxy,
-            predicted,
-            global_profiles=global_profiles,
-            sticker_mask_erosion=sticker_mask_erosion,
-            show_sticker_identities=show_sticker_identities,
-            show_sticker_centroids=show_sticker_centroids,
-            source_image=source_image,
-        )
-    return draw_sticker_mask_heatmap(
-        image,
-        roi_xyxy,
-        predicted,
-        sticker_mask_erosion=sticker_mask_erosion,
-        show_sticker_identities=show_sticker_identities,
-        show_sticker_centroids=show_sticker_centroids,
-        show_sticker_mask=show_sticker_mask,
-    )
 
 
 def refine_pose_with_sticker_centers(
@@ -9562,13 +7637,100 @@ def refine_pose_with_sticker_centers(
     )
 
 
+def refine_static_pose_from_all_observations(
+    candidate: StickerPnPCandidate, validate_sticker_facing: bool = True,
+) -> StickerPnPCandidate:
+    """Try bounded full-observation PnP/rematching before the inlier solve.
+
+    A small planar seed can miss an entire visible face with the 5% inlier
+    gate. Rematching all measured landmarks lets that face correct the pose.
+    Accept only a globally improved fit that puts *every* observation inside
+    the existing gate; partial turns/outliers retain the robust inlier path.
+    This is an optional rigid proposal, never a frame-acceptance requirement:
+    an unsuccessful attempt returns the input pose for inlier refinement.
+    The measured sticker anchors remain fixed throughout rematching.
+    """
+    if (candidate.assignment_image_points is None or candidate.assignment_object_points is None
+            or candidate.assignment_projected_points is None or candidate.assignment_observed_class_ids is None):
+        return candidate
+    observed = np.asarray(candidate.assignment_image_points, dtype=np.float32).reshape(-1, 2)
+    objects = np.asarray(candidate.assignment_object_points, dtype=np.float32).reshape(-1, 3).copy()
+    projected = np.asarray(candidate.assignment_projected_points, dtype=np.float32).reshape(-1, 2).copy()
+    classes = np.asarray(candidate.assignment_observed_class_ids, dtype=np.int32).reshape(-1)
+    if (len(observed) < 4 or not (len(observed) == len(objects) == len(projected) == len(classes))
+            or not np.isfinite(observed).all() or not np.isfinite(objects).all() or not np.isfinite(projected).all()):
+        return candidate
+    fixed = candidate.assignment_fixed_mask
+    if fixed is None:
+        fixed = np.arange(len(observed)) < len(candidate.image_points)
+    fixed = np.asarray(fixed, dtype=bool).reshape(-1)
+    if len(fixed) != len(observed) or int(fixed.sum()) != len(candidate.object_points):
+        return candidate
+    anchor_indices = np.flatnonzero(fixed)
+    baseline = assignment_geometric_quality(observed, projected)
+    best = candidate
+    best_mean = baseline[0]
+    rvec, tvec = candidate.rvec.copy(), candidate.tvec.copy()
+    for _ in range(6):
+        unique = unique_object_point_indices(objects, observed, projected)
+        if len(unique) < 4:
+            break
+        try:
+            ok, next_rvec, next_tvec = cv2.solvePnP(
+                objects[unique], observed[unique], candidate.camera_matrix, candidate.dist_coeffs,
+                rvec=rvec.copy(), tvec=tvec.copy(), useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+        except cv2.error:
+            break
+        if (not ok or not np.isfinite(next_rvec).all() or not np.isfinite(next_tvec).all()
+                or float(next_tvec[2, 0]) <= 0.0
+                or (validate_sticker_facing and not canonical_sticker_is_camera_facing(
+                    candidate.object_points, next_rvec, next_tvec))):
+            break
+        score, rows, columns, lattice_projected, lattice_objects, lattice_classes = evaluate_pose_hypothesis(
+            next_rvec, next_tvec, observed, classes, candidate.image_size,
+            candidate.camera_matrix, candidate.dist_coeffs, float("inf"), anchor_indices, candidate.object_points,
+        )
+        if not np.isfinite(score) or len(rows) != len(observed):
+            break
+        objects[rows] = lattice_objects[columns]
+        projected[rows] = lattice_projected[columns]
+        residuals = np.linalg.norm(observed - projected, axis=1)
+        mean, p90 = float(np.mean(residuals)), float(np.percentile(residuals, 90))
+        proposal = replace(candidate, rvec=next_rvec.copy(), tvec=next_tvec.copy())
+        limit = PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * projected_cube_diameter(proposal)
+        if (np.isfinite(limit) and np.all(residuals <= limit) and mean < best_mean - 1e-6
+                and p90 <= baseline[1] + 1e-6):
+            anchor_projected, _ = cv2.projectPoints(
+                candidate.object_points, next_rvec, next_tvec, candidate.camera_matrix, candidate.dist_coeffs,
+            )
+            anchor_projected = anchor_projected.reshape(-1, 2)
+            assigned_classes = np.empty_like(classes)
+            assigned_classes[rows] = lattice_classes[columns]
+            best = replace(
+                proposal, projected_sticker_points=anchor_projected,
+                reprojection_error=float(np.linalg.norm(anchor_projected - candidate.image_points, axis=1).mean()),
+                overall_reprojection_error=float(np.mean(huber_loss(residuals))),
+                assignment_object_points=objects.copy(), assignment_projected_points=projected.copy(),
+                assignment_projected_class_ids=assigned_classes,
+                final_solve_image_points=observed[unique].copy(),
+                pre_final_rvec=candidate.rvec.copy(), pre_final_tvec=candidate.tvec.copy(),
+            )
+            best_mean = mean
+        converged = (np.linalg.norm(next_tvec - tvec) <= 1e-5
+                     and np.linalg.norm(next_rvec - rvec) <= 1e-6)
+        rvec, tvec = next_rvec, next_tvec
+        if converged:
+            break
+    return best
+
+
 def solve_pnp_from_low_error_assignments(
     candidate: StickerPnPCandidate,
     validate_sticker_facing: bool = True,
     record_all_turn_candidates: bool = False,
     recover_layer_turns: bool = False,
     turn_color_priors: dict[str, np.ndarray] | None = None,
-    turn_global_profiles: dict[str, GlobalColorProfile] | None = None,
     turn_expected_color_by_label: dict[str, str] | None = None,
     turn_geometry_frame: dict[str, object] | None = None,
     turn_previous_move: str | None = None,
@@ -9631,7 +7793,6 @@ def solve_pnp_from_low_error_assignments(
             turn_geometry_frame,
             record_all_turn_candidates=record_all_turn_candidates,
             color_priors=turn_color_priors,
-            global_profiles=turn_global_profiles,
             expected_color_by_label=turn_expected_color_by_label,
             previous_move=turn_previous_move,
             previous_states=turn_previous_states,
@@ -9646,6 +7807,8 @@ def solve_pnp_from_low_error_assignments(
             turn_candidate_scores=(),
             turn_candidate_debug=(),
         )
+        candidate = refine_static_pose_from_all_observations(candidate, validate_sticker_facing)
+        assignment_error_limit = PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * projected_cube_diameter(candidate)
     image_points = np.asarray(candidate.assignment_image_points, dtype=np.float32).reshape(-1, 2)
     object_points = np.asarray(candidate.assignment_object_points, dtype=np.float32).reshape(-1, 3)
     projected_points = np.asarray(candidate.assignment_projected_points, dtype=np.float32).reshape(-1, 2)
@@ -9898,10 +8061,12 @@ def best_sticker_pnp_candidates(
 ) -> tuple[StickerPnPCandidate, ...]:
     """Solve prioritized stickers and retain the best full-cube hypotheses.
 
-    Up to three four-point stickers are tried in descending confidence order.
+    Color-point seeds use pixel diagonal-center error, preferring four
+    measurements on ties, then confidence. Up to three distinct landmark
+    groups are fitted, retaining ambiguous class-consistent sticker types.
     All successful candidates are returned in score order so temporal logic
     can keep alternatives alive. If none of the four-point stickers yields a
-    pose, the same process falls back to three-point stickers.
+    pose, legacy mask seeds fall back to three-point stickers.
     """
 
     valid_matches = tuple(
@@ -9937,31 +8102,26 @@ def best_sticker_pnp_candidates(
         prioritized_matches: tuple[StickerKeypointMatch, ...],
     ) -> tuple[StickerPnPCandidate, ...]:
         candidates: list[StickerPnPCandidate] = []
-        prioritized = sorted(prioritized_matches, key=sticker_match_priority_key)[
-            :MAX_STICKER_PNP_CANDIDATES
-        ]
-        for match in prioritized:
-            sticker_contour = None
-            if (
-                sticker_contours_by_mask
-                and 0 <= match.mask_index < len(local_masks or ())
-            ):
-                sticker_contour = sticker_contours_by_mask[match.mask_index]
-            solved_candidates = solve_sticker_pnp_candidates(
-                frame_points,
-                point_class_ids,
-                match,
-                image_size,
-                focal_scale,
-                sticker_contour,
-                scoring_points,
-                sticker_contours,
-                sticker_boundary_samples,
-                sticker_mask_centers,
-                sticker_mask_center_uncertainties,
-                sticker_mask_colors,
-            )
-            candidates.extend(solved_candidates)
+        color_seeds = all(match.center_error is not None for match in prioritized_matches)
+        prioritized = sorted(prioritized_matches, key=sticker_match_priority_key)
+        if color_seeds:
+            groups: dict[tuple[int, ...], list[StickerKeypointMatch]] = {}
+            for match in prioritized:
+                group = groups.setdefault(tuple(sorted(match.keypoint_indices)), [])
+                if not any(existing.sticker_type == match.sticker_type for existing in group):
+                    group.append(match)
+            prioritized_groups = list(groups.values())
+        else:
+            prioritized_groups = [[match] for match in prioritized[:MAX_STICKER_PNP_CANDIDATES]]
+        solved_groups = 0
+        for group in prioritized_groups:
+            before = len(candidates)
+            for match in group:
+                candidates.extend(solve_match(match))
+            if len(candidates) > before:
+                solved_groups += 1
+            if solved_groups >= MAX_STICKER_PNP_CANDIDATES:
+                break
         candidates.sort(
             key=lambda candidate: (
                 pose_hypothesis_visual_score(candidate),
@@ -9970,6 +8130,31 @@ def best_sticker_pnp_candidates(
         )
         return tuple(candidates)
 
+    def solve_match(match: StickerKeypointMatch) -> tuple[StickerPnPCandidate, ...]:
+        sticker_contour = None
+        if (
+            sticker_contours_by_mask
+            and 0 <= match.mask_index < len(local_masks or ())
+        ):
+            sticker_contour = sticker_contours_by_mask[match.mask_index]
+        solved_candidates = solve_sticker_pnp_candidates(
+            frame_points,
+            point_class_ids,
+            match,
+            image_size,
+            focal_scale,
+            sticker_contour,
+            scoring_points,
+            sticker_contours,
+            sticker_boundary_samples,
+            sticker_mask_centers,
+            sticker_mask_center_uncertainties,
+            sticker_mask_colors,
+        )
+        return solved_candidates
+
+    if all(match.center_error is not None for match in valid_matches):
+        return solve_matches(valid_matches)
     candidates = solve_matches(four_point_matches)
     if candidates:
         return candidates
@@ -10179,24 +8364,6 @@ def predict_pose_result(
     return results[0] if results else None
 
 
-def predict_models_parallel_cpu(
-    sticker_seg_model: object | None,
-    pose_model: object,
-    model_roi: np.ndarray,
-    args: argparse.Namespace,
-) -> tuple[tuple[list[np.ndarray], object, np.ndarray, np.ndarray | None] | None, object | None]:
-    """Run the independent CPU model calls concurrently."""
-
-    sticker_future = (
-        CPU_NEURAL_EXECUTOR.submit(predict_sticker_masks, sticker_seg_model, model_roi, args)
-        if sticker_seg_model is not None and args.run_sticker_segmentation
-        else None
-    )
-    pose_future = CPU_NEURAL_EXECUTOR.submit(predict_pose_result, pose_model, model_roi, args)
-    sticker_masks = sticker_future.result() if sticker_future is not None else None
-    return sticker_masks, pose_future.result()
-
-
 def local_to_frame_points(
     local_points: np.ndarray,
     roi_xyxy: tuple[int, int, int, int],
@@ -10233,7 +8400,7 @@ def tracking_bounds(
         if 0 <= int(class_id) < len(CLASS_NAMES)
         and float(box_confidence)
         >= independent_pose_class_threshold(CLASS_NAMES[int(class_id)], class_confidences)
-        and float(point_confidence) >= point_threshold
+        and float(point_confidence) >= pose_keypoint_confidence_threshold(int(class_id), point_threshold)
         and np.isfinite(point).all()
         and 0 <= float(point[0]) < width
         and 0 <= float(point[1]) < height
@@ -10307,7 +8474,8 @@ def draw_pose(
             continue
         class_name = CLASS_NAMES[int(class_id)]
         class_threshold = independent_pose_class_threshold(class_name, class_confidences)
-        if float(box_confidence) < class_threshold or float(point_confidence) < point_threshold:
+        if (float(box_confidence) < class_threshold
+                or float(point_confidence) < pose_keypoint_confidence_threshold(int(class_id), point_threshold)):
             continue
         class_index = per_class_index[int(class_id)]
         per_class_index[int(class_id)] += 1
@@ -10525,602 +8693,6 @@ def projected_sticker_faces(
     return projected
 
 
-def sticker_segmentation_masks_in_roi(
-    predicted: tuple[list[np.ndarray], object, np.ndarray, np.ndarray | None],
-    roi_shape: tuple[int, int],
-    sticker_mask_erosion: int = 0,
-) -> list[np.ndarray]:
-    """Resize each sticker instance and intersect it with the cube mask."""
-
-    if len(predicted) == 4:
-        local_masks, _names, _class_ids, cube_mask = predicted
-    else:
-        local_masks, _names, _class_ids = predicted
-        cube_mask = None
-    roi_height, roi_width = roi_shape
-    resized_cube = None
-    if cube_mask is not None:
-        resized_cube = cv2.resize(
-            np.asarray(cube_mask, dtype=np.uint8),
-            (roi_width, roi_height),
-            interpolation=cv2.INTER_NEAREST,
-        ) > 0
-    masks: list[np.ndarray] = []
-    for local_mask in local_masks:
-        resized = cv2.resize(
-            np.asarray(local_mask, dtype=np.uint8),
-            (roi_width, roi_height),
-            interpolation=cv2.INTER_NEAREST,
-        ) > 0
-        resized = erode_binary_mask(resized, sticker_mask_erosion)
-        if resized_cube is not None:
-            resized &= resized_cube
-        if bool(resized.any()):
-            masks.append(resized)
-    return masks
-
-
-def sticker_view_reliability_weight(
-    candidate: StickerPnPCandidate,
-    identity: StickerIdentity,
-    rotation: np.ndarray | None = None,
-) -> float:
-    """Return a lower evidence weight for nearly edge-on sticker views.
-
-    The reliability is the absolute cosine between the sticker normal and
-    the camera-facing direction.  It therefore tends to zero as the viewing
-    angle approaches 90 degrees, where projected sticker locations are most
-    sensitive to pose error.
-    """
-
-    if rotation is None:
-        rotation, _ = cv2.Rodrigues(
-            np.asarray(candidate.rvec, dtype=np.float64).reshape(3, 1)
-        )
-    cubie_index, axis, side = sticker_geometry_key(candidate, identity)
-    center = cubelet_center_object_point(*cubie_index)
-    face = cubelet_face_object_points(center, axis, side)
-    transformed_center, transformed_face = apply_cubelet_layer_rotations(
-        center,
-        face,
-        physical_sticker_rotations(candidate),
-    )
-    normal = np.cross(
-        transformed_face[1] - transformed_face[0],
-        transformed_face[2] - transformed_face[0],
-    )
-    center_camera = (
-        rotation @ np.asarray(transformed_center, dtype=np.float64)
-        + np.asarray(candidate.tvec, dtype=np.float64).reshape(3)
-    )
-    normal_camera = rotation @ normal
-    denominator = float(np.linalg.norm(normal_camera) * np.linalg.norm(center_camera))
-    if denominator <= 1e-12:
-        return STICKER_VIEW_WEIGHT_FLOOR
-    normal_alignment = abs(float(np.dot(normal_camera, center_camera))) / denominator
-    return float(max(STICKER_VIEW_WEIGHT_FLOOR, normal_alignment))
-
-
-def sample_projected_sticker_colors(
-    frame_bgr: np.ndarray,
-    roi_xyxy: tuple[int, int, int, int],
-    predicted: tuple[list[np.ndarray], object, np.ndarray, np.ndarray | None] | None,
-    candidate: StickerPnPCandidate | None,
-    *,
-    max_samples_per_sticker: int = 128,
-    min_samples_per_sticker: int = 4,
-    sticker_mask_erosion: int = 0,
-    intersection_masks: dict[str, np.ndarray] | None = None,
-) -> dict[str, np.ndarray]:
-    """Average reliable pixels for each projected sticker identity in one frame."""
-
-    if predicted is None or candidate is None:
-        return {}
-    x1, y1, x2, y2 = roi_xyxy
-    roi = frame_bgr[y1:y2, x1:x2]
-    if roi.size == 0:
-        return {}
-    segmentation_masks = sticker_segmentation_masks_in_roi(
-        predicted,
-        roi.shape[:2],
-        sticker_mask_erosion,
-    )
-    if not segmentation_masks:
-        return {}
-    segmentation_mask = np.logical_or.reduce(segmentation_masks)
-    reliable_mask = _reliable_color_mask(roi)
-    observations: dict[str, np.ndarray] = {}
-    projected_faces = projected_sticker_faces(
-        candidate,
-        candidate.rvec,
-        candidate.tvec,
-    )
-    # The face list is far-to-near.  Assigning each pixel in that order makes
-    # the nearer projected face own any overlap, so a projected polygon cannot
-    # borrow visible pixels from another sticker behind it.
-    projected_face_owners = np.full(roi.shape[:2], -1, dtype=np.int32)
-    for face_index, (_identity, _depth, polygon) in enumerate(projected_faces):
-        polygon_roi = np.round(polygon - np.asarray((x1, y1), dtype=np.float32)).astype(np.int32)
-        projected_mask = np.zeros(roi.shape[:2], dtype=np.uint8)
-        cv2.fillConvexPoly(projected_mask, polygon_roi, 1)
-        projected_face_owners[projected_mask > 0] = face_index
-
-    # A combined segmentation model normally returns one instance per visible
-    # sticker. Match those instances to projected faces before sampling so a
-    # small pose error cannot mix a neighboring sticker's color into this one.
-    # Keep the union fallback for a model that returns one mask covering all
-    # stickers rather than separate instances.
-    face_to_segmentation: dict[int, np.ndarray] = {}
-    if len(segmentation_masks) > 1:
-        pairings = []
-        for face_index, _face in enumerate(projected_faces):
-            face_mask = projected_face_owners == face_index
-            face_area = int(face_mask.sum())
-            if face_area == 0:
-                continue
-            for mask_index, segmentation_instance in enumerate(segmentation_masks):
-                overlap = int(np.count_nonzero(face_mask & segmentation_instance))
-                if overlap < max(1, int(min_samples_per_sticker)):
-                    continue
-                union = face_area + int(segmentation_instance.sum()) - overlap
-                pairings.append(
-                    (
-                        overlap / max(1, union),
-                        overlap,
-                        face_index,
-                        mask_index,
-                    )
-                )
-        used_faces: set[int] = set()
-        used_masks: set[int] = set()
-        for _iou, _overlap, face_index, mask_index in sorted(
-            pairings,
-            key=lambda pairing: (-pairing[0], -pairing[1], pairing[2], pairing[3]),
-        ):
-            if face_index in used_faces or mask_index in used_masks:
-                continue
-            used_faces.add(face_index)
-            used_masks.add(mask_index)
-            face_to_segmentation[face_index] = segmentation_masks[mask_index]
-
-    for face_index, (identity, _depth, _polygon) in enumerate(projected_faces):
-        if len(segmentation_masks) > 1:
-            sticker_mask = face_to_segmentation.get(face_index)
-            if sticker_mask is None:
-                continue
-        else:
-            sticker_mask = segmentation_mask
-        intersection = (projected_face_owners == face_index) & sticker_mask
-        sample_mask = intersection & reliable_mask
-        ys, xs = np.nonzero(sample_mask)
-        if len(xs) < max(1, int(min_samples_per_sticker)):
-            continue
-        if len(xs) > max(1, int(max_samples_per_sticker)):
-            selected = np.linspace(
-                0,
-                len(xs) - 1,
-                max(1, int(max_samples_per_sticker)),
-                dtype=np.int32,
-            )
-            ys = ys[selected]
-            xs = xs[selected]
-        mean_bgr = roi[ys, xs].astype(np.float32).mean(axis=0)
-        observations[identity.label] = np.round(mean_bgr[::-1]).clip(0, 255).astype(np.uint8)
-        if intersection_masks is not None:
-            intersection_masks[identity.label] = intersection
-    return observations
-
-
-def draw_projected_classified_masks(
-    image: np.ndarray, source_image: np.ndarray,
-    roi_xyxy: tuple[int, int, int, int], predicted: object,
-    candidate: StickerPnPCandidate | None,
-    global_profiles: dict[str, GlobalColorProfile],
-    *, sticker_mask_erosion: int = 0, opacity: float = 0.72,
-    max_samples_per_sticker: int = 128, min_samples_per_sticker: int = 4,
-) -> np.ndarray:
-    """Color projected sticker/segmentation intersections without identity priors."""
-    masks: dict[str, np.ndarray] = {}
-    samples = sample_projected_sticker_colors(
-        source_image, roi_xyxy, predicted, candidate,
-        max_samples_per_sticker=max_samples_per_sticker,
-        min_samples_per_sticker=min_samples_per_sticker,
-        sticker_mask_erosion=sticker_mask_erosion, intersection_masks=masks,
-    )
-    output = image.copy()
-    x1, y1, x2, y2 = roi_xyxy
-    output_roi = output[y1:y2, x1:x2]
-    opacity = float(np.clip(opacity, 0.0, 1.0))
-    for label, rgb in samples.items():
-        likelihoods = rgb_observation_color_likelihoods(rgb, global_profiles)
-        color = max(likelihoods, key=likelihoods.get)
-        mask = masks[label]
-        bgr = np.asarray(PURE_COLOR_RGB[color][::-1], dtype=np.float32)
-        output_roi[mask] = np.clip(
-            output_roi[mask].astype(np.float32) * (1.0 - opacity) + bgr * opacity,
-            0, 255,
-        ).astype(np.uint8)
-    return output
-
-
-def save_sticker_rgb_html_plot(
-    trace: StickerColorTrace,
-    output_path: Path,
-    *,
-    title: str,
-    normalize_rgb: bool = False,
-    point_size: float = 5.0,
-    global_profiles: dict[str, GlobalColorProfile] | None = None,
-    global_observations: dict[str, list[tuple[str, int, np.ndarray]]] | None = None,
-) -> None:
-    """Save one interactive RGB trajectory plot with one trace per sticker."""
-
-    try:
-        import plotly.graph_objects as go
-    except ImportError as exc:
-        raise RuntimeError(
-            "Plotly is required for --rgb-html-plot. Install it in the Python environment."
-        ) from exc
-
-    figure = go.Figure()
-    category_titles = {"center": "Centers", "edge": "Edges", "corner": "Corners"}
-    category_seen: set[str] = set()
-    raw_trace_indexes: list[int] = []
-    regression_trace_indexes: list[int] = []
-    global_raw_trace_indexes: dict[str, int] = {}
-    global_profile_trace_indexes: dict[str, int] = {}
-    profiles = {
-        identity.label: fit_sticker_color_profile(trace, identity.label)
-        for identity in trace.identities
-    }
-    if global_profiles is None or global_observations is None:
-        global_profiles, global_observations = build_global_color_profiles(trace)
-    for identity in trace.identities:
-        entries = trace.observations.get(identity.label, ())
-        frames = np.asarray([entry[0] for entry in entries], dtype=np.int32)
-        rgb = np.asarray([entry[1] for entry in entries], dtype=np.uint8).reshape(-1, 3)
-        plot_rgb = rgb.astype(np.float32)
-        if normalize_rgb:
-            plot_rgb /= np.maximum(np.linalg.norm(plot_rgb, axis=1, keepdims=True), 1.0)
-        customdata = np.column_stack((frames, rgb))
-        raw_trace_indexes.append(len(figure.data))
-        figure.add_trace(
-            go.Scatter3d(
-                x=plot_rgb[:, 0],
-                y=plot_rgb[:, 1],
-                z=plot_rgb[:, 2],
-                mode="markers",
-                marker={
-                    "size": point_size,
-                    "color": [
-                        f"rgb({int(red)},{int(green)},{int(blue)})"
-                        for red, green, blue in rgb
-                    ],
-                    "opacity": 0.82,
-                },
-                customdata=customdata,
-                hovertemplate=(
-                    f"{identity.label}<br>"
-                    "frame=%{customdata[0]}<br>"
-                    "R=%{customdata[1]} G=%{customdata[2]} B=%{customdata[3]}<br>"
-                    "x=%{x:.3f} y=%{y:.3f} z=%{z:.3f}<extra></extra>"
-                ),
-                name=identity.label,
-                legendgroup=identity.category,
-                legendgrouptitle=(
-                    {"text": category_titles[identity.category]}
-                    if identity.category not in category_seen
-                    else None
-                ),
-            )
-        )
-        profile = profiles[identity.label]
-        if profile is None:
-            regression_rgb = np.empty((0, 3), dtype=np.float32)
-        else:
-            regression_rgb = sample_profile_polyline(profile.polyline_rgb, count=96).astype(
-                np.float32
-            )
-            if normalize_rgb:
-                regression_rgb /= np.maximum(
-                    np.linalg.norm(regression_rgb, axis=1, keepdims=True),
-                    1.0,
-                )
-        regression_trace_indexes.append(len(figure.data))
-        figure.add_trace(
-            go.Scatter3d(
-                x=regression_rgb[:, 0],
-                y=regression_rgb[:, 1],
-                z=regression_rgb[:, 2],
-                mode="lines",
-                line={"color": "rgba(0,0,0,0.9)", "width": 5},
-                hovertemplate=(
-                    f"{identity.label} fitted regression<br>"
-                    "R=%{x:.3f} G=%{y:.3f} B=%{z:.3f}<extra></extra>"
-                ),
-                name=f"{identity.label} regression",
-                legendgroup=identity.category,
-                showlegend=False,
-            )
-        )
-        category_seen.add(identity.category)
-
-    def global_plot_color(color_name: str) -> str:
-        red, green, blue = PURE_COLOR_RGB[color_name]
-        # A pure white line disappears on Plotly's white background.
-        if color_name == "white":
-            return "rgb(80,80,80)"
-        return f"rgb({red},{green},{blue})"
-
-    for color_name in GLOBAL_COLOR_NAMES:
-        entries = global_observations[color_name]
-        if entries:
-            rgb = np.asarray([entry[2] for entry in entries], dtype=np.uint8).reshape(-1, 3)
-            plot_rgb = rgb.astype(np.float32)
-            if normalize_rgb:
-                plot_rgb /= np.maximum(np.linalg.norm(plot_rgb, axis=1, keepdims=True), 1.0)
-            customdata = [
-                [entry[0], entry[1], int(red), int(green), int(blue)]
-                for entry, (red, green, blue) in zip(entries, rgb, strict=True)
-            ]
-        else:
-            rgb = np.empty((0, 3), dtype=np.uint8)
-            plot_rgb = np.empty((0, 3), dtype=np.float32)
-            customdata = []
-        global_raw_trace_indexes[color_name] = len(figure.data)
-        figure.add_trace(
-            go.Scatter3d(
-                x=plot_rgb[:, 0],
-                y=plot_rgb[:, 1],
-                z=plot_rgb[:, 2],
-                mode="markers",
-                marker={
-                    "size": point_size,
-                    "color": [
-                        f"rgb({int(red)},{int(green)},{int(blue)})"
-                        for red, green, blue in rgb
-                    ],
-                    "opacity": 0.88,
-                    "line": {"color": "black", "width": 1},
-                },
-                customdata=customdata,
-                hovertemplate=(
-                    f"{color_name} global group<br>"
-                    "sticker=%{customdata[0]}<br>"
-                    "frame=%{customdata[1]}<br>"
-                    "R=%{customdata[2]} G=%{customdata[3]} B=%{customdata[4]}"
-                    "<extra></extra>"
-                ),
-                name=f"{color_name} observations",
-                legendgroup="global-colors",
-                legendgrouptitle={"text": "Whole colors and regressions"},
-            )
-        )
-        fitted = _global_profile_reference(global_profiles[color_name])
-        if fitted is None:
-            profile_rgb = np.empty((0, 3), dtype=np.float32)
-        else:
-            profile_rgb = sample_profile_polyline(fitted.polyline_rgb, count=96).astype(
-                np.float32
-            )
-            if normalize_rgb:
-                profile_rgb /= np.maximum(
-                    np.linalg.norm(profile_rgb, axis=1, keepdims=True),
-                    1.0,
-                )
-        global_profile_trace_indexes[color_name] = len(figure.data)
-        figure.add_trace(
-            go.Scatter3d(
-                x=profile_rgb[:, 0],
-                y=profile_rgb[:, 1],
-                z=profile_rgb[:, 2],
-                mode="lines",
-                line={
-                    "color": global_plot_color(color_name),
-                    "width": 7,
-                },
-                name=(f"{color_name} global profile regression" if global_profiles[color_name].fitted is not None
-                      else f"{color_name} global profile prior"),
-                legendgroup="global-colors",
-                legendgrouptitle={"text": "Whole colors and regressions"},
-                showlegend=True,
-                hovertemplate=(
-                    f"{color_name} global profile<br>"
-                    "R=%{x:.3f} G=%{y:.3f} B=%{z:.3f}<extra></extra>"
-                ),
-            )
-        )
-
-    sticker_count = len(trace.identities)
-    plot_trace_count = len(figure.data)
-
-    all_sticker_visibility = [False] * plot_trace_count
-    for index in range(len(trace.identities)):
-        all_sticker_visibility[raw_trace_indexes[index]] = True
-        all_sticker_visibility[regression_trace_indexes[index]] = True
-
-    def global_visibility(color_names: set[str]) -> list[bool]:
-        visibility = [False] * plot_trace_count
-        for color_name in color_names:
-            visibility[global_raw_trace_indexes[color_name]] = True
-            visibility[global_profile_trace_indexes[color_name]] = True
-        return visibility
-
-    def visibility_for(predicate) -> list[bool]:
-        visibility = [False] * plot_trace_count
-        for index, identity in enumerate(trace.identities):
-            if predicate(identity):
-                visibility[raw_trace_indexes[index]] = True
-                visibility[regression_trace_indexes[index]] = True
-        return visibility
-
-    selector_buttons = [
-        {
-            "label": "All stickers and colors",
-            "method": "update",
-            "args": [
-                {"visible": [True] * plot_trace_count},
-                {"title": f"{title} — All stickers and colors"},
-            ],
-        },
-        {
-            "label": "All stickers",
-            "method": "update",
-            "args": [
-                {"visible": all_sticker_visibility},
-                {"title": f"{title} (all {sticker_count} stickers)"},
-            ],
-        },
-        {
-            "label": "All colors",
-            "method": "update",
-            "args": [
-                {"visible": global_visibility(set(GLOBAL_COLOR_NAMES))},
-                {"title": f"{title} — All colors"},
-            ],
-        },
-        {
-            "label": "Centers",
-            "method": "update",
-            "args": [
-                {
-                    "visible": visibility_for(
-                        lambda identity: identity.category == "center"
-                    )
-                },
-                {"title": f"{title} — Centers"},
-            ],
-        },
-        {
-            "label": "Edges",
-            "method": "update",
-            "args": [
-                {
-                    "visible": visibility_for(
-                        lambda identity: identity.category == "edge"
-                    )
-                },
-                {"title": f"{title} — Edges"},
-            ],
-        },
-        {
-            "label": "Corners",
-            "method": "update",
-            "args": [
-                {
-                    "visible": visibility_for(
-                        lambda identity: identity.category == "corner"
-                    )
-                },
-                {"title": f"{title} — Corners"},
-            ],
-        },
-    ]
-    for color_name in GLOBAL_COLOR_NAMES:
-        selector_buttons.append(
-            {
-                "label": color_name,
-                "method": "update",
-                "args": [
-                    {"visible": global_visibility({color_name})},
-                    {"title": f"{title} — {color_name}"},
-                ],
-            }
-        )
-    for trace_index, identity in enumerate(trace.identities):
-        sticker_visibility = [False] * plot_trace_count
-        sticker_visibility[raw_trace_indexes[trace_index]] = True
-        sticker_visibility[regression_trace_indexes[trace_index]] = True
-        selector_buttons.append(
-            {
-                "label": identity.label,
-                "method": "update",
-                "args": [
-                    {"visible": sticker_visibility},
-                    {"title": f"{title} — {identity.label}"},
-                ],
-            }
-        )
-
-    axis_range = [0.0, 1.0] if normalize_rgb else [0.0, 255.0]
-    axis_title = "normalized RGB" if normalize_rgb else "RGB"
-    figure.update_layout(
-        title=f"{title} ({sum(bool(trace.observations.get(identity.label)) for identity in trace.identities)} stickers)",
-        scene={
-            "xaxis": {"title": f"R ({axis_title})", "range": axis_range},
-            "yaxis": {"title": f"G ({axis_title})", "range": axis_range},
-            "zaxis": {"title": f"B ({axis_title})", "range": axis_range},
-            "aspectmode": "cube",
-        },
-        updatemenus=[
-            {
-                "active": 0,
-                "buttons": selector_buttons,
-                "direction": "down",
-                "showactive": True,
-                "x": 0.0,
-                "xanchor": "left",
-                "y": 1.16,
-                "yanchor": "top",
-            }
-        ],
-        clickmode="event+select",
-        margin={"l": 0, "r": 0, "b": 0, "t": 86},
-        legend={
-            "itemsizing": "constant",
-            "groupclick": "toggleitem",
-            "itemclick": "toggle",
-        },
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.write_html(str(output_path), include_plotlyjs="cdn", full_html=True)
-
-
-def normalized_rgb_html_plot_path(rgb_html_path: Path) -> Path:
-    suffix = rgb_html_path.suffix or ".html"
-    return rgb_html_path.with_name(f"{rgb_html_path.stem}_normalized{suffix}")
-
-
-def raw_rgb_html_plot_path(rgb_html_path: Path) -> Path:
-    suffix = rgb_html_path.suffix or ".html"
-    return rgb_html_path.with_name(f"{rgb_html_path.stem}_raw{suffix}")
-
-
-def save_sticker_color_plots(
-    trace: StickerColorTrace,
-    output_path: Path,
-    *,
-    title: str,
-    primary_normalized: bool,
-    point_size: float,
-    global_profiles: dict[str, GlobalColorProfile] | None = None,
-    global_observations: dict[str, list[tuple[str, int, np.ndarray]]] | None = None,
-) -> None:
-    save_sticker_rgb_html_plot(
-        trace,
-        output_path,
-        title=title,
-        normalize_rgb=primary_normalized,
-        point_size=point_size,
-        global_profiles=global_profiles,
-        global_observations=global_observations,
-    )
-    companion_path = (
-        raw_rgb_html_plot_path(output_path)
-        if primary_normalized
-        else normalized_rgb_html_plot_path(output_path)
-    )
-    save_sticker_rgb_html_plot(
-        trace,
-        companion_path,
-        title=f"{title} {'raw' if primary_normalized else 'normalized'}",
-        normalize_rgb=not primary_normalized,
-        point_size=point_size,
-        global_profiles=global_profiles,
-        global_observations=global_observations,
-    )
-
-
 def projected_cubelet_faces(
     candidate: StickerPnPCandidate,
     rvec: np.ndarray,
@@ -11253,19 +8825,30 @@ def project_cube_orientation_axes(
     tvec: np.ndarray,
     axis_length: float,
 ) -> np.ndarray | None:
-    """Project the cube-centered positive X/Y/Z axes into the image."""
+    """Project display X+/Y+/Z+ toward the red/white/green center stickers."""
 
     if not np.isfinite(axis_length) or float(axis_length) <= 0.0:
         return None
-    object_points = np.asarray(
-        (
-            (0.0, 0.0, 0.0),
-            (float(axis_length), 0.0, 0.0),
-            (0.0, float(axis_length), 0.0),
-            (0.0, 0.0, float(axis_length)),
-        ),
-        dtype=np.float32,
-    )
+    centers = {identity.label: identity for identity in canonical_sticker_identities()
+               if identity.category == "center"}
+    labels = getattr(candidate, "orientation_axis_center_labels", None)
+    if labels is None:
+        by_face = {identity.face: identity.label for identity in centers.values()}
+        labels = tuple(by_face[face] for face in ORIENTATION_AXIS_DEFAULT_FACES)
+    rotations = getattr(candidate, "sticker_layer_rotations", None)
+    if rotations is None:
+        rotations = getattr(candidate, "layer_rotations", ())
+    object_points = [np.zeros(3, dtype=np.float64)]
+    for label in labels:
+        identity = centers[label]
+        cubie_index, axis, side = sticker_geometry_key(candidate, identity)
+        cubie_center = cubelet_center_object_point(*cubie_index)
+        face_center = cubie_center.copy()
+        face_center[axis] += side * CUBE_LAYER_SIZE_MM / 2.0
+        _, transformed = apply_cubelet_layer_rotations(cubie_center, face_center[None, :], tuple(rotations))
+        direction = transformed[0]
+        object_points.append(direction * (float(axis_length) / np.linalg.norm(direction)))
+    object_points = np.asarray(object_points, dtype=np.float32)
     try:
         projected, _ = cv2.projectPoints(
             object_points,
@@ -11290,9 +8873,8 @@ def draw_orientation_axes(
 ) -> bool:
     """Draw a cube-attached 3-axis orientation gizmo.
 
-    The axes are projected from the same object frame as the pose wireframe,
-    so the gizmo follows the symmetry-canonicalized pose continuously across
-    a video rather than being a separate screen-space indicator.
+    Display X+/Y+/Z+ follow the red/white/green centers, including committed
+    center permutations and partial wide turns, in the wireframe's pose.
     """
 
     projected = project_cube_orientation_axes(
@@ -11392,6 +8974,16 @@ def append_turn_candidate_log(
             pruning_examples=root.get("pruning_examples", []),
             root_return_examples=root.get("root_return_examples", []),
         ) for root in search_diagnostics["roots"]]
+    candidates = [dict(trial) for trial in candidates]
+    for trial in candidates:
+        observed = trial.get("color_match_count", 0)
+        error = trial.get("color_error")
+        if observed and isinstance(error, (float, int)) and np.isfinite(error) and 0 <= error <= 1:
+            trial.update(
+                color_observed_count=int(observed),
+                color_correct_count=int(round((1.0 - error) * observed)),
+                color_score=1.0 - error,
+            )
     static_scores = (
         list(getattr(candidate, "turn_fit_static_scores", ()))
         if candidate is not None
@@ -11404,19 +8996,19 @@ def append_turn_candidate_log(
         and getattr(candidate, "turn_fit_articulated_scores", None) is not None
         else None
     )
-    color_likelihoods = (
-        getattr(candidate, "turn_color_likelihoods", None)
+    color_matches = (
+        getattr(candidate, "turn_color_matches", None)
         if candidate is not None
         else None
     )
     color_identity_labels = (
         [identity.label for identity in canonical_sticker_identities()]
-        if color_likelihoods is not None
+        if color_matches is not None
         else None
     )
     color_observation_centers = (
         getattr(candidate, "sticker_mask_centers", ())
-        if candidate is not None and color_likelihoods is not None
+        if candidate is not None
         else None
     )
     rotations_for_log = tuple(candidate.layer_rotations) if candidate is not None else ()
@@ -11476,6 +9068,7 @@ def append_turn_candidate_log(
                 "sticker_mask_center_uncertainties",
                 (),
             ),
+            "sticker_color_names": getattr(candidate, "sticker_color_names", ()),
             "cube_geometry_state": (
                 getattr(candidate, "cube_geometry_state").to_json()
                 if getattr(candidate, "cube_geometry_state", None) is not None
@@ -11500,7 +9093,9 @@ def append_turn_candidate_log(
             }
         )
     record = {
-        "log_schema_version": 2,
+        "log_schema_version": 3,
+        "geometry_scoring_version": PNP_TURN_GEOMETRY_SCORE_VERSION,
+        "color_scoring": "direct_match_fraction",
         "frame_index": frame_index,
         "has_pose": candidate is not None,
         "turn_fit_evaluated": bool(
@@ -11525,7 +9120,8 @@ def append_turn_candidate_log(
         ),
         "turn_color_identity_labels": color_identity_labels,
         "turn_color_observation_centers": color_observation_centers,
-        "turn_color_likelihoods": color_likelihoods,
+        "turn_color_observation_names": getattr(candidate, "sticker_color_names", ()) if candidate else (),
+        "turn_color_matches": color_matches,
         "static_fit_scores": static_scores,
         "selected_fit_scores": articulated_scores,
         "lookahead_action_score": float(
@@ -11609,73 +9205,28 @@ def append_turn_candidate_log(
         log_file.write("\n")
 
 
-def projected_turn_color_likelihoods_by_identity(
+def projected_turn_color_matches_by_identity(
     candidate: StickerPnPCandidate,
     rvec: np.ndarray,
     tvec: np.ndarray,
 ) -> dict[str, float]:
-    """Map contained observed mask likelihoods onto projected identities."""
-
-    likelihoods = getattr(candidate, "turn_color_likelihoods", None)
-    centers = tuple(getattr(candidate, "sticker_mask_centers", ()))
-    if likelihoods is None or not centers:
+    """Map each projected sticker to its best contained color-class match."""
+    matrix = getattr(candidate, "turn_color_matches", None)
+    if matrix is None:
         return {}
-    likelihoods = np.asarray(likelihoods, dtype=np.float64)
-    if likelihoods.ndim != 2 or likelihoods.shape[1] == 0:
-        return {}
-    try:
-        projected_faces = projected_sticker_faces(candidate, rvec, tvec)
-    except cv2.error:
-        return {}
-    if not projected_faces:
-        return {}
-    projected_centers = np.asarray(
-        [np.mean(np.asarray(face[2], dtype=np.float64), axis=0) for face in projected_faces],
-        dtype=np.float64,
-    )
-    observed_centers = np.asarray(
-        centers[: likelihoods.shape[1]],
-        dtype=np.float64,
-    ).reshape(-1, 2)
-    if len(observed_centers) == 0 or not np.isfinite(observed_centers).all():
-        return {}
-    identity_indices = {
-        (identity.cubie_index, identity.axis, identity.side): index
-        for index, identity in enumerate(canonical_sticker_identities())
-    }
-    values: dict[str, tuple[float, float]] = {}
-    for face_index, (identity, _depth, polygon) in enumerate(projected_faces):
-        identity_index = identity_indices.get(
-            (identity.cubie_index, identity.axis, identity.side)
-        )
-        if identity_index is None:
+    faces = projected_sticker_faces(candidate, rvec, tvec)
+    identity_indices = {identity.label: index for index, identity in enumerate(canonical_sticker_identities())}
+    result = {}
+    for observation_index, point in enumerate(candidate.sticker_mask_centers):
+        containing = [face for face in faces if cv2.pointPolygonTest(
+            np.asarray(face[2], dtype=np.float32), tuple(float(v) for v in point), False,
+        ) >= 0]
+        if not containing:
             continue
-        face_center = projected_centers[face_index]
-        distances = np.linalg.norm(observed_centers - face_center, axis=1)
-        inside_indices = [
-            observation_index
-            for observation_index, observed_center in enumerate(observed_centers)
-            if cv2.pointPolygonTest(
-                np.asarray(polygon, dtype=np.float32),
-                tuple(float(value) for value in observed_center),
-                False,
-            ) >= 0.0
-        ]
-        if not inside_indices:
-            continue
-        candidate_indices = inside_indices
-        observation_index = min(
-            candidate_indices,
-            key=lambda index: float(distances[index]),
-        )
-        value = float(likelihoods[identity_index, observation_index])
-        distance = float(distances[observation_index])
-        if not np.isfinite(value) or not np.isfinite(distance):
-            continue
-        previous = values.get(identity.label)
-        if previous is None or distance < previous[0]:
-            values[identity.label] = (distance, value)
-    return {label: value for label, (_distance, value) in values.items()}
+        face = min(containing, key=lambda face: float(np.linalg.norm(np.mean(face[2], axis=0) - point)))
+        label = face[0].label
+        result[label] = max(result.get(label, 0.), float(matrix[identity_indices[label], observation_index]))
+    return result
 
 
 def draw_projected_sticker_identity_labels(
@@ -11701,7 +9252,7 @@ def draw_projected_sticker_identity_labels(
         likelihood_by_identity
         if likelihood_by_identity is not None
         else (
-            projected_turn_color_likelihoods_by_identity(candidate, rvec, tvec)
+            projected_turn_color_matches_by_identity(candidate, rvec, tvec)
             if show_observation_likelihood
             else {}
         )
@@ -11808,10 +9359,10 @@ def draw_classified_cube_diagnostic_panel(
     image: np.ndarray,
     candidate: StickerPnPCandidate | None,
     sticker_color_names: dict[str, str],
-    sticker_likelihoods: dict[str, dict[str, float]] | None = None,
     rvec: np.ndarray | None = None,
     orientation_axis_length: float = 24.0,
     show_sticker_identities: bool = True,
+    show_orientation_axes: bool = True,
 ) -> np.ndarray:
     """Append a classified projected cube beside the original diagnostic image."""
 
@@ -11829,7 +9380,7 @@ def draw_classified_cube_diagnostic_panel(
     )
     cv2.putText(
         output,
-        "classified cube | color confidence",
+        "virtual cube | sticker color match" if show_sticker_identities else "virtual cube",
         (width + 10, 24),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
@@ -11862,14 +9413,12 @@ def draw_classified_cube_diagnostic_panel(
     # Mask centers are recorded in the source camera frame.  Assign them to
     # physical identities using the source pose first; the diagnostic cube is
     # projected at a different depth only after that identity mapping.
-    turn_likelihoods_by_identity = projected_turn_color_likelihoods_by_identity(
+    turn_likelihoods_by_identity = projected_turn_color_matches_by_identity(
         candidate,
         candidate.rvec,
         candidate.tvec,
     )
-    # Only display the turn-search value here.  It is the requested
-    # p(observation | identity prior), rather than the separate classifier
-    # quantity p(observation | color) stored in sticker_likelihoods.
+    # The displayed value is binary agreement with the expected sticker color.
     displayed_likelihoods = turn_likelihoods_by_identity or None
     draw_projected_cube_pose(
         output,
@@ -11891,14 +9440,15 @@ def draw_classified_cube_diagnostic_panel(
             show_observation_likelihood=displayed_likelihoods is not None,
             likelihood_by_identity=displayed_likelihoods,
         )
-    draw_orientation_axes(
-        output,
-        candidate,
-        display_rvec,
-        display_tvec,
-        orientation_axis_length,
-        image_offset=image_offset,
-    )
+    if show_orientation_axes:
+        draw_orientation_axes(
+            output,
+            candidate,
+            display_rvec,
+            display_tvec,
+            orientation_axis_length,
+            image_offset=image_offset,
+        )
     return output
 
 
@@ -11932,7 +9482,6 @@ def save_turn_candidate_images(
             base_image,
             rendered_candidate,
             show_status=False,
-            show_final_pose=False,
         )
         if rank < len(candidate.turn_candidate_scores):
             _label, mean_score, inlier_count, p90_error, mean_error = (
@@ -11964,7 +9513,6 @@ def draw_sticker_pnp_candidate(
     image: np.ndarray,
     candidate: StickerPnPCandidate | None,
     show_status: bool,
-    show_final_pose: bool = False,
     show_orientation_axes: bool = True,
     orientation_axis_length: float = 24.0,
     turn_candidate_log: Path | None = None,
@@ -11979,24 +9527,7 @@ def draw_sticker_pnp_candidate(
     if candidate is None:
         return output
     draw_reprojection_error_overlay(output, candidate)
-    has_pre_final_pose = (
-        candidate.pre_final_rvec is not None
-        and candidate.pre_final_tvec is not None
-    )
-    has_final_pose = show_final_pose and has_pre_final_pose
-    if has_final_pose:
-        draw_projected_cube_pose(
-            output,
-            candidate,
-            candidate.pre_final_rvec,
-            candidate.pre_final_tvec,
-            (0, 0, 0),
-            1,
-        )
-    # The candidate stored in the buffer is always the current finalized
-    # measurement. ``show_final_pose`` controls whether the pre-final pose is
-    # shown as an additional diagnostic, never which pose is displayed as the
-    # main result.
+    # Draw only the finalized measurement, without a pre-refinement wireframe.
     display_rvec = candidate.rvec
     display_tvec = candidate.tvec
     if not draw_projected_cube_pose(
@@ -12103,7 +9634,7 @@ def draw_sticker_pnp_candidate(
 
     turn_candidate_scores = getattr(candidate, "turn_candidate_scores", ())
     if show_status:
-        pose_label = "final" if has_final_pose else "candidate"
+        pose_label = "final"
         fit_error = pose_reprojection_fit_metric(candidate)
         fit_text = f"{fit_error:.3f}" if np.isfinite(fit_error) else "inf"
         threshold_text = (
@@ -12272,11 +9803,9 @@ def draw_reprojection_error_overlay(
         if np.isfinite(overall_error)
         else "inf"
     )
-    anchor_text = (
-        f"{anchor_error:.1f}px"
-        if np.isfinite(anchor_error)
-        else "inf"
-    )
+    anchor_points = getattr(candidate, "image_points", None)
+    anchor_text = ("--" if anchor_points is not None and not len(anchor_points) else
+                   f"{anchor_error:.1f}px" if np.isfinite(anchor_error) else "inf")
     label = (
         f"REPROJ fit {fit_text}/{threshold_text}"
         f" | raw {overall_text} | anchor {anchor_text}"
@@ -12330,7 +9859,6 @@ def draw_translucent_sticker_pnp_candidate(
         image,
         candidate,
         show_status=False,
-        show_final_pose=False,
         show_orientation_axes=True,
     )
     changed = np.any(rendered != image, axis=2)
@@ -12406,8 +9934,6 @@ def prepare_pose_hypotheses(
     prepared: list[StickerPnPCandidate] = []
     for candidate in candidates:
         finalized = candidate
-        if symmetry_tracker is not None:
-            finalized = canonicalize_pose_symmetry(finalized, symmetry_tracker)
         prepared.append(
             replace(
                 finalized,
@@ -12423,45 +9949,34 @@ def render_frame(
     pose_model: object,
     roi_tracker: RoiTracker,
     args: argparse.Namespace,
-    sticker_seg_model: object | None = None,
     turn_candidate_log: Path | None = None,
     turn_candidate_image_dir: Path | None = None,
     frame_index: int | None = None,
     symmetry_tracker: CubeSymmetryTracker | None = None,
     pose_hypothesis_buffer: PoseHypothesisBuffer | None = None,
-    sticker_color_trace: StickerColorTrace | None = None,
     sticker_color_names: dict[str, str] | None = None,
-    sticker_likelihoods: dict[str, dict[str, float]] | None = None,
     cached_final_only: bool = False,
     *,
     neural_cache: list[NeuralFrameData] | None = None,
     neural_data: NeuralFrameData | None = None,
     neural_only: bool = False,
     candidate_only: bool = False,
-    collect_color_observations: bool = True,
-    global_profiles: dict[str, GlobalColorProfile] | None = None,
-    global_color_samples: list[tuple[str, int, np.ndarray]] | None = None,
     move_accumulator: MoveAccumulator | None = None,
 ) -> tuple[np.ndarray, str, int]:
     height, width = frame.shape[:2]
 
     def overlay_sticker_masks(output: np.ndarray, pose: StickerPnPCandidate | None = None) -> np.ndarray:
-        if getattr(args, "show_colored_masks", False) and cached_final_only and global_profiles is not None:
-            return draw_projected_classified_masks(
-                output, frame, roi_xyxy, sticker_masks, pose, global_profiles,
-                sticker_mask_erosion=getattr(args, "sticker_mask_erosion", 0),
-                max_samples_per_sticker=getattr(args, "color_samples_per_sticker", 128),
-                min_samples_per_sticker=getattr(args, "color_min_samples_per_sticker", 4),
-            )
-        return draw_sticker_mask_overlay(
-            output, roi_xyxy, sticker_masks, global_profiles=global_profiles,
-            debug_color_masks=getattr(args, "debug_color_masks", False),
-            sticker_mask_erosion=getattr(args, "sticker_mask_erosion", 0),
-            show_sticker_identities=getattr(args, "show_sticker_identities", True),
-            show_sticker_centroids=getattr(args, "show_keypoints", True),
-            show_sticker_mask=getattr(args, "show_sticker_mask", False),
-            source_image=frame,
-        )
+        if not getattr(args, "show_colored_masks", False) or pose is None:
+            return output
+        observations = projected_color_observations(pose)
+        overlay = output.copy()
+        for identity, _depth, polygon in projected_sticker_faces(pose, pose.rvec, pose.tvec):
+            colors = observations.get(identity.label, ())
+            if colors:
+                expected = (sticker_color_names or {}).get(identity.label)
+                color = expected if expected in colors else colors[0]
+                cv2.fillConvexPoly(overlay, np.round(polygon).astype(np.int32), STICKER_COLORS_BGR[color])
+        return cv2.addWeighted(overlay, 0.5, output, 0.5, 0)
 
     def log_turn_frame(candidate_for_log: StickerPnPCandidate | None) -> None:
         # Candidate generation and the neural-only foreground pass do not run
@@ -12512,15 +10027,6 @@ def render_frame(
             pose_hypothesis_buffer,
         )
         output = draw_context(frame, None, None, "none", 0, args.show_status)
-        if sticker_color_names is not None:
-            output = draw_classified_cube_diagnostic_panel(
-                output,
-                None,
-                sticker_color_names,
-                sticker_likelihoods=sticker_likelihoods,
-                orientation_axis_length=args.orientation_axis_length,
-                show_sticker_identities=getattr(args, "show_sticker_identities", True),
-            )
         log_turn_frame(None)
         return output, "none", 0
 
@@ -12549,23 +10055,12 @@ def render_frame(
             pose_hypothesis_buffer,
         )
         output = draw_context(frame, roi_xyxy, candidate, roi_source, 0, args.show_status)
-        if sticker_color_names is not None:
-            output = draw_classified_cube_diagnostic_panel(
-                output,
-                None,
-                sticker_color_names,
-                sticker_likelihoods=sticker_likelihoods,
-                orientation_axis_length=args.orientation_axis_length,
-                show_sticker_identities=getattr(args, "show_sticker_identities", True),
-            )
         log_turn_frame(None)
         return output, roi_source, 0
 
     if neural_data is None:
         model_roi = resize_to_square(roi, args.view_size)
-        sticker_masks, result = predict_models_parallel_cpu(
-            sticker_seg_model, pose_model, model_roi, args,
-        )
+        result = predict_pose_result(pose_model, model_roi, args)
         if result is None:
             local_points = np.empty((0, 2), dtype=np.float32)
             point_confidences = np.empty((0,), dtype=np.float32)
@@ -12580,7 +10075,7 @@ def render_frame(
                     frame=frame.copy(),
                     roi_xyxy=roi_xyxy,
                     roi_source=roi_source,
-                    sticker_masks=copy_sticker_masks(sticker_masks),
+                    sticker_masks=None,
                     local_points=np.asarray(local_points, dtype=np.float32).copy(),
                     point_confidences=np.asarray(point_confidences, dtype=np.float32).copy(),
                     class_ids=np.asarray(class_ids, dtype=np.int32).copy(),
@@ -12588,26 +10083,10 @@ def render_frame(
                 )
             )
     else:
-        sticker_masks = neural_data.sticker_masks
         local_points = np.asarray(neural_data.local_points)
         point_confidences = np.asarray(neural_data.point_confidences)
         class_ids = np.asarray(neural_data.class_ids)
         box_confidences = np.asarray(neural_data.box_confidences)
-    if (
-        global_color_samples is not None
-        and getattr(args, "debug_color_masks", False)
-        and not cached_final_only
-    ):
-        sample_frame_index = 0 if frame_index is None else int(frame_index)
-        for mask_index, rgb in sticker_mask_rgb_observations(
-            frame,
-            roi_xyxy,
-            sticker_masks,
-            getattr(args, "sticker_mask_erosion", 0),
-        ):
-            global_color_samples.append(
-                (f"M{mask_index}", sample_frame_index, rgb)
-            )
     if candidate_only and len(local_points) == 0:
         return frame, roi_source, 0
     if cached_final_only and neural_data is not None and neural_data.pose_ready:
@@ -12646,12 +10125,7 @@ def render_frame(
             point_count,
             args.show_status,
         )
-        display_sticker_color_names = sticker_color_names
         if move_accumulator is not None:
-            display_sticker_color_names = (
-                move_accumulator.current_color_names(sticker_color_names)
-                or display_sticker_color_names
-            )
             move_accumulator.observe(
                 pnp_candidate,
                 displacement_candidate=diagnostic_candidate,
@@ -12662,7 +10136,6 @@ def render_frame(
                 output,
                 pnp_candidate,
                 args.show_status,
-                getattr(args, "show_final_pnp_pose", False),
                 getattr(args, "show_orientation_axes", True),
                 getattr(args, "orientation_axis_length", 24.0),
                 turn_candidate_log if getattr(args, "recognize_moves", False) else None,
@@ -12683,15 +10156,6 @@ def render_frame(
                 diagnostic_candidate,
             )
         output = overlay_sticker_masks(output, pnp_candidate)
-        if sticker_color_names is not None:
-            output = draw_classified_cube_diagnostic_panel(
-                output,
-                pnp_candidate,
-                display_sticker_color_names or sticker_color_names,
-                sticker_likelihoods=sticker_likelihoods,
-                orientation_axis_length=args.orientation_axis_length,
-                show_sticker_identities=getattr(args, "show_sticker_identities", True),
-            )
         if move_accumulator is not None:
             # The accumulator was updated once above, before the diagnostic
             # drawing.  Do not observe the same frame again: a second observe
@@ -12709,34 +10173,17 @@ def render_frame(
         output = frame.copy()
         output = draw_context(output, roi_xyxy, candidate, roi_source, 0, args.show_status)
         output = overlay_sticker_masks(output)
-        if sticker_color_names is not None:
-            output = draw_classified_cube_diagnostic_panel(
-                output,
-                None,
-                sticker_color_names,
-                orientation_axis_length=args.orientation_axis_length,
-                show_sticker_identities=getattr(args, "show_sticker_identities", True),
-            )
         log_turn_frame(None)
         return output, roi_source, 0
 
-    sticker_matches = (
-        tuple()
-        if neural_only
-        else (
-            sticker_keypoint_matches_for_masks(
-                sticker_masks[0],
-                local_points,
-                point_confidences,
-                class_ids,
-                box_confidences,
-                args.keypoint_conf,
-                args.pose_class_conf,
-            )
-            if sticker_masks is not None
-            else tuple()
-        )
-    )
+    usable = usable_pose_points(local_points, point_confidences, class_ids,
+                                box_confidences, args.keypoint_conf, args.pose_class_conf)
+    landmark_mask = usable & (class_ids >= 0) & (class_ids < 3)
+    color_mask = usable & (class_ids >= 3)
+    sticker_matches = (() if neural_only else sticker_keypoint_matches_for_colors(
+        local_points[landmark_mask], point_confidences[landmark_mask],
+        class_ids[landmark_mask], local_points[color_mask],
+    ))
     frame_points, local_roi_points = local_to_frame_points(local_points, roi_xyxy, args.view_size)
     output = frame if candidate_only else frame.copy()
     point_count = int(len(frame_points))
@@ -12796,36 +10243,6 @@ def render_frame(
         candidate_hypotheses = (pnp_candidate,)
     recognize_moves = bool(getattr(args, "recognize_moves", False))
 
-    def record_color_observations(candidate: StickerPnPCandidate) -> None:
-        if not collect_color_observations or sticker_color_trace is None:
-            return
-        sticker_observations = sample_projected_sticker_colors(
-            frame,
-            roi_xyxy,
-            sticker_masks,
-            candidate,
-            max_samples_per_sticker=args.color_samples_per_sticker,
-            min_samples_per_sticker=args.color_min_samples_per_sticker,
-            sticker_mask_erosion=args.sticker_mask_erosion,
-        )
-        candidate_rotation, _ = cv2.Rodrigues(
-            np.asarray(candidate.rvec, dtype=np.float64).reshape(3, 1)
-        )
-        sticker_observation_weights = {
-            identity.label: sticker_view_reliability_weight(
-                candidate,
-                identity,
-                candidate_rotation,
-            )
-            for identity in sticker_color_trace.identities
-            if identity.label in sticker_observations
-        }
-        sticker_color_trace.observe(
-            0 if frame_index is None else frame_index,
-            sticker_observations,
-            observation_weights=sticker_observation_weights,
-        )
-
     # Move recognition is a per-frame computation.  It must still run when
     # pose drawing is disabled, because ``--recognize-moves`` is an analysis
     # request rather than a rendering option.
@@ -12833,28 +10250,15 @@ def render_frame(
         args.show_pnp or recognize_moves or candidate_only
     )
     if should_generate_candidate:
-        mask_color_entries = sticker_mask_rgb_observations(
-            frame,
-            roi_xyxy,
-            sticker_masks,
-            args.sticker_mask_erosion,
-        )
-        sticker_mask_colors = tuple(
-            rgb for _mask_index, rgb in mask_color_entries
-        )
         current_candidates = best_sticker_pnp_candidates(
-            frame_points,
-            class_ids,
-            sticker_matches,
-            (width, height),
-            args.pnp_focal_scale,
-            sticker_masks[0] if sticker_masks is not None else None,
-            roi_xyxy,
-            frame_points,
-            sticker_mask_erosion=args.sticker_mask_erosion,
-            prepare_mask_geometry=not candidate_only,
-            sticker_mask_colors=sticker_mask_colors,
+            frame_points[landmark_mask], class_ids[landmark_mask], sticker_matches,
+            (width, height), args.pnp_focal_scale,
+            scoring_points=frame_points[landmark_mask], prepare_mask_geometry=False,
         )
+        current_candidates = tuple(attach_color_keypoints(
+            hypothesis, frame_points[color_mask],
+            tuple(CLASS_NAMES[int(cid)] for cid in class_ids[color_mask]),
+        ) for hypothesis in current_candidates)
         prepared_candidates = prepare_pose_hypotheses(
             current_candidates,
             None,
@@ -12869,10 +10273,6 @@ def render_frame(
             neural_data.pose_candidate = pnp_candidate
             neural_data.pose_candidates = candidate_hypotheses
             neural_data.pose_ready = True
-        if pnp_candidate is not None:
-            # Keep the inexpensive color history used by pose symmetry and
-            # later turn scoring; defer only the expensive pose refinement.
-            record_color_observations(pnp_candidate)
         return output, roi_source, point_count
     refined_candidates: tuple[StickerPnPCandidate, ...] = ()
     diagnostic_candidate: StickerPnPCandidate | None = None
@@ -12896,11 +10296,20 @@ def render_frame(
             refined_candidates,
             None,
             pose_hypothesis_buffer.previous_candidates()
-            if pose_hypothesis_buffer is not None
-            else (),
+            if pose_hypothesis_buffer is not None else (),
             max_core_displacement_mm=POSE_MOTION_DISPLACEMENT_TOLERANCE_MM,
         )
         if selected_candidate is not None:
+            initial_state = CubeState.from_scramble(getattr(args, "initial_scramble", ()))
+            expected_colors = {
+                identity.label: initial_state.color_at((identity.cubie_index, identity.axis, identity.side))
+                for identity in canonical_sticker_identities()
+            }
+            geometry_state = (move_accumulator._geometry_state.copy()
+                              if move_accumulator is not None else CubeGeometryState.identity())
+            selected_candidate = match_orientation_to_colors(
+                replace(selected_candidate, cube_geometry_state=geometry_state), expected_colors,
+            )
             if recognize_moves:
                 geometry_state = (
                     move_accumulator._geometry_state.copy()
@@ -12935,6 +10344,7 @@ def render_frame(
                     selected_candidate = solve_pnp_from_low_error_assignments(
                         selected_candidate,
                         recover_layer_turns=True,
+                        turn_expected_color_by_label=expected_colors,
                         record_all_turn_candidates=turn_candidate_log is not None,
                         turn_previous_move=(
                             move_accumulator.moves[-1]
@@ -12947,14 +10357,6 @@ def render_frame(
             pnp_candidate = replace(
                 selected_candidate, orientation_anchor=orientation_anchor_for_candidate(selected_candidate)
             )
-            if symmetry_tracker is not None:
-                # Recover orientation only after root selection, move fitting,
-                # and pose selection have completed.
-                pnp_candidate = canonicalize_pose_symmetry(
-                    pnp_candidate,
-                    symmetry_tracker,
-                )
-                symmetry_tracker.observe(pnp_candidate.rvec, frame_index)
         else:
             # Do not display or classify a pose that fails the normalized
             # reprojection acceptance gate.
@@ -12967,12 +10369,7 @@ def render_frame(
             if neural_data is not None:
                 neural_data.pose_candidate = None
                 neural_data.pose_candidates = ()
-        display_sticker_color_names = sticker_color_names
         if move_accumulator is not None:
-            display_sticker_color_names = (
-                move_accumulator.current_color_names(sticker_color_names)
-                or display_sticker_color_names
-            )
             move_accumulator.observe(
                 pnp_candidate,
                 displacement_candidate=diagnostic_candidate,
@@ -12984,30 +10381,19 @@ def render_frame(
                     pnp_candidate, move_accumulator.solved_frame_index,
                 )
         if pnp_candidate is not None:
-            record_color_observations(pnp_candidate)
             if args.show_pnp:
                 output = draw_sticker_pnp_candidate(
                     output,
                     pnp_candidate,
                     args.show_status,
-                    getattr(args, "show_final_pnp_pose", False),
                     getattr(args, "show_orientation_axes", True),
                     getattr(args, "orientation_axis_length", 24.0),
                     turn_candidate_log if recognize_moves else None,
                     turn_candidate_image_dir if recognize_moves else None,
                     frame_index,
                     getattr(args, "show_sticker_identities", False),
-                    None if sticker_color_names is not None else sticker_color_names,
+                    None,
                 )
-                if sticker_color_names is not None:
-                    output = draw_classified_cube_diagnostic_panel(
-                        output,
-                        pnp_candidate,
-                        display_sticker_color_names or sticker_color_names,
-                        sticker_likelihoods=sticker_likelihoods,
-                        orientation_axis_length=args.orientation_axis_length,
-                        show_sticker_identities=getattr(args, "show_sticker_identities", True),
-                    )
         elif diagnostic_candidate is not None and (
             args.show_pnp or recognize_moves
         ):
@@ -13024,24 +10410,14 @@ def render_frame(
             output,
             pnp_candidate,
             args.show_status,
-            getattr(args, "show_final_pnp_pose", False),
             getattr(args, "show_orientation_axes", True),
             getattr(args, "orientation_axis_length", 24.0),
             turn_candidate_log if recognize_moves else None,
             turn_candidate_image_dir if recognize_moves else None,
             frame_index,
             getattr(args, "show_sticker_identities", False),
-            None if sticker_color_names is not None else sticker_color_names,
+            None,
         )
-        if sticker_color_names is not None:
-            output = draw_classified_cube_diagnostic_panel(
-                output,
-                pnp_candidate,
-                sticker_color_names,
-                sticker_likelihoods=sticker_likelihoods,
-                orientation_axis_length=args.orientation_axis_length,
-                show_sticker_identities=getattr(args, "show_sticker_identities", True),
-            )
     output = overlay_sticker_masks(output, pnp_candidate)
     if neural_data is not None:
         neural_data.pose_candidate = pnp_candidate
@@ -13236,9 +10612,7 @@ def consume_neural_cache_for_pose(
     records: SimpleQueue[NeuralFrameData | None],
     bbox_detector: YOLOCubeDetector | None,
     pose_model: object | None,
-    sticker_seg_model: object | None,
     args: argparse.Namespace,
-    sticker_color_trace: StickerColorTrace | None,
     turn_candidate_log: Path | None,
     turn_candidate_image_dir: Path | None,
     progress: CombinedHeadlessProgress | None = None,
@@ -13258,14 +10632,12 @@ def consume_neural_cache_for_pose(
             pose_model,
             roi_tracker,
             args,
-            sticker_seg_model,
-            turn_candidate_log,
-            turn_candidate_image_dir,
-            record.frame_index,
-            None,
-            None,
-            sticker_color_trace,
-            None,
+            turn_candidate_log=turn_candidate_log,
+            turn_candidate_image_dir=turn_candidate_image_dir,
+            frame_index=record.frame_index,
+            symmetry_tracker=None,
+            pose_hypothesis_buffer=None,
+            sticker_color_names=None,
             neural_data=record,
             candidate_only=True,
         )
@@ -13278,14 +10650,11 @@ def run_neural_video_pass(
     source: int | str,
     bbox_detector: YOLOCubeDetector,
     pose_model: object,
-    sticker_seg_model: object | None,
     args: argparse.Namespace,
     *,
-    sticker_color_trace: StickerColorTrace | None = None,
     output_path: Path | None = None,
     turn_candidate_log: Path | None = None,
     turn_candidate_image_dir: Path | None = None,
-    global_color_samples: list[tuple[str, int, np.ndarray]] | None = None,
 ) -> tuple[list[NeuralFrameData], int, bool, float]:
     """Collect/cache every NN result while a worker consumes pose results."""
 
@@ -13310,9 +10679,7 @@ def run_neural_video_pass(
             records,
             None,
             None,
-            None,
             args,
-            sticker_color_trace,
             turn_candidate_log,
             turn_candidate_image_dir,
             progress,
@@ -13348,17 +10715,14 @@ def run_neural_video_pass(
                 pose_model,
                 roi_tracker,
                 args,
-                sticker_seg_model,
-                None,
-                None,
-                frame_index,
-                None,
-                None,
-                None,
-                None,
+                turn_candidate_log=None,
+                turn_candidate_image_dir=None,
+                frame_index=frame_index,
+                symmetry_tracker=None,
+                pose_hypothesis_buffer=None,
+                sticker_color_names=None,
                 neural_cache=cache,
                 neural_only=True,
-                global_color_samples=global_color_samples,
             )
             render_end = perf_counter()
             processing_fps = 1.0 / max(render_end - render_start, 1e-6)
@@ -13419,11 +10783,7 @@ def run_cached_video_pass(
     cache: list[NeuralFrameData],
     args: argparse.Namespace,
     *,
-    sticker_color_trace: StickerColorTrace | None = None,
     sticker_color_names: dict[str, str] | None = None,
-    sticker_color_names_by_frame: dict[int, dict[str, str]] | None = None,
-    sticker_likelihoods_by_frame: dict[int, dict[str, dict[str, float]]] | None = None,
-    global_profiles: dict[str, GlobalColorProfile] | None = None,
     output_path: Path | None = None,
     fps: float = 30.0,
 ) -> bool:
@@ -13447,35 +10807,20 @@ def run_cached_video_pass(
                 else 1.0 / max(now - previous_loop_end, 1e-6)
             )
             previous_loop_end = now
-            frame_sticker_color_names = (
-                sticker_color_names_by_frame.get(record.frame_index, {})
-                if sticker_color_names_by_frame is not None
-                else sticker_color_names
-            )
             rendered, _roi_source, _point_count = render_frame(
                 record.frame,
                 None,
                 None,
                 roi_tracker,
                 args,
-                None,
-                None,
-                None,
-                record.frame_index,
-                None,
-                None,
-                sticker_color_trace,
-                frame_sticker_color_names,
-                sticker_likelihoods=(
-                    sticker_likelihoods_by_frame.get(record.frame_index, {})
-                    if sticker_likelihoods_by_frame is not None
-                    else None
-                ),
-                # Pose recovery already selected and cached the pose result;
-                # this replay only presents it.
+                turn_candidate_log=None,
+                turn_candidate_image_dir=None,
+                frame_index=record.frame_index,
+                symmetry_tracker=None,
+                pose_hypothesis_buffer=None,
+                sticker_color_names=sticker_color_names,
                 cached_final_only=True,
                 neural_data=record,
-                global_profiles=global_profiles,
                 move_accumulator=move_accumulator,
             )
             render_end = perf_counter()
@@ -13589,14 +10934,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-height", type=int, default=480, help="Requested camera height (0 leaves it unchanged).")
     parser.add_argument("--camera-fps", type=float, default=30.0, help="Requested camera FPS (0 leaves it unchanged).")
     parser.add_argument("--model", type=Path, default=DEFAULT_POSE_MODEL)
-    parser.add_argument(
-        "--combined-seg-model",
-        "--sticker-seg-model",
-        dest="sticker_seg_model",
-        type=Path,
-        default=DEFAULT_COMBINED_SEGMENTATION_MODEL,
-        help="Combined cube/sticker segmentation checkpoint; only its sticker class is rendered.",
-    )
     parser.add_argument("--bbox-model", type=Path, default=DEFAULT_BBOX_MODEL)
     parser.add_argument("--device", choices=("cpu",), default="cpu", help="Neural inference runs on CPU.")
     parser.add_argument("--bbox-conf", type=float, default=0.25)
@@ -13624,41 +10961,19 @@ def build_parser() -> argparse.ArgumentParser:
         dest="keypoint_conf",
         type=float,
         default=0.05,
-        help="Minimum independent pose keypoint confidence for drawing points (default: 0.05).",
+        help="Minimum landmark keypoint confidence (default: 0.05); sticker color keypoints have a 0.25 floor.",
     )
     parser.add_argument("--track-conf", type=float, default=0.05)
     parser.add_argument("--imgsz", type=int, default=256)
     parser.add_argument("--view-size", type=int, default=256)
-    parser.add_argument("--max-det", type=int, default=64)
-    parser.add_argument("--sticker-mask-conf", type=float, default=0.25)
-    parser.add_argument("--sticker-mask-opacity", type=float, default=0.25)
-    parser.add_argument("--sticker-border-thickness", type=int, default=2)
-    parser.add_argument(
-        "--sticker-mask-erosion",
-        type=int,
-        default=0,
-        help="Erode each sticker mask by this many ROI pixels before rendering and sampling.",
-    )
-    parser.add_argument(
-        "--run-sticker-segmentation",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Run the combined segmentation model even when its mask is not displayed.",
-    )
-    parser.add_argument(
-        "--show-sticker-mask",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Show a transparent red sticker heatmap in final output.",
-    )
+    parser.add_argument("--max-det", type=int, default=128)
     parser.add_argument(
         "--show-colored-masks",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help=("Color projected sticker/segmentation intersection masks in the final video using "
-              "global color profiles independently for each mask."),
+        help="Color observed projected stickers using the pose model's color classes.",
     )
-    parser.add_argument("--roi-padding", type=float, default=0.08)
+    parser.add_argument("--roi-padding", type=float, default=0.4)
     parser.add_argument("--roi-tracking-gain", type=float, default=1.4)
     parser.add_argument("--roi-tracking-padding", type=float, default=0.18)
     parser.add_argument(
@@ -13675,12 +10990,6 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Draw the cube pose during the final cached pass.",
-    )
-    parser.add_argument(
-        "--show-final-pnp-pose",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Draw the final low-error solvePnP pose over the candidate pose.",
     )
     parser.add_argument(
         "--show-orientation-axes",
@@ -13725,12 +11034,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--debug-pose-symmetry",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Print per-frame pose-symmetry trigger and tested-orientation scores.",
-    )
-    parser.add_argument(
         "--turn-candidate-log",
         type=Path,
         default=None,
@@ -13761,38 +11064,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Approximate focal length as a multiple of max(image width, height).",
     )
     parser.add_argument("--show-fps", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument(
-        "--rgb-html-plot",
-        type=Path,
-        help=(
-            "Output an interactive grouped RGB plot. Each visible sticker contributes "
-            "one averaged point per frame when the projected sticker intersects the "
-            "sticker/cube segmentation mask."
-        ),
-    )
-    parser.add_argument(
-        "--color-samples-per-sticker",
-        type=int,
-        default=128,
-        help="Maximum reliable pixels averaged for each sticker in each frame.",
-    )
-    parser.add_argument(
-        "--color-min-samples-per-sticker",
-        type=int,
-        default=4,
-        help="Minimum reliable pixels required before plotting a sticker for a frame.",
-    )
-    parser.add_argument(
-        "--normalize-rgb-plot",
-        action="store_true",
-        help="Use brightness-normalized RGB coordinates for the primary HTML plot.",
-    )
-    parser.add_argument(
-        "--plotly-point-size",
-        type=float,
-        default=5.0,
-        help="Marker size in the grouped RGB HTML plot.",
-    )
     parser.add_argument("--save", type=Path, help="Output image path, or one frame with --once.")
     parser.add_argument(
         "--save-video",
@@ -13800,60 +11071,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output path for the first pass containing neural outputs only.",
     )
     parser.add_argument(
-        "--show-classified-colors",
-        "--show-classified-stickers",
-        "--show-classified-centers",
-        dest="show_classified_colors",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Color visible projected stickers during the final cached pass "
-            "using the legal standard cube color scheme."
-        ),
-    )
-    parser.add_argument(
-        "--recognize-scramble",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Report a solved-to-recognized scramble after color classification "
-            "(disabled by default)."
-        ),
-    )
-    parser.add_argument(
-        "--debug-independent-color-posteriors",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Color each observed sticker per frame by its nearest global profile; "
-            "disable temporal and legal cube color assignments while retaining pose recovery."
-        ),
-    )
-    parser.add_argument(
-        "--debug-color-masks",
-        "--debug-sticker-mask-colors",
-        dest="debug_color_masks",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Color each segmentation mask directly from its image pixels; requires "
-            "--debug-independent-color-posteriors and --no-show-pnp, and disables the heatmap."
-        ),
-    )
-    parser.add_argument(
         "--save-final-video",
         type=Path,
         dest="save_final_video",
         help=(
-            "Optional output path for the final cached video pass, including pose "
-            "output even when color classification is disabled."
+            "Output path for the final cached video pass with pose and move overlays."
         ),
-    )
-    parser.add_argument(
-        "--save-colored-video",
-        type=Path,
-        dest="save_final_video",
-        help=argparse.SUPPRESS,
     )
     parser.add_argument("--once", action="store_true", help="Process one video/camera frame and exit.")
     parser.add_argument("--no-display", dest="display", action="store_false")
@@ -13861,99 +11084,44 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def process_cached_pose_and_profiles(
-    cache: list[NeuralFrameData], trace: StickerColorTrace | None,
-    args: argparse.Namespace, known_initial_colors: dict[str, str],
-    global_color_samples: list[tuple[str, int, np.ndarray]] | None,
+def process_cached_poses(
+    cache: list[NeuralFrameData], args: argparse.Namespace,
+    known_initial_colors: dict[str, str],
     source_fps: float = PNP_TURN_LOOKAHEAD_REFERENCE_FPS,
-) -> tuple[StickerColorTrace, dict[str, GlobalColorProfile], dict[str, list[tuple[str, int, np.ndarray]]]]:
-    """Fit pose-free profiles, recover continuity, then orient and recognize moves."""
-    initial_trace = trace if trace is not None else StickerColorTrace.create()
-    prepared_trace = initial_trace
-    print("Building global color profiles from segmentation masks...", flush=True)
-    samples = global_color_samples
-    if samples is None:
-        samples = []
-        for record in cache:
-            if record.roi_xyxy is None:
-                continue
-            samples.extend(
-                (f"M{mask_index}", record.frame_index, rgb)
-                for mask_index, rgb in sticker_mask_rgb_observations(
-                    record.frame, record.roi_xyxy, record.sticker_masks,
-                    args.sticker_mask_erosion,
-                )
-            )
-    profiles, observations = build_global_color_profiles_from_samples(samples)
-    needs_pose = args.show_pnp or args.recognize_moves or getattr(args, "show_colored_masks", False)
+) -> None:
+    """Recover poses and optional moves directly from the cached model predictions."""
+    trace = StickerColorTrace.create()
+    needs_pose = args.show_pnp or args.recognize_moves or args.show_colored_masks
     if needs_pose:
-        print("Refining pose candidates and establishing frame-to-frame continuity...", flush=True)
-        prepared_trace = recover_cached_pose_symmetries(
-            cache, initial_trace, progress=not args.display, refine_pose=True,
-            recover_orientation=False, sticker_mask_erosion=args.sticker_mask_erosion,
-            global_profiles=profiles,
-            source_fps=source_fps,
-            color_samples_per_sticker=args.color_samples_per_sticker,
-            color_min_samples_per_sticker=args.color_min_samples_per_sticker,
-        )
-    if needs_pose:
-        print("Matching cube orientation to the initial scramble and observed colors...", flush=True)
-        prepared_trace = recover_cached_pose_symmetries(
-            cache, prepared_trace, debug=args.debug_pose_symmetry,
-            progress=not args.display, pose_prepared=True,
+        print("Refining poses and matching observed sticker colors to the scramble...", flush=True)
+        trace = recover_cached_pose_symmetries(
+            cache,
+            trace,
+            progress=not args.display,
+            refine_pose=True,
             recover_orientation=True,
-            require_orientation=args.recognize_moves,
-            recognize_moves=False, global_profiles=profiles,
-            source_fps=source_fps,
-            sticker_mask_erosion=args.sticker_mask_erosion,
             known_initial_colors=known_initial_colors,
+            source_fps=source_fps,
         )
     if args.recognize_moves:
-        print("Searching for layer moves and updating the cube state...", flush=True)
-        prepared_trace = recover_cached_pose_symmetries(
-            cache, prepared_trace, progress=not args.display, pose_prepared=True,
-            recover_orientation=False, recognize_moves=True,
+        if args.turning_start_frame is not None:
+            print(
+                f"Holding cube state static through frame {args.turning_start_frame} (inclusive).",
+                flush=True,
+            )
+        recover_cached_pose_symmetries(
+            cache,
+            trace,
+            progress=not args.display,
+            pose_prepared=True,
+            recover_orientation=False,
+            recognize_moves=True,
             source_fps=source_fps,
-            turning_start_frame=getattr(args, 'turning_start_frame', None),
-            record_all_turn_candidates=args.turn_candidate_log is not None,
-            turn_candidate_log=args.turn_candidate_log, global_profiles=profiles,
-            sticker_mask_erosion=args.sticker_mask_erosion,
             known_initial_colors=known_initial_colors,
-            # Keep the full-video unsupervised groups for diagnostics. The
-            # inspection labels live separately on each profile.
-            calibrate_initial_colors=True,
-            use_calibrated_solve_continuity=True,
-            color_samples_per_sticker=args.color_samples_per_sticker,
-            color_min_samples_per_sticker=args.color_min_samples_per_sticker,
+            turning_start_frame=args.turning_start_frame,
+            record_all_turn_candidates=args.turn_candidate_log is not None,
+            turn_candidate_log=args.turn_candidate_log,
         )
-    return prepared_trace, profiles, observations
-
-
-def classify_cached_colors(
-    trace: StickerColorTrace, args: argparse.Namespace,
-    profiles: dict[str, GlobalColorProfile], known_initial_colors: dict[str, str],
-    *, image: bool,
-) -> tuple[dict[int, dict[str, dict[str, float]]], dict[int, dict[str, str]] | None, dict[str, str], dict[str, str]]:
-    """Prepare the normal known-state view or independent debug color view."""
-    likelihoods: dict[int, dict[str, dict[str, float]]] = {}
-    names_by_frame = None
-    names: dict[str, str] = {}
-    centers: dict[str, str] = {}
-    if not args.show_classified_colors:
-        return likelihoods, names_by_frame, names, centers
-    if args.debug_independent_color_posteriors:
-        likelihoods = build_sticker_global_profile_likelihoods(trace, profiles)
-        names_by_frame = classify_sticker_colors_by_frame_global_profile(trace, profiles)
-        frame_index = 0 if image else max(names_by_frame, default=None)
-        names = names_by_frame.get(frame_index, {})
-    else:
-        names = dict(known_initial_colors)
-    centers = {
-        identity.label: names[identity.label]
-        for identity in trace.identities
-        if identity.category == "center" and identity.label in names
-    }
-    return likelihoods, names_by_frame, names, centers
 
 
 def main() -> int:
@@ -13973,32 +11141,6 @@ def main() -> int:
         + (" ".join(args.initial_scramble) if args.initial_scramble else "(solved)"),
         flush=True,
     )
-    if args.debug_independent_color_posteriors:
-        args.show_classified_colors = True
-        print(
-            "Debug color mode: per-frame nearest global profiles; "
-            "temporal and legal cube color assignments disabled; pose recovery retained",
-            flush=True,
-        )
-        if not args.show_pnp:
-            # Without a pose there is no identity projection to display, so
-            # debug color mode automatically switches to direct mask coloring.
-            args.debug_color_masks = True
-            args.show_sticker_mask = False
-    if args.debug_color_masks:
-        if not args.debug_independent_color_posteriors:
-            raise SystemExit(
-                "--debug-color-masks requires --debug-independent-color-posteriors"
-            )
-        if args.show_pnp:
-            raise SystemExit("--debug-color-masks requires --no-show-pnp")
-        args.show_classified_colors = True
-        args.show_sticker_mask = False
-        print(
-            "Debug mask color mode: segmentation masks classified directly; "
-            "sticker heatmap disabled",
-            flush=True,
-        )
     args.device = args.device or "cpu"
     if args.turn_candidate_log is not None:
         turn_candidate_output_dir = args.turn_candidate_log
@@ -14018,36 +11160,12 @@ def main() -> int:
         raise SystemExit("--pose-conf must be in [0, 1]")
     if args.pose_conf is not None and args.pose_conf > min(args.pose_class_conf.values()):
         raise SystemExit("--pose-conf cannot exceed the lowest --pose-class-conf threshold")
-    if not 0.0 <= args.sticker_mask_conf <= 1.0:
-        raise SystemExit("--sticker-mask-conf must be in [0, 1]")
-    if not 0.0 <= args.sticker_mask_opacity <= 1.0:
-        raise SystemExit("--sticker-mask-opacity must be in [0, 1]")
-    if args.show_colored_masks and not args.run_sticker_segmentation:
-        raise SystemExit("--show-colored-masks requires --run-sticker-segmentation")
-    if args.show_colored_masks and args.debug_color_masks:
-        raise SystemExit("--show-colored-masks cannot be combined with --debug-color-masks")
     if args.pnp_focal_scale <= 0.0:
         raise SystemExit("--pnp-focal-scale must be positive")
     if args.orientation_axis_length <= 0.0:
         raise SystemExit("--orientation-axis-length must be positive")
-    if args.sticker_border_thickness < 0:
-        raise SystemExit("--sticker-border-thickness must be non-negative")
-    if args.sticker_mask_erosion < 0:
-        raise SystemExit("--sticker-mask-erosion must be non-negative")
-    if args.color_samples_per_sticker < 1:
-        raise SystemExit("--color-samples-per-sticker must be positive")
-    if args.color_min_samples_per_sticker < 1:
-        raise SystemExit("--color-min-samples-per-sticker must be positive")
-    if args.plotly_point_size <= 0.0:
-        raise SystemExit("--plotly-point-size must be positive")
-    if args.rgb_html_plot is not None and not args.run_sticker_segmentation:
-        raise SystemExit("--rgb-html-plot requires --run-sticker-segmentation")
-    if args.rgb_html_plot is not None and not args.show_pnp:
-        raise SystemExit("--rgb-html-plot requires --show-pnp")
     if not args.model.is_file():
         raise SystemExit(f"Could not find independent pose model: {args.model}")
-    if args.run_sticker_segmentation and not args.sticker_seg_model.is_file():
-        raise SystemExit(f"Could not find sticker segmentation model: {args.sticker_seg_model}")
     if not args.bbox_model.is_file():
         raise SystemExit(f"Could not find bbox model: {args.bbox_model}")
 
@@ -14060,23 +11178,9 @@ def main() -> int:
         device=args.device,
     )
     pose_model = YOLO(str(args.model))
-    sticker_seg_model = YOLO(str(args.sticker_seg_model)) if args.run_sticker_segmentation else None
-    if sticker_seg_model is not None:
-        print(f"Combined segmentation model (sticker class only): {args.sticker_seg_model}", flush=True)
+    if not set(CLASS_NAMES).issubset(set(pose_model.names.values())):
+        raise SystemExit("Pose checkpoint must predict the three landmark classes and six sticker colors")
     source = parse_source(args.source)
-    if args.show_classified_colors and isinstance(source, int):
-        raise SystemExit("--show-classified-colors requires a replayable image or video source")
-    if args.show_classified_colors and not args.run_sticker_segmentation:
-        raise SystemExit("--show-classified-colors requires --run-sticker-segmentation")
-    if (
-        args.show_classified_colors
-        and not args.show_pnp
-        and not args.debug_independent_color_posteriors
-    ):
-        raise SystemExit("--show-classified-colors requires --show-pnp")
-    sticker_color_trace = None if args.debug_color_masks else StickerColorTrace.create()
-    global_color_samples = [] if args.debug_color_masks else None
-
     if is_image_source(source):
         frame = cv2.imread(str(source), cv2.IMREAD_COLOR)
         if frame is None:
@@ -14088,17 +11192,8 @@ def main() -> int:
             pose_model,
             RoiTracker(),
             args,
-            sticker_seg_model,
-            None,
-            None,
-            0,
-            None,
-            None,
-            None,
-            None,
             neural_cache=image_cache,
             neural_only=True,
-            global_color_samples=global_color_samples,
         )
         if args.save:
             args.save.parent.mkdir(parents=True, exist_ok=True)
@@ -14110,148 +11205,59 @@ def main() -> int:
             cv2.waitKey(0)
             cv2.destroyAllWindows()
         print(f"ROI source: {roi_source}; rendered points: {point_count}")
-        # Select and cache all cheap pose candidates. Pose/orientation/layer
-        # recovery happens below as one joint pass.
         render_frame(
             frame,
             None,
             None,
             RoiTracker(),
             args,
-            None,
-            args.turn_candidate_log,
-            args.turn_candidate_images,
-            0,
-            None,
-            None,
-            sticker_color_trace,
-            None,
+            turn_candidate_log=args.turn_candidate_log,
+            turn_candidate_image_dir=args.turn_candidate_images,
+            frame_index=0,
             neural_data=image_cache[0],
             candidate_only=True,
         )
-        sticker_color_trace, global_profiles, global_observations = process_cached_pose_and_profiles(
-            image_cache, sticker_color_trace, args, known_initial_colors, global_color_samples
-        )
-        sticker_likelihoods_by_frame, sticker_color_names_by_frame, sticker_color_names, center_color_names = classify_cached_colors(
-            sticker_color_trace, args, global_profiles, known_initial_colors, image=True
-        )
-        if center_color_names:
-            print(
-                "Classified centers: "
-                + ", ".join(
-                    f"{label}={color}"
-                    for label, color in sorted(center_color_names.items())
-                ),
-                flush=True,
-            )
-        if args.show_classified_colors and args.recognize_scramble:
-            report_classified_scramble(
-                sticker_color_trace,
-                sticker_color_names,
-            )
-        if (args.show_classified_colors or args.show_pnp or args.show_colored_masks) and args.display:
-            colored_rendered, _colored_roi_source, _colored_point_count = render_frame(
+        process_cached_poses(image_cache, args, known_initial_colors)
+        if args.show_pnp or args.show_colored_masks:
+            rendered, _, _ = render_frame(
                 frame,
                 None,
                 None,
                 RoiTracker(),
                 args,
-                None,
-                None,
-                None,
-                0,
-                CubeSymmetryTracker(),
-                PoseHypothesisBuffer(max_frames=8),
-                None,
-                (
-                    sticker_color_names_by_frame.get(0, {})
-                    if sticker_color_names_by_frame is not None
-                    else sticker_color_names
-                ) if args.show_classified_colors else None,
-                sticker_likelihoods=sticker_likelihoods_by_frame.get(0, {}),
+                frame_index=0,
+                sticker_color_names=known_initial_colors,
                 cached_final_only=True,
                 neural_data=image_cache[0],
-                global_profiles=global_profiles,
                 move_accumulator=MoveAccumulator(),
             )
-            cv2.imshow(WINDOW_NAME, colored_rendered)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
-        if sticker_color_trace is not None and args.rgb_html_plot is not None:
-            save_sticker_color_plots(
-                sticker_color_trace,
-                args.rgb_html_plot,
-                title="Independent-keypoint sticker RGB observations",
-                primary_normalized=args.normalize_rgb_plot,
-                point_size=args.plotly_point_size,
-                global_profiles=global_profiles,
-                global_observations=global_observations,
-            )
-            print(f"Saved sticker color plots: {args.rgb_html_plot}")
+            if args.save:
+                if not cv2.imwrite(str(args.save), rendered):
+                    raise SystemExit(f"Could not write rendered image: {args.save}")
+            if args.display:
+                cv2.imshow(WINDOW_NAME, rendered)
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
         return 0
 
-    cache, frame_count, first_pass_completed, source_fps = run_neural_video_pass(
+    cache, _, first_pass_completed, source_fps = run_neural_video_pass(
         source,
         bbox_detector,
         pose_model,
-        sticker_seg_model,
         args,
-        sticker_color_trace=sticker_color_trace,
         output_path=args.save_video,
         turn_candidate_log=args.turn_candidate_log,
         turn_candidate_image_dir=args.turn_candidate_images,
-        global_color_samples=global_color_samples,
     )
-    sticker_color_trace, global_profiles, global_observations = process_cached_pose_and_profiles(
-        cache, sticker_color_trace, args, known_initial_colors, global_color_samples,
-        source_fps=source_fps,
-    )
-    sticker_likelihoods_by_frame, sticker_color_names_by_frame, sticker_color_names, center_color_names = classify_cached_colors(
-        sticker_color_trace, args, global_profiles, known_initial_colors, image=False
-    )
-    if center_color_names:
-        print(
-            "Classified centers: "
-            + ", ".join(
-                f"{label}={color}"
-                for label, color in sorted(center_color_names.items())
-            ),
-            flush=True,
-        )
-    if args.show_classified_colors and args.recognize_scramble:
-        report_classified_scramble(
-            sticker_color_trace,
-            sticker_color_names,
-        )
-    if (
-        first_pass_completed
-        and (args.display or args.save_final_video is not None)
-    ):
+    process_cached_poses(cache, args, known_initial_colors, source_fps=source_fps)
+    if first_pass_completed and (args.display or args.save_final_video is not None):
         run_cached_video_pass(
             cache,
             args,
-            sticker_color_trace=sticker_color_trace,
-            sticker_color_names=sticker_color_names if args.show_classified_colors else None,
-            sticker_color_names_by_frame=sticker_color_names_by_frame,
-            sticker_likelihoods_by_frame=sticker_likelihoods_by_frame,
-            global_profiles=global_profiles,
+            sticker_color_names=known_initial_colors,
             output_path=args.save_final_video,
             fps=source_fps,
         )
-    if sticker_color_trace is not None and args.rgb_html_plot is not None:
-        save_sticker_color_plots(
-            sticker_color_trace,
-            args.rgb_html_plot,
-            title=(
-                "Independent-keypoint sticker RGB observations "
-                f"across {frame_count} frames"
-            ),
-            primary_normalized=args.normalize_rgb_plot,
-            point_size=args.plotly_point_size,
-            global_profiles=global_profiles,
-            global_observations=global_observations,
-        )
-        print(f"Saved sticker color plots: {args.rgb_html_plot}")
     return 0
 
 

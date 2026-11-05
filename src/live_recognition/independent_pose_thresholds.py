@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-INDEPENDENT_POSE_CLASS_NAMES = ("corner", "corner-edge", "corner-edge-center")
+INDEPENDENT_POSE_CLASS_NAMES = (
+    "corner", "corner-edge", "corner-edge-center",
+    "white", "yellow", "orange", "red", "blue", "green",
+)
 
 # Chosen from the 100% learning-curve threshold sweep. The edge class needs a
 # stricter threshold because it contributes most of the background false
@@ -13,6 +16,7 @@ DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES = {
     "corner": 0.25,
     "corner-edge": 0.4,
     "corner-edge-center": 0.25,
+    **dict.fromkeys(("white", "yellow", "orange", "red", "blue", "green"), 0.25),
 }
 
 

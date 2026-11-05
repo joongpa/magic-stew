@@ -106,9 +106,17 @@ def review_candidates(record: dict[str, object]) -> list[dict[str, object]]:
 
 
 def color_likelihood_payload(record: dict[str, object]) -> dict[str, object]:
-    """Return the logged per-identity color likelihood table, if present."""
+    """Return direct color matches, or probabilities from a legacy log."""
 
-    likelihoods = record.get("turn_color_likelihoods")
+    if record.get("color_scoring") == "direct_match_fraction" or "turn_color_matches" in record:
+        return {
+            "color_scoring": "direct_match_fraction",
+            "color_identity_labels": record.get("turn_color_identity_labels") or [],
+            "color_observation_centers": record.get("turn_color_observation_centers") or [],
+            "color_observation_names": record.get("turn_color_observation_names") or [],
+            "color_matches": record.get("turn_color_matches") or [],
+        }
+    likelihoods = record.get("turn_color_matches", record.get("turn_color_likelihoods"))
     labels = record.get("turn_color_identity_labels")
     centers = record.get("turn_color_observation_centers")
     if not isinstance(likelihoods, list) or not likelihoods:
@@ -121,11 +129,14 @@ def color_likelihood_payload(record: dict[str, object]) -> dict[str, object]:
         labels = [f"identity {index}" for index in range(len(likelihoods))]
     if not isinstance(centers, list):
         centers = []
-    return {
+    payload = {
         "color_identity_labels": labels,
         "color_observation_centers": centers,
         "color_likelihoods": likelihoods,
     }
+    if "turn_color_matches" in record:
+        payload["color_scoring"] = "direct_match_fraction"
+    return payload
 
 
 def selected_candidate_index(record: dict[str, object]) -> int | None:
@@ -434,15 +445,18 @@ def draw_candidate(
                     2,
                     cv2.LINE_AA,
                 )
-    heatmap_centers = pose.get("sticker_mask_centers") or []
-    centers = np.asarray(heatmap_centers, dtype=np.float64)
+    centers = np.asarray(pose.get("sticker_mask_centers") or [], dtype=np.float64)
+    color_names = pose.get("sticker_color_names") or record.get("turn_color_observation_names") or []
+    color_bgr = {"white": (255, 255, 255), "yellow": (0, 255, 255), "orange": (0, 165, 255),
+                 "red": (0, 0, 255), "blue": (255, 0, 0), "green": (0, 180, 0)}
     if centers.size == 0:
         centers = np.empty((0, 2), dtype=np.float64)
-    for center in centers.reshape(-1, 2):
+    for observation_index, center in enumerate(centers.reshape(-1, 2)):
         if np.isfinite(center).all():
             point = tuple(np.round(center).astype(int))
             cv2.circle(output, point, 7, (0, 0, 0), -1, cv2.LINE_AA)
-            cv2.circle(output, point, 5, HEATMAP_COLOR_BGR, -1, cv2.LINE_AA)
+            name = color_names[observation_index] if observation_index < len(color_names) else None
+            cv2.circle(output, point, 5, color_bgr.get(name, HEATMAP_COLOR_BGR), -1, cv2.LINE_AA)
 
     identity_geometry = record.get("turn_color_identity_geometry", [])
     geometry_by_key = {}
@@ -719,7 +733,7 @@ label { display:flex; gap:5px; align-items:center; }
       <textarea id="note" placeholder="Optional note about the scoring failure..."></textarea>
     </div>
     <div id="candidates"></div>
-    <details id="colorPanel" class="color-panel"><summary>p(observation | prior) by sticker identity</summary><div id="colorTable" class="muted">No color likelihoods recorded for this frame.</div></details>
+    <details id="colorPanel" class="color-panel"><summary>Color evidence by sticker identity</summary><div id="colorTable" class="muted">No color evidence recorded for this frame.</div></details>
   </aside>
 </main>
 <script>
@@ -816,27 +830,44 @@ function formatProbability(value) {
   const number=Number(value);
   return Number.isFinite(number) ? number.toExponential(3) : '—';
 }
+function colorAgreementText(candidate) {
+  const total=candidate.color_observed_count??candidate.color_match_count;
+  const error=candidate.color_error;
+  if(typeof total!=='number' || total<=0 || typeof error!=='number' || !Number.isFinite(error)) return 'not scored';
+  const correct=candidate.color_correct_count??Math.round((1-error)*total);
+  return `${correct}/${total} correct (${(100*correct/total).toFixed(1)}%)`;
+}
 function renderColorLikelihoods(data, candidate) {
   const root=$('colorTable'); root.innerHTML='';
-  const perCandidate=candidate?.color_likelihoods_by_identity;
+  const direct=data.color_scoring==='direct_match_fraction';
+  const formatEvidence=value=>direct ? (value==null?'—':String(Number(value))) : formatProbability(value);
+  const perCandidate=candidate?.color_matches_by_identity??candidate?.color_likelihoods_by_identity;
   if(perCandidate && typeof perCandidate==='object' && !Array.isArray(perCandidate) && Object.keys(perCandidate).length) {
     const table=document.createElement('table');
     const head=document.createElement('tr');
     const identityHead=document.createElement('th'); identityHead.textContent='identity'; head.appendChild(identityHead);
-    const probabilityHead=document.createElement('th'); probabilityHead.textContent='p(observation | prior)'; head.appendChild(probabilityHead);
+    const probabilityHead=document.createElement('th'); probabilityHead.textContent=direct?'color match':'p(observation | prior)'; head.appendChild(probabilityHead);
     table.appendChild(head);
     Object.entries(perCandidate).sort(([first],[second])=>first.localeCompare(second)).forEach(([label,value])=>{
       const row=document.createElement('tr');
       const identity=document.createElement('td'); identity.textContent=String(label); row.appendChild(identity);
-      const probability=document.createElement('td'); probability.textContent=formatProbability(value); row.appendChild(probability);
+      const probability=document.createElement('td'); probability.textContent=formatEvidence(value); row.appendChild(probability);
       table.appendChild(row);
     });
     root.appendChild(table);
     return;
   }
-  const labels=data.color_identity_labels||[], matrix=data.color_likelihoods||[];
-  if(!labels.length || !matrix.length) { root.textContent='No color likelihoods recorded for this frame.'; return; }
-  const centers=data.color_observation_centers||[];
+  const labels=data.color_identity_labels||[], matrix=data.color_matches||data.color_likelihoods||[];
+  const centers=data.color_observation_centers||[], names=data.color_observation_names||[];
+  if(!labels.length || !matrix.length) {
+    root.textContent=names.length ? `Observed color keypoints (no color score): ${names.map((name,index)=>`o${index} ${name}`).join(', ')}` : 'No color evidence recorded for this frame.';
+    return;
+  }
+  if(direct) {
+    const note=document.createElement('div'); note.className='muted';
+    note.textContent='1 = matching color, 0 = different color. One vote per observed projected sticker; any matching duplicate wins. Points outside the projected cube are excluded.';
+    root.appendChild(note);
+  }
   const columnCount=Math.max(0,...matrix.map(row=>Array.isArray(row)?row.length:0));
   if(!columnCount) { root.textContent='No observed sticker colors recorded for this frame.'; return; }
   const table=document.createElement('table');
@@ -845,7 +876,7 @@ function renderColorLikelihoods(data, candidate) {
   for(let column=0; column<columnCount; column++) {
     const cell=document.createElement('th');
     const center=centers[column];
-    cell.textContent=Array.isArray(center) ? `o${column} (${center.map(value=>Math.round(Number(value))).join(',')})` : `o${column}`;
+    cell.textContent=`o${column}${names[column]?` ${names[column]}`:''}${Array.isArray(center)?` (${center.map(value=>Math.round(Number(value))).join(',')})`:''}`;
     head.appendChild(cell);
   }
   table.appendChild(head);
@@ -853,7 +884,7 @@ function renderColorLikelihoods(data, candidate) {
     const row=document.createElement('tr');
     const identity=document.createElement('td'); identity.textContent=String(label); row.appendChild(identity);
     for(let column=0; column<columnCount; column++) {
-      const cell=document.createElement('td'); cell.textContent=formatProbability(matrix[rowIndex]?.[column]); row.appendChild(cell);
+      const cell=document.createElement('td'); cell.textContent=formatEvidence(matrix[rowIndex]?.[column]); row.appendChild(cell);
     }
     table.appendChild(row);
   });
@@ -1032,7 +1063,7 @@ async function loadFrame() {
       const title=document.createElement('div');title.className='title';
       title.textContent=`${i}: ${c.label}${i===current.selected_index?' · renderer selection':''}`;
       const metrics=document.createElement('div');metrics.className='metrics';
-      metrics.textContent=`frame fit ${scoreText(c.global_mean_error)} · kp ${scoreText(c.keypoint_mean_error)} · heat ${scoreText(c.heatmap_mean_error)} · color ${scoreText(c.color_error??c.color_mean_error)} · matches ${c.color_match_count??'—'} · inliers ${c.inlier_count??'—'}`;
+      metrics.textContent=`frame fit ${scoreText(c.global_mean_error)} · kp ${scoreText(c.keypoint_mean_error)} · sticker points ${scoreText(c.heatmap_mean_error)} · ${data.color_scoring==='direct_match_fraction'?`colors ${colorAgreementText(c)} · mismatch ${scoreText(c.color_error)}`:`color ${scoreText(c.color_error??c.color_mean_error)} · matches ${c.color_match_count??'—'}`} · inliers ${c.inlier_count??'—'}`;
       el.append(title,metrics);
       if(c.search_status){const state=document.createElement('div');state.className='metrics';
         state.textContent=`${moveText(c)} · ${searchStatusLabels[c.search_status]||c.search_status}${typeof c.best_sequence_score==='number'?` · best sequence ${scoreText(c.best_sequence_score)}`:''}${c.eliminated_depth!=null?` at depth ${c.eliminated_depth}`:''}`;

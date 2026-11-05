@@ -729,7 +729,8 @@ def main():
         duplicate_detection=not args.no_deduplicate,
         queue_key_format="unique insertion id" if args.no_deduplicate else "exact observation/update context",
         geometry_scope="all retained source-log options and discrete color offsets",
-        orientation_policy="fixed recorded poses; no new calibration or orientation rescue",
+        orientation_policy="24-way state-color rescue below 2/3 accuracy before move search",
+        orientation_rescue_minimum_color_accuracy=2./3.,
         goal="physical cube colors solved in any whole-cube orientation",reference_solution_used=False)
     (args.output_dir/"config.json").write_text(json.dumps(config,indent=2))
     if args.queue_backend == "buffered":
@@ -750,7 +751,8 @@ def main():
             if scorer_mode == "prepared":
                 item.update(color_configurations_scored=scorer.color_configurations_scored,
                             child_states_built=scorer.child_states_built)
-            latest.clear();latest.update(item)
+            latest.clear()
+            latest.update(item)
             log.write(json.dumps(item,allow_nan=False)+"\n")
             if item["event"] in {"started","progress","solved","already_solved","exhausted"}:
                 print(format_console_progress(item,args.console_timezone,now),flush=True)

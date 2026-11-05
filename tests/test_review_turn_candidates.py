@@ -223,3 +223,16 @@ def test_pose_for_candidate_applies_rescued_orientation_only_to_unselected_trial
     np.testing.assert_allclose(cv2.Rodrigues(np.array(alternative['rvec']))[0], expected, atol=1e-12)
     assert alternative['tvec'] == pose['tvec']
     assert record['search_pose'] is pose
+
+
+def test_direct_color_matches_are_exposed_without_probabilities():
+    payload = review_script.color_likelihood_payload({
+        "turn_color_identity_labels": ["C01 U"],
+        "turn_color_observation_centers": [[12., 34.], [13., 35.]],
+        "turn_color_matches": [[0., 1.]],
+        "turn_color_observation_names": ["red", "white"],
+        "color_scoring": "direct_match_fraction",
+    })
+    assert payload["color_scoring"] == "direct_match_fraction"
+    assert payload["color_matches"] == [[0., 1.]]
+    assert payload["color_observation_names"] == ["red", "white"]
