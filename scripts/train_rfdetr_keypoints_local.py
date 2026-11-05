@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import shutil
 from collections import Counter
@@ -23,6 +24,73 @@ from pathlib import Path
 DEFAULT_CLASS_NAMES = ["corner", "corner-edge", "corner-edge-center"]
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 KEYPOINT_SHAPE = [1, 3]
+
+
+def parse_positive_int_or_auto(value: str) -> int | str:
+    if value.lower() == "auto":
+        return "auto"
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer or 'auto'") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer or 'auto'")
+    return parsed
+
+
+def parse_nonnegative_int_or_auto(value: str) -> int | str:
+    if value.lower() == "auto":
+        return "auto"
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer or 'auto'") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer or 'auto'")
+    return parsed
+
+
+def resolve_num_workers(value: int | str) -> int:
+    """Choose a modest DataLoader worker count without starving the trainer."""
+    if value != "auto":
+        return value
+    try:
+        cpu_count = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cpu_count = os.cpu_count() or 1
+    return min(8, max(1, cpu_count // 2))
+
+
+def resolve_batch_size(value: int | str, device: str | None, imgsz: int) -> int:
+    """Choose a conservative batch from CUDA VRAM and square image resolution."""
+    if value != "auto":
+        return value
+
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return 1
+        if device in (None, "cuda"):
+            device_index = torch.cuda.current_device()
+        else:
+            device_index = int(device.split(":", 1)[1])
+        memory_gib = torch.cuda.get_device_properties(device_index).total_memory / 2**30
+    except (ImportError, IndexError, ValueError, RuntimeError):
+        return 1
+
+    if memory_gib >= 48:
+        base_batch = 8
+    elif memory_gib >= 32:
+        base_batch = 6
+    elif memory_gib >= 20:
+        base_batch = 4
+    elif memory_gib >= 12:
+        base_batch = 2
+    else:
+        base_batch = 1
+    resolution_scale = (288 / imgsz) ** 2
+    return max(1, min(16, math.floor(base_batch * resolution_scale)))
 
 
 def parse_class_names(value: str) -> list[str]:
@@ -104,6 +172,7 @@ def write_dataset(
     pose_subdir: str = "pose",
     extra_negative_dir: Path | None = None,
     class_names: list[str] | None = None,
+    skip_missing_labels: bool = False,
 ) -> Path:
     """Validate all labels, then prepare reproducible train/val splits."""
     import yaml
@@ -131,6 +200,7 @@ def write_dataset(
 
     samples = []
     seen_images: set[Path] = set()
+    skipped_missing = 0
     for source_dir in source_dirs:
         images_dir, labels_dir = source_dir / "images", source_dir / pose_subdir
         if not images_dir.is_dir() or not labels_dir.is_dir():
@@ -142,13 +212,21 @@ def write_dataset(
         for image_index, image_path in enumerate(images, 1):
             label_path = labels_dir / f"{image_path.stem}.txt"
             if not label_path.is_file():
-                raise FileNotFoundError(f"Missing pose label: {label_path}")
+                if not skip_missing_labels:
+                    raise FileNotFoundError(f"Missing pose label: {label_path}")
+                skipped_missing += 1
+                print(f"  Skipping image with missing pose label: {image_path}", flush=True)
+                continue
             counts = validate_label_file(label_path, class_names)
             if image_path.resolve() not in seen_images:
                 samples.append((image_path, label_path, counts))
                 seen_images.add(image_path.resolve())
             if image_index % 1000 == 0 or image_index == len(images):
                 print(f"  Validated {image_index:,}/{len(images):,} labels", flush=True)
+    if skipped_missing:
+        print(f"Skipped {skipped_missing:,} image(s) with missing pose labels.", flush=True)
+    if not samples:
+        raise ValueError("No images with pose labels found in the dataset sources.")
     if extra_negative_dir is not None:
         if not extra_negative_dir.is_dir():
             raise FileNotFoundError(f"Missing extra-negative image directory: {extra_negative_dir}")
@@ -256,7 +334,7 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
         from rfdetr import RFDETRKeypointPreview
     except ImportError as exc:
         raise RuntimeError(
-            'RF-DETR Keypoint training requires: python -m pip install -e ".[rfdetr]"'
+            'RF-DETR Keypoint training requires: python -m pip install "rfdetr[train]" PyYAML'
         ) from exc
 
     class_names = list(yaml.safe_load(data_yaml.read_text())["names"].values())
@@ -277,17 +355,19 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
     while output_dir.exists():
         output_dir = runs_dir / f"{args.name}-{suffix}"
         suffix += 1
+    batch_size = resolve_batch_size(args.batch, args.device, args.imgsz)
+    num_workers = resolve_num_workers(args.workers)
     train_kwargs = {
         "dataset_dir": str(data_yaml.parent),
         "dataset_file": "yolo",
         "class_names": class_names,
         "output_dir": str(output_dir.resolve()),
         "epochs": args.epochs,
-        "batch_size": args.batch,
+        "batch_size": batch_size,
         "grad_accum_steps": args.grad_accum_steps,
         "lr": args.lr,
         "lr_encoder": args.lr_encoder,
-        "num_workers": args.workers,
+        "num_workers": num_workers,
         "seed": args.seed,
         "early_stopping": args.patience > 0,
         "early_stopping_patience": args.patience,
@@ -308,7 +388,7 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
         train_kwargs["device"] = args.device
     print(
         f"Starting training: {args.epochs} epochs, {args.imgsz}x{args.imgsz}, "
-        f"batch {args.batch}, device {args.device or 'auto'}\n"
+        f"batch {batch_size}, workers {num_workers}, device {args.device or 'auto'}\n"
         f"Output directory: {output_dir.resolve()}",
         flush=True,
     )
@@ -349,11 +429,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", type=Path, help="Optional pretrained checkpoint override.")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", "--resolution", type=int, default=288)
-    parser.add_argument("--batch", type=int, default=4)
+    parser.add_argument(
+        "--batch",
+        type=parse_positive_int_or_auto,
+        default="auto",
+        help="Per-step batch size, or auto-select from GPU VRAM and resolution.",
+    )
     parser.add_argument("--grad-accum-steps", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--lr-encoder", type=float, default=2e-5)
-    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument(
+        "--workers",
+        type=parse_nonnegative_int_or_auto,
+        default="auto",
+        help="DataLoader workers, or auto-select from available CPU cores.",
+    )
     parser.add_argument("--device", help="cpu, mps, cuda, cuda:N, or a GPU index such as 0.")
     parser.add_argument("--name", default="cube_keypoints_rfdetr")
     parser.add_argument("--patience", type=int, default=25, help="Early-stop patience; 0 disables.")
@@ -365,9 +455,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--imgsz must be a positive multiple of 24 (e.g. 144, 264, 288).")
     if not 0 <= args.val_fraction < 1:
         parser.error("--val-fraction must be in [0, 1).")
-    if min(args.epochs, args.batch, args.grad_accum_steps) <= 0:
-        parser.error("--epochs, --batch, and --grad-accum-steps must be positive.")
-    if args.workers < 0 or args.patience < 0:
+    if min(args.epochs, args.grad_accum_steps) <= 0:
+        parser.error("--epochs and --grad-accum-steps must be positive.")
+    if (args.workers != "auto" and args.workers < 0) or args.patience < 0:
         parser.error("--workers and --patience must be nonnegative.")
     if not all(math.isfinite(rate) and rate > 0 for rate in (args.lr, args.lr_encoder)):
         parser.error("Learning rates must be positive and finite.")

@@ -231,6 +231,13 @@ not create arbitrary adversarial images.
 
 ## RF-DETR landmark and sticker keypoint training
 
+To train on a Colab GPU, open `notebooks/train_rfdetr_keypoints_colab.ipynb`
+in Google Colab and run the cells in order. The notebook accepts a generated
+dataset ZIP containing one or more dataset folders plus an optional
+negative-images ZIP and can save checkpoints
+directly to Google Drive. It bundles a snapshot of the trainer, so it doesn't
+require a repository checkout or the project's `kociemba` dependency.
+
 `scripts/train_rfdetr_keypoints_local.py` fine-tunes RF-DETR Keypoint Preview
 on the same independent one-keypoint YOLO pose rows. It reads class order from
 the generator's `sticker_keypoint_manifest.json` (combined landmarks and six

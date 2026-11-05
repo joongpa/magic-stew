@@ -127,6 +127,13 @@ def test_missing_label_is_not_silently_treated_as_background(training, tmp_path)
         training.write_dataset([source], tmp_path / "out", 0.2, 17)
 
 
+def test_skipping_missing_labels_requires_at_least_one_labeled_image(training, tmp_path):
+    source = make_source(tmp_path / "source", ["point"], count=1)
+    (source / "pose/0.txt").unlink()
+    with pytest.raises(ValueError, match="No images with pose labels"):
+        training.write_dataset([source], tmp_path / "out", 0.2, 17, skip_missing_labels=True)
+
+
 def test_output_cannot_replace_source_or_unrecognized_directory(training, tmp_path):
     source = make_source(tmp_path / "source", ["point"])
     with pytest.raises(ValueError, match="separate"):
@@ -205,6 +212,31 @@ def test_training_requires_positive_validation_data(training, tmp_path):
     prepared = training.write_dataset([source], tmp_path / "dataset", 0.2, 17)
     with pytest.raises(ValueError, match="at least two positives"):
         training.train(prepared, tmp_path / "runs", training.parse_args([]))
+
+
+def test_auto_resource_defaults_and_resolution_scaling(training, monkeypatch):
+    args = training.parse_args([])
+    assert args.batch == "auto"
+    assert args.workers == "auto"
+    assert training.resolve_num_workers(3) == 3
+    assert training.resolve_batch_size(2, "cuda:0", 288) == 2
+
+    class FakeCuda:
+        def is_available(self):
+            return True
+
+        def current_device(self):
+            return 0
+
+        def get_device_properties(self, index):
+            assert index == 0
+            return types.SimpleNamespace(total_memory=24 * 2**30)
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.cuda = FakeCuda()
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    assert training.resolve_batch_size("auto", "cuda:0", 288) == 4
+    assert training.resolve_batch_size("auto", "cuda:0", 144) == 16
 
 
 @pytest.mark.parametrize(
