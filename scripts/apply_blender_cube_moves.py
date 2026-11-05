@@ -107,10 +107,16 @@ LIGHTING_SETUP_WEIGHTS = (
 )
 SUNLIGHT_WINDOW_PROBABILITY = 0.42
 LIGHT_TEMPERATURE_PROFILES = (
-    # name, probability, indoor sources, window daylight
-    ("warm_yellow", 0.30, (2700.0, 3600.0), (3500.0, 4800.0)),
-    ("neutral_white", 0.50, (4000.0, 5600.0), (5000.0, 6500.0)),
-    ("cool_blue", 0.20, (6500.0, 8500.0), (7000.0, 10000.0)),
+    # name, probability, indoor sources, window daylight, tint target, tint amount
+    # Tints are blended with the temperature-derived color rather than replacing
+    # it, keeping colored-light examples visible but still plausible.
+    ("warm_yellow", 0.22, (2700.0, 3600.0), (3500.0, 4800.0), (1.0, 0.72, 0.32), 0.08),
+    ("neutral_white", 0.32, (4000.0, 5600.0), (5000.0, 6500.0), (1.0, 1.0, 1.0), 0.0),
+    ("cool_blue", 0.16, (6500.0, 8500.0), (7000.0, 10000.0), (0.32, 0.72, 1.0), 0.08),
+    ("soft_amber", 0.12, (3000.0, 4300.0), (4000.0, 5600.0), (1.0, 0.38, 0.08), 0.28),
+    ("muted_cyan", 0.08, (4200.0, 6000.0), (5200.0, 7000.0), (0.12, 0.72, 1.0), 0.24),
+    ("dusty_rose", 0.06, (3400.0, 5000.0), (4500.0, 6200.0), (1.0, 0.32, 0.44), 0.20),
+    ("soft_sage", 0.04, (3600.0, 5200.0), (4800.0, 6400.0), (0.36, 1.0, 0.48), 0.16),
 )
 LIGHT_TARGET_JITTER_RANGE = (-0.35, 0.35)
 LIGHT_TEMPERATURE_KELVIN_RANGE = (2700.0, 7500.0)
@@ -1366,6 +1372,21 @@ def kelvin_to_rgb(temperature_kelvin: float) -> tuple[float, float, float]:
     return tuple(max(0.0, min(channel / 255.0, 1.0)) for channel in (red, green, blue))
 
 
+def blend_light_color(
+    base_color: tuple[float, float, float],
+    tint_color: tuple[float, float, float] | None,
+    tint_amount: float,
+) -> tuple[float, float, float]:
+    """Blend a restrained tint into a temperature-derived light color."""
+    if tint_color is None or tint_amount <= 0.0:
+        return base_color
+    amount = max(0.0, min(tint_amount, 1.0))
+    return tuple(
+        max(0.0, min((1.0 - amount) * base + amount * tint, 1.0))
+        for base, tint in zip(base_color, tint_color)
+    )
+
+
 def clear_scene_lights() -> None:
     """Remove authored and previously generated lights so each rig is self-contained."""
     for obj in list(bpy.data.objects):
@@ -1403,6 +1424,8 @@ def add_light_source(
     size_y: float | None = None,
     sun_angle_degrees: float | None = None,
     color_override: tuple[float, float, float] | None = None,
+    color_tint: tuple[float, float, float] | None = None,
+    tint_amount: float = 0.0,
 ) -> dict[str, object]:
     """Create one intentionally placed source and return reproducibility metadata."""
     name = f"{SYNTHETIC_LIGHT_PREFIX}.{role}"
@@ -1412,7 +1435,11 @@ def add_light_source(
     light.location = location
     look_at(light, target)
 
-    color = color_override or kelvin_to_rgb(temperature_kelvin)
+    color = color_override or blend_light_color(
+        kelvin_to_rgb(temperature_kelvin),
+        color_tint,
+        tint_amount,
+    )
     data.energy = energy
     data.color = color
     data.use_shadow = True
@@ -1432,6 +1459,8 @@ def add_light_source(
         "energy": energy,
         "temperature_kelvin": temperature_kelvin,
         "color": list(color),
+        "color_tint": list(color_tint) if color_tint is not None else None,
+        "tint_amount": tint_amount,
         "size": getattr(data, "size", None) if light_type == "AREA" else None,
         "size_y": getattr(data, "size_y", None) if light_type == "AREA" else None,
         "sun_angle_degrees": sun_angle_degrees if light_type == "SUN" else None,
@@ -1483,6 +1512,8 @@ def add_window_aperture(
 def add_floor_lamp_source(
     target: Vector,
     temperature_kelvin: float,
+    color_tint: tuple[float, float, float] | None = None,
+    tint_amount: float = 0.0,
 ) -> dict[str, object]:
     """Add a broad, elevated lamp-like key light 10–15 feet from the cube."""
     table_forward, table_right = camera_table_basis()
@@ -1513,18 +1544,23 @@ def add_floor_lamp_source(
         temperature_kelvin + random.uniform(-220.0, 220.0),
         size=random.uniform(*FLOOR_LAMP_SIZE_RANGE),
         size_y=random.uniform(*FLOOR_LAMP_SIZE_RANGE),
+        color_tint=color_tint,
+        tint_amount=tint_amount,
     )
 
 
 def configure_world_lighting(
     strength_range: tuple[float, float],
     temperature_range: tuple[float, float],
+    color_tint: tuple[float, float, float] | None = None,
+    tint_amount: float = 0.0,
 ) -> dict[str, object]:
     world = bpy.context.scene.world or bpy.data.worlds.new("SyntheticDataWorld")
     bpy.context.scene.world = world
     strength = random.uniform(*strength_range)
     temperature_kelvin = random.uniform(*temperature_range)
-    tint = kelvin_to_rgb(temperature_kelvin)
+    temperature_color = kelvin_to_rgb(temperature_kelvin)
+    tint = blend_light_color(temperature_color, color_tint, tint_amount)
     color = tuple(channel * random.uniform(0.92, 1.08) for channel in tint)
     world.color = tuple(strength * channel for channel in color)
 
@@ -1540,6 +1576,8 @@ def configure_world_lighting(
         "temperature_kelvin": temperature_kelvin,
         "color": list(color),
         "display_color": list(world.color),
+        "color_tint": list(color_tint) if color_tint is not None else None,
+        "tint_amount": tint_amount,
     }
 
 
@@ -1655,15 +1693,22 @@ def randomize_light(
         weights=[weight for _name, weight in LIGHTING_SETUP_WEIGHTS],
         k=1,
     )[0]
-    temperature_profile, _profile_weight, room_temperature_range, window_temperature_range = random.choices(
+    (
+        temperature_profile,
+        _profile_weight,
+        room_temperature_range,
+        window_temperature_range,
+        color_tint,
+        tint_amount,
+    ) = random.choices(
         LIGHT_TEMPERATURE_PROFILES,
-        weights=[weight for _name, weight, _room_range, _window_range in LIGHT_TEMPERATURE_PROFILES],
+        weights=[weight for _name, weight, _room_range, _window_range, _tint, _amount in LIGHT_TEMPERATURE_PROFILES],
         k=1,
     )[0]
     base_temperature = random.uniform(*room_temperature_range)
     target = lighting_target()
     sources: list[dict[str, object]] = []
-    sources.append(add_floor_lamp_source(target, base_temperature))
+    sources.append(add_floor_lamp_source(target, base_temperature, color_tint, tint_amount))
 
     if setup == "ceiling_lights":
         fixture_count = random.choice((2, 3, 3, 4))
@@ -1679,6 +1724,7 @@ def randomize_light(
                 f"ceiling_{index + 1}", "AREA", location, downward_target,
                 random.uniform(260.0, 560.0), base_temperature + random.uniform(-180.0, 180.0),
                 size=random.uniform(1.8, 3.0), size_y=random.uniform(3.5, 5.5),
+                color_tint=color_tint, tint_amount=tint_amount,
             ))
         world_ranges = ((0.12, 0.25), room_temperature_range)
         exposure_range = (-0.20, 0.18)
@@ -1698,6 +1744,7 @@ def randomize_light(
             "lamp", "AREA", location, lamp_target,
             random.uniform(260.0, 580.0), base_temperature + random.uniform(-180.0, 180.0),
             size=random.uniform(1.2, 2.2), size_y=random.uniform(1.2, 2.2),
+            color_tint=color_tint, tint_amount=tint_amount,
         ))
         sources.append(add_light_source(
             "room_fill", "AREA",
@@ -1705,6 +1752,7 @@ def randomize_light(
             Vector((0.0, 0.0, BACKGROUND_TABLE_Z)),
             random.uniform(140.0, 280.0), base_temperature + random.uniform(-300.0, 300.0),
             size=random.uniform(5.0, 8.0), size_y=random.uniform(5.0, 8.0),
+            color_tint=color_tint, tint_amount=tint_amount,
         ))
         world_ranges = ((0.10, 0.22), room_temperature_range)
         exposure_range = (-0.05, 0.28)
@@ -1737,6 +1785,7 @@ def randomize_light(
             "window_sun", "AREA", window_location, patch_target,
             random.uniform(900.0, 1700.0), window_temperature,
             size=random.uniform(0.22, 0.42), size_y=random.uniform(0.22, 0.42),
+            color_tint=color_tint, tint_amount=tint_amount,
         ))
         window_metadata = {
             "enabled": True,
@@ -1753,7 +1802,7 @@ def randomize_light(
     )
     if laptop_source is not None:
         sources.append(laptop_source)
-    world = configure_world_lighting(*world_ranges)
+    world = configure_world_lighting(world_ranges[0], world_ranges[1], color_tint, tint_amount)
 
     exposure = random.uniform(*exposure_range)
     bpy.context.scene.view_settings.exposure = exposure
@@ -1769,6 +1818,8 @@ def randomize_light(
             "base_kelvin": base_temperature,
             "room_range_kelvin": list(room_temperature_range),
             "window_range_kelvin": list(window_temperature_range),
+            "tint_color": list(color_tint),
+            "tint_amount": tint_amount,
         },
         "sunlight_window": window_metadata or {
             "enabled": False,
