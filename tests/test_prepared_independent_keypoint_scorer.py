@@ -63,11 +63,14 @@ def observation_record(m, kind="normal"):
 
 
 @pytest.mark.parametrize("kind", ["normal", "zero", "outside", "empty"])
-def test_base_pose_projection_and_move_permutations_match_legacy(renderer, kind):
+@pytest.mark.parametrize('track', [False, True])
+def test_base_pose_projection_and_move_permutations_match_legacy(renderer, kind, track):
     import torch
     records = {7: observation_record(renderer, kind)}
-    legacy = search.ReplayScorer(renderer, records, torch.device("cpu"), cache_size=0)
-    prepared = search.PreparedReplayScorer(renderer, records, torch.device("cpu"), cache_size=0)
+    legacy = search.ReplayScorer(renderer, records, torch.device("cpu"), cache_size=0,
+                                 track_sticker_observations=track)
+    prepared = search.PreparedReplayScorer(renderer, records, torch.device("cpu"), cache_size=0,
+                                          track_sticker_observations=track)
     initial = renderer.CubeGeometryState.identity()
     for state in (initial, initial.apply_moves(("R", "U", "F'")),
                   initial.apply_moves(("Rw'", "Uw", "Bw", "Lw", "Dw'", "Fw"))):
@@ -88,6 +91,13 @@ def test_base_pose_projection_and_move_permutations_match_legacy(renderer, kind)
             for field in ("state_moves", "color_match_count", "keypoint_mean_error",
                           "heatmap_mean_error", "keypoint_p90_error", "inlier_count"):
                 assert actual.payload[field] == expected.payload[field]
+            if track:
+                for field in ('sticker_observed_mask_hex','sticker_correct_mask_hex'):
+                    assert actual.payload[field] == expected.payload[field]
+                observed = int(actual.payload['sticker_observed_mask_hex'],16)
+                correct = int(actual.payload['sticker_correct_mask_hex'],16)
+                assert observed.bit_count() == actual.payload['color_match_count']
+                assert correct.bit_count() == round((1-actual.payload['color_error'])*observed.bit_count())
     compiled = prepared.prepare(7)
     assert compiled["source_geometry_count"] == 48
     assert compiled["configuration_count"] == 144
@@ -119,7 +129,8 @@ def test_prepared_frames_survive_revisiting_beyond_legacy_lru(renderer, monkeypa
     assert len(scorer.compiled_frames) == 35
 
 
-def test_state_orientation_rescue_matches_legacy_and_preserves_physical_move_context(renderer):
+@pytest.mark.parametrize('track', [False, True])
+def test_state_orientation_rescue_matches_legacy_and_preserves_physical_move_context(renderer, track):
     import torch
     m = renderer
     record = observation_record(m)
@@ -143,8 +154,10 @@ def test_state_orientation_rescue_matches_legacy_and_preserves_physical_move_con
                 sticker_mask_centers=[point.tolist() for point in candidate.sticker_mask_centers],
                 sticker_color_names=list(observed_colors))
     record["turn_color_matches"] = m.turn_color_match_matrix(candidate, expected_color_by_label=colors).tolist()
-    legacy = search.ReplayScorer(m, {7: record}, torch.device("cpu"), initial_colors=colors)
-    prepared = search.PreparedReplayScorer(m, {7: record}, torch.device("cpu"), initial_colors=colors)
+    legacy = search.ReplayScorer(m, {7: record}, torch.device("cpu"), initial_colors=colors,
+                                 track_sticker_observations=track)
+    prepared = search.PreparedReplayScorer(m, {7: record}, torch.device("cpu"), initial_colors=colors,
+                                          track_sticker_observations=track)
     compact = prepared.key(initial)
     old, new = legacy(7, initial), prepared(7, compact)
     def keyed(choices):
@@ -155,6 +168,13 @@ def test_state_orientation_rescue_matches_legacy_and_preserves_physical_move_con
     for key in a:
         assert a[key].score == pytest.approx(b[key].score, abs=1e-10)
         assert a[key].payload["orientation_symmetry_index"] == b[key].payload["orientation_symmetry_index"]
+        if track:
+            for field in ('sticker_observed_mask_hex','sticker_correct_mask_hex'):
+                assert a[key].payload[field] == b[key].payload[field]
+            observed = int(b[key].payload['sticker_observed_mask_hex'],16)
+            correct = int(b[key].payload['sticker_correct_mask_hex'],16)
+            assert observed.bit_count() == b[key].payload['color_match_count']
+            assert correct.bit_count() == round((1-b[key].payload['color_error'])*observed.bit_count())
     hold = next(t for t in new if not t.payload["state_moves"])
     assert hold.state == compact
     assert hold.payload["color_error"] == pytest.approx(0.)

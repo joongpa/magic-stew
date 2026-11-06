@@ -108,9 +108,9 @@ def review_candidates(record: dict[str, object]) -> list[dict[str, object]]:
 def color_likelihood_payload(record: dict[str, object]) -> dict[str, object]:
     """Return direct color matches, or probabilities from a legacy log."""
 
-    if record.get("color_scoring") == "direct_match_fraction" or "turn_color_matches" in record:
+    if record.get("color_scoring") in ("direct_match_fraction", "directional_confusion_cost") or "turn_color_matches" in record:
         return {
-            "color_scoring": "direct_match_fraction",
+            "color_scoring": record.get('color_scoring', 'direct_match_fraction'),
             "color_identity_labels": record.get("turn_color_identity_labels") or [],
             "color_observation_centers": record.get("turn_color_observation_centers") or [],
             "color_observation_names": record.get("turn_color_observation_names") or [],
@@ -835,11 +835,11 @@ function colorAgreementText(candidate) {
   const error=candidate.color_error;
   if(typeof total!=='number' || total<=0 || typeof error!=='number' || !Number.isFinite(error)) return 'not scored';
   const correct=candidate.color_correct_count??Math.round((1-error)*total);
-  return `${correct}/${total} correct (${(100*correct/total).toFixed(1)}%)`;
+  return `${correct}/${total} correct (${(100*correct/total).toFixed(1)}%)${typeof candidate.color_confusion_count==='number'?` · ${candidate.color_confusion_count} allowed confusions · ${candidate.color_forbidden_count??0} unlisted`:''}`;
 }
 function renderColorLikelihoods(data, candidate) {
   const root=$('colorTable'); root.innerHTML='';
-  const direct=data.color_scoring==='direct_match_fraction';
+  const direct=['direct_match_fraction','directional_confusion_cost'].includes(data.color_scoring);
   const formatEvidence=value=>direct ? (value==null?'—':String(Number(value))) : formatProbability(value);
   const perCandidate=candidate?.color_matches_by_identity??candidate?.color_likelihoods_by_identity;
   if(perCandidate && typeof perCandidate==='object' && !Array.isArray(perCandidate) && Object.keys(perCandidate).length) {
@@ -1039,6 +1039,12 @@ async function loadFrame() {
   $('frameInfo').textContent=staticOnly
     ? `frame ${frameIndex} · turn search not tested · showing static pose`
     : `frame ${frameIndex} · ${count} tested configurations · ${data.search?'selection uses sequence score':'current-frame scores'} · selected: ${selectionLabel}`;
+  if(typeof data.search?.sticker_mismatch_count==='number')
+    $('frameInfo').textContent=`frame ${frameIndex} · mismatched stickers ${data.search.sticker_mismatch_count}/54 · ${data.search.sticker_history_qualified_count??0} stickers have 4 observations · selected: ${selectionLabel}`;
+  if(typeof data.search?.sticker_history_penalty==='number')
+    $('frameInfo').textContent+=` · history penalty ${scoreText(data.search.sticker_history_penalty)} · queue ${scoreText(data.search.queue_priority??data.search.inherited_queue_priority)}`;
+  if(data.search?.soft_window_penalty)
+    $('frameInfo').textContent+=` · old-fork penalty ${scoreText(data.search.soft_window_penalty)}`;
   $('candidateTitle').textContent=staticOnly ? 'Static pose (turn search not tested)' : (count ? `Candidate ${candidateIndex+1}/${count}` : 'No tested candidate');
   $('layerInfo').textContent=activeLayer ? `${groupTitle(`${activeLayer.axis}:${activeLayer.side}:${activeLayer.width}`)} · sticker angle ${candidateAngle(candidates[candidateIndex])}° · , / . to adjust` : 'Click a layer; double-click for two layers. Use , / . to turn.';
   $('correct').disabled=!count; $('selectNext').disabled=!count;
@@ -1063,7 +1069,10 @@ async function loadFrame() {
       const title=document.createElement('div');title.className='title';
       title.textContent=`${i}: ${c.label}${i===current.selected_index?' · renderer selection':''}`;
       const metrics=document.createElement('div');metrics.className='metrics';
-      metrics.textContent=`frame fit ${scoreText(c.global_mean_error)} · kp ${scoreText(c.keypoint_mean_error)} · sticker points ${scoreText(c.heatmap_mean_error)} · ${data.color_scoring==='direct_match_fraction'?`colors ${colorAgreementText(c)} · mismatch ${scoreText(c.color_error)}`:`color ${scoreText(c.color_error??c.color_mean_error)} · matches ${c.color_match_count??'—'}`} · inliers ${c.inlier_count??'—'}`;
+      metrics.textContent=`frame fit ${scoreText(c.global_mean_error)} · kp ${scoreText(c.keypoint_mean_error)} · sticker points ${scoreText(c.heatmap_mean_error)} · ${['direct_match_fraction','directional_confusion_cost'].includes(data.color_scoring)?`colors ${colorAgreementText(c)} · mismatch ${scoreText(c.color_error)}`:`color ${scoreText(c.color_error??c.color_mean_error)} · matches ${c.color_match_count??'—'}`} · inliers ${c.inlier_count??'—'}`;
+      if(typeof c.sticker_mismatch_count==='number')metrics.textContent+=` · mismatched stickers ${c.sticker_mismatch_count}/54`;
+      if(typeof c.sticker_history_penalty==='number')metrics.textContent+=` · history penalty ${scoreText(c.sticker_history_penalty)} · queue ${scoreText(c.queue_priority??c.inherited_queue_priority)}`;
+      if(c.soft_window_penalty)metrics.textContent+=` · old-fork penalty ${scoreText(c.soft_window_penalty)}`;
       el.append(title,metrics);
       if(c.search_status){const state=document.createElement('div');state.className='metrics';
         state.textContent=`${moveText(c)} · ${searchStatusLabels[c.search_status]||c.search_status}${typeof c.best_sequence_score==='number'?` · best sequence ${scoreText(c.best_sequence_score)}`:''}${c.eliminated_depth!=null?` at depth ${c.eliminated_depth}`:''}`;

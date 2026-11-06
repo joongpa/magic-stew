@@ -1,0 +1,1321 @@
+{
+  "source": "nahmSolve.mov zero-indexed frame 587; orientation 6 confirmed by user. Retains static geometry plus source options 14 and 140.",
+  "scramble": "F R2 B' F2 L U2 F2 U2 F2 L2 F2 R D B R F2 L' R' D' L'",
+  "encoded_parent_state": [
+    46,
+    45,
+    47,
+    9,
+    8,
+    32,
+    30,
+    31,
+    24,
+    25,
+    4,
+    23,
+    22,
+    42,
+    44,
+    43,
+    11,
+    10,
+    51,
+    53,
+    52,
+    20,
+    21,
+    3,
+    27,
+    26,
+    1,
+    0,
+    15,
+    14,
+    2,
+    13,
+    12,
+    50,
+    49,
+    48,
+    28,
+    29,
+    35,
+    33,
+    34,
+    7,
+    6,
+    5,
+    16,
+    17,
+    41,
+    39,
+    40,
+    19,
+    18,
+    36,
+    37,
+    38
+  ],
+  "sticker_history": [
+    32,
+    64,
+    64,
+    73,
+    65,
+    79,
+    64,
+    64,
+    65,
+    67,
+    64,
+    64,
+    67,
+    67,
+    64,
+    67,
+    68,
+    79,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    67,
+    76,
+    65,
+    64,
+    65,
+    64,
+    65,
+    64,
+    78,
+    72,
+    64,
+    67,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    72,
+    64,
+    64,
+    64,
+    65
+  ],
+  "source_geometry_indices": [
+    0,
+    14,
+    17,
+    34,
+    51,
+    68,
+    85,
+    102,
+    119,
+    136,
+    140,
+    153,
+    170,
+    187
+  ],
+  "record": {
+    "frame_index": 587,
+    "has_pose": true,
+    "search_pose": {
+      "rvec": [
+        [
+          1.3351691112145534
+        ],
+        [
+          0.21723817232767056
+        ],
+        [
+          1.718219955617766
+        ]
+      ],
+      "tvec": [
+        [
+          1.9071593858953766
+        ],
+        [
+          -34.544297946057966
+        ],
+        [
+          272.7278665346603
+        ]
+      ],
+      "camera_matrix": [
+        [
+          1152.0,
+          0.0,
+          480.0
+        ],
+        [
+          0.0,
+          1152.0,
+          477.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "dist_coeffs": [
+        [
+          0.0
+        ],
+        [
+          0.0
+        ],
+        [
+          0.0
+        ],
+        [
+          0.0
+        ]
+      ],
+      "image_size": [
+        960,
+        954
+      ],
+      "sticker_type": "center",
+      "assignment_image_points": [
+        [
+          589.1375732421875,
+          344.31707763671875
+        ],
+        [
+          585.332763671875,
+          406.6888732910156
+        ],
+        [
+          523.2982177734375,
+          436.77484130859375
+        ],
+        [
+          428.27154541015625,
+          237.0446319580078
+        ],
+        [
+          506.203857421875,
+          253.816162109375
+        ],
+        [
+          537.4825439453125,
+          211.64085388183594
+        ],
+        [
+          496.1703796386719,
+          158.65884399414062
+        ],
+        [
+          354.267578125,
+          219.69482421875
+        ],
+        [
+          425.96490478515625,
+          143.614013671875
+        ],
+        [
+          462.059814453125,
+          196.95330810546875
+        ],
+        [
+          388.7926025390625,
+          182.37667846679688
+        ],
+        [
+          567.454833984375,
+          174.23464965820312
+        ],
+        [
+          473.2205810546875,
+          299.53118896484375
+        ],
+        [
+          393.19219970703125,
+          281.89471435546875
+        ],
+        [
+          643.755859375,
+          192.00343322753906
+        ],
+        [
+          558.5235595703125,
+          321.32208251953125
+        ],
+        [
+          647.099853515625,
+          436.2135009765625
+        ],
+        [
+          618.5255737304688,
+          229.30474853515625
+        ],
+        [
+          590.4730224609375,
+          270.40582275390625
+        ],
+        [
+          459.4576416015625,
+          398.6005859375
+        ],
+        [
+          405.2884521484375,
+          357.8157958984375
+        ],
+        [
+          314.81927490234375,
+          262.7261962890625
+        ],
+        [
+          456.4266052246094,
+          470.50006103515625
+        ],
+        [
+          431.96405029296875,
+          535.163330078125
+        ],
+        [
+          442.23480224609375,
+          530.731689453125
+        ]
+      ],
+      "assignment_observed_class_ids": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        1,
+        0,
+        2,
+        1,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        2,
+        0,
+        1,
+        0,
+        0
+      ],
+      "assignment_fixed_mask": [
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "sticker_mask_centers": [
+        [
+          592.4893188476562,
+          200.60565185546875
+        ],
+        [
+          531.8172607421875,
+          284.8515930175781
+        ],
+        [
+          514.1294555664062,
+          347.2124328613281
+        ],
+        [
+          373.59271240234375,
+          249.07681274414062
+        ],
+        [
+          407.88427734375,
+          208.49012756347656
+        ],
+        [
+          433.002685546875,
+          326.6866455078125
+        ],
+        [
+          449.837158203125,
+          267.47650146484375
+        ],
+        [
+          442.57818603515625,
+          168.92459106445312
+        ],
+        [
+          486.259033203125,
+          486.66766357421875
+        ],
+        [
+          515.6717529296875,
+          184.44232177734375
+        ],
+        [
+          483.3519592285156,
+          224.60472106933594
+        ],
+        [
+          618.94775390625,
+          419.0291442871094
+        ],
+        [
+          562.268310546875,
+          240.6736297607422
+        ],
+        [
+          431.24188232421875,
+          414.1310729980469
+        ],
+        [
+          602.7193603515625,
+          283.3924865722656
+        ],
+        [
+          492.1698913574219,
+          420.99139404296875
+        ],
+        [
+          627.81640625,
+          245.84226989746094
+        ],
+        [
+          556.810546875,
+          389.99896240234375
+        ],
+        [
+          573.6292114257812,
+          332.7284240722656
+        ],
+        [
+          383.60089111328125,
+          369.7540588378906
+        ],
+        [
+          617.4744873046875,
+          365.51031494140625
+        ],
+        [
+          343.64019775390625,
+          360.37542724609375
+        ],
+        [
+          352.86614990234375,
+          306.90338134765625
+        ],
+        [
+          619.4146728515625,
+          410.01251220703125
+        ],
+        [
+          553.8824462890625,
+          450.1879577636719
+        ]
+      ],
+      "sticker_mask_center_uncertainties": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "sticker_color_names": [
+        "yellow",
+        "yellow",
+        "green",
+        "red",
+        "green",
+        "yellow",
+        "blue",
+        "yellow",
+        "orange",
+        "green",
+        "yellow",
+        "red",
+        "red",
+        "green",
+        "blue",
+        "red",
+        "red",
+        "red",
+        "red",
+        "green",
+        "red",
+        "red",
+        "green",
+        "red",
+        "red"
+      ],
+      "cube_geometry_state": {
+        "C01 U": [
+          [
+            1,
+            1,
+            2
+          ],
+          2,
+          1
+        ],
+        "C02 D": [
+          [
+            1,
+            1,
+            0
+          ],
+          2,
+          -1
+        ],
+        "C03 F": [
+          [
+            1,
+            0,
+            1
+          ],
+          1,
+          -1
+        ],
+        "C04 B": [
+          [
+            1,
+            2,
+            1
+          ],
+          1,
+          1
+        ],
+        "C05 R": [
+          [
+            2,
+            1,
+            1
+          ],
+          0,
+          1
+        ],
+        "C06 L": [
+          [
+            0,
+            1,
+            1
+          ],
+          0,
+          -1
+        ],
+        "E01 UF/U": [
+          [
+            1,
+            0,
+            2
+          ],
+          2,
+          1
+        ],
+        "E02 UF/F": [
+          [
+            1,
+            0,
+            2
+          ],
+          1,
+          -1
+        ],
+        "E03 UR/U": [
+          [
+            2,
+            1,
+            2
+          ],
+          2,
+          1
+        ],
+        "E04 UR/R": [
+          [
+            2,
+            1,
+            2
+          ],
+          0,
+          1
+        ],
+        "E05 UB/U": [
+          [
+            1,
+            2,
+            2
+          ],
+          2,
+          1
+        ],
+        "E06 UB/B": [
+          [
+            1,
+            2,
+            2
+          ],
+          1,
+          1
+        ],
+        "E07 UL/U": [
+          [
+            0,
+            1,
+            2
+          ],
+          2,
+          1
+        ],
+        "E08 UL/L": [
+          [
+            0,
+            1,
+            2
+          ],
+          0,
+          -1
+        ],
+        "E09 DF/D": [
+          [
+            1,
+            0,
+            0
+          ],
+          2,
+          -1
+        ],
+        "E10 DF/F": [
+          [
+            1,
+            0,
+            0
+          ],
+          1,
+          -1
+        ],
+        "E11 DR/D": [
+          [
+            2,
+            1,
+            0
+          ],
+          2,
+          -1
+        ],
+        "E12 DR/R": [
+          [
+            2,
+            1,
+            0
+          ],
+          0,
+          1
+        ],
+        "E13 DB/D": [
+          [
+            1,
+            2,
+            0
+          ],
+          2,
+          -1
+        ],
+        "E14 DB/B": [
+          [
+            1,
+            2,
+            0
+          ],
+          1,
+          1
+        ],
+        "E15 DL/D": [
+          [
+            0,
+            1,
+            0
+          ],
+          2,
+          -1
+        ],
+        "E16 DL/L": [
+          [
+            0,
+            1,
+            0
+          ],
+          0,
+          -1
+        ],
+        "E17 FR/F": [
+          [
+            2,
+            0,
+            1
+          ],
+          1,
+          -1
+        ],
+        "E18 FR/R": [
+          [
+            2,
+            0,
+            1
+          ],
+          0,
+          1
+        ],
+        "E19 FL/F": [
+          [
+            0,
+            0,
+            1
+          ],
+          1,
+          -1
+        ],
+        "E20 FL/L": [
+          [
+            0,
+            0,
+            1
+          ],
+          0,
+          -1
+        ],
+        "E21 BR/B": [
+          [
+            2,
+            2,
+            1
+          ],
+          1,
+          1
+        ],
+        "E22 BR/R": [
+          [
+            2,
+            2,
+            1
+          ],
+          0,
+          1
+        ],
+        "E23 BL/B": [
+          [
+            0,
+            2,
+            1
+          ],
+          1,
+          1
+        ],
+        "E24 BL/L": [
+          [
+            0,
+            2,
+            1
+          ],
+          0,
+          -1
+        ],
+        "K01 UFR/U": [
+          [
+            2,
+            0,
+            2
+          ],
+          2,
+          1
+        ],
+        "K02 UFR/F": [
+          [
+            2,
+            0,
+            2
+          ],
+          1,
+          -1
+        ],
+        "K03 UFR/R": [
+          [
+            2,
+            0,
+            2
+          ],
+          0,
+          1
+        ],
+        "K04 UFL/U": [
+          [
+            0,
+            0,
+            2
+          ],
+          2,
+          1
+        ],
+        "K05 UFL/F": [
+          [
+            0,
+            0,
+            2
+          ],
+          1,
+          -1
+        ],
+        "K06 UFL/L": [
+          [
+            0,
+            0,
+            2
+          ],
+          0,
+          -1
+        ],
+        "K07 UBL/U": [
+          [
+            0,
+            2,
+            2
+          ],
+          2,
+          1
+        ],
+        "K08 UBL/B": [
+          [
+            0,
+            2,
+            2
+          ],
+          1,
+          1
+        ],
+        "K09 UBL/L": [
+          [
+            0,
+            2,
+            2
+          ],
+          0,
+          -1
+        ],
+        "K10 UBR/U": [
+          [
+            2,
+            2,
+            2
+          ],
+          2,
+          1
+        ],
+        "K11 UBR/B": [
+          [
+            2,
+            2,
+            2
+          ],
+          1,
+          1
+        ],
+        "K12 UBR/R": [
+          [
+            2,
+            2,
+            2
+          ],
+          0,
+          1
+        ],
+        "K13 DFR/D": [
+          [
+            2,
+            0,
+            0
+          ],
+          2,
+          -1
+        ],
+        "K14 DFR/F": [
+          [
+            2,
+            0,
+            0
+          ],
+          1,
+          -1
+        ],
+        "K15 DFR/R": [
+          [
+            2,
+            0,
+            0
+          ],
+          0,
+          1
+        ],
+        "K16 DFL/D": [
+          [
+            0,
+            0,
+            0
+          ],
+          2,
+          -1
+        ],
+        "K17 DFL/F": [
+          [
+            0,
+            0,
+            0
+          ],
+          1,
+          -1
+        ],
+        "K18 DFL/L": [
+          [
+            0,
+            0,
+            0
+          ],
+          0,
+          -1
+        ],
+        "K19 DBL/D": [
+          [
+            0,
+            2,
+            0
+          ],
+          2,
+          -1
+        ],
+        "K20 DBL/B": [
+          [
+            0,
+            2,
+            0
+          ],
+          1,
+          1
+        ],
+        "K21 DBL/L": [
+          [
+            0,
+            2,
+            0
+          ],
+          0,
+          -1
+        ],
+        "K22 DBR/D": [
+          [
+            2,
+            2,
+            0
+          ],
+          2,
+          -1
+        ],
+        "K23 DBR/B": [
+          [
+            2,
+            2,
+            0
+          ],
+          1,
+          1
+        ],
+        "K24 DBR/R": [
+          [
+            2,
+            2,
+            0
+          ],
+          0,
+          1
+        ]
+      }
+    },
+    "search": {
+      "geometry": {
+        "scoring_version": 2,
+        "scope": "whole_cube",
+        "options": [
+          {
+            "label": "static X-",
+            "is_baseline": true,
+            "layer_axis": 0,
+            "layer_side": -1,
+            "layer_count": 1,
+            "color_error": 0.0,
+            "color_match_count": 0,
+            "inlier_count": 28,
+            "layer_inlier_count": 11,
+            "keypoint_inlier_count": 14,
+            "keypoint_layer_inlier_count": 6,
+            "reprojection_fit_error": 0.10471230355234679,
+            "global_mean_error": 0.09438558634374665,
+            "global_robust_error": 0.19496863882189802,
+            "keypoint_mean_error": 0.06506640111187276,
+            "heatmap_mean_error": 0.02931918523187389,
+            "heatmap_match_count": 14,
+            "keypoint_p90_error": 0.13786362219277432,
+            "layer_rotations": []
+          },
+          {
+            "label": "X-+33w1",
+            "is_baseline": false,
+            "layer_axis": 0,
+            "layer_side": -1,
+            "layer_count": 1,
+            "color_error": 0.0,
+            "color_match_count": 0,
+            "inlier_count": 48,
+            "layer_inlier_count": 31,
+            "keypoint_inlier_count": 24,
+            "keypoint_layer_inlier_count": 16,
+            "reprojection_fit_error": 0.024553558140722416,
+            "global_mean_error": 0.01767977493557329,
+            "global_robust_error": 0.0486779227908603,
+            "keypoint_mean_error": 0.014572944467970063,
+            "heatmap_mean_error": 0.0031068304676032284,
+            "heatmap_match_count": 24,
+            "keypoint_p90_error": 0.024340375634381475,
+            "layer_rotations": [
+              {
+                "axis": 0,
+                "side": -1,
+                "angle_degrees": 33.0,
+                "layer_count": 1
+              }
+            ]
+          },
+          {
+            "label": "static X-",
+            "is_baseline": true,
+            "layer_axis": 0,
+            "layer_side": -1,
+            "layer_count": 2,
+            "color_error": 0.0,
+            "color_match_count": 0,
+            "inlier_count": 28,
+            "layer_inlier_count": 19,
+            "keypoint_inlier_count": 14,
+            "keypoint_layer_inlier_count": 9,
+            "reprojection_fit_error": 0.10471230355234679,
+            "global_mean_error": 0.09438558634374665,
+            "global_robust_error": 0.19496863882189802,
+            "keypoint_mean_error": 0.06506640111187276,
+            "heatmap_mean_error": 0.02931918523187389,
+            "heatmap_match_count": 14,
+            "keypoint_p90_error": 0.13786362219277432,
+            "layer_rotations": []
+          },
+          {
+            "label": "static X+",
+            "is_baseline": true,
+            "layer_axis": 0,
+            "layer_side": 1,
+            "layer_count": 1,
+            "color_error": 0.0,
+            "color_match_count": 0,
+            "inlier_count": 28,
+            "layer_inlier_count": 6,
+            "keypoint_inlier_count": 14,
+            "keypoint_layer_inlier_count": 2,
+            "reprojection_fit_error": 0.10471230355234679,
+            "global_mean_error": 0.09438558634374665,
+            "global_robust_error": 0.19496863882189802,
+            "keypoint_mean_error": 0.06506640111187276,
+            "heatmap_mean_error": 0.02931918523187389,
+            "heatmap_match_count": 14,
+            "keypoint_p90_error": 0.13786362219277432,
+            "layer_rotations": []
+          },
+          {
+            "label": "static X+",
+            "is_baseline": true,
+            "layer_axis": 0,
+            "layer_side": 1,
+            "layer_count": 2,
+            "color_error": 0.0,
+            "color_match_count": 0,
+            "inlier_count": 28,
+            "layer_inlier_count": 14,
+            "keypoint_inlier_count": 14,
+            "keypoint_layer_inlier_count": 5,
+            "reprojection_fit_error": 0.10471230355234679,
+            "global_mean_error": 0.09438558634374665,
+            "global_robust_error": 0.19496863882189802,
+            "keypoint_mean_error": 0.06506640111187276,
+            "heatmap_mean_error": 0.02931918523187389,
+            "heatmap_match_count": 14,
+            "keypoint_p90_error": 0.13786362219277432,
+            "layer_rotations": []
+          },
+          {
+            "label": "static Y-",
+            "is_baseline": true,
+            "layer_axis": 1,
+            "layer_side": -1,
+            "layer_count": 1,
+            "color_error": 0.0,
+            "color_match_count": 0,
+            "inlier_count": 28,
+            "layer_inlier_count": 19,
+            "keypoint_inlier_count": 14,
+            "keypoint_layer_inlier_count": 8,
+            "reprojection_fit_error": 0.10471230355234679,
+            "global_mean_error": 0.09438558634374665,
+            "global_robust_error": 0.19496863882189802,
+            "keypoint_mean_error": 0.06506640111187276,
+            "heatmap_mean_error": 0.02931918523187389,
+            "heatmap_match_count": 14,
+            "keypoint_p90_error": 0.13786362219277432,
+            "layer_rotations": []
+          },
+          {
+            "label": "static Y-",
+            "is_baseline": true,
+            "layer_axis": 1,
+            "layer_side": -1,
+            "layer_count": 2,
+            "color_error": 0.0,
+            "color_match_count": 0,
+            "inlier_count": 28,
+            "layer_inlier_count": 24,
+            "keypoint_inlier_count": 14,
+            "keypoint_layer_inlier_count": 11,
+            "reprojection_fit_error": 0.10471230355234679,
+            "global_mean_error": 0.09438558634374665,
+            "global_robust_error": 0.19496863882189802,
+            "keypoint_mean_error": 0.06506640111187276,
+            "heatmap_mean_error": 0.02931918523187389,
+            "heatmap_match_count": 14,
+            "keypoint_p90_error": 0.13786362219277432,
+            "layer_rotations": []
+          },
+          {
+            "label": "static Y+",
+            "is_baseline": true,
+            "layer_axis": 1,
+            "layer_side": 1,
+            "layer_count": 1,
+            "color_error": 0.0,
+            "color_match_count": 0,
+            "inlier_count": 28,
+            "layer_inlier_count": 2,
+            "keypoint_inlier_count": 14,
+            "keypoint_layer_inlier_count": 1,
+            "reprojection_fit_error": 0.10471230355234679,
+            "global_mean_error": 0.09438558634374665,
+            "global_robust_error": 0.19496863882189802,
+            "keypoint_mean_error": 0.06506640111187276,
+            "heatmap_mean_error": 0.02931918523187389,
+            "heatmap_match_count": 14,
+            "keypoint_p90_error": 0.13786362219277432,
+            "layer_rotations": []
+          },
+          {
+            "label": "static Y+",
+            "is_baseline": true,
+            "layer_axis": 1,
+            "layer_side": 1,
+            "layer_count": 2,
+            "color_error": 0.0,
+            "color_match_count": 0,
+            "inlier_count": 28,
+            "layer_inlier_count": 6,
+            "keypoint_inlier_count": 14,
+            "keypoint_layer_inlier_count": 3,
+            "reprojection_fit_error": 0.10471230355234679,
+            "global_mean_error": 0.09438558634374665,
+            "global_robust_error": 0.19496863882189802,
+            "keypoint_mean_error": 0.06506640111187276,
+            "heatmap_mean_error": 0.02931918523187389,
+            "heatmap_match_count": 14,
+            "keypoint_p90_error": 0.13786362219277432,
+            "layer_rotations": []
+          },
+          {
+            "label": "static Z-",
+            "is_baseline": true,
+            "layer_axis": 2,
+            "layer_side": -1,
+            "layer_count": 1,
+            "color_error": 0.0,
+            "color_match_count": 0,
+            "inlier_count": 28,
+            "layer_inlier_count": 10,
+            "keypoint_inlier_count": 14,
+            "keypoint_layer_inlier_count": 5,
+            "reprojection_fit_error": 0.10471230355234679,
+            "global_mean_error": 0.09438558634374665,
+            "global_robust_error": 0.19496863882189802,
+            "keypoint_mean_error": 0.06506640111187276,
+            "heatmap_mean_error": 0.02931918523187389,
+            "heatmap_match_count": 14,
+            "keypoint_p90_error": 0.13786362219277432,
+            "layer_rotations": []
+          },
+          {
+            "label": "Z--27w1",
+            "is_baseline": false,
+            "layer_axis": 2,
+            "layer_side": -1,
+            "layer_count": 1,
+            "color_error": 0.0,
+            "color_match_count": 0,
+            "inlier_count": 25,
+            "layer_inlier_count": 9,
+            "keypoint_inlier_count": 9,
+            "keypoint_layer_inlier_count": 2,
+            "reprojection_fit_error": 0.15499800813833436,
+            "global_mean_error": 0.1183419955395615,
+            "global_robust_error": 0.23507305664256975,
+            "keypoint_mean_error": 0.08882877159916532,
+            "heatmap_mean_error": 0.02951322394039618,
+            "heatmap_match_count": 16,
+            "keypoint_p90_error": 0.17152400735883036,
+            "layer_rotations": [
+              {
+                "axis": 2,
+                "side": -1,
+                "angle_degrees": -27.0,
+                "layer_count": 1
+              }
+            ]
+          },
+          {
+            "label": "static Z-",
+            "is_baseline": true,
+            "layer_axis": 2,
+            "layer_side": -1,
+            "layer_count": 2,
+            "color_error": 0.0,
+            "color_match_count": 0,
+            "inlier_count": 28,
+            "layer_inlier_count": 18,
+            "keypoint_inlier_count": 14,
+            "keypoint_layer_inlier_count": 8,
+            "reprojection_fit_error": 0.10471230355234679,
+            "global_mean_error": 0.09438558634374665,
+            "global_robust_error": 0.19496863882189802,
+            "keypoint_mean_error": 0.06506640111187276,
+            "heatmap_mean_error": 0.02931918523187389,
+            "heatmap_match_count": 14,
+            "keypoint_p90_error": 0.13786362219277432,
+            "layer_rotations": []
+          },
+          {
+            "label": "static Z+",
+            "is_baseline": true,
+            "layer_axis": 2,
+            "layer_side": 1,
+            "layer_count": 1,
+            "color_error": 0.0,
+            "color_match_count": 0,
+            "inlier_count": 28,
+            "layer_inlier_count": 7,
+            "keypoint_inlier_count": 14,
+            "keypoint_layer_inlier_count": 3,
+            "reprojection_fit_error": 0.10471230355234679,
+            "global_mean_error": 0.09438558634374665,
+            "global_robust_error": 0.19496863882189802,
+            "keypoint_mean_error": 0.06506640111187276,
+            "heatmap_mean_error": 0.02931918523187389,
+            "heatmap_match_count": 14,
+            "keypoint_p90_error": 0.13786362219277432,
+            "layer_rotations": []
+          },
+          {
+            "label": "static Z+",
+            "is_baseline": true,
+            "layer_axis": 2,
+            "layer_side": 1,
+            "layer_count": 2,
+            "color_error": 0.0,
+            "color_match_count": 0,
+            "inlier_count": 28,
+            "layer_inlier_count": 15,
+            "keypoint_inlier_count": 14,
+            "keypoint_layer_inlier_count": 6,
+            "reprojection_fit_error": 0.10471230355234679,
+            "global_mean_error": 0.09438558634374665,
+            "global_robust_error": 0.19496863882189802,
+            "keypoint_mean_error": 0.06506640111187276,
+            "heatmap_mean_error": 0.02931918523187389,
+            "heatmap_match_count": 14,
+            "keypoint_p90_error": 0.13786362219277432,
+            "layer_rotations": []
+          }
+        ]
+      }
+    }
+  },
+  "expected": {
+    "move": "D",
+    "orientation": 6,
+    "geometry": 0.1767977493557329,
+    "correct": 18,
+    "total": 24,
+    "fit": 0.21339887467786645,
+    "queue_score": 0.7446488746778664
+  }
+}

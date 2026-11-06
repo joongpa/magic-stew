@@ -844,7 +844,10 @@ def turn_trial_log_payload(trial: dict[str, object]) -> dict[str, object]:
         'color_error', 'color_match_count', 'inlier_count', 'layer_inlier_count',
         'keypoint_inlier_count', 'keypoint_layer_inlier_count',
         'orientation_symmetry_index', 'orientation_symmetry', 'orientation_rescue',
-        'score_components',
+        'score_components', 'reprojection_fit_error',
+        'sticker_observed_mask_hex', 'sticker_correct_mask_hex',
+        'color_scoring', 'color_correct_count', 'color_confusion_count',
+        'color_forbidden_count', 'color_confusion_cost',
     )
     result = {name: trial[name] for name in names if name in trial}
     for output, source in (
@@ -865,6 +868,15 @@ def turn_trial_has_invalid_color(trial: dict[str, object]) -> bool:
     """Missing color is neutral; an available nonfinite color fit is invalid."""
 
     return 'color_error' in trial and not np.isfinite(float(trial['color_error']))
+
+
+def turn_trial_activity_layer(trial: dict[str, object]) -> tuple | None:
+    """Activity changes the legal next moves, so holds must retain this key."""
+    rotations = trial.get('layer_rotations', ())
+    active = bool(trial.get('state_moves')) or any(
+        abs(float(r['angle_degrees'] if isinstance(r, dict) else r.angle_degrees)) > 1e-8
+        for r in rotations)
+    return tuple(int(trial[k]) for k in ('layer_axis', 'layer_side', 'layer_count')) if active else None
 
 
 def state_update_layer_direction(value: dict[str, object] | object) -> tuple | None:
@@ -1558,6 +1570,17 @@ class MoveAccumulator:
                 and pose_reprojection_error_is_acceptable(candidate)):
             self.solved_frame_index = 0 if frame_index is None else frame_index
         return self.solved_frame_index is not None
+
+    def observe_unobserved_moves(self, moves, *, sticker_color_names=None):
+        """Replay inferred gap moves without treating a pose as a measurement."""
+        self.observe(None, sticker_color_names=sticker_color_names)
+        self.current_fit = 'inferred ' + (' '.join(moves) if moves else 'hold')
+        self.moves.extend(moves)
+        for move in moves:
+            self._recent_states.append((self._observation_index, self._geometry_state.signature()))
+            self._geometry_state = self._geometry_state.apply_move(move)
+            if self._state is not None:
+                self._state.apply_move(move)
 
     def observe(
         self,
@@ -5855,6 +5878,10 @@ def _build_turn_geometry_frame(
             if hasattr(value, "detach"):
                 value = value.detach().cpu().numpy()
             option[field_name] = value
+        # Use precisely the REPROJ fit metric shown in the display. Keep it
+        # separate from the clipped geometry component of the search score.
+        option['reprojection_fit_error'] = pose_reprojection_fit_metric(replace(
+            candidate, assignment_projected_points=option['assignment_projected_points']))
         materialized_options.append(option)
     options = tuple(materialized_options)
     if len(layers) != 12 or not static_trials:
@@ -5977,6 +6004,12 @@ def _orientation_rescue_diagnostic(inherited_error: float, selected_error: float
                 tested_orientations=tested)
 
 
+def _joint_orientation_rescue_diagnostic(inherited_error, selected_error, tested, score):
+    return dict(_orientation_rescue_diagnostic(inherited_error, selected_error, tested),
+                phase='joint_orientation_and_turn_fit', selection='geometric_plus_color_fit',
+                selected_fit_score=score)
+
+
 def balanced_geometry_cost(keypoint_error, sticker_error):
     """Map the two geometry components to equal halves of a 0..1 cost."""
     keypoint = np.asarray(keypoint_error, dtype=np.float64)
@@ -5984,6 +6017,94 @@ def balanced_geometry_cost(keypoint_error, sticker_error):
     return np.where(np.isfinite(keypoint) & np.isfinite(sticker),
                     .5 * np.clip(keypoint / PNP_FINAL_ASSIGNMENT_ERROR_FRACTION, 0., 1.)
                     + .5 * np.clip(sticker / PNP_TURN_CENTER_PENALTY_SCALE, 0., 1.), float("inf"))
+
+
+COLOR_CLASS_CONFUSIONS = {
+    'red': frozenset(('orange',)),
+    'orange': frozenset(('yellow', 'red')),
+    'yellow': frozenset(('orange', 'white', 'green')),
+    'white': frozenset(('blue', 'yellow')),
+    'green': frozenset(('yellow',)),
+    'blue': frozenset(),
+}
+_COLOR_MASK_POPCOUNTS = np.asarray([i.bit_count() for i in range(256)], dtype=np.uint8)
+
+
+def turn_color_confusion_costs(candidate, expected_color_by_label, confusion_cost=.5):
+    """Costs [physical sticker, predicted point]; arrows mean expected -> predicted.
+
+    Lookup uses only direct pairs, never graph reachability or reverse edges.
+    Unlisted mismatches have cost one and are hard-rejected by the scorer.
+    """
+    if not np.isfinite(confusion_cost) or not 0 < confusion_cost < 1:
+        raise ValueError('Color confusion cost must be strictly between zero and one')
+    predicted = tuple(candidate.sticker_color_names)
+    if len(predicted) != len(candidate.sticker_mask_centers):
+        raise ValueError('Color confusion pruning requires one class per sticker keypoint')
+    expected = [expected_color_by_label.get(i.label) for i in canonical_sticker_identities()]
+    if any(c not in COLOR_CLASS_CONFUSIONS for c in (*expected, *predicted)):
+        raise ValueError('Color confusion pruning requires known scramble colors and six-class observations')
+    return np.asarray([[0. if truth == observed else
+                        confusion_cost if observed in COLOR_CLASS_CONFUSIONS[truth] else 1.
+                        for observed in predicted] for truth in expected], dtype=np.float64).reshape(54, len(predicted))
+
+
+def sticker_color_confusion_metrics(identity_indices, nearest, valid, costs, confusion_cost=.5):
+    """One best color per observed projected sticker, vectorized over poses.
+
+    Any exact or directly permitted duplicate wins over forbidden duplicates.
+    Outside points add neither a vote nor a rejection. Outputs have shape
+    [configuration] or [state, configuration], matching the input identities.
+    """
+    identities = np.asarray(identity_indices)
+    single = identities.ndim == 1
+    identities = identities[None, :] if single else identities
+    nearest, valid = np.asarray(nearest), np.asarray(valid, dtype=bool)
+    bits = np.left_shift(np.uint64(1), nearest.astype(np.uint64))
+    occupied = np.bitwise_or.reduce(np.where(valid, bits, np.uint64(0)), axis=-1, initial=np.uint64(0))
+    point_costs = np.asarray(costs)[identities[:, nearest], np.arange(nearest.shape[-1])]
+    exact = np.bitwise_or.reduce(np.where(valid[None, :, :] & (point_costs == 0), bits[None, :, :],
+                                         np.uint64(0)), axis=-1, initial=np.uint64(0))
+    permitted = np.bitwise_or.reduce(np.where(valid[None, :, :] & (point_costs < 1), bits[None, :, :],
+                                             np.uint64(0)), axis=-1, initial=np.uint64(0))
+    def count(mask):
+        octets = np.ascontiguousarray(mask).view(np.uint8).reshape((*mask.shape, 8))
+        return _COLOR_MASK_POPCOUNTS[octets].sum(axis=-1).astype(np.int32)
+    total = np.broadcast_to(count(occupied)[None, :], exact.shape)
+    correct, allowed = count(exact), count(permitted)
+    confused, forbidden = allowed-correct, total-allowed
+    error = (confusion_cost*confused+forbidden)/np.maximum(total, 1)
+    error = np.where(total > 0, error, 0. if nearest.shape[-1] == 0 else np.inf)
+    result = dict(error=error, correct=correct, confused=confused, forbidden=forbidden, total=total)
+    return {k:v[0] for k,v in result.items()} if single else result
+
+
+def color_confusion_trial_fields(metrics, index, confusion_cost=.5):
+    return dict(color_scoring='directional_confusion_cost',
+                color_correct_count=int(metrics['correct'][index]),
+                color_confusion_count=int(metrics['confused'][index]),
+                color_forbidden_count=int(metrics['forbidden'][index]),
+                color_confusion_cost=confusion_cost)
+
+
+def sticker_color_observation_masks(identity_indices, nearest, valid, color_matches):
+    """Return one observed/correct bit per persistent physical sticker.
+
+    Keep identities through pose symmetries and discrete offsets. Duplicate
+    keypoints contribute one observation, correct when any of their colors fit.
+    """
+    physical = np.asarray(identity_indices)[np.asarray(nearest)]
+    valid = np.asarray(valid, dtype=bool)
+    count = len(physical)
+    occupied = np.zeros((count, 54), dtype=bool)
+    correct = np.zeros_like(occupied)
+    if color_matches is not None and physical.shape[1]:
+        rows = np.arange(count)[:, None]
+        np.logical_or.at(occupied, (rows, physical), valid)
+        matches = np.asarray(color_matches)[physical, np.arange(physical.shape[1])] > 0
+        np.logical_or.at(correct, (rows, physical), valid & matches)
+    bits = np.left_shift(np.uint64(1), np.arange(54, dtype=np.uint64))
+    return occupied.astype(np.uint64) @ bits, correct.astype(np.uint64) @ bits
 
 
 def balanced_robust_cost(geometry_robust_error, color_error):
@@ -6003,12 +6124,17 @@ def _score_turn_color_offsets_with_orientation_rescue(
     geometry_states: tuple[CubeGeometryState | None, ...],
     *, projection_cache: dict | None = None, balance_geometry_color: bool = False,
     minimum_color_accuracy: float | None = None,
+    include_sticker_observations: bool = False,
+    joint_orientation_rescue: bool = False,
+    confusion_costs: np.ndarray | None = None, confusion_cost: float = .5,
+    prune_color_confusions: bool = True,
+    preserve_layer_activity: bool = False,
 ) -> list[list[dict[str, object]]] | None:
-    """Rescue each unchanged state's orientation before generating its moves.
+    """Trigger rescue from each unchanged state's static color agreement.
 
-    Below 2/3 color accuracy, choose one of the 24 cube orientations using
-    only the unchanged state's color agreement. Then evaluate moves in that
-    orientation and map them back to the physical state's coordinates.
+    With joint_orientation_rescue, fit all 24 orientations with partial turns
+    and offsets, retaining one combined-fit winner per physical successor.
+    Otherwise choose an orientation from static colors before fitting moves.
     A pose correction never commits a move or changes the physical state.
     """
     static_options = tuple(option for option in geometry_options
@@ -6018,6 +6144,10 @@ def _score_turn_color_offsets_with_orientation_rescue(
             candidate, geometry_options, assignment_error_limit, scoring_device,
             color_matches, geometry_states, projection_cache=projection_cache,
             balance_geometry_color=balance_geometry_color, minimum_color_accuracy=minimum_color_accuracy,
+            include_sticker_observations=include_sticker_observations,
+            confusion_costs=confusion_costs, confusion_cost=confusion_cost,
+            prune_color_confusions=prune_color_confusions,
+            preserve_layer_activity=preserve_layer_activity,
         )
     static = _score_turn_color_offsets_for_states_on_gpu(
         candidate, static_options, assignment_error_limit, scoring_device,
@@ -6034,6 +6164,45 @@ def _score_turn_color_offsets_with_orientation_rescue(
         if np.isfinite(error) and error > PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR:
             rescue_indices.append(index)
             inherited_errors[index] = best_errors[index] = error
+    if joint_orientation_rescue and rescue_indices:
+        # The static check triggers rescue but does not choose its orientation.
+        # Every pose shares the same geometric projections; collapse physical
+        # successors before returning them to the search queue.
+        jobs, states = [], []
+        for index, state in enumerate(geometry_states):
+            jobs.append((index, None))
+            states.append(state)
+            if index in inherited_errors:
+                for pose_index, symmetry in enumerate(CUBE_SYMMETRY_MATRICES):
+                    if np.array_equal(symmetry, np.eye(3)):
+                        continue
+                    jobs.append((index, pose_index))
+                    states.append(_geometry_state_under_symmetry(
+                        state if state is not None else CubeGeometryState.identity(), symmetry.T))
+        batches = _score_turn_color_offsets_for_states_on_gpu(
+            candidate, geometry_options, assignment_error_limit, scoring_device,
+            color_matches, tuple(states), projection_cache=projection_cache,
+            balance_geometry_color=balance_geometry_color, minimum_color_accuracy=minimum_color_accuracy,
+            include_sticker_observations=include_sticker_observations,
+            confusion_costs=confusion_costs, confusion_cost=confusion_cost,
+            prune_color_confusions=prune_color_confusions,
+            preserve_layer_activity=preserve_layer_activity)
+        if batches is None:
+            return None
+        collapsed = [{} for _ in geometry_states]
+        for (index, pose_index), trials in zip(jobs, batches, strict=True):
+            for trial in trials:
+                if pose_index is not None:
+                    trial = _turn_trial_under_pose_symmetry(trial, CUBE_SYMMETRY_MATRICES[pose_index], pose_index)
+                if index in inherited_errors:
+                    trial = dict(trial, orientation_rescue=_joint_orientation_rescue_diagnostic(
+                        inherited_errors[index], trial['color_error'], 24, trial['state_score']))
+                key = (tuple(trial['state_moves']), state_update_layer_direction(trial),
+                       turn_trial_activity_layer(trial) if preserve_layer_activity else None)
+                prior = collapsed[index].get(key)
+                if prior is None or trial['rank'] < prior['rank']:
+                    collapsed[index][key] = trial
+        return [sorted(group.values(), key=lambda t:t['rank']) for group in collapsed]
     tested = 1
     for symmetry_index, symmetry in enumerate(CUBE_SYMMETRY_MATRICES):
         if not rescue_indices or np.array_equal(symmetry, np.eye(3)):
@@ -6065,6 +6234,10 @@ def _score_turn_color_offsets_with_orientation_rescue(
         candidate, geometry_options, assignment_error_limit, scoring_device,
         color_matches, tuple(oriented_states), projection_cache=projection_cache,
         balance_geometry_color=balance_geometry_color, minimum_color_accuracy=minimum_color_accuracy,
+        include_sticker_observations=include_sticker_observations,
+        confusion_costs=confusion_costs, confusion_cost=confusion_cost,
+        prune_color_confusions=prune_color_confusions,
+        preserve_layer_activity=preserve_layer_activity,
     )
     if results is None:
         return None
@@ -6088,6 +6261,10 @@ def _score_turn_color_offsets_for_states_on_gpu(
     color_offsets: tuple[float, ...] = (-90.0, 0.0, 90.0),
     balance_geometry_color: bool = False,
     minimum_color_accuracy: float | None = None,
+    include_sticker_observations: bool = False,
+    confusion_costs: np.ndarray | None = None, confusion_cost: float = .5,
+    prune_color_confusions: bool = True,
+    preserve_layer_activity: bool = False,
 ) -> list[list[dict[str, object]]] | None:
     """Reuse partial-pose assignments and score frontier states by identity gathers."""
 
@@ -6134,6 +6311,10 @@ def _score_turn_color_offsets_for_states_on_gpu(
         projected = projection_cache.get('projected') if projection_cache is not None and projection_cache.get('key') == projection_key else None
         projection_configurations, projection_rows, source_permutations, group_ids = _turn_color_projection_plan(
             tuple(configurations))
+        if preserve_layer_activity:
+            active_holds = np.asarray([abs(item[1]) < 1e-8 and abs(item[5]) > 1e-8
+                                       for item in configurations])
+            group_ids = 2*group_ids+active_holds
         projection_count = len(projection_configurations)
         if projected is None:
             axes = torch.as_tensor(
@@ -6274,6 +6455,9 @@ def _score_turn_color_offsets_for_states_on_gpu(
         elif projection_cache is not None:
             projection_cache['hits'] = projection_cache.get('hits', 0) + 1
         projected_face_centers, projected_face_polygons, visible_faces, scale = projected
+        observation_assignments = (projection_cache.get('assignments') if projection_cache is not None
+                                   else {} if include_sticker_observations or confusion_costs is not None else None)
+        color_match_matrix = color_matches
         color_errors, color_matches = _gpu_sticker_color_fit_metrics(
             candidate,
             torch,
@@ -6285,7 +6469,7 @@ def _score_turn_color_offsets_for_states_on_gpu(
             float(assignment_error_limit),
             color_matches,
             return_tensors=True,
-            assignment_cache=projection_cache.get("assignments") if projection_cache is not None else None,
+            assignment_cache=observation_assignments,
             configuration_mapping=(projection_rows, source_permutations),
         )
         color_vectors = torch.stack(
@@ -6297,6 +6481,23 @@ def _score_turn_color_offsets_for_states_on_gpu(
         if color_errors_np.ndim == 1:
             color_errors_np = np.broadcast_to(color_errors_np, (len(geometry_states), count))
             color_matches_np = np.broadcast_to(color_matches_np, (len(geometry_states), count))
+        observation_nearest = observation_valid = None
+        if (include_sticker_observations or confusion_costs is not None) and observation_assignments and observation_assignments.get('value') is not None:
+            nearest_t, valid_t, _totals_t = observation_assignments['value']
+            # The shared metric caches full configurations after applying
+            # their discrete-offset permutations, rather than raw projections.
+            observation_nearest = nearest_t.cpu().numpy()
+            observation_valid = valid_t.cpu().numpy()
+        confusion = None
+        if confusion_costs is not None:
+            if observation_nearest is not None:
+                confusion = sticker_color_confusion_metrics(sticker_identity_indices, observation_nearest,
+                    observation_valid, confusion_costs, confusion_cost)
+                color_errors_np, color_matches_np = confusion['error'], confusion['total']
+            else:
+                zero = np.zeros_like(color_matches_np)
+                confusion = dict(error=color_errors_np, total=color_matches_np, correct=zero,
+                                 confused=zero, forbidden=zero)
 
         # For the same layer and discrete offset, different partial angles
         # lead to the same next state. Choose their best combined fit for
@@ -6321,7 +6522,12 @@ def _score_turn_color_offsets_for_states_on_gpu(
                 costs = .5 * geometry_scores + .5 * errors
             if minimum_color_accuracy is not None:
                 costs = np.where(errors <= 1. - minimum_color_accuracy, costs, float("inf"))
-            eligible = (np.flatnonzero(np.isfinite(costs)) if minimum_color_accuracy is not None
+            if confusion is not None and prune_color_confusions:
+                forbidden = confusion['forbidden'][state_index] > 0
+                costs = np.where(forbidden, np.inf, costs)
+                if projection_cache is not None:
+                    projection_cache['confusion_pruned_fits'] = projection_cache.get('confusion_pruned_fits', 0)+int(forbidden.sum())
+            eligible = (np.flatnonzero(np.isfinite(costs)) if minimum_color_accuracy is not None or confusion is not None
                         else np.arange(len(costs)))
             if not len(eligible):
                 results_by_state.append([])
@@ -6330,7 +6536,12 @@ def _score_turn_color_offsets_for_states_on_gpu(
                                          costs[eligible], group_ids[eligible]))]
             ordered_groups = group_ids[order]
             best_indices = np.sort(order[np.r_[True, ordered_groups[1:] != ordered_groups[:-1]]])
-            for index in best_indices:
+            observed_masks = correct_masks = np.zeros(len(best_indices), dtype=np.uint64)
+            if include_sticker_observations and observation_nearest is not None:
+                observed_masks, correct_masks = sticker_color_observation_masks(
+                    sticker_identity_indices[state_index], observation_nearest[best_indices],
+                    observation_valid[best_indices], color_match_matrix)
+            for chosen_index, index in enumerate(best_indices):
                 option_index, offset, axis, side, layer_count, _angle = configurations[index]
                 option = geometry_options[option_index]
                 geometry_rotations = tuple(option.get("layer_rotations", ()))
@@ -6399,6 +6610,11 @@ def _score_turn_color_offsets_for_states_on_gpu(
                         "sticker_layer_match_count": int(option.get("sticker_layer_match_count", 0)),
                         "color_error": color_error,
                         "color_match_count": int(color_matches_np[state_index, index]),
+                        **(color_confusion_trial_fields(confusion, (state_index, index), confusion_cost)
+                           if confusion is not None else {}),
+                        **(dict(sticker_observed_mask_hex=f'{int(observed_masks[chosen_index]):014x}',
+                                sticker_correct_mask_hex=f'{int(correct_masks[chosen_index]):014x}')
+                           if include_sticker_observations else {}),
                         "keypoint_inlier_count": int(option.get("keypoint_inlier_count", 0)),
                         "keypoint_layer_inlier_count": int(option.get("keypoint_layer_inlier_count", 0)),
                         "inlier_count": inlier_count,
@@ -8979,9 +9195,9 @@ def append_turn_candidate_log(
         observed = trial.get("color_match_count", 0)
         error = trial.get("color_error")
         if observed and isinstance(error, (float, int)) and np.isfinite(error) and 0 <= error <= 1:
+            trial.setdefault('color_correct_count', int(round((1.0-error)*observed)))
             trial.update(
                 color_observed_count=int(observed),
-                color_correct_count=int(round((1.0 - error) * observed)),
                 color_score=1.0 - error,
             )
     static_scores = (
@@ -9095,7 +9311,7 @@ def append_turn_candidate_log(
     record = {
         "log_schema_version": 3,
         "geometry_scoring_version": PNP_TURN_GEOMETRY_SCORE_VERSION,
-        "color_scoring": "direct_match_fraction",
+        "color_scoring": next((t['color_scoring'] for t in candidates if t.get('color_scoring')), 'direct_match_fraction'),
         "frame_index": frame_index,
         "has_pose": candidate is not None,
         "turn_fit_evaluated": bool(

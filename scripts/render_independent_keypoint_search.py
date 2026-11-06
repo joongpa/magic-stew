@@ -42,7 +42,9 @@ def candidate_for_step(m, record, step, state, colors, *, after_solution=False):
     """Apply the saved trial to the pre-move physical state, never choosing a new move."""
     if record.get("has_pose") is False:
         return None
-    pose = record.get("search_pose") or record.get("selected_pose") or {}
+    pose = record.get("search_pose") or {}
+    if pose.get("rvec") is None:
+        pose = record.get("selected_pose") or {}
     if pose.get("rvec") is None:
         return None
     centers = {colors[i.label]: i.label for i in m.canonical_sticker_identities()
@@ -66,7 +68,12 @@ def candidate_for_step(m, record, step, state, colors, *, after_solution=False):
         orientation_axis_center_labels=tuple(centers[c] for c in m.ORIENTATION_AXIS_CENTER_COLORS),
     )
     candidate = static_assignments(m, candidate)
-    if step and "geometry_option_index" in step:
+    if step and step.get('bridge_inferred'):
+        rotations = ((m.CubeLayerRotation(step['layer_axis'], step['layer_side'],
+                      step['color_offset'], step['layer_count']),) if step['state_moves'] else ())
+        candidate = replace(candidate, turn_state_moves=tuple(step['state_moves']),
+                            sticker_layer_rotations=rotations, turn_color_unreliable=True)
+    elif step and "geometry_option_index" in step:
         # Stored rotations/moves already use physical coordinates after rescue.
         # The camera must receive the same symmetry before drawing that trial.
         trial = dict(step, layer_rotations=tuple(m.CubeLayerRotation(**r)
@@ -147,6 +154,7 @@ def render_result(m, records, result, source, *, output_path=None, display=False
     if turn_log is not None:
         Path(turn_log).parent.mkdir(parents=True, exist_ok=True)
     completed = True
+    last_reliable_candidate = None
     try:
         while True:
             ok, frame = capture.read()
@@ -156,9 +164,11 @@ def render_result(m, records, result, source, *, output_path=None, display=False
             if record is None:
                 raise ValueError(f"Missing cached observations for source frame {frame_index}")
             step = steps.get(frame_index)
+            state_before = state
+            bridged = bool(step and step.get('bridge_inferred'))
             tail = result["status"] == "already_solved" or goal is not None and frame_index > goal
             candidate = candidate_for_step(m, record, step, state, colors, after_solution=tail)
-            if candidate is None and step and step.get("state_moves"):
+            if candidate is None and step and step.get("state_moves") and not bridged:
                 raise ValueError(f"Move at frame {frame_index} has no cached pose")
             image = frame.copy()
             if candidate is not None and show_keypoints:
@@ -168,44 +178,94 @@ def render_result(m, records, result, source, *, output_path=None, display=False
                     np.asarray([m.CLASS_NAMES.index(c) for c in candidate.sticker_color_names])))
                 ones = np.ones(len(points))
                 image, _ = m.draw_pose(image, points, ones, classes, ones, 0., {}, False, False)
-            accumulator.observe(candidate, sticker_color_names=colors)
-            if candidate is not None:
+            moves = tuple(step.get("state_moves", ())) if step else ()
+            if bridged:
+                accumulator.observe_unobserved_moves(moves, sticker_color_names=colors)
+            else:
+                accumulator.observe(candidate, sticker_color_names=colors)
+            if candidate is not None and not bridged:
                 image = m.draw_sticker_pnp_candidate(image, candidate, False,
                                                     show_orientation_axes)
+                last_reliable_candidate = candidate
             if show_virtual_cube:
+                virtual = candidate
+                if bridged and virtual is None and last_reliable_candidate is not None:
+                    rotations = ((m.CubeLayerRotation(step['layer_axis'], step['layer_side'],
+                                  step['color_offset'], step['layer_count']),) if moves else ())
+                    virtual = replace(last_reliable_candidate, cube_geometry_state=state,
+                        layer_rotations=(), sticker_layer_rotations=rotations,
+                        sticker_mask_centers=(), sticker_color_names=(), turn_color_matches=None)
                 image = m.draw_classified_cube_diagnostic_panel(
-                    image, candidate, colors, show_sticker_identities=False,
+                    image, virtual, colors,
+                    rvec=last_reliable_candidate.rvec if bridged and last_reliable_candidate else None,
+                    show_sticker_identities=False,
                     show_orientation_axes=show_orientation_axes)
-            moves = tuple(step.get("state_moves", ())) if step else ()
             state = state.apply_moves(moves)
             if result["status"] == "already_solved" or goal is not None and frame_index >= goal:
                 accumulator.solved_frame_index = goal if goal is not None else 0
             image = m.draw_move_accumulator_overlay(image, accumulator)
-            if step and "color_error" in step:
+            if bridged:
+                label = f"frame {frame_index} | unreliable observations bridged | inferred {' '.join(moves) or 'hold'}"
+            elif step and "color_error" in step:
                 total = step["color_match_count"]
-                correct = round((1. - step["color_error"]) * total)
+                correct = step.get('color_correct_count', round((1.-step['color_error'])*total))
                 label = f"frame {frame_index} | score {step['state_score']:.3f} | colors {correct}/{total}"
+                if 'color_confusion_count' in step:
+                    label += f" | allowed confusions {step['color_confusion_count']}"
             else:
                 phase = ("solved state held" if tail else
                          (step or {}).get("observation_status", "outside search interval"))
                 label = f"frame {frame_index} | {phase}"
+            if step and 'sticker_mismatch_count' in step:
+                label += f" | mismatches {step['sticker_mismatch_count']}/54"
+            if step and 'sticker_history_penalty' in step:
+                label += f" | history {step['sticker_history_penalty']:.3f}"
+                priority = step.get('queue_priority', step.get('inherited_queue_priority'))
+                if priority is not None:
+                    label += f" | queue {priority:.3f}"
+            if (step or {}).get('soft_window_penalty'):
+                label += f" | old fork +{step['soft_window_penalty']:.2f}"
+            if (step or {}).get('local_frame_rank') is not None:
+                label += f" | local rank {step['local_frame_rank']}/{step['local_candidate_count']}"
+                if step.get('outside_top_k_penalty'):
+                    label += f" | outside top K +{step['outside_top_k_penalty']:.2f}"
             (width, height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, .5, 1)
             cv2.rectangle(image, (4, 46-height), (min(image.shape[1]-1, width+12), 50+baseline),
                           (0, 0, 0), -1)
             cv2.putText(image, label, (8, 48), cv2.FONT_HERSHEY_SIMPLEX, .5,
                         (255, 255, 255), 1, cv2.LINE_AA)
             if turn_log is not None:
+                history_info = {key:step[key] for key in ('sticker_mismatch_count',
+                    'sticker_history_qualified_count','sticker_mismatched_mask_hex',
+                    'sticker_history_penalty','queue_priority','inherited_queue_priority',
+                    'soft_window_penalty','soft_window_penalty_until_frame',
+                    'supported_move_count','soft_window_protected_frame', 'color_scoring',
+                    'color_correct_count','color_confusion_count','color_forbidden_count',
+                    'color_confusion_cost', 'local_frame_rank', 'local_candidate_count',
+                    'outside_top_k_penalty', 'layer_activity', 'previous_layer_activity',
+                    'activity_evidence_status') if step and key in step}
                 forced_static = (step or {}).get("observation_status") == "turning_start_frame"
-                search_status = ("forced_static" if forced_static else
+                search_status = ('unreliable_frame_bridge' if bridged else
+                                 "forced_static" if forced_static else
                                  "full_search_winning_path" if step else
                                  "solved_hold" if tail else "outside_search_interval")
-                m.append_turn_candidate_log(Path(turn_log), replace(candidate,
+                if candidate is None and bridged:
+                    row = dict(record, selected_committed_moves=list(moves),
+                        cube_geometry_state_before=state_before.to_json(),
+                        search=dict(status=search_status, frame_quality=step['frame_quality'],
+                                    geometry_score_used=False, color_score_used=False, **history_info))
+                    with Path(turn_log).open('a') as stream:
+                        stream.write(json.dumps(row)+'\n')
+                else:
+                    m.append_turn_candidate_log(Path(turn_log), replace(candidate,
                     turn_selected_trial_id=(step or {}).get("trial_id"),
                     turn_candidate_diagnostics=(dict(step),) if step and "trial_id" in step else (),
                     turn_search_diagnostics=dict(status=search_status,
-                        turning_start_frame=config.get("turning_start_frame")),
+                        turning_start_frame=config.get("turning_start_frame"),
+                        frame_quality=(step or {}).get('frame_quality'),
+                        geometry_score_used=not bridged, color_score_used=not bridged, **history_info),
                     turn_fit_evaluated=bool(step and "trial_id" in step),
-                ) if candidate is not None else None, frame_index)
+                    ) if candidate is not None else None, frame_index)
             if output_path is not None:
                 if writer is None:
                     writer = m.create_video_writer(Path(output_path), image, fps)

@@ -118,6 +118,20 @@ LIGHT_TEMPERATURE_PROFILES = (
     ("dusty_rose", 0.06, (3400.0, 5000.0), (4500.0, 6200.0), (1.0, 0.32, 0.44), 0.20),
     ("soft_sage", 0.04, (3600.0, 5200.0), (4800.0, 6400.0), (0.36, 1.0, 0.48), 0.16),
 )
+# The hard-color-recognition mode deliberately samples much stronger color
+# casts than the ordinary, plausible-lighting distribution. Yellow and blue
+# dominate because they are the most useful stress cases for distinguishing
+# adjacent sticker classes; the remaining profiles keep the mode from
+# becoming a two-color shortcut.
+HARD_COLOR_LIGHT_TEMPERATURE_PROFILES = (
+    # name, probability, indoor sources, window daylight, tint target, tint amount
+    ("hard_yellow", 0.38, (2400.0, 3400.0), (3000.0, 4300.0), (1.0, 0.52, 0.015), 0.72),
+    ("hard_blue", 0.38, (7600.0, 12000.0), (8200.0, 14000.0), (0.015, 0.16, 1.0), 0.72),
+    ("hard_red", 0.06, (2500.0, 4200.0), (3200.0, 5200.0), (1.0, 0.025, 0.012), 0.58),
+    ("hard_magenta", 0.06, (3000.0, 5200.0), (4000.0, 6500.0), (1.0, 0.015, 0.48), 0.56),
+    ("hard_cyan", 0.06, (5200.0, 8200.0), (6500.0, 10000.0), (0.01, 0.88, 1.0), 0.56),
+    ("hard_green", 0.06, (3400.0, 6200.0), (4800.0, 7600.0), (0.025, 1.0, 0.10), 0.52),
+)
 LIGHT_TARGET_JITTER_RANGE = (-0.35, 0.35)
 LIGHT_TEMPERATURE_KELVIN_RANGE = (2700.0, 7500.0)
 FLOOR_LAMP_DISTANCE_FEET_RANGE = (10.0, 15.0)
@@ -1687,14 +1701,21 @@ def add_laptop_screen_glow(
 
 def randomize_light(
     background_randomization: dict[str, object] | None = None,
+    *,
+    hard_color_recognition: bool = False,
 ) -> dict[str, object]:
-    """Build broad room lighting with an optional physical window aperture."""
+    """Build room lighting, optionally using saturated color-recognition cases."""
     clear_scene_lights()
     setup = random.choices(
         [name for name, _weight in LIGHTING_SETUP_WEIGHTS],
         weights=[weight for _name, weight in LIGHTING_SETUP_WEIGHTS],
         k=1,
     )[0]
+    temperature_profiles = (
+        HARD_COLOR_LIGHT_TEMPERATURE_PROFILES
+        if hard_color_recognition
+        else LIGHT_TEMPERATURE_PROFILES
+    )
     (
         temperature_profile,
         _profile_weight,
@@ -1703,8 +1724,8 @@ def randomize_light(
         color_tint,
         tint_amount,
     ) = random.choices(
-        LIGHT_TEMPERATURE_PROFILES,
-        weights=[weight for _name, weight, _room_range, _window_range, _tint, _amount in LIGHT_TEMPERATURE_PROFILES],
+        temperature_profiles,
+        weights=[weight for _name, weight, _room_range, _window_range, _tint, _amount in temperature_profiles],
         k=1,
     )[0]
     base_temperature = random.uniform(*room_temperature_range)
@@ -1811,6 +1832,7 @@ def randomize_light(
     bpy.context.view_layer.update()
     primary = sources[0]
     return {
+        "mode": "hard_color_recognition" if hard_color_recognition else "standard",
         "setup": setup,
         "source_count": len(sources),
         "sources": sources,
@@ -4660,6 +4682,7 @@ def randomize_scene(
     background_object_count: int = DEFAULT_BACKGROUND_OBJECT_COUNT,
     desk_no_hands: bool = False,
     solved: bool = False,
+    hard_color_recognition: bool = False,
 ) -> tuple[
     list[str],
     dict[str, object],
@@ -4687,7 +4710,10 @@ def randomize_scene(
     )
     # Build the rig after appending the background so lights bundled in an asset
     # cannot accidentally leak into, or conflict with, the selected setup.
-    light_randomization = randomize_light(background_randomization)
+    light_randomization = randomize_light(
+        background_randomization,
+        hard_color_recognition=hard_color_recognition,
+    )
     background_randomization["world_color"] = light_randomization["world"]["display_color"]
     background_randomization["world_lighting"] = light_randomization["world"]
     moves = scene_scramble_moves(scramble_length, solved)
@@ -4742,6 +4768,7 @@ def build_hard_case_scene(
     scramble_length: int,
     background_object_count: int,
     solved: bool = False,
+    hard_color_recognition: bool = False,
 ) -> tuple[
     list[str],
     dict[str, object],
@@ -4780,6 +4807,7 @@ def build_hard_case_scene(
         scramble_length=scramble_length,
         background_object_count=background_object_count,
         solved=solved,
+        hard_color_recognition=hard_color_recognition,
     )
 
 
@@ -4788,6 +4816,7 @@ def build_solid_background_patch_case(
     scramble_length: int,
     background_object_count: int,
     solved: bool = False,
+    hard_color_recognition: bool = False,
 ) -> tuple[
     list[str],
     dict[str, object],
@@ -4975,7 +5004,10 @@ def build_solid_background_patch_case(
         },
     }
 
-    light_randomization = randomize_light(background_randomization)
+    light_randomization = randomize_light(
+        background_randomization,
+        hard_color_recognition=hard_color_recognition,
+    )
     background_randomization["world_color"] = light_randomization["world"]["display_color"]
     background_randomization["world_lighting"] = light_randomization["world"]
 
@@ -5143,6 +5175,7 @@ def build_controlled_cube_case(
     camera_mode: str,
     lighting_mode: str,
     forced_hand_visibility: str,
+    hard_color_recognition: bool = False,
     solved: bool = False,
     backdrop: bool = False,
 ) -> tuple[
@@ -5303,7 +5336,10 @@ def build_controlled_cube_case(
     # and split-shadow cases then apply a bounded override to that sampled rig,
     # so they retain variation in setup, color temperature, window light,
     # laptop glow, and world exposure.
-    light_randomization = randomize_light(background_randomization)
+    light_randomization = randomize_light(
+        background_randomization,
+        hard_color_recognition=hard_color_recognition,
+    )
     if lighting_mode in {"sharp", "split"}:
         light_randomization = apply_hard_case_lighting_override(
             light_randomization,
@@ -6977,7 +7013,13 @@ def apply_video_compression(
     return decoded, metadata
 
 
-def apply_camera_degradation(path: Path, probability: float) -> dict[str, object] | None:
+def apply_camera_degradation(
+    path: Path,
+    probability: float,
+    *,
+    disable_blur: bool = False,
+) -> dict[str, object] | None:
+    """Apply post-render camera artifacts, optionally excluding blur operators."""
     if probability <= 0.0 or random.random() >= probability:
         return None
 
@@ -7009,17 +7051,23 @@ def apply_camera_degradation(path: Path, probability: float) -> dict[str, object
         frame = cv2.resize(small, (width, height), interpolation=cv2.INTER_LINEAR)
         metadata["rescale"] = {"scale": scale}
 
-    if random.random() < DEGRADE_GAUSSIAN_BLUR_PROBABILITY:
+    if not disable_blur and random.random() < DEGRADE_GAUSSIAN_BLUR_PROBABILITY:
         kernel = odd_kernel(random.choice((3, 3, 5)))
         sigma = random.uniform(0.25, 0.9)
         frame = cv2.GaussianBlur(frame, (kernel, kernel), sigmaX=sigma, sigmaY=sigma)
         metadata["gaussian_blur"] = {"kernel": kernel, "sigma": sigma}
 
-    if random.random() < DEGRADE_MOTION_BLUR_PROBABILITY:
+    if not disable_blur and random.random() < DEGRADE_MOTION_BLUR_PROBABILITY:
         kernel_size = odd_kernel(random.choice((3, 5, 7)))
         angle = random.uniform(0.0, 180.0)
         frame = cv2.filter2D(frame, -1, motion_blur_kernel(kernel_size, angle))
         metadata["motion_blur"] = {"kernel": kernel_size, "angle_degrees": angle}
+
+    if disable_blur:
+        metadata["blur_disabled"] = {
+            "gaussian_blur": True,
+            "motion_blur": True,
+        }
 
     if random.random() < DEGRADE_NOISE_PROBABILITY:
         sigma = random.uniform(1.0, 7.0)
@@ -9469,6 +9517,7 @@ def generate_dataset(
     cube_rotational_blur_samples: int,
     degrade_probability: float,
     hard_case: str = DEFAULT_HARD_CASE,
+    hard_color_recognition: bool = False,
     nvidia_gpu: bool = False,
 ) -> None:
     if (width, height) not in RFDETR_KEYPOINT_DATASET_RESOLUTIONS:
@@ -9491,6 +9540,21 @@ def generate_dataset(
             {
                 "format": "combined_landmark_and_sticker_keypoints_v1",
                 "model": "RF-DETRKeypointPreview",
+                "generation_mode": (
+                    "hard_color_recognition"
+                    if hard_color_recognition
+                    else "standard"
+                ),
+                "blur_policy": {
+                    "cube_rotational_blur": not hard_color_recognition,
+                    "post_render_gaussian_blur": not hard_color_recognition,
+                    "post_render_motion_blur": not hard_color_recognition,
+                    "other_post_render_augmentations": [
+                        "rescale",
+                        "sensor_noise",
+                        "video_compression",
+                    ],
+                },
                 "model_native_input_resolution": list(RFDETR_KEYPOINT_NATIVE_INPUT_SIZE),
                 "dataset_resolutions": [
                     list(resolution) for resolution in RFDETR_KEYPOINT_DATASET_RESOLUTIONS
@@ -9661,6 +9725,7 @@ def generate_dataset(
                 background_object_count=background_object_count,
                 desk_no_hands=desk_no_hands,
                 solved=cube_solved,
+                hard_color_recognition=hard_color_recognition,
             )
         else:
             # Deliberate cases own their scene setup.  In particular, do not
@@ -9679,6 +9744,7 @@ def generate_dataset(
                 scramble_length=scramble_length,
                 background_object_count=background_object_count,
                 solved=cube_solved,
+                hard_color_recognition=hard_color_recognition,
             )
         base_cube_pose = cube_pose
         objects = cube_objects()
@@ -9826,7 +9892,11 @@ def generate_dataset(
             rotational_blur = render_cube_rotational_blur_png(
                 image_path,
                 render_objects,
-                probability=cube_rotational_blur_probability,
+                probability=(
+                    0.0
+                    if hard_color_recognition
+                    else cube_rotational_blur_probability
+                ),
                 max_degrees=max_cube_rotational_blur_degrees,
                 samples=cube_rotational_blur_samples,
                 local_object_axes=localized_blur_object_axes,
@@ -9835,6 +9905,7 @@ def generate_dataset(
             camera_degradation = apply_camera_degradation(
                 image_path,
                 probability=degrade_probability,
+                disable_blur=hard_color_recognition,
             )
             sticker_roots = list(objects) + core_objects
             cube_visibility_states = set_mesh_objects_render_visible(sticker_roots)
@@ -9868,6 +9939,16 @@ def generate_dataset(
         metadata_entry = {
             "active_random_seed": ACTIVE_RANDOM_SEED,
             "hard_case": active_hard_case,
+            "generation_mode": (
+                "hard_color_recognition"
+                if hard_color_recognition
+                else "standard"
+            ),
+            "blur_policy": {
+                "cube_rotational_blur": not hard_color_recognition,
+                "post_render_gaussian_blur": not hard_color_recognition,
+                "post_render_motion_blur": not hard_color_recognition,
+            },
             "hard_case_sampling": {
                 "mode": "automatic" if auto_sample_hard_case else "fixed",
                 "hard_case_probability": HARD_CASE_GLOBAL_PROBABILITY,
@@ -9986,6 +10067,14 @@ def cli_args() -> argparse.Namespace:
         help="Probability of applying post-render blur, noise, rescale softness, and video codec artifacts.",
     )
     parser.add_argument(
+        "--hard-color-recognition",
+        action="store_true",
+        help=(
+            "Focus samples on saturated color casts (yellow/blue weighted), "
+            "disable rotational/Gaussian/motion blur, and keep other augmentations active."
+        ),
+    )
+    parser.add_argument(
         "--enable-mid-turns",
         "--enable-moves",
         dest="enable_mid_turns",
@@ -10036,6 +10125,7 @@ def main() -> None:
         cube_rotational_blur_samples=args.cube_rotational_blur_samples,
         degrade_probability=args.degrade_probability,
         hard_case=DEFAULT_HARD_CASE,
+        hard_color_recognition=args.hard_color_recognition,
         nvidia_gpu=args.gpu,
     )
 

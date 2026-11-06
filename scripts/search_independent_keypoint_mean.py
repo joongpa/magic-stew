@@ -39,8 +39,25 @@ SPEC.loader.exec_module(replay)
 def format_console_progress(item, console_timezone="America/Chicago", now=None):
     now = datetime.now(timezone.utc) if now is None else now
     stamp = now.astimezone(ZoneInfo(console_timezone)).strftime("%Y-%m-%d %H:%M:%S %Z")
+    mismatch = item.get('current_sticker_mismatch_count')
+    suffix = f' | mismatched stickers: {mismatch}/54' if mismatch is not None else ''
+    if item.get('current_sticker_history_penalty') is not None:
+        suffix += f" | history penalty: {item['current_sticker_history_penalty']:.3f}"
+    if item.get('current_queue_score') is not None:
+        suffix += f" | queue score: {item['current_queue_score']:.3f}"
+    if item.get('soft_window_protected_frame') is not None:
+        suffix += f" | protected through frame: {item['soft_window_protected_frame']}"
+    if item.get('current_soft_window_penalty') is not None:
+        suffix += f" | old-fork penalty: {item['current_soft_window_penalty']:.3f}"
+    if item.get('color_confusion_pruning'):
+        suffix += (f" | forbidden fits: {item.get('confusion_pruned_fits', 0):,}"
+                   f" | color dead ends: {item.get('confusion_dead_end_states', 0):,}")
+    if item.get('require_layer_activity'):
+        suffix += f" | activity pruned: {item.get('activity_pruned', 0):,}"
+    if item.get('soft_top_k'):
+        suffix += f" | outside top {item['soft_top_k']}: {item.get('outside_top_k_offered', 0):,}"
     return (f"[{stamp}] explored states: {item['evaluated_states']:,} | "
-            f"furthest branch: {item['furthest_video_frame']}/{item['total_video_frames']}")
+            f"furthest branch: {item['furthest_video_frame']}/{item['total_video_frames']}{suffix}")
 
 
 @dataclass
@@ -50,8 +67,9 @@ class MeanNode:
     total_cost: float
     update: tuple
     path_id: int = 0
-    recent: tuple = ()
+    recent: tuple | bytes = ()
     priority: float | None = None
+    secondary_priority: float = 0.
 
     @property
     def mean(self):
@@ -76,14 +94,23 @@ class MeanQueue:
                 key BLOB PRIMARY KEY, total REAL NOT NULL, priority REAL NOT NULL,
                 depth INTEGER NOT NULL, serial INTEGER NOT NULL,
                 pending INTEGER NOT NULL, payload BLOB NOT NULL) WITHOUT ROWID;
-            CREATE INDEX IF NOT EXISTS mean_pending_priority
-                ON contexts(priority, depth DESC, serial) WHERE pending=1;
             CREATE TABLE IF NOT EXISTS deferred (
                 key BLOB PRIMARY KEY, required REAL NOT NULL, total REAL NOT NULL,
                 priority REAL NOT NULL, depth INTEGER NOT NULL, serial INTEGER NOT NULL,
                 payload BLOB NOT NULL) WITHOUT ROWID;
-            CREATE INDEX IF NOT EXISTS mean_deferred_priority
-                ON deferred(required, priority, depth DESC, serial);
+        """)
+        # Zero secondary priority preserves the ordering of older databases.
+        for table in ('contexts', 'deferred'):
+            columns = {row[1] for row in self.connection.execute(f'PRAGMA table_info({table})')}
+            if 'secondary' not in columns:
+                self.connection.execute(f'ALTER TABLE {table} ADD COLUMN secondary REAL NOT NULL DEFAULT 0')
+        self.connection.executescript("""
+            CREATE INDEX IF NOT EXISTS mean_pending_rank
+                ON contexts(priority, secondary, depth DESC, serial) WHERE pending=1;
+            CREATE INDEX IF NOT EXISTS mean_deferred_rank
+                ON deferred(required, priority, secondary, depth DESC, serial);
+            DROP INDEX IF EXISTS mean_pending_priority;
+            DROP INDEX IF EXISTS mean_deferred_priority;
         """)
         self.pending_count = self.connection.execute(
             "SELECT count(*) FROM contexts WHERE pending=1").fetchone()[0]
@@ -106,21 +133,25 @@ class MeanQueue:
         if self.operations % 500 == 0:
             self.connection.commit()
 
-    def offer(self, context, node, encoded_state, step=None):
+    def offer(self, context, node, encoded_state, step=None, *, preceding_steps=()):
         previous = self.connection.execute(
             "SELECT total,pending FROM contexts WHERE key=?", (context,)).fetchone()
         if previous is not None and previous[0] <= node.total_cost:
             return None
         path_id = node.path_id
+        for preceding in preceding_steps:
+            path_id = self.connection.execute("INSERT INTO paths(parent,step) VALUES (?,?)",
+                (path_id, self.pack(preceding))).lastrowid
         if step is not None:
             path_id = self.connection.execute("INSERT INTO paths(parent,step) VALUES (?,?)",
                 (path_id, self.pack(step))).lastrowid
         self.serial += 1
         payload = self.pack((encoded_state, node.update, path_id, node.recent))
-        self.connection.execute("""INSERT INTO contexts VALUES (?,?,?,?,?,1,?)
+        self.connection.execute("""INSERT INTO contexts(key,total,priority,depth,serial,pending,payload,secondary)
+            VALUES (?,?,?,?,?,1,?,?)
             ON CONFLICT(key) DO UPDATE SET total=excluded.total, priority=excluded.priority,
-            depth=excluded.depth, serial=excluded.serial, pending=1, payload=excluded.payload""",
-            (context, node.total_cost, node.queue_priority, node.depth, self.serial, payload))
+            depth=excluded.depth, serial=excluded.serial, pending=1, payload=excluded.payload,secondary=excluded.secondary""",
+            (context, node.total_cost, node.queue_priority, node.depth, self.serial, payload,node.secondary_priority))
         if previous is None:
             self.context_count += 1
             self.pending_count += 1
@@ -134,16 +165,16 @@ class MeanQueue:
         return status
 
     def pop(self, deserialize_state):
-        row = self.connection.execute("""SELECT key,depth,total,payload,priority FROM contexts
-            WHERE pending=1 ORDER BY priority,depth DESC,serial LIMIT 1""").fetchone()
+        row = self.connection.execute("""SELECT key,depth,total,payload,priority,secondary FROM contexts
+            WHERE pending=1 ORDER BY priority,secondary,depth DESC,serial LIMIT 1""").fetchone()
         if row is None:
             return None
-        context, depth, total, payload, priority = row
+        context, depth, total, payload, priority, secondary = row
         encoded, update, path_id, recent = self.unpack(payload)
         self.connection.execute("UPDATE contexts SET pending=0 WHERE key=?", (context,))
         self.pending_count -= 1
         self.tick()
-        return MeanNode(depth, deserialize_state(encoded), total, update, path_id, recent, priority)
+        return MeanNode(depth, deserialize_state(encoded), total, update, path_id, recent, priority,secondary)
 
     def defer(self, key, required, node, encoded_state, step):
         previous = self.connection.execute("SELECT total FROM deferred WHERE key=?",(key,)).fetchone()
@@ -153,34 +184,45 @@ class MeanQueue:
             (node.path_id,self.pack(step))).lastrowid
         self.serial += 1
         payload = self.pack((encoded_state,node.update,path_id,node.recent))
-        self.connection.execute("""INSERT INTO deferred VALUES (?,?,?,?,?,?,?)
+        self.connection.execute("""INSERT INTO deferred(key,required,total,priority,depth,serial,payload,secondary)
+            VALUES (?,?,?,?,?,?,?,?)
             ON CONFLICT(key) DO UPDATE SET total=excluded.total,priority=excluded.priority,
-            serial=excluded.serial,payload=excluded.payload""",
-            (key,required,node.total_cost,node.queue_priority,node.depth,self.serial,payload))
+            serial=excluded.serial,payload=excluded.payload,secondary=excluded.secondary""",
+            (key,required,node.total_cost,node.queue_priority,node.depth,self.serial,payload,node.secondary_priority))
         if previous is None:
             self.deferred_count += 1
         self.tick()
         return True
 
     def pop_deferred(self, deserialize_state):
-        row = self.connection.execute("""SELECT key,required,depth,total,payload,priority FROM deferred
-            ORDER BY required,priority,depth DESC,serial LIMIT 1""").fetchone()
-        key,required,depth,total,payload,priority = row
+        row = self.connection.execute("""SELECT key,required,depth,total,payload,priority,secondary FROM deferred
+            ORDER BY required,priority,secondary,depth DESC,serial LIMIT 1""").fetchone()
+        key,required,depth,total,payload,priority,secondary = row
         self.connection.execute("DELETE FROM deferred WHERE key=?",(key,))
         self.deferred_count -= 1
         self.tick()
         encoded,update,path_id,recent = self.unpack(payload)
-        return required,MeanNode(depth,deserialize_state(encoded),total,update,path_id,recent,priority)
+        return required,MeanNode(depth,deserialize_state(encoded),total,update,path_id,recent,priority,secondary)
 
     def minimum_deferred(self):
         row = self.connection.execute("""SELECT required FROM deferred
-            ORDER BY required,priority,depth DESC,serial LIMIT 1""").fetchone()
+            ORDER BY required,priority,secondary,depth DESC,serial LIMIT 1""").fetchone()
         return row[0] if row else None
 
     def minimum(self):
         row = self.connection.execute("""SELECT priority FROM contexts WHERE pending=1
-            ORDER BY priority,depth DESC,serial LIMIT 1""").fetchone()
+            ORDER BY priority,secondary,depth DESC,serial LIMIT 1""").fetchone()
         return row[0] if row else None
+
+    def minimum_secondary(self):
+        row = self.connection.execute('SELECT secondary FROM contexts WHERE pending=1 '
+            'ORDER BY priority,secondary,depth DESC,serial LIMIT 1').fetchone()
+        return row[0] if row else None
+
+    def minimum_frame_score(self):
+        row = self.connection.execute('SELECT payload FROM contexts WHERE pending=1 '
+            'ORDER BY priority,secondary,depth DESC,serial LIMIT 1').fetchone()
+        return self.last_step(self.unpack(row[0])[2]).get('state_score') if row else None
 
     def steps(self, path_id):
         result = []
@@ -189,6 +231,13 @@ class MeanQueue:
                 "SELECT parent,step FROM paths WHERE id=?", (path_id,)).fetchone()
             result.append(self.unpack(value))
         return list(reversed(result))
+
+    def last_step(self, path_id):
+        """Read the preceding frame's evidence without reconstructing its path."""
+        if not path_id:
+            return {}
+        row = self.connection.execute('SELECT step FROM paths WHERE id=?', (path_id,)).fetchone()
+        return self.unpack(row[0])
 
     def close(self):
         self.connection.commit()
@@ -205,11 +254,12 @@ class _BufferedContext:
     encoded: object
     update: tuple
     path_id: int
-    recent: tuple
+    recent: tuple | bytes
+    secondary_priority: float = 0.
 
     @property
     def rank(self):
-        return self.priority, -self.depth, self.serial
+        return self.priority, self.secondary_priority, -self.depth, self.serial
 
 
 class BufferedMeanQueue(MeanQueue):
@@ -238,7 +288,7 @@ class BufferedMeanQueue(MeanQueue):
         self.flush_seconds = flush_seconds
         self.heap = []
         self.resident = {}
-        self.boundary = (float("-inf"), 0, 0) if self.pending_count else None
+        self.boundary = (float("-inf"), 0, 0, 0) if self.pending_count else None
         self.dirty = {}
         self.dirty_deferred = {}
         self.path_buffer = {}
@@ -291,10 +341,17 @@ class BufferedMeanQueue(MeanQueue):
         self.path_buffer[self.path_serial] = parent, dict(step)
         return self.path_serial
 
-    def _row(self, node, encoded_state, step):
+    def last_step(self, path_id):
+        buffered = self.path_buffer.get(path_id)
+        return buffered[1] if buffered is not None else super().last_step(path_id)
+
+    def _row(self, node, encoded_state, step, preceding_steps=()):
         self.serial += 1
+        path_id = node.path_id
+        for preceding in preceding_steps:
+            path_id = self._path(path_id, preceding)
         return _BufferedContext(node.total_cost, node.queue_priority, node.depth, self.serial, 1,
-            encoded_state, node.update, self._path(node.path_id, step), node.recent)
+            encoded_state, node.update, self._path(path_id, step), node.recent,node.secondary_priority)
 
     def _admit(self, context, row):
         self.resident.pop(context, None)
@@ -318,14 +375,14 @@ class BufferedMeanQueue(MeanQueue):
                 or time.monotonic()-self.last_flush >= self.flush_seconds):
             self.flush()
 
-    def offer(self, context, node, encoded_state, step=None):
+    def offer(self, context, node, encoded_state, step=None, *, preceding_steps=()):
         if not self.deduplicate:
             context = (self.serial+1).to_bytes(8, "big")
         previous = self._previous(context)
         if previous is not None and previous[0] <= node.total_cost:
             self._maybe_flush()
             return None
-        row = self._row(node, encoded_state, step)
+        row = self._row(node, encoded_state, step, preceding_steps)
         self.dirty[context] = row
         self._remember(self.cost_cache, context, (row.total, 1))
         self._admit(context, row)
@@ -348,19 +405,21 @@ class BufferedMeanQueue(MeanQueue):
             self.connection.executemany("INSERT INTO paths(id,parent,step) VALUES (?,?,?)",
                 ((index, parent, self.pack(step)) for index, (parent, step) in self.path_buffer.items()))
         if self.dirty:
-            self.connection.executemany("""INSERT INTO contexts VALUES (?,?,?,?,?,?,?)
+            self.connection.executemany("""INSERT INTO contexts(key,total,priority,depth,serial,pending,payload,secondary)
+                VALUES (?,?,?,?,?,?,?,?)
                 ON CONFLICT(key) DO UPDATE SET total=excluded.total, priority=excluded.priority,
                 depth=excluded.depth, serial=excluded.serial, pending=excluded.pending,
-                payload=excluded.payload""",
+                payload=excluded.payload,secondary=excluded.secondary""",
                 ((key, row.total, row.priority, row.depth, row.serial, row.pending,
-                  self.pack((row.encoded, row.update, row.path_id, row.recent)))
+                  self.pack((row.encoded, row.update, row.path_id, row.recent)),row.secondary_priority)
                  for key, row in self.dirty.items()))
         if self.dirty_deferred:
-            self.connection.executemany("""INSERT INTO deferred VALUES (?,?,?,?,?,?,?)
+            self.connection.executemany("""INSERT INTO deferred(key,required,total,priority,depth,serial,payload,secondary)
+                VALUES (?,?,?,?,?,?,?,?)
                 ON CONFLICT(key) DO UPDATE SET total=excluded.total, priority=excluded.priority,
-                serial=excluded.serial, payload=excluded.payload""",
+                serial=excluded.serial, payload=excluded.payload,secondary=excluded.secondary""",
                 ((key, required, row.total, row.priority, row.depth, row.serial,
-                  self.pack((row.encoded, row.update, row.path_id, row.recent)))
+                  self.pack((row.encoded, row.update, row.path_id, row.recent)),row.secondary_priority)
                  for key, (required, row) in self.dirty_deferred.items()))
         self.connection.commit()
         self.metrics["flushes"] += 1
@@ -372,8 +431,8 @@ class BufferedMeanQueue(MeanQueue):
 
     def _refill(self):
         self.flush()
-        rows = self.connection.execute("""SELECT key,total,priority,depth,serial,payload FROM contexts
-            WHERE pending=1 ORDER BY priority,depth DESC,serial LIMIT ?""",
+        rows = self.connection.execute("""SELECT key,total,priority,depth,serial,payload,secondary FROM contexts
+            WHERE pending=1 ORDER BY priority,secondary,depth DESC,serial LIMIT ?""",
             (self.frontier_cache_size,)).fetchall()
         if not rows:
             if self.pending_count:
@@ -382,20 +441,20 @@ class BufferedMeanQueue(MeanQueue):
         self.metrics["frontier_refills"] += 1
         self.resident.clear()
         self.heap.clear()
-        for key, total, priority, depth, serial, payload in rows:
+        for key, total, priority, depth, serial, payload, secondary in rows:
             encoded, update, path_id, recent = self.unpack(payload)
-            row = _BufferedContext(total, priority, depth, serial, 1, encoded, update, path_id, recent)
+            row = _BufferedContext(total, priority, depth, serial, 1, encoded, update, path_id, recent,secondary)
             self.resident[key] = row
             self.heap.append((*row.rank, key))
             self._remember(self.cost_cache, key, (total, 1))
-        self.boundary = self.heap[-1][:3]
+        self.boundary = self.heap[-1][:4]
         heapq.heapify(self.heap)
 
     def _peek(self):
         while self.heap:
             entry = self.heap[0]
-            row = self.resident.get(entry[3])
-            if row is not None and row.serial == entry[2]:
+            row = self.resident.get(entry[4])
+            if row is not None and row.serial == entry[3]:
                 return entry
             heapq.heappop(self.heap)
         if self.pending_count:
@@ -408,7 +467,7 @@ class BufferedMeanQueue(MeanQueue):
         if entry is None:
             return None
         heapq.heappop(self.heap)
-        context = entry[3]
+        context = entry[4]
         row = self.resident.pop(context)
         row.pending = 0
         self.dirty[context] = row
@@ -416,7 +475,7 @@ class BufferedMeanQueue(MeanQueue):
         self.pending_count -= 1
         self._maybe_flush()
         return MeanNode(row.depth, deserialize_state(row.encoded), row.total, row.update, row.path_id,
-                        row.recent, row.priority)
+                        row.recent, row.priority,row.secondary_priority)
 
     def defer(self, key, required, node, encoded_state, step):
         if not self.deduplicate:
@@ -435,18 +494,26 @@ class BufferedMeanQueue(MeanQueue):
 
     def pop_deferred(self, deserialize_state):
         self.flush()
-        row = self.connection.execute("""SELECT key,required,depth,total,payload,priority FROM deferred
-            ORDER BY required,priority,depth DESC,serial LIMIT 1""").fetchone()
-        key, required, depth, total, payload, priority = row
+        row = self.connection.execute("""SELECT key,required,depth,total,payload,priority,secondary FROM deferred
+            ORDER BY required,priority,secondary,depth DESC,serial LIMIT 1""").fetchone()
+        key, required, depth, total, payload, priority, secondary = row
         self.connection.execute("DELETE FROM deferred WHERE key=?", (key,))
         self.deferred_cache.pop(key, None)
         self.deferred_count -= 1
         encoded, update, path_id, recent = self.unpack(payload)
-        return required, MeanNode(depth, deserialize_state(encoded), total, update, path_id, recent, priority)
+        return required, MeanNode(depth, deserialize_state(encoded), total, update, path_id, recent, priority,secondary)
 
     def minimum(self):
         entry = self._peek()
         return entry[0] if entry is not None else None
+
+    def minimum_secondary(self):
+        entry = self._peek()
+        return entry[1] if entry is not None else None
+
+    def minimum_frame_score(self):
+        entry = self._peek()
+        return self.last_step(self.resident[entry[4]].path_id).get('state_score') if entry is not None else None
 
     def minimum_deferred(self):
         value = super().minimum_deferred()

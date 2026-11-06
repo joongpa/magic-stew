@@ -62,7 +62,8 @@ def test_color_cutoff_prunes_below_two_thirds_but_keeps_exact_boundary():
     bad, exact = edge("bad", 0.), edge("goal", .8)
     bad.payload["color_error"] = .5
     exact.payload["color_error"] = 1. - 2./3.
-    result = search.frame_full_solve("root", (0,), lambda *_: (bad, exact), lambda s: s == "goal", str)
+    result = search.frame_full_solve("root", (0,), lambda *_: (bad, exact), lambda s: s == "goal", str,
+                                     minimum_color_accuracy=2./3.)
     assert result["status"] == "solved"
     assert result["color_pruned"] == 1
     assert result["steps"][0]["state_score"] == .8
@@ -71,7 +72,8 @@ def test_color_cutoff_prunes_below_two_thirds_but_keeps_exact_boundary():
 def test_color_pruning_exhausts_without_retrying_pruned_branches():
     bad = edge("goal", 0.)
     bad.payload["color_error"] = .5
-    result = search.frame_full_solve("root", (0,), lambda *_: (bad,), lambda s: s == "goal", str)
+    result = search.frame_full_solve("root", (0,), lambda *_: (bad,), lambda s: s == "goal", str,
+                                     minimum_color_accuracy=2./3.)
     assert result["status"] == "exhausted"
     assert result["color_pruned"] == 1
     assert result["queue_pending"] == 0
@@ -154,20 +156,46 @@ def test_replay_rejects_old_probability_logs_and_nonbinary_matches(renderer):
         scorer.prepare(0)
 
 
-def test_full_search_main_solves_using_raw_nine_class_colors(renderer, tmp_path, monkeypatch):
+@pytest.mark.parametrize('queue_order', ['sticker-history', 'sticker-mismatches', 'frame-score'])
+@pytest.mark.parametrize('confusion_pruning', [False, True])
+def test_full_search_main_solves_using_raw_nine_class_colors(renderer, tmp_path, monkeypatch, queue_order, confusion_pruning):
     source = tmp_path / "observations.jsonl"
     source.write_text(json.dumps(observation_record(renderer)) + "\n")
     output = tmp_path / "search"
     monkeypatch.setattr(sys, "argv", ["frame-search", "--log", str(source),
-        "--initial-scramble", "R", "--fps", "30", "--output-dir", str(output)])
+        "--initial-scramble", "R", "--fps", "30", "--queue-order", queue_order, "--output-dir", str(output),
+        "--no-require-layer-activity", "--soft-top-k", "0",
+        "--color-confusion-pruning" if confusion_pruning else "--no-color-confusion-pruning"])
     search.main()
     result = json.loads((output / "result.json").read_text())
     assert result["status"] == "solved"
     assert result["steps"][0]["state_moves"] == ["R'"]
     assert result["steps"][0]["state_score"] == pytest.approx(0.)
-    assert result["config"]["priority_statistic"] == "latest_frame_geometric_plus_color_cost"
+    if queue_order == 'frame-score':
+        assert result["config"]["priority_statistic"] == "latest_frame_geometric_plus_color_cost"
+    else:
+        assert result['config']['sticker_history']['includes_current_frame']
+        assert result['steps'][0]['sticker_mismatch_count'] == 0
+        assert result['steps'][0]['sticker_history_qualified_count'] == 0
+        assert int(result['steps'][0]['sticker_observed_mask_hex'],16).bit_count() > 0
+    if queue_order == 'sticker-history':
+        assert result['config']['minimum_color_accuracy'] is None
+        assert result['config']['sticker_history']['weight'] == .1
+        assert result['config']['history_merging']['enabled']
+        assert result['config']['soft_move_window']['enabled']
+        assert result['config']['soft_move_window']['supported_moves'] == 4
+        step = result['steps'][0]
+        assert step['queue_priority'] == pytest.approx(step['state_score']+.1*step['sticker_history_penalty'])
+    else:
+        assert result['config']['minimum_color_accuracy'] is None
+        assert not result['config']['history_merging']['enabled']
+        assert not result['config']['soft_move_window']['enabled']
     assert result["config"]["forecast_frames"] == 0
     assert result["config"]["past_path_priority_weight"] == 0.
+    assert result['config']['color_confusion_pruning']['enabled'] == confusion_pruning
+    if confusion_pruning:
+        assert result['steps'][0]['color_forbidden_count'] == 0
+        assert result['steps'][0]['color_confusion_count'] == 0
 
 
 def test_video_input_defaults_to_medium_nine_class_checkpoint_and_static_gate():
@@ -176,4 +204,12 @@ def test_video_input_defaults_to_medium_nine_class_checkpoint_and_static_gate():
     assert "yoloPoseMedium" in str(args.model)
     assert args.turning_start_frame == 380
     assert args.fps is None
+    assert args.queue_order == 'frame-score'
+    assert args.color_confusion_scoring and not args.color_confusion_pruning
+    assert args.color_confusion_cost == .5
+    assert args.soft_top_k == 8 and args.outside_top_k_penalty == .25
+    assert args.require_layer_activity
+    assert args.sticker_history_weight == .1
+    assert args.merge_sticker_histories and args.soft_backtrack_moves == 4
+    assert args.late_fork_penalty == .5
     assert not hasattr(args, "threshold") and not hasattr(args, "forecast_frames")

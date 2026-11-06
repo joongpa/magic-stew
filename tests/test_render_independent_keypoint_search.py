@@ -73,6 +73,18 @@ def test_saved_rescue_partial_angle_and_color_offset_render_in_physical_coordina
     assert candidate.assignment_projected_points.shape == candidate.assignment_image_points.shape
 
 
+def test_static_frames_use_selected_pose_when_search_pose_is_not_populated(m):
+    source = record(m)
+    source['selected_pose'] = source['search_pose']
+    source['search_pose'] = dict(source['search_pose'], rvec=None, tvec=None)
+    candidate = video.candidate_for_step(m, source,
+        dict(state_moves=[], observation_status='turning_start_frame'),
+        m.CubeGeometryState.identity(), video.replay.initial_sticker_colors(m, 'R U'))
+    assert candidate is not None
+    np.testing.assert_allclose(candidate.rvec, source['selected_pose']['rvec'])
+    assert candidate.turn_state_moves == ()
+
+
 def test_video_replays_consecutive_moves_once_and_freezes_solved_tail(m, tmp_path, monkeypatch):
     source, output, log = (tmp_path / name for name in ('input.avi', 'output.avi', 'turns.jsonl'))
     writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*'MJPG'), 25., (256, 256))
@@ -81,7 +93,10 @@ def test_video_replays_consecutive_moves_once_and_freezes_solved_tail(m, tmp_pat
         writer.write(np.full((256, 256, 3), 30 + 20*i, dtype=np.uint8))
     writer.release()
     monkeypatch.setattr(m, 'add_quicktime_frame_counter', lambda _: False)
-    move = step(m)
+    move = dict(step(m),soft_window_penalty=.5,soft_window_penalty_until_frame=1,
+                supported_move_count=5,soft_window_protected_frame=1,
+                color_scoring='directional_confusion_cost',color_error=.25,color_match_count=4,
+                color_correct_count=2,color_confusion_count=2,color_forbidden_count=0,color_confusion_cost=.5)
     result = dict(status='solved', solved_frame_index=2, config=dict(initial_scramble='R2', fps=25.),
         steps=[dict(frame_index=0, state_moves=[], observation_status='turning_start_frame'),
                dict(move, frame_index=1), dict(move, frame_index=2)])
@@ -107,8 +122,37 @@ def test_video_replays_consecutive_moves_once_and_freezes_solved_tail(m, tmp_pat
     assert records[3]['cube_geometry_state_before'] == records[4]['cube_geometry_state_before']
     assert records[0]['search']['status'] == 'forced_static'
     assert records[3]['search']['status'] == 'solved_hold'
+    assert records[1]['search']['soft_window_penalty'] == .5
+    assert records[1]['search']['soft_window_penalty_until_frame'] == 1
+    assert records[1]['search']['supported_move_count'] == 5
+    assert records[1]['color_scoring'] == 'directional_confusion_cost'
+    assert records[1]['candidates'][0]['color_correct_count'] == 2
+    assert records[1]['candidates'][0]['color_confusion_count'] == 2
 
 
 def test_unsolved_results_are_not_presented_as_winning_paths(m):
     with pytest.raises(ValueError, match='solved result'):
         video.render_result(m, {}, dict(status='exhausted'), 'missing.mp4')
+
+
+def test_unobserved_bridge_move_keeps_video_and_log_state_in_sync(m, tmp_path, monkeypatch):
+    source, output, log = (tmp_path/name for name in ['in.avi', 'out.avi', 'turns.jsonl'])
+    writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*'MJPG'), 25., (256, 256))
+    for _ in range(4):
+        writer.write(np.zeros((256, 256, 3), dtype=np.uint8))
+    writer.release()
+    monkeypatch.setattr(m, 'add_quicktime_frame_counter', lambda _: False)
+    move = step(m)
+    skipped = dict(move, frame_index=1, state_score=None, queue_priority=None,
+                   bridge_inferred=True, observation_status='unreliable_frame_bridge', frame_quality={})
+    skipped.pop('geometry_option_index')
+    records = {i: record(m) for i in range(4)}
+    records[1] = dict(has_pose=False, search_pose=None, selected_pose=None)
+    result = dict(status='solved', solved_frame_index=2, config=dict(initial_scramble='R2', fps=25.),
+        steps=[dict(frame_index=0, state_moves=[]), skipped, dict(move, frame_index=2)])
+    report = video.render_result(m, records, result, source, output_path=output, turn_log=log)
+    assert report['committed_moves'] == move['state_moves']*2
+    rows = [json.loads(s) for s in log.read_text().splitlines()]
+    assert rows[1]['selected_committed_moves'] == move['state_moves']
+    assert rows[1]['search']['status'] == 'unreliable_frame_bridge'
+    assert rows[1]['cube_geometry_state_before'] == m.CubeGeometryState.identity().to_json()
