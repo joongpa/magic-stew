@@ -6399,6 +6399,7 @@ def write_sticker_keypoint_mask(
 ) -> None:
     try:
         import cv2
+        import numpy as np
     except ImportError:
         raise RuntimeError("OpenCV is required for sticker keypoint masks.") from None
     if landmark_pose_objects:
@@ -6409,9 +6410,9 @@ def write_sticker_keypoint_mask(
             height,
             image_path=image_path,
         )
-        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        image = read_image_file(path, cv2, np, cv2.IMREAD_COLOR)
     else:
-        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        image = read_image_file(image_path, cv2, np, cv2.IMREAD_COLOR)
     if image is None or image.shape[:2] != (height, width):
         raise RuntimeError(f"Could not read rendered image for sticker keypoint mask: {image_path}")
     output = image.copy()
@@ -6425,7 +6426,7 @@ def write_sticker_keypoint_mask(
         cv2.circle(output, center, outline_radius, (0, 0, 0), thickness=-1, lineType=cv2.LINE_AA)
         cv2.circle(output, center, point_radius, color, thickness=-1, lineType=cv2.LINE_AA)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(path), output):
+    if not write_image_file(path, output, cv2):
         raise RuntimeError(f"Could not write sticker keypoint mask: {path}")
 
 
@@ -6559,7 +6560,7 @@ def write_segmentation_mask(
     output[cube_mask != 0] = (180, 80, 0)
     output[sticker_mask != 0] = (0, 210, 0)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(path), output):
+    if not write_image_file(path, output, cv2):
         raise RuntimeError(f"Could not write segmentation mask: {path}")
 
 
@@ -6615,8 +6616,36 @@ def write_yolo_segmentation_label(
 
 
 def render_png(path: Path) -> None:
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
     bpy.context.scene.render.filepath = str(path)
     bpy.ops.render.render(write_still=True)
+    if not path.is_file():
+        raise RuntimeError(f"Blender did not write the expected render: {path}")
+
+
+def read_image_file(path: Path, cv2: object, np: object, flags: int) -> object | None:
+    """Read an image through Python file I/O for Windows path compatibility."""
+    try:
+        encoded = np.frombuffer(path.read_bytes(), dtype=np.uint8)
+    except OSError:
+        return None
+    if encoded.size == 0:
+        return None
+    return cv2.imdecode(encoded, flags)
+
+
+def write_image_file(path: Path, image: object, cv2: object) -> bool:
+    """Write an image through Python file I/O for Windows path compatibility."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    success, encoded = cv2.imencode(path.suffix.lower() or ".png", image)
+    if not success:
+        return False
+    try:
+        path.write_bytes(encoded.tobytes())
+    except OSError:
+        return False
+    return True
 
 
 def object_transforms(objects: list[bpy.types.Object]) -> dict[str, tuple[Vector, Quaternion]]:
@@ -6761,14 +6790,15 @@ def average_rendered_pngs(sample_paths: list[Path], output_path: Path) -> None:
 
     accumulator = None
     for sample_path in sample_paths:
-        image = cv2.imread(str(sample_path), cv2.IMREAD_UNCHANGED)
+        image = read_image_file(sample_path, cv2, np, cv2.IMREAD_UNCHANGED)
         if image is None:
             raise RuntimeError(f"Could not read rendered blur sample: {sample_path}")
         image_float = image.astype(np.float32)
         accumulator = image_float if accumulator is None else accumulator + image_float
 
     averaged = np.clip(accumulator / len(sample_paths), 0, 255).astype(np.uint8)
-    cv2.imwrite(str(output_path), averaged)
+    if not write_image_file(output_path, averaged, cv2):
+        raise RuntimeError(f"Could not write averaged rotational blur render: {output_path}")
 
 
 def render_cube_rotational_blur_png(
@@ -6926,7 +6956,7 @@ def apply_video_compression(
                 borderMode=cv2.BORDER_REFLECT_101,
             )
             source_path = temp_path / f"source_{frame_index:03d}.png"
-            if not cv2.imwrite(str(source_path), context_frame):
+            if not write_image_file(source_path, context_frame, cv2):
                 raise RuntimeError(f"Could not write temporary video frame: {source_path}")
 
         encode_command = [
@@ -6993,7 +7023,7 @@ def apply_video_compression(
             raise RuntimeError(f"Video degradation failed: {details}") from error
 
         decoded_path = temp_path / f"decoded_{center_index + 1:03d}.png"
-        decoded = cv2.imread(str(decoded_path), cv2.IMREAD_COLOR)
+        decoded = read_image_file(decoded_path, cv2, np, cv2.IMREAD_COLOR)
         if decoded is None:
             raise RuntimeError(f"Could not read decoded video frame: {decoded_path}")
         if decoded.shape[:2] != (height, width):
@@ -7032,9 +7062,12 @@ def apply_camera_degradation(
             "Install cv2 and numpy in Blender's Python environment."
         ) from None
 
-    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    image = read_image_file(path, cv2, np, cv2.IMREAD_UNCHANGED)
     if image is None:
-        raise RuntimeError(f"Could not read rendered image for degradation: {path}")
+        raise RuntimeError(
+            "Could not read rendered image for degradation: "
+            f"{path.resolve()} (exists={path.exists()})"
+        )
 
     metadata: dict[str, object] = {}
     alpha = image[:, :, 3] if image.ndim == 3 and image.shape[2] == 4 else None
@@ -7081,7 +7114,8 @@ def apply_camera_degradation(
     if alpha is not None:
         frame = np.dstack([frame, alpha])
 
-    cv2.imwrite(str(path), frame)
+    if not write_image_file(path, frame, cv2):
+        raise RuntimeError(f"Could not write degraded image: {path}")
     return metadata or None
 
 
@@ -8563,10 +8597,11 @@ def write_wireframe_overlay(
     """Draw the exported visible wireframe over the final rendered image."""
     try:
         import cv2
+        import numpy as np
     except ImportError:
         raise RuntimeError("OpenCV is required to write wireframe verification renders.") from None
 
-    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    image = read_image_file(image_path, cv2, np, cv2.IMREAD_COLOR)
     if image is None:
         raise RuntimeError(f"Could not read rendered image for wireframe overlay: {image_path}")
     output = image.copy()
@@ -8582,7 +8617,7 @@ def write_wireframe_overlay(
         cv2.line(output, start_point, end_point, WIREFRAME_LINE_SHADOW_COLOR, shadow_width, cv2.LINE_AA)
         cv2.line(output, start_point, end_point, WIREFRAME_LINE_COLOR, line_width, cv2.LINE_AA)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(path), output):
+    if not write_image_file(path, output, cv2):
         raise RuntimeError(f"Could not write wireframe verification render: {path}")
 
 
@@ -9249,7 +9284,7 @@ def write_pose_keypoint_mask(
     if image_path is None:
         output = np.zeros((height, width, 3), dtype=np.uint8)
     else:
-        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        image = read_image_file(image_path, cv2, np, cv2.IMREAD_COLOR)
         if image is None or image.shape[:2] != (height, width):
             raise RuntimeError(f"Could not read rendered image for keypoint mask: {image_path}")
         # Preserve the rendered image at full brightness; the compact colored
@@ -9315,7 +9350,8 @@ def write_pose_keypoint_mask(
                 lineType=cv2.LINE_AA,
             )
 
-    cv2.imwrite(str(path), output)
+    if not write_image_file(path, output, cv2):
+        raise RuntimeError(f"Could not write keypoint visualization mask: {path}")
 
 
 def write_ordered_keypoint_overlay(
@@ -9328,12 +9364,13 @@ def write_ordered_keypoint_overlay(
     """Write a full-brightness image with visible ordered keypoints numbered 0-25."""
     try:
         import cv2
+        import numpy as np
     except ImportError:
         raise RuntimeError(
             "OpenCV and NumPy are required to write keypoint overlay masks."
         ) from None
 
-    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    image = read_image_file(image_path, cv2, np, cv2.IMREAD_COLOR)
     if image is None or image.shape[:2] != (height, width):
         raise RuntimeError(f"Could not read rendered image for keypoint overlay: {image_path}")
     output = image.copy()
@@ -9412,7 +9449,7 @@ def write_ordered_keypoint_overlay(
         )
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(path), output):
+    if not write_image_file(path, output, cv2):
         raise RuntimeError(f"Could not write ordered keypoint overlay: {path}")
 
 
