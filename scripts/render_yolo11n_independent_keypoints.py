@@ -6,9 +6,9 @@ landmarks and sticker colors with one pose model inside the tracked ROI, and
 caches the raw predictions. A background worker seeds sticker poses from each
 color point's nearest class-valid three/four landmarks, ranked by diagonal-center
 alignment and excluding other sticker points. Cached recovery then
-refines geometry, matches all observed colors directly to the known cube state,
-and optionally searches layer moves. No segmentation or pixel color sampling
-is performed.
+refines geometry, smooths weak rigid poses, matches observed colors to the
+known cube state, and optionally searches layer moves. The smoother can use
+outlines of adjacent uniform-color faces when the cached image supports them.
 
 Examples:
 
@@ -66,6 +66,10 @@ from live_recognition.roi_tracking import \
 
 CLASS_NAMES = INDEPENDENT_POSE_CLASS_NAMES
 STICKER_KEYPOINT_MIN_CONFIDENCE = 0.25
+DEFAULT_RENDER_POSE_CLASS_CONFIDENCES = {
+    **DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES,
+    **dict.fromkeys(CLASS_NAMES[3:], .90),
+}
 # OpenCV uses BGR colors. These match the independent-keypoint generator.
 CLASS_COLORS_BGR = (
     (255, 255, 255),
@@ -8726,7 +8730,11 @@ def draw_pose(
         per_class_index[int(class_id)] += 1
         color = CLASS_COLORS_BGR[int(class_id)]
         radius = max(1, round(min(output.shape[:2]) / 128.0 * 0.8))
-        cv2.circle(output, (int(x), int(y)), radius, color, -1, cv2.LINE_AA)
+        if int(class_id) < 3:
+            cv2.drawMarker(output, (int(x), int(y)), color, cv2.MARKER_DIAMOND,
+                           2 * radius + 1, max(1, radius // 3), cv2.LINE_AA)
+        else:
+            cv2.circle(output, (int(x), int(y)), radius, color, -1, cv2.LINE_AA)
         if show_labels:
             label = f"{class_name}:{class_index}"
             if show_confidences:
@@ -11170,6 +11178,1083 @@ def parse_turning_start_frame(value: str) -> int:
     return result
 
 
+def parse_render_pose_class_confidences(value: str) -> dict[str, float]:
+    overrides = parse_independent_pose_class_confidences(value)
+    names = {part.partition("=")[0].strip() for part in value.split(",") if part.strip()}
+    return {**DEFAULT_RENDER_POSE_CLASS_CONFIDENCES, **{name: overrides[name] for name in names}}
+
+
+@dataclass(frozen=True)
+class RigidPoseObservations:
+    landmarks: np.ndarray
+    classes: np.ndarray
+    stickers: np.ndarray
+    colors: tuple[str, ...]
+    pixel_scale: float
+
+
+@dataclass(frozen=True)
+class RigidPoseMatches:
+    landmark_errors: np.ndarray
+    sticker_errors: np.ndarray
+    landmark_rows: np.ndarray
+    landmark_objects: np.ndarray
+    sticker_rows: np.ndarray
+    sticker_indices: np.ndarray
+
+    @property
+    def sticker_count(self) -> int:
+        return int(np.count_nonzero(self.sticker_errors <= 1e-4))
+
+
+def _rigid_pose_observations(
+    record: NeuralFrameData, args: argparse.Namespace,
+) -> RigidPoseObservations | None:
+    if record.roi_xyxy is None:
+        return None
+    use = usable_pose_points(record.local_points, record.point_confidences, record.class_ids,
+                            record.box_confidences, args.keypoint_conf, args.pose_class_conf)
+    points, _ = local_to_frame_points(record.local_points, record.roi_xyxy, args.view_size)
+    landmarks = use & (record.class_ids < 3)
+    stickers = use & (record.class_ids >= 3)
+    if not np.any(landmarks) and not np.any(stickers):
+        return None
+    x0, y0, x1, y1 = record.roi_xyxy
+    # Scale pixel tolerances from the detection crop, not the fitted depth.
+    pixel_scale = max(max(x1 - x0, y1 - y0) / 400.0, .3)
+    return RigidPoseObservations(
+        points[landmarks], record.class_ids[landmarks], points[stickers],
+        tuple(CLASS_NAMES[i] for i in record.class_ids[stickers]), pixel_scale,
+    )
+
+
+def _project_rigid_geometry(
+    objects: np.ndarray, rvec: np.ndarray, tvec: np.ndarray, camera: StickerPnPCandidate,
+) -> np.ndarray:
+    if not objects.size:
+        return np.empty((*objects.shape[:-1], 2))
+    projected, _ = cv2.projectPoints(objects.reshape(-1, 3), rvec, tvec,
+                                     camera.camera_matrix, camera.dist_coeffs)
+    return projected.reshape(*objects.shape[:-1], 2)
+
+
+def _outside_sticker_distances(points: np.ndarray, polygons: np.ndarray) -> np.ndarray:
+    edges = (np.roll(polygons, -1, axis=1) - polygons)[None, :, :, :]
+    offsets = points[:, None, None, :] - polygons[None, :, :, :]
+    cross = edges[..., 0] * offsets[..., 1] - edges[..., 1] * offsets[..., 0]
+    inside = np.all(cross >= -1e-6, axis=-1) | np.all(cross <= 1e-6, axis=-1)
+    along = np.clip(np.sum(edges * offsets, axis=-1) /
+                    np.maximum(np.sum(edges**2, axis=-1), 1e-12), 0, 1)
+    distances = np.linalg.norm(offsets - along[..., None] * edges, axis=-1).min(axis=-1)
+    return np.where(inside, 0.0, distances)
+
+
+def _assign_rigid_observations(cost: np.ndarray, gate: float) -> tuple[np.ndarray, ...]:
+    from scipy.optimize import linear_sum_assignment
+
+    # Each detection has an outlier slot. A projected point or sticker can
+    # account for at most one detection.
+    n, m = cost.shape
+    padded = np.column_stack((cost, np.full((n, n), gate)))
+    rows, cols = linear_sum_assignment(padded)
+    matched = cols < m
+    return padded[rows, cols], rows[matched], cols[matched]
+
+
+def _match_rigid_pose(
+    observations: RigidPoseObservations, rvec: np.ndarray, tvec: np.ndarray,
+    camera: StickerPnPCandidate,
+) -> RigidPoseMatches:
+    scale = observations.pixel_scale
+    objects, classes = visible_cube_lattice_points(rvec, tvec)
+    projected = _project_rigid_geometry(objects, rvec, tvec, camera)
+    landmark_cost = np.linalg.norm(observations.landmarks[:, None] - projected, axis=-1)
+    if PNP_ASSIGNMENT_MODE == "class-aware":
+        landmark_cost[observations.classes[:, None] != classes] = np.inf
+    landmark_errors, landmark_rows, landmark_cols = _assign_rigid_observations(
+        landmark_cost, 18 * scale)
+
+    _, _, faces, centers, _, normals, _ = _turn_gpu_static_geometry()
+    camera_origin = -cv2.Rodrigues(rvec)[0].T @ tvec.reshape(3)
+    visible = np.flatnonzero(np.einsum("ij,ij->i", normals, camera_origin - centers) > 0)
+    polygons = _project_rigid_geometry(faces[visible], rvec, tvec, camera)
+    x, y = polygons[..., 0], polygons[..., 1]
+    area = .5 * np.abs(np.sum(x * np.roll(y, -1, axis=1) - y * np.roll(x, -1, axis=1), axis=1))
+    visible, polygons = visible[area >= 1.0], polygons[area >= 1.0]
+    sticker_cost = _outside_sticker_distances(observations.stickers, polygons)
+    # Break containment ties without penalizing distance to a sticker center.
+    if sticker_cost.size:
+        center_distances = np.linalg.norm(observations.stickers[:, None] - polygons.mean(axis=1),
+                                          axis=-1)
+        sticker_cost += np.where(sticker_cost == 0, 1e-8 * center_distances, 0)
+    sticker_errors, sticker_rows, sticker_cols = _assign_rigid_observations(
+        sticker_cost, 10 * scale)
+    sticker_errors[sticker_errors < 1e-4] = 0.0
+    return RigidPoseMatches(landmark_errors, sticker_errors, landmark_rows, objects[landmark_cols],
+                            sticker_rows, visible[sticker_cols])
+
+
+def _rigid_anchor_supported(matches: RigidPoseMatches, scale: float) -> bool:
+    inliers = matches.landmark_errors[matches.landmark_rows] < 8 * scale
+    objects = matches.landmark_objects[inliers]
+    if (len(objects) < max(5, .55 * len(matches.landmark_errors))
+            or matches.sticker_count < max(4, .75 * len(matches.sticker_errors))):
+        return False
+    # A near-perfect fit to one plane can be the wrong face or planar branch.
+    singular_values = np.linalg.svd(objects - objects.mean(axis=0), compute_uv=False)
+    return bool(singular_values[-1] >= .10 * singular_values[0])
+
+
+def _rigid_core_coordinates(candidate: StickerPnPCandidate) -> np.ndarray:
+    origin = np.zeros((1, 3), dtype=np.float64)
+    uv = _project_rigid_geometry(origin, candidate.rvec, candidate.tvec, candidate)[0]
+    return np.r_[uv, candidate.tvec.reshape(3)[2]]
+
+
+def _rigid_translation(core: np.ndarray, camera: StickerPnPCandidate) -> np.ndarray:
+    ray = cv2.undistortPoints(core[:2].reshape(1, 1, 2),
+                             camera.camera_matrix, camera.dist_coeffs).reshape(2)
+    return (np.r_[ray, 1.0] * core[2]).reshape(3, 1)
+
+
+def _align_rigid_rotation(rvec: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    rotation = cv2.Rodrigues(rvec)[0]
+    alternatives = rotation @ np.asarray(CUBE_SYMMETRY_MATRICES)
+    return alternatives[np.argmax(np.einsum("ijk,jk->i", alternatives, reference))]
+
+
+def _capped_pose_residual(errors: np.ndarray, cutoff: float) -> np.ndarray:
+    clipped = np.minimum(errors, cutoff)
+    ratio = (clipped / cutoff) ** 2
+    return clipped * np.sqrt(1 - ratio + ratio**2 / 3)
+
+
+@lru_cache(maxsize=1)
+def _mixed_sticker_seed_objects() -> dict[tuple[int, int], tuple[np.ndarray, ...]]:
+    """Use sticker centers as approximate AP3P seeds, never as final targets."""
+    pairs: dict[tuple[int, int], list[np.ndarray]] = {}
+    for sticker_type, classes in STICKER_TYPE_CLASS_IDS.items():
+        points = canonical_sticker_object_points(sticker_type)
+        for i, cls in enumerate(classes):
+            for j in ((i - 1) % 4, (i + 1) % 4):
+                pairs.setdefault((cls, classes[j]), []).append(
+                    np.asarray((points[i], points[j], points.mean(axis=0)), dtype=np.float64))
+    return {key: tuple(value) for key, value in pairs.items()}
+
+
+def _mixed_rigid_seeds(
+    observations: RigidPoseObservations, camera: StickerPnPCandidate, depth: float | None,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    seeds = []
+    pairs = _mixed_sticker_seed_objects()
+    for center in observations.stickers if depth is None else observations.stickers[:8]:
+        offsets = observations.landmarks - center
+        distance = np.linalg.norm(offsets, axis=1)
+        for i, j in combinations(np.argsort(distance)[:5], 2):
+            if (distance[i] < 1 or distance[j] > 3.5 * distance[i]
+                    or abs(offsets[i] @ offsets[j]) > .96 * distance[i] * distance[j]):
+                continue
+            pixels = np.asarray((observations.landmarks[i], observations.landmarks[j], center),
+                                dtype=np.float64)
+            for objects in pairs.get((observations.classes[i], observations.classes[j]), ()):
+                try:
+                    ok, rotations, translations = cv2.solveP3P(
+                        objects, pixels, camera.camera_matrix, camera.dist_coeffs,
+                        flags=cv2.SOLVEPNP_AP3P)
+                except cv2.error:
+                    continue
+                if ok:
+                    seeds.extend((rvec, tvec) for rvec, tvec in zip(rotations, translations, strict=True)
+                                 if tvec[2, 0] > CUBE_SIZE_MM
+                                 and (depth is None or .65 * depth < tvec[2, 0] < 1.5 * depth)
+                                 and np.isfinite(rvec).all() and np.isfinite(tvec).all())
+    return seeds
+
+
+def _rigid_image_residuals(landmark_errors, sticker_errors, scale, *, expansion=1.0):
+    return np.r_[_capped_pose_residual(landmark_errors, 8 * scale * expansion) / (4 * scale),
+                 _capped_pose_residual(sticker_errors, 6 * scale * expansion) / (5 * scale)]
+
+
+def _rigid_image_score(matches: RigidPoseMatches, scale: float) -> float:
+    errors = _rigid_image_residuals(matches.landmark_errors, matches.sticker_errors, scale)
+    return .5 * float(errors @ errors) + .5 * (len(matches.sticker_errors) - matches.sticker_count)
+
+
+def _mixed_rigid_baseline(
+    obs: RigidPoseObservations, camera: StickerPnPCandidate, base: StickerPnPCandidate | None,
+) -> tuple[np.ndarray, np.ndarray, RigidPoseMatches] | None:
+    """Bootstrap with the experiment's two-landmark/one-sticker hypotheses."""
+    from scipy.spatial.transform import Rotation
+
+    if len(obs.landmarks) < 2 or not len(obs.stickers):
+        return None
+    seeds = _mixed_rigid_seeds(obs, camera, None)
+    if base is not None:
+        seeds.append((base.rvec, base.tvec))
+    if not seeds:
+        return None
+    _, _, _, centers, _, normals, _ = _turn_gpu_static_geometry()
+    lattice = CUBE_LATTICE_OBJECT_POINTS_MM
+    span = max(float(np.linalg.norm(np.ptp(np.vstack((obs.landmarks, obs.stickers)), axis=0))), 1.)
+
+    def coarse(poses):
+        rv = np.asarray([r.reshape(3) for r, _ in poses])
+        tv = np.asarray([t.reshape(3) for _, t in poses])
+        matrices = Rotation.from_rotvec(rv).as_matrix()
+        origins = -np.einsum("bji,bj->bi", matrices, tv)
+        facing = (CUBE_LATTICE_BOUNDARY_FACE_MASK & (
+            np.einsum("lfj,blj->blf", CUBE_LATTICE_BOUNDARY_NORMALS, origins[:, None] - lattice) > 0
+        )).any(axis=2)
+        face_facing = np.einsum("lj,blj->bl", normals, origins[:, None] - centers) > 0
+
+        def assign(points, objects, visible, compatible):
+            if not np.any(camera.dist_coeffs):
+                xyz = objects @ matrices.transpose(0, 2, 1) + tv[:, None]
+                homogeneous = xyz @ camera.camera_matrix.T
+                pixels = homogeneous[..., :2] / np.maximum(xyz[..., 2:], 1.)
+            else:
+                pixels = np.asarray([
+                    _project_rigid_geometry(objects, r, t, camera) for r, t in poses
+                ])
+            distance = np.linalg.norm(points[None, :, None] - pixels[:, None], axis=-1)
+            distance = np.where(visible[:, None] & compatible, distance, np.inf)
+            columns = distance.argmin(axis=-1)
+            return np.take_along_axis(distance, columns[..., None], axis=-1)[..., 0], columns
+
+        compatible = (obs.classes[:, None] == CUBE_LATTICE_CLASS_IDS
+                      if PNP_ASSIGNMENT_MODE == "class-aware" else True)
+        dl, il = assign(obs.landmarks, lattice, facing, compatible)
+        dc, ic = assign(obs.stickers, centers, face_facing, True)
+        quality = .5 * (np.mean(np.minimum(dl / (.045 * span), 1.)**1.3, axis=1)
+                        + np.mean(np.minimum(dc / (.045 * span), 1.)**1.3, axis=1))
+        return quality, dl, il, dc, ic
+
+    def unique(errors, columns, limit):
+        rows = np.argsort(errors)
+        rows = rows[errors[rows] <= limit]
+        _, keep = np.unique(columns[rows], return_index=True)
+        return rows[keep]
+
+    ranked = np.concatenate([coarse(seeds[i:i + 128])[0] for i in range(0, len(seeds), 128)])
+    shortlisted = []
+    for index in np.argsort(ranked):
+        rvec, tvec = seeds[index]
+        if any(np.linalg.norm(tvec - t) < 4 and rotation_symmetry_distance(rvec, r) < .10
+               for r, t in shortlisted):
+            continue
+        shortlisted.append((rvec, tvec))
+        if len(shortlisted) >= 10:
+            break
+
+    finalists = []
+    for rvec, tvec in shortlisted:
+        best = None
+        for iteration in range(9):
+            quality, dl, il, dc, ic = coarse([(rvec, tvec)])
+            if best is None or quality[0] < best[0]:
+                best = (quality[0], rvec, tvec)
+            limit = (.10 if iteration < 3 else .055) * span
+            li, ci = unique(dl[0], il[0], limit), unique(dc[0], ic[0], limit)
+            if len(li) + len(ci) < 4:
+                break
+            # Center correspondences are only for this initialization.
+            # The complete fit below compares distance outside sticker areas.
+            objects = np.r_[lattice[il[0, li]], centers[ic[0, ci]]]
+            pixels = np.r_[obs.landmarks[li], obs.stickers[ci]]
+            try:
+                ok, next_rvec, next_tvec = cv2.solvePnP(
+                    np.ascontiguousarray(objects), np.ascontiguousarray(pixels),
+                    camera.camera_matrix, camera.dist_coeffs, rvec.copy(), tvec.copy(), True,
+                    flags=cv2.SOLVEPNP_ITERATIVE)
+            except cv2.error:
+                break
+            if (not ok or not np.isfinite(next_rvec).all() or not np.isfinite(next_tvec).all()
+                    or next_tvec[2, 0] <= CUBE_SIZE_MM):
+                break
+            if np.linalg.norm(next_tvec - tvec) < .01 and np.linalg.norm(next_rvec - rvec) < .0001:
+                break
+            rvec, tvec = next_rvec, next_tvec
+        if best is not None:
+            _, rvec, tvec = best
+            finalists.append((rvec, tvec, _match_rigid_pose(obs, rvec, tvec, camera)))
+    return min(finalists, key=lambda fit: _rigid_image_score(fit[2], obs.pixel_scale), default=None)
+
+
+def _refit_rigid_trajectory_pose(
+    observations: RigidPoseObservations,
+    camera: StickerPnPCandidate,
+    center: np.ndarray,
+    rotation: np.ndarray,
+    seeds: list[tuple[np.ndarray, np.ndarray | None]],
+    sigma: np.ndarray,
+    angle_sigma: float,
+    initial_matches: RigidPoseMatches | None,
+    outline_objects: np.ndarray,
+    outline_pixels: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, RigidPoseMatches] | None:
+    from scipy.optimize import least_squares
+
+    scale = observations.pixel_scale
+    faces = _turn_gpu_static_geometry()[2]
+    lower = np.r_[[-.70] * 3, -4 * sigma]
+    upper = -lower
+    lower[5] = max(lower[5], CUBE_SIZE_MM - center[2])
+
+    def pose(x):
+        rvec = cv2.Rodrigues(cv2.Rodrigues(x[:3])[0] @ rotation)[0]
+        return rvec, _rigid_translation(center + x[3:], camera)
+
+    def outline_error(rvec, tvec):
+        return (_project_rigid_geometry(outline_objects, rvec, tvec, camera)
+                - outline_pixels).ravel() / (4 * scale)
+
+    def image_score(matches, rvec, tvec):
+        outlines = outline_error(rvec, tvec)
+        return (_rigid_image_score(matches, scale)
+                + float(huber_loss(np.abs(outlines), delta=2).sum()))
+
+    def score(x, matches, rvec, tvec):
+        return (image_score(matches, rvec, tvec)
+                + .5 * (np.sum((x[:3] / angle_sigma) ** 2) + np.sum((x[3:] / sigma) ** 2)))
+
+    starts = [np.zeros(6)]
+    gross = initial_matches is None
+    if initial_matches is not None:
+        # Keep the image-only fit in the comparison even if it lies outside
+        # the bounded local optimizer.
+        delta = cv2.Rodrigues(_align_rigid_rotation(camera.rvec, rotation) @ rotation.T)[0]
+        initial = np.r_[delta.ravel(), _rigid_core_coordinates(camera) - center]
+        baseline_cost = score(initial, initial_matches, camera.rvec, camera.tvec)
+        starts.append(np.clip(initial, lower, upper))
+        gross = bool(abs(initial[5]) > 4 * sigma[2] or np.linalg.norm(initial[3:5] / sigma[:2]) > 5)
+    else:
+        baseline_cost = np.inf
+
+    options = []
+    for orientation, translation in seeds:
+        delta = cv2.Rodrigues(_align_rigid_rotation(orientation, rotation) @ rotation.T)[0]
+        offset = np.zeros(3)
+        if translation is not None:
+            uv = _project_rigid_geometry(np.zeros((1, 3)), orientation, translation, camera)[0]
+            offset[:2] = uv - center[:2]
+        options.append(np.r_[delta.ravel(), offset])
+    if gross:
+        nearby = [starts[0], *options[:2]]
+        for x in nearby:
+            for direction in np.r_[np.eye(2), -np.eye(2)]:
+                options.append(x + np.r_[np.zeros(3), direction * 2 * sigma[:2], 0.])
+            for direction in np.r_[np.eye(3), -np.eye(3)]:
+                options.append(x + np.r_[.23 * direction, np.zeros(3)])
+    ranked = []
+    for x in options:
+        if np.any(x < lower) or np.any(x > upper):
+            continue
+        rvec, tvec = pose(x)
+        matches = _match_rigid_pose(observations, rvec, tvec, camera)
+        inliers = np.count_nonzero(matches.landmark_errors < 8 * scale)
+        ranked.append((score(x, matches, rvec, tvec) - .25 * inliers, x))
+    for _, x in sorted(ranked, key=lambda item: item[0]):
+        if all(np.linalg.norm(x - previous) > .06 for previous in starts):
+            starts.append(x)
+        if len(starts) >= (10 if gross else 6):
+            break
+
+    best = None
+    for x in starts:
+        for iteration in range(6):
+            rvec, tvec = pose(x)
+            matches = _match_rigid_pose(observations, rvec, tvec, camera)
+            value = score(x, matches, rvec, tvec)
+            inliers = np.count_nonzero(matches.landmark_errors < 8 * scale)
+            near_track = np.linalg.norm(x[3:5] / sigma[:2]) < 2.5
+            supported = (inliers >= 4 or
+                         (inliers >= 2 and matches.sticker_count >= 2) or
+                         (near_track and inliers >= 1 and matches.sticker_count >= 3))
+            if outline_objects.size:
+                supported = supported or np.median(np.abs(outline_error(rvec, tvec))) < 2
+            if supported and value < baseline_cost - .05 and (best is None or value < best[0]):
+                best = (value, rvec, tvec, matches)
+            if iteration == 5:
+                break
+            expansion = 1.4 if iteration < 2 else 1.0
+            lr, sr = matches.landmark_rows, matches.sticker_rows
+            li = matches.landmark_errors[lr] < 8 * scale * expansion
+            si = matches.sticker_errors[sr] < 6 * scale * expansion
+            land_objects = matches.landmark_objects[li]
+            sticker_objects = faces[matches.sticker_indices[si]]
+
+            def residual(z):
+                rv, tv = pose(z)
+                lp = _project_rigid_geometry(land_objects, rv, tv, camera)
+                sp = _project_rigid_geometry(sticker_objects, rv, tv, camera)
+                ld = np.linalg.norm(lp - observations.landmarks[lr[li]], axis=1)
+                sd = np.diag(_outside_sticker_distances(observations.stickers[sr[si]], sp))
+                return np.r_[_rigid_image_residuals(ld, sd, scale, expansion=expansion),
+                             outline_error(rv, tv), z[:3] / angle_sigma, z[3:] / sigma]
+
+            fitted = least_squares(residual, x, bounds=(lower, upper),
+                                   loss="soft_l1", f_scale=2, max_nfev=25,
+                                   x_scale=np.r_[[.2] * 3, sigma])
+            if np.linalg.norm(fitted.x - x) < .005 and iteration >= 2:
+                break
+            x = fitted.x
+    return best[1:] if best is not None else None
+
+
+def _rigid_face_colors(
+    record: NeuralFrameData, observations: RigidPoseObservations, matches: RigidPoseMatches,
+) -> tuple[tuple[np.ndarray, float, int, int], ...]:
+    """Learn outlines only from faces supported by distinct same-color stickers."""
+    if record.frame is None:
+        return ()
+    normals = _turn_gpu_static_geometry()[5]
+    groups: dict[tuple[int, int], list[int]] = {}
+    for row, index in zip(matches.sticker_rows, matches.sticker_indices, strict=True):
+        if matches.sticker_errors[row] == 0:
+            normal = normals[index]
+            axis = int(np.argmax(np.abs(normal)))
+            groups.setdefault((axis, int(np.sign(normal[axis]))), []).append(int(row))
+    samples = []
+    height, width = record.frame.shape[:2]
+    for (axis, side), rows in groups.items():
+        if len(rows) < 5:
+            continue
+        colors = [observations.colors[row] for row in rows]
+        dominant = max(dict.fromkeys(colors), key=colors.count)
+        if dominant == "white" or colors.count(dominant) < max(5, .8 * len(rows)):
+            continue
+        xy = np.rint([observations.stickers[row] for row in rows
+                      if observations.colors[row] == dominant]).astype(int)
+        xy = xy[(xy[:, 0] >= 0) & (xy[:, 0] < width) & (xy[:, 1] >= 0) & (xy[:, 1] < height)]
+        if len(xy) < 4:
+            continue
+        bgr = record.frame[xy[:, 1], xy[:, 0]].reshape(-1, 1, 3)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+        hsv = hsv[hsv[:, 1] >= 70]
+        if len(hsv) < 4:
+            continue
+        offset = (hsv[:, 0].astype(float) - float(hsv[0, 0]) + 90) % 180 - 90
+        hue = (float(hsv[0, 0]) + float(np.median(offset))) % 180
+        if np.count_nonzero(np.abs((hsv[:, 0] - hue + 90) % 180 - 90) < 9) < .75 * len(hsv):
+            continue
+        saturation = int(np.clip(.60 * np.median(hsv[:, 1]), 70, 155))
+        value = int(np.clip(.60 * np.median(hsv[:, 2]), 45, 145))
+        objects = 3 * cubelet_face_object_points(np.zeros(3), axis, side)
+        samples.append((objects, hue, saturation, value))
+    return tuple(samples) if len(samples) >= 2 else ()
+
+
+def _rigid_face_outline_matches(
+    image: np.ndarray | None, samples: tuple[tuple[np.ndarray, float, int, int], ...],
+    rvec: np.ndarray, tvec: np.ndarray, camera: StickerPnPCandidate, diameter: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Find two adjacent face outlines around a motion-predicted pose."""
+    empty = np.empty((0, 3)), np.empty((0, 2))
+    if image is None or not samples:
+        return empty
+    height, width = image.shape[:2]
+    fits = []
+    rotation = cv2.Rodrigues(rvec)[0]
+    camera_origin = -rotation.T @ tvec.reshape(3)
+    for objects, hue, saturation, value in samples:
+        normal = np.cross(objects[1] - objects[0], objects[2] - objects[0])
+        if normal @ (camera_origin - objects.mean(axis=0)) <= 0:
+            continue
+        quad = _project_rigid_geometry(objects, rvec, tvec, camera)
+        area = cv2.contourArea(quad.astype(np.float32))
+        if area < .035 * diameter**2:
+            continue
+        margin = .20 * diameter
+        x0, y0 = np.maximum(np.floor(quad.min(axis=0) - margin).astype(int), 0)
+        x1, y1 = np.minimum(np.ceil(quad.max(axis=0) + margin).astype(int), [width, height])
+        if x1 <= x0 or y1 <= y0:
+            continue
+        hsv = cv2.cvtColor(image[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+        hue_error = np.abs((hsv[..., 0].astype(float) - hue + 90) % 180 - 90)
+        mask = ((hue_error < 9) & (hsv[..., 1] >= saturation) & (hsv[..., 2] >= value))
+        kernel_size = int(np.clip(round(.023 * diameter), 3, 9)) | 1
+        mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE,
+                               np.ones((kernel_size, kernel_size), dtype=np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        for contour in contours:
+            if not .42 * area < cv2.contourArea(contour) < 1.65 * area:
+                continue
+            hull = cv2.convexHull(contour)
+            length = cv2.arcLength(hull, True)
+            for epsilon in (.018, .025, .032):
+                corners = cv2.approxPolyDP(hull, epsilon * length, True).reshape(-1, 2)
+                if len(corners) != 4:
+                    continue
+                corners = corners + [x0, y0]
+                orders = [np.roll(order, shift, axis=0)
+                          for order in (corners, corners[::-1]) for shift in range(4)]
+                ordered = min(orders, key=lambda order: np.linalg.norm(order - quad))
+                error = float(np.linalg.norm(ordered - quad, axis=1).mean())
+                if error < .20 * diameter and (best is None or error < best[0]):
+                    best = (error, ordered)
+        if best is not None:
+            fits.append((objects, best[1], area))
+    pairs = []
+    for (first, first_pixels, first_area), (second, second_pixels, second_area) in combinations(fits, 2):
+        shared = np.linalg.norm(first[:, None] - second[None], axis=-1) < .001
+        if np.count_nonzero(shared) != 2:
+            continue
+        a, b = np.nonzero(shared)
+        if np.max(np.linalg.norm(first_pixels[a] - second_pixels[b], axis=1)) < .15 * diameter:
+            pairs.append((min(first_area, second_area), np.r_[first, second],
+                          np.r_[first_pixels, second_pixels]))
+    if pairs:
+        return max(pairs, key=lambda item: item[0])[1:]
+    return empty
+
+
+def _candidate_from_rigid_trajectory(
+    camera: StickerPnPCandidate, observations: RigidPoseObservations,
+    rvec: np.ndarray, tvec: np.ndarray, matches: RigidPoseMatches,
+) -> StickerPnPCandidate:
+    # The new pose may have come from another frame. Rebuild correspondences
+    # from this frame and clear the old single-sticker seed and its projections.
+    _, rows, columns, projected, objects, classes = evaluate_pose_hypothesis(
+        rvec, tvec, observations.landmarks, observations.classes, camera.image_size,
+        camera.camera_matrix, camera.dist_coeffs,
+    )
+    rows = np.asarray(rows, dtype=int)
+    columns = np.asarray(columns, dtype=int)
+    errors = np.linalg.norm(observations.landmarks[rows] - projected[columns], axis=1)
+    return attach_color_keypoints(replace(
+        camera, rvec=rvec, tvec=tvec, image_points=np.empty((0, 2)),
+        object_points=np.empty((0, 3)), projected_sticker_points=np.empty((0, 2)),
+        reprojection_error=float(np.mean(errors)) if len(errors) else float("inf"),
+        overall_reprojection_error=float(np.mean(huber_loss(errors))) if len(errors) else float("inf"),
+        assignment_image_points=observations.landmarks[rows],
+        assignment_projected_points=projected[columns],
+        assignment_object_points=objects[columns],
+        assignment_observed_class_ids=observations.classes[rows],
+        assignment_projected_class_ids=classes[columns].reshape(-1),
+        assignment_fixed_mask=np.zeros(len(rows), dtype=bool),
+        final_solve_image_points=observations.landmarks[
+            matches.landmark_errors < 8 * observations.pixel_scale],
+        pre_final_rvec=None, pre_final_tvec=None, object_symmetry=None,
+        orientation_anchor=all_cube_orientation_anchor(),
+    ), observations.stickers, observations.colors)
+
+
+@dataclass(frozen=True)
+class RigidTrajectoryRepair:
+    camera: StickerPnPCandidate
+    rvec: np.ndarray
+    tvec: np.ndarray
+    matches: RigidPoseMatches
+    outline_objects: np.ndarray
+    outline_pixels: np.ndarray
+
+
+def _smooth_rigid_outline_gap(
+    gap: list[RigidTrajectoryRepair], observations: list[RigidPoseObservations],
+    frame_indices: list[int], endpoints: tuple[StickerPnPCandidate, StickerPnPCandidate] | None = None,
+) -> list[RigidTrajectoryRepair]:
+    """Fit contiguous two-face observations and a shared motion trajectory."""
+    from scipy.optimize import least_squares
+    from scipy.sparse import lil_matrix
+
+    reference = cv2.Rodrigues(endpoints[0].rvec if endpoints else gap[0].rvec)[0]
+    initial_rotations = [cv2.Rodrigues(fit.rvec)[0] for fit in gap]
+    symmetries = [rotation.T @ _align_rigid_rotation(fit.rvec, reference)
+                  for fit, rotation in zip(gap, initial_rotations, strict=True)]
+    initial_core = np.asarray([
+        _rigid_core_coordinates(replace(fit.camera, rvec=fit.rvec, tvec=fit.tvec)) for fit in gap
+    ])
+    if endpoints:
+        left_core, right_core = (_rigid_core_coordinates(pose) for pose in endpoints)
+        right_rotation = _align_rigid_rotation(endpoints[1].rvec, reference)
+    scale = float(np.median([obs.pixel_scale for obs in observations]))
+    dt = np.diff(frame_indices).astype(float)
+    if np.any(dt <= 0):
+        return gap
+    associations = []
+    faces = _turn_gpu_static_geometry()[2]
+    for fit, obs in zip(gap, observations, strict=True):
+        landmark_rows, sticker_rows = fit.matches.landmark_rows, fit.matches.sticker_rows
+        li = fit.matches.landmark_errors[landmark_rows] < 8 * obs.pixel_scale
+        si = fit.matches.sticker_errors[sticker_rows] < 4 * obs.pixel_scale
+        associations.append((fit.matches.landmark_objects[li], obs.landmarks[landmark_rows[li]],
+                             faces[fit.matches.sticker_indices[si]], obs.stickers[sticker_rows[si]]))
+
+    stationary = []
+    if not endpoints:
+        outlines = []
+        for fit, symmetry in zip(gap, symmetries, strict=True):
+            corners = np.sign(fit.outline_objects @ symmetry).astype(int)
+            outlines.append({key: fit.outline_pixels[np.all(corners == key, axis=1)].mean(axis=0)
+                             for key in {tuple(corner) for corner in corners}})
+        still = []
+        for first, second in zip(outlines, outlines[1:]):
+            shared = first.keys() & second.keys()
+            steps = [np.linalg.norm(first[key] - second[key]) for key in shared]
+            still.append(len(steps) >= 5 and np.percentile(steps, 75) <= 3 * scale)
+        # Apply a hold only when several measured outline steps agree.
+        for i in range(len(still) - 2):
+            if all(still[i:i + 3]):
+                stationary.extend(range(i, i + 3))
+        stationary = sorted(set(stationary))
+
+    def image_residual(fit, obs, rotation, core, associations):
+        rvec, tvec = cv2.Rodrigues(rotation)[0], _rigid_translation(core, fit.camera)
+        uv = _project_rigid_geometry(fit.outline_objects, rvec, tvec, fit.camera)
+        landmark_objects, landmarks, sticker_objects, stickers = associations
+        lp = _project_rigid_geometry(landmark_objects, rvec, tvec, fit.camera)
+        sp = _project_rigid_geometry(sticker_objects, rvec, tvec, fit.camera)
+        landmark_error = np.linalg.norm(lp - landmarks, axis=1)
+        sticker_error = np.diag(_outside_sticker_distances(stickers, sp))
+        return np.r_[((uv - fit.outline_pixels) / (3 * obs.pixel_scale)).ravel(),
+                     _rigid_image_residuals(landmark_error, sticker_error, obs.pixel_scale)]
+
+    def unpack(flat):
+        values = flat.reshape(-1, 6)
+        rotations = [cv2.Rodrigues(row[:3])[0] @ rotation
+                     for row, rotation in zip(values, initial_rotations, strict=True)]
+        return rotations, initial_core + values[:, 3:]
+
+    def residual(flat):
+        rotations, cores = unpack(flat)
+        image_errors = []
+        for fit, obs, rotation, core, points in zip(
+            gap, observations, rotations, cores, associations, strict=True,
+        ):
+            image_errors.extend(image_residual(fit, obs, rotation, core, points))
+        aligned = [r @ s for r, s in zip(rotations, symmetries, strict=True)]
+        if endpoints:
+            cores = np.vstack([left_core, cores, right_core])
+            aligned = [reference, *aligned, right_rotation]
+        steps = np.diff(cores, axis=0) / dt[:, None]
+        angles = np.array([cv2.Rodrigues(b @ a.T)[0].ravel()
+                           for a, b in zip(aligned, aligned[1:])]) / dt[:, None]
+        acceleration = np.diff(steps, axis=0) / [2 * scale, 2 * scale, 7]
+        angular_acceleration = np.diff(angles, axis=0) / .04
+        hold = steps[stationary] / [1.5 * scale, 1.5 * scale, 1.]
+        return np.r_[image_errors, acceleration.ravel(), angular_acceleration.ravel(), hold.ravel()]
+
+    n = len(gap)
+    image_lengths = [fit.outline_pixels.size + len(points[1]) + len(points[3])
+                     for fit, points in zip(gap, associations, strict=True)]
+    motion_count = n if endpoints else n - 2
+    jacobian = lil_matrix((sum(image_lengths) + motion_count * 6 + 3 * len(stationary), n * 6),
+                         dtype=int)
+    row = 0
+    for i, count in enumerate(image_lengths):
+        jacobian[row:row + count, 6 * i:6 * (i + 1)] = 1
+        row += count
+    for i in range(motion_count):
+        begin = i - 1 if endpoints else i
+        columns = slice(6 * max(0, begin), 6 * min(n, begin + 3))
+        jacobian[row + 3 * i:row + 3 * (i + 1), columns] = 1
+        jacobian[row + 3 * (motion_count + i):row + 3 * (motion_count + i + 1), columns] = 1
+    row += motion_count * 6
+    for i, step in enumerate(stationary):
+        jacobian[row + 3 * i:row + 3 * (i + 1), 6 * step:6 * (step + 2)] = 1
+    bound = np.tile([.15, .15, .15, 8 * scale, 8 * scale, 20] if endpoints
+                    else [.25, .25, .25, 24 * scale, 24 * scale, 75], n)
+    lower = -bound.copy()
+    lower[5::6] = np.maximum(lower[5::6], CUBE_SIZE_MM - initial_core[:, 2])
+    result = least_squares(residual, np.zeros(n * 6), bounds=(lower, bound),
+                           jac_sparsity=jacobian.tocsr(), loss="soft_l1", f_scale=2, max_nfev=35)
+    rotations, cores = unpack(result.x)
+    refined = []
+    for fit, obs, rotation, core in zip(gap, observations, rotations, cores, strict=True):
+        rvec, tvec = cv2.Rodrigues(rotation)[0], _rigid_translation(core, fit.camera)
+        matches = _match_rigid_pose(obs, rvec, tvec, fit.camera)
+        before_landmarks = np.count_nonzero(fit.matches.landmark_errors < 8 * obs.pixel_scale)
+        after_landmarks = np.count_nonzero(matches.landmark_errors < 8 * obs.pixel_scale)
+        if endpoints:
+            if (matches.sticker_count < fit.matches.sticker_count
+                    or after_landmarks < before_landmarks - 2):
+                return gap
+        elif (matches.sticker_count < max(4, fit.matches.sticker_count - 2)
+              or (_rigid_anchor_supported(fit.matches, obs.pixel_scale)
+                  and after_landmarks < .60 * before_landmarks
+                  and matches.sticker_count <= fit.matches.sticker_count)):
+            refined.append(fit)
+            continue
+        refined.append(replace(fit, rvec=rvec, tvec=tvec, matches=matches))
+    return refined
+
+
+def _local_rigid_depth(
+    i: int, anchors: np.ndarray, frames: np.ndarray, coordinates: dict[int, np.ndarray], fps: float,
+) -> float | None:
+    k = int(np.searchsorted(anchors, i))
+    left = anchors[max(0, k - 3):k]
+    right = anchors[k:k + 4]
+    right = right[right != i][:3]
+    neighbors = np.r_[left, right]
+    elapsed = (frames[neighbors] - frames[i]) / fps
+    nearby = np.abs(elapsed) <= .18
+    neighbors, elapsed = neighbors[nearby], elapsed[nearby]
+    if len(neighbors) < 2 or np.min(np.abs(elapsed)) > .06:
+        return None
+    depth = np.asarray([coordinates[int(j)][2] for j in neighbors])
+    bracketing = elapsed.min() < 0 < elapsed.max()
+    trend = np.column_stack((np.ones(len(depth)), elapsed)) if bracketing else np.ones((len(depth), 1))
+    proximity = np.exp(-np.abs(elapsed) / .08)
+    weight = proximity.copy()
+    for _ in range(4):
+        sqrt_weight = np.sqrt(weight)
+        line = np.linalg.lstsq(trend * sqrt_weight[:, None], depth * sqrt_weight, rcond=None)[0]
+        weight = proximity / np.maximum(1., np.abs(depth - trend @ line) / (.023 * np.median(depth)))
+    return float(line[0])
+
+
+def _regularize_rigid_depth(
+    pose: StickerPnPCandidate, obs: RigidPoseObservations, target: float,
+) -> tuple[np.ndarray, RigidPoseMatches] | None:
+    """Prefer the local depth trend even on well-supported frames."""
+    core = _rigid_core_coordinates(pose)
+    change = target - core[2]
+    if abs(change) < 2 or abs(change) > .16 * target:
+        return None
+    scale = obs.pixel_scale
+    baseline = _match_rigid_pose(obs, pose.rvec, pose.tvec, pose)
+    sigma = max(6., .012 * target)
+    cost = _rigid_image_score(baseline, scale) + .5 * (change / sigma) ** 2
+    minimum_landmarks = max(3, np.count_nonzero(baseline.landmark_errors < 8 * scale) - 2)
+    minimum_stickers = baseline.sticker_count - int(baseline.sticker_count >= 12)
+    best = None
+    for fraction in (.25, .50, .75, 1.0):
+        position = core.copy()
+        position[2] += fraction * change
+        tvec = _rigid_translation(position, pose)
+        match = _match_rigid_pose(obs, pose.rvec, tvec, pose)
+        if (match.sticker_count < minimum_stickers
+                or np.count_nonzero(match.landmark_errors < 8 * scale) < minimum_landmarks):
+            continue
+        value = _rigid_image_score(match, scale) + .5 * ((position[2] - target) / sigma) ** 2
+        if value < cost - .05:
+            cost, best = value, (tvec, match)
+    return best
+
+
+def _store_rigid_pose(
+    record: NeuralFrameData, pose: StickerPnPCandidate, diagnostics: dict[str, object],
+) -> None:
+    record.pose_candidate = replace(pose, pose_continuity_diagnostics=diagnostics)
+    record.pose_candidates = (record.pose_candidate,)
+    record.pose_diagnostic_candidate = None
+    record.pose_ready = True
+
+
+def _smooth_visible_face_tracks(
+    cache: list[NeuralFrameData], observations: list[RigidPoseObservations | None],
+    anchors: np.ndarray, fps: float,
+) -> set[int]:
+    """Discover continuous outline tracks, including well-fitted frames and the clip ends."""
+    samples = {}
+    poses = [record.pose_candidate for record in cache]
+    pending = []
+    changed = set()
+
+    def finish() -> None:
+        if len(pending) < 4:
+            return
+        indices, fits = zip(*pending, strict=True)
+        refined = _smooth_rigid_outline_gap(
+            list(fits), [observations[i] for i in indices], [cache[i].frame_index for i in indices],
+        )
+        for i, before, after in zip(indices, fits, refined, strict=True):
+            if before is after:
+                continue
+            candidate = _candidate_from_rigid_trajectory(
+                after.camera, observations[i], after.rvec, after.tvec, after.matches,
+            )
+            if pose_reprojection_error_is_acceptable(candidate):
+                _store_rigid_pose(cache[i], candidate, {
+                    "method": "rigid_outline_track",
+                    "outline_corners": len(after.outline_objects),
+                    "sticker_areas": after.matches.sticker_count,
+                })
+                changed.add(i)
+
+    for i, (obs, pose) in enumerate(zip(observations, poses, strict=True)):
+        fit = None
+        if (obs is not None and cache[i].frame is not None and isinstance(pose, StickerPnPCandidate)
+                and not pose.layer_rotations and not physical_sticker_rotations(pose)
+                and pose.tvec.reshape(3)[2] > CUBE_SIZE_MM):
+            k = int(np.searchsorted(anchors, i))
+            nearby = anchors[max(0, k - 2):k + 3]
+            nearby = sorted(nearby, key=lambda j: abs(cache[j].frame_index - cache[i].frame_index))
+            diameter = projected_cube_diameter(pose)
+            for ref in nearby:
+                if abs(cache[ref].frame_index - cache[i].frame_index) > max(2, .10 * fps):
+                    break
+                reference = poses[ref]
+                if ref not in samples:
+                    match = _match_rigid_pose(observations[ref], reference.rvec, reference.tvec, reference)
+                    samples[ref] = _rigid_face_colors(cache[ref], observations[ref], match)
+                if not samples[ref] or not np.isfinite(diameter):
+                    continue
+                aligned = _align_rigid_rotation(pose.rvec, cv2.Rodrigues(reference.rvec)[0])
+                rvec = cv2.Rodrigues(aligned)[0]
+                objects, pixels = _rigid_face_outline_matches(
+                    cache[i].frame, samples[ref], rvec, pose.tvec, pose, diameter,
+                )
+                if objects.size:
+                    match = _match_rigid_pose(obs, rvec, pose.tvec, pose)
+                    fit = RigidTrajectoryRepair(pose, rvec, pose.tvec, match, objects, pixels)
+                    break
+        if (fit is None or len(pending) == 32 or (pending
+                and cache[i].frame_index != cache[pending[-1][0]].frame_index + 1)):
+            finish()
+            pending.clear()
+        if fit is not None:
+            pending.append((i, fit))
+    finish()
+    return changed
+
+
+def smooth_cached_rigid_poses(
+    cache: list[NeuralFrameData], args: argparse.Namespace, source_fps: float,
+    known_initial_colors: dict[str, str],
+) -> int:
+    """Fit the cached rigid trajectory from image evidence and local motion."""
+    from scipy.interpolate import PchipInterpolator
+
+    fps = source_fps if np.isfinite(source_fps) and source_fps > 0 else 30.0
+    observations = [_rigid_pose_observations(record, args) for record in cache]
+    poses = [record.pose_candidate for record in cache]
+    matches: dict[int, RigidPoseMatches] = {}
+    coordinates: dict[int, np.ndarray] = {}
+    mixed_baselines = set()
+    supported = []
+    camera = next((pose for pose in poses if isinstance(pose, StickerPnPCandidate)), None)
+    if camera is None:
+        record = next((record for record in cache if record.frame is not None), None)
+        if record is None:
+            return 0
+        height, width = record.frame.shape[:2]
+        camera = StickerPnPCandidate(
+            "corner", 0., np.empty((0, 2)), np.empty((0, 3)), np.empty((0, 2)),
+            default_camera_matrix((width, height), args.pnp_focal_scale), np.zeros((4, 1)),
+            np.zeros((3, 1)), np.zeros((3, 1)), float("inf"), image_size=(width, height),
+        )
+    for i, (pose, obs) in enumerate(zip(poses, observations, strict=True)):
+        if obs is None or (isinstance(pose, StickerPnPCandidate)
+                           and (pose.layer_rotations or physical_sticker_rotations(pose))):
+            continue
+        if (not isinstance(pose, StickerPnPCandidate) or not np.isfinite(pose.rvec).all()
+                or not np.isfinite(pose.tvec).all() or pose.tvec.reshape(3)[2] <= CUBE_SIZE_MM):
+            pose = None
+        template = camera if pose is None else pose
+        match = None if pose is None else _match_rigid_pose(obs, pose.rvec, pose.tvec, pose)
+        cost = float("inf") if match is None else _rigid_image_score(match, obs.pixel_scale)
+        mixed = _mixed_rigid_baseline(obs, template, pose) if cost > .05 else None
+        if mixed is not None and _rigid_image_score(mixed[2], obs.pixel_scale) + .05 < cost:
+            rvec, tvec, proposed = mixed
+            if (proposed.sticker_count >= min(3, len(obs.stickers))
+                    and np.count_nonzero(proposed.landmark_errors < 8 * obs.pixel_scale) >= 2):
+                candidate = _candidate_from_rigid_trajectory(template, obs, rvec, tvec, proposed)
+                if pose_reprojection_error_is_acceptable(candidate):
+                    pose, match = candidate, proposed
+                    poses[i] = candidate
+                    mixed_baselines.add(i)
+        if pose is None or match is None:
+            continue
+        matches[i] = match
+        coordinates[i] = _rigid_core_coordinates(pose)
+        if _rigid_anchor_supported(match, obs.pixel_scale):
+            supported.append(i)
+
+    # Do not let an otherwise well-matched, isolated jump anchor its own
+    # neighborhood. Require support on both sides before overruling it.
+    isolated = set()
+    for a, i, b in zip(supported, supported[1:], supported[2:]):
+        if cache[b].frame_index - cache[a].frame_index > max(3, .08 * fps):
+            continue
+        left, current, right = (coordinates[k] for k in (a, i, b))
+        expected = (left + right) / 2
+        diameter = projected_cube_diameter(poses[a])
+        if (np.linalg.norm(left[:2] - right[:2]) < .16 * diameter
+                and abs(left[2] - right[2]) < .12 * expected[2]
+                and (np.linalg.norm(current[:2] - expected[:2]) > .22 * diameter
+                     or abs(current[2] - expected[2]) > .23 * expected[2])):
+            isolated.add(i)
+    # At a clip boundary a short, stable one-sided neighborhood can still
+    # expose a displaced first or last pose.
+    for order in (supported[:4], supported[-4:][::-1]):
+        if len(order) < 4:
+            continue
+        i, *nearby = order
+        if abs(cache[nearby[-1]].frame_index - cache[i].frame_index) > max(3, .08 * fps):
+            continue
+        values = np.asarray([coordinates[j] for j in nearby])
+        center = np.median(values, axis=0)
+        diameter = projected_cube_diameter(poses[nearby[0]])
+        if (np.max(np.linalg.norm(values[:, :2] - center[:2], axis=1)) < .07 * diameter
+                and np.ptp(values[:, 2]) < .08 * center[2]
+                and (np.linalg.norm(coordinates[i][:2] - center[:2]) > .10 * diameter
+                     or abs(coordinates[i][2] - center[2]) > .09 * center[2])):
+            isolated.add(i)
+    strong = np.asarray([i for i in supported if i not in isolated], dtype=int)
+    strong_set = set(strong)
+    # A well-matched multicolor face can guide the position of the track
+    # through a longer occlusion, provided its depth agrees with nearby 3D
+    # fits. A monochrome face supplies no such position anchor by itself.
+    position_guides = set()
+    for i, match in matches.items():
+        if (i in strong_set or i in isolated
+                or match.sticker_count < max(4, .8 * len(match.sticker_errors))):
+            continue
+        obs = observations[i]
+        if (np.count_nonzero(match.landmark_errors < 8 * obs.pixel_scale) < 5
+                or np.median(match.landmark_errors) > 3 * obs.pixel_scale
+                or len({color for color, error in zip(obs.colors, match.sticker_errors, strict=True)
+                        if error == 0}) < 2):
+            continue
+        k = int(np.searchsorted(strong, i))
+        if k == 0 or k == len(strong):
+            continue
+        a, b = int(strong[k - 1]), int(strong[k])
+        t0, t1 = cache[a].frame_index, cache[b].frame_index
+        if t1 <= t0 or t1 - t0 > max(3, .40 * fps):
+            continue
+        fraction = (cache[i].frame_index - t0) / (t1 - t0)
+        expected = (1 - fraction) * coordinates[a] + fraction * coordinates[b]
+        if (abs(coordinates[i][2] - expected[2]) < .13 * expected[2]
+                and np.linalg.norm(coordinates[i][:2] - expected[:2])
+                < .30 * projected_cube_diameter(poses[a])):
+            position_guides.add(i)
+    anchors = np.asarray(sorted(strong_set | position_guides), dtype=int)
+    anchor_set = set(anchors)
+    frames = np.asarray([record.frame_index for record in cache])
+    repairs: dict[tuple[int, int], dict[int, RigidTrajectoryRepair]] = {}
+    face_colors = {}
+    for i, obs in enumerate(observations):
+        if obs is None or i in anchor_set:
+            continue
+        base = poses[i]
+        if isinstance(base, StickerPnPCandidate) and (base.layer_rotations or physical_sticker_rotations(base)):
+            continue
+        k = int(np.searchsorted(anchors, i))
+        if len(anchors) < 2:
+            continue
+        frame = cache[i].frame_index
+        one_sided = k == 0 or k == len(anchors)
+        if one_sided:
+            nearby = anchors[:2] if k == 0 else anchors[-2:]
+            a, b = (int(x) for x in nearby)
+            if max(abs(frame - cache[x].frame_index) for x in nearby) > max(2, .08 * fps):
+                continue
+            diameter = projected_cube_diameter(poses[a])
+            if (np.linalg.norm(coordinates[a][:2] - coordinates[b][:2]) > .10 * diameter
+                    or abs(coordinates[a][2] - coordinates[b][2]) > .09 * coordinates[a][2]):
+                continue
+            neighbors = [a, b]
+        else:
+            a, b = int(anchors[k - 1]), int(anchors[k])
+            neighbors = [int(x) for x in anchors[max(0, k - 2):k + 2]]
+        gap = cache[b].frame_index - cache[a].frame_index
+        if gap <= 0 or gap > max(3, round(.32 * fps)):
+            continue
+        times = [cache[x].frame_index for x in neighbors]
+        if any(x >= y for x, y in zip(times, times[1:])):
+            continue
+        if one_sided:
+            center = (coordinates[a] + coordinates[b]) / 2
+        else:
+            center = PchipInterpolator(times, [coordinates[x] for x in neighbors], axis=0)(frame)
+        depth = _local_rigid_depth(i, anchors, frames, coordinates, fps)
+        if depth is not None:
+            center[2] = depth
+        template = base if i in matches else poses[a]
+        left_rotation = cv2.Rodrigues(poses[a].rvec)[0]
+        right_rotation = _align_rigid_rotation(poses[b].rvec, left_rotation)
+        alpha = float(np.clip((frame - cache[a].frame_index) / gap, 0, 1))
+        relative = cv2.Rodrigues(right_rotation @ left_rotation.T)[0]
+        rotation = cv2.Rodrigues(alpha * relative)[0] @ left_rotation
+        diameter = projected_cube_diameter(template, cv2.Rodrigues(rotation)[0],
+                                           _rigid_translation(center, template))
+        if not np.isfinite(diameter):
+            continue
+        outline_objects, outline_pixels = np.empty((0, 3)), np.empty((0, 2))
+        for ref in sorted((a, b), key=lambda x: abs(cache[x].frame_index - frame)):
+            if ref not in face_colors:
+                face_colors[ref] = _rigid_face_colors(cache[ref], observations[ref], matches[ref])
+            if not face_colors[ref]:
+                continue
+            aligned = _align_rigid_rotation(cv2.Rodrigues(rotation)[0], cv2.Rodrigues(poses[ref].rvec)[0])
+            outline_objects, outline_pixels = _rigid_face_outline_matches(
+                cache[i].frame, face_colors[ref], cv2.Rodrigues(aligned)[0],
+                _rigid_translation(center, template), template, diameter)
+            if outline_objects.size:
+                rotation = aligned
+                break
+        sigma = np.array([max(3., .025 * diameter), max(3., .025 * diameter),
+                          max(8., .025 * center[2])]) * (1 + gap / fps)
+        seeds = [(poses[a].rvec, None), (poses[b].rvec, None)]
+        if not outline_objects.size and (i not in matches or matches[i].sticker_count < 5):
+            seeds.extend(_mixed_rigid_seeds(obs, template, center[2]))
+        result = _refit_rigid_trajectory_pose(
+            obs, template, center, rotation, seeds, sigma,
+            .17 + gap / fps + (.09 if a in position_guides or b in position_guides else 0),
+            matches.get(i), outline_objects, outline_pixels,
+        )
+        if result is None:
+            continue
+        rvec, tvec, fit = result
+        repairs.setdefault((a, b), {})[i] = RigidTrajectoryRepair(
+            template, rvec, tvec, fit, outline_objects, outline_pixels)
+
+    repaired = set()
+    for (a, b), group in repairs.items():
+        indices = list(group)
+        fits = list(group.values())
+        if (len(fits) >= 2 and indices == list(range(a + 1, b))
+                and all(fit.outline_objects.size for fit in fits)):
+            fits = _smooth_rigid_outline_gap(
+                fits, [observations[i] for i in indices],
+                [cache[i].frame_index for i in range(a, b + 1)], (poses[a], poses[b]),
+            )
+        for i, fit in zip(indices, fits, strict=True):
+            candidate = _candidate_from_rigid_trajectory(
+                fit.camera, observations[i], fit.rvec, fit.tvec, fit.matches)
+            if not pose_reprojection_error_is_acceptable(candidate):
+                continue
+            _store_rigid_pose(cache[i], candidate, {
+                "method": "rigid_trajectory",
+                "anchor_frames": [cache[a].frame_index, cache[b].frame_index],
+                "outline_corners": len(fit.outline_objects),
+                "sticker_areas": fit.matches.sticker_count,
+            })
+            repaired.add(i)
+    for i in mixed_baselines - repaired:
+        _store_rigid_pose(cache[i], poses[i], {
+            "method": "mixed_rigid", "sticker_areas": matches[i].sticker_count,
+        })
+    for i in anchors:
+        target = _local_rigid_depth(i, anchors, frames, coordinates, fps)
+        if target is None:
+            continue
+        pose, obs = cache[i].pose_candidate, observations[i]
+        depth_fit = _regularize_rigid_depth(pose, obs, target)
+        if depth_fit is None:
+            continue
+        tvec, fit = depth_fit
+        candidate = _candidate_from_rigid_trajectory(pose, obs, pose.rvec, tvec, fit)
+        if pose_reprojection_error_is_acceptable(candidate):
+            _store_rigid_pose(cache[i], candidate, {
+                "method": "rigid_depth_trend", "sticker_areas": fit.sticker_count,
+            })
+            repaired.add(i)
+    repaired.update(_smooth_visible_face_tracks(cache, observations, anchors, fps))
+    repaired.update(mixed_baselines)
+    if known_initial_colors:
+        for i in sorted(repaired):
+            candidate = cache[i].pose_candidate
+            _store_rigid_pose(cache[i], match_orientation_to_colors(candidate, known_initial_colors),
+                              candidate.pose_continuity_diagnostics)
+    return len(repaired)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Render the independent cube-keypoint model with bbox-to-ROI tracking."
@@ -11191,8 +12276,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--pose-class-conf",
-        type=parse_independent_pose_class_confidences,
-        default=dict(DEFAULT_INDEPENDENT_POSE_CLASS_CONFIDENCES),
+        type=parse_render_pose_class_confidences,
+        default=dict(DEFAULT_RENDER_POSE_CLASS_CONFIDENCES),
         help=(
             "Per-class boxes.conf thresholds as class=value pairs, for example "
             "corner=0.25,corner-edge=0.30,corner-edge-center=0.25."
@@ -11235,6 +12320,10 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Draw the cube pose during the final cached pass.",
+    )
+    parser.add_argument(
+        "--pose-smoothing", action=argparse.BooleanOptionalAction, default=True,
+        help="Use mixed seeds, nearby poses, and face evidence to fit the cached video trajectory.",
     )
     parser.add_argument(
         "--show-orientation-axes",
@@ -11348,6 +12437,10 @@ def process_cached_poses(
             known_initial_colors=known_initial_colors,
             source_fps=source_fps,
         )
+        if len(cache) >= 3 and getattr(args, "pose_smoothing", True):
+            print("Refitting the cached rigid pose trajectory...", flush=True)
+            repaired = smooth_cached_rigid_poses(cache, args, source_fps, known_initial_colors)
+            print(f"Refit {repaired} cached rigid poses.", flush=True)
     if args.recognize_moves:
         if args.turning_start_frame is not None:
             print(

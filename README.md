@@ -406,12 +406,18 @@ is an alias. Use `--model PATH` to override the checkpoint; it must predict the
 three landmark classes and six colors.
 
 Detections are filtered by `boxes.conf` and keypoint confidence. Defaults are
-`corner=0.25`, `corner-edge=0.40`, `corner-edge-center=0.25`, and `0.25` for each
+`corner=0.25`, `corner-edge=0.40`, `corner-edge-center=0.25`, and `0.90` for each
 color. Override any class with `--pose-class-conf red=0.35,corner-edge=0.45`.
 `--min-keypoint-conf` filters point visibility (default `0.05` for landmarks);
 sticker color keypoints have a minimum of `0.25` for scoring, drawing, and ROI
 tracking. `--track-conf` controls ROI tracking. Neural inference runs on CPU. Move recognition uses Apple MPS and
 requires an available MPS device.
+
+The cached video pose pass also evaluates mixed landmark/sticker seeds, then
+refits weak rigid poses against nearby observations. It tracks image-plane
+position and depth separately and can jointly fit runs with two visible face
+outlines. Use `--no-pose-smoothing` to compare with the original single-frame
+pose pass.
 
 Each sticker color keypoint finds its closest class-valid three- and four-landmark
 groups by expanding the nearest-landmark neighborhood. Cyclic classes must match

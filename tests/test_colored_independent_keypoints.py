@@ -100,6 +100,58 @@ def test_color_thresholds_are_applied_before_candidates_and_scoring():
     assert valid.tolist() == [True, False, False, False]
 
 
+@pytest.mark.parametrize(("missing", "anchor_frames"), [(0, [101, 102]), (1, [100, 102])])
+def test_cached_trajectory_recovers_missing_pose_from_current_detections(
+    monkeypatch, missing, anchor_frames,
+):
+    # Exercise recovery when the single-frame proposal stage has no result.
+    monkeypatch.setattr(m, "_mixed_rigid_baseline", lambda *_: None)
+    args = m.build_parser().parse_args(["--source", "clip.mp4", "--initial-scramble", ""])
+    records = []
+    positions = (0., 0., 0.) if missing == 0 else (-5., 0., 5.)
+    for frame, tx in enumerate(positions, start=100):
+        pose = replace(cube(), tvec=np.array([[tx], [1.0], [230.0]]))
+        objects, classes = m.visible_cube_lattice_points(pose.rvec, pose.tvec)
+        landmarks = cv2.projectPoints(objects, pose.rvec, pose.tvec, pose.camera_matrix,
+                                      pose.dist_coeffs)[0].reshape(-1, 2)
+        stickers = [quad.mean(axis=0) for _, _, quad in
+                    m.projected_sticker_faces(pose, pose.rvec, pose.tvec)]
+        points = np.vstack((landmarks, stickers))
+        confidences = np.ones(len(points))
+        records.append(m.NeuralFrameData(
+            frame, np.zeros((256, 256, 3), dtype=np.uint8), (0, 0, 256, 256), "tracker", None,
+            points, confidences, np.r_[classes, np.full(len(stickers), 4)], confidences,
+            pose_candidate=None if frame == 100 + missing else pose, pose_ready=True,
+        ))
+    endpoints = [records[frame - 100].pose_candidate for frame in anchor_frames]
+
+    assert m.smooth_cached_rigid_poses(records, args, 60.0, {}) == 1
+    result = records[missing].pose_candidate
+    np.testing.assert_allclose(result.tvec.ravel(), [0, 1, 230], atol=.5)
+    assert result.layer_rotations == ()
+    assert result.pose_continuity_diagnostics["anchor_frames"] == anchor_frames
+    assert all(records[frame - 100].pose_candidate is pose
+               for frame, pose in zip(anchor_frames, endpoints, strict=True))
+
+
+def test_render_confidence_override_retains_other_sticker_thresholds():
+    args = m.build_parser().parse_args([
+        "--source", "clip.mp4", "--initial-scramble", "", "--pose-class-conf", "red=.8",
+    ])
+    assert args.pose_class_conf["red"] == .8
+    assert args.pose_class_conf["yellow"] == .9
+
+
+def test_rigid_fit_counts_duplicate_sticker_detections_as_one_area():
+    pose = cube()
+    _, _, quad = m.projected_sticker_faces(pose, pose.rvec, pose.tvec)[0]
+    duplicate = np.tile(quad.mean(axis=0), (2, 1))
+    observations = m.RigidPoseObservations(np.empty((0, 2)), np.empty(0, dtype=int),
+                                           duplicate, ("red", "red"), 1.0)
+    fit = m._match_rigid_pose(observations, pose.rvec, pose.tvec, pose)
+    assert fit.sticker_count == 1
+
+
 def test_color_matrix_is_exact_class_equality():
     expected = initial_colors()
     candidate = observed_cube(expected=expected)
