@@ -2688,6 +2688,48 @@ def test_projected_cube_faces_mark_only_anchor_layers():
     assert any(is_anchor for _depth, _face, is_anchor in faces)
 
 
+def test_turn_occlusion_allows_shallow_seam_hits_but_keeps_deeper_hits():
+    torch = pytest.importorskip("torch")
+    m = render_script
+    # This view puts two seam vertices just behind the turning face and a
+    # third seam vertex well behind it.
+    rvec = np.array([1.06345, -0.83809, -0.39880])
+    tvec = np.array([-66.84, -35.86, 956.41])
+    camera = np.array([[2304., 0., 540.], [0., 2304., 960.], [0., 0., 1.]])
+    distortion = np.zeros(4)
+    indices = [m.CUBE_LATTICE_COORDS.index(point)
+               for point in ((2, 0, 1), (1, 0, 1), (0, 2, 1))]
+    objects = m.CUBE_LATTICE_OBJECT_POINTS_MM[indices].astype(np.float64)
+    classes = m.CUBE_LATTICE_CLASS_IDS[indices]
+    observed, _ = cv2.projectPoints(objects, rvec, tvec, camera, distortion)
+    observed = observed.reshape(-1, 2)
+    candidate = m.StickerPnPCandidate(
+        sticker_type="edge", sticker_average_confidence=1.0,
+        image_points=np.empty((0, 2)), object_points=np.empty((0, 3)),
+        projected_sticker_points=np.empty((0, 2)), reprojection_error=0.0,
+        camera_matrix=camera, dist_coeffs=distortion, rvec=rvec, tvec=tvec,
+        assignment_image_points=observed, assignment_projected_points=observed,
+        assignment_object_points=objects, assignment_observed_class_ids=classes,
+        image_size=(1080, 1920),
+    )
+    rotation = m.CubeLayerRotation(2, -1, -45.0, 1)
+    limit = 0.05 * m.projected_cube_diameter(candidate)
+
+    def assignments(**kwargs):
+        trials = m._score_turn_configurations_on_gpu(
+            candidate, limit, torch.device("cpu"), angle_values=np.array([-45.0]),
+            enforce_layer_observation_gate=False, enforce_validity_gate=False, **kwargs,
+        )
+        return next(trial["assignment_projected_points"] for trial in trials
+                    if trial["layer_rotations"] == (rotation,))
+
+    strict = np.linalg.norm(assignments(seam_clearance_mm=0.0) - observed, axis=1)
+    relaxed = np.linalg.norm(assignments() - observed, axis=1)
+    assert np.all(strict[:2] > limit)
+    np.testing.assert_allclose(relaxed[:2], 0.0, atol=1e-6)
+    assert relaxed[2] > limit
+
+
 def test_recover_misaligned_layer_updates_assignment_geometry(monkeypatch):
     import torch
     monkeypatch.setattr(render_script, "_turn_torch_scoring_device", lambda _device: torch.device("cpu"))

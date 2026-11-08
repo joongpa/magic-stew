@@ -19,6 +19,8 @@ import zlib
 
 import numpy as np
 
+from search_independent_keypoint_forecast import advance_update, canonical_update
+
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
     "score_analysis_search", ROOT / "scripts/search_independent_keypoint_frame.py")
@@ -94,7 +96,7 @@ def local_candidate_rows(m, scorer, branches, gap):
             state = selected_state
             chosen = search.replay.Transition(state, step['state_score'], (), step,
                                               m.state_update_layer_direction(step))
-            update = search.advance_update(update, chosen, frame, gap)
+            update = advance_update(update, chosen, frame, gap)
             assert update is not None
     return rows
 
@@ -172,10 +174,12 @@ def main():
     start = max(config['start_frame'], turning_start+1 if turning_start is not None else config['start_frame'])
     end = result['solved_frame_index']
     gap = config['min_state_update_gap_frames']
+    sampled_frames = list(config.get('sampled_frame_indices', range(config['start_frame'], end+1)))
+    reference_indices = [frame for frame in sampled_frames if start <= frame <= end]
     fronts = {name: {(initial, (None, None, 0), 0): (0., None)}
               for name in ('reference_gated', 'reference_ungated')}
     reference_frames = []
-    for frame in range(start, end+1):
+    for frame in reference_indices:
         gated.prepare(frame)
         for name, scorer in (('reference_gated', gated), ('reference_ungated', ungated)):
             prior = fronts[name]
@@ -183,7 +187,7 @@ def main():
             for (state, update, progress), (cost, parent) in prior.items():
                 choices, _ = scorer.for_update_context(frame, state, update, gap)
                 for choice in choices:
-                    updated = search.advance_update(update, choice, frame, gap)
+                    updated = advance_update(update, choice, frame, gap)
                     if updated is None:
                         continue
                     moved = len(choice.payload['state_moves'])
@@ -191,7 +195,7 @@ def main():
                     matches = reference_states.get(canonical(scorer.key(choice.state)), set())
                     if target not in matches:
                         continue
-                    key = (scorer.key(choice.state), search.canonical_update(updated, frame+1, gap), target)
+                    key = (scorer.key(choice.state), canonical_update(updated, frame+1, gap), target)
                     candidate_cost = cost + choice.score
                     previous = following.get(key)
                     if previous is None or candidate_cost < previous[0]:
@@ -232,11 +236,11 @@ def main():
     by_frame = {}
     for key, depth, pending, priority, payload in connection.execute(
             'SELECT key,depth,pending,priority,payload FROM contexts WHERE depth BETWEEN ? AND ?',
-            (start-config['start_frame']+1, end-config['start_frame']+1)):
+            (sampled_frames.index(reference_indices[0])+1, sampled_frames.index(end)+1)):
         encoded, _update, path_id, _recent = pickle.loads(zlib.decompress(payload))
         step = paths[path_id][1]
         frame = step['frame_index']
-        assert abs(priority-step['state_score']) < 1e-9
+        assert abs(priority-step.get('queue_priority', step['state_score'])) < 1e-9
         if encoded == found_states[frame]:
             continue
         row = details(step, 'other_retained_context')
@@ -269,7 +273,7 @@ def main():
             break
     connection.close()
     distributions = []
-    for frame in range(start, end+1):
+    for frame in reference_indices:
         entries = by_frame.get(frame, [])
         row = dict(frame_index=frame, other_contexts=len(entries))
         for field in ('geometry', 'color_accuracy', 'combined'):

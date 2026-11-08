@@ -96,7 +96,11 @@ def test_video_replays_consecutive_moves_once_and_freezes_solved_tail(m, tmp_pat
     move = dict(step(m),soft_window_penalty=.5,soft_window_penalty_until_frame=1,
                 supported_move_count=5,soft_window_protected_frame=1,
                 color_scoring='directional_confusion_cost',color_error=.25,color_match_count=4,
-                color_correct_count=2,color_confusion_count=2,color_forbidden_count=0,color_confusion_cost=.5)
+                color_correct_count=2,color_confusion_count=2,color_forbidden_count=0,color_confusion_cost=.5,
+                ilds_budget=2,ilds_choice_index=3,ilds_discrepancy=1,ilds_discrepancies_used=2,
+                compensatory_beam_id=1,compensatory_beam_start_frame=1,
+                compensatory_beam_end_frame=3,compensatory_beam_level=1,
+                compensatory_beam_phase='local',compensatory_beam_trigger='better_geometry_worse_color')
     result = dict(status='solved', solved_frame_index=2, config=dict(initial_scramble='R2', fps=25.),
         steps=[dict(frame_index=0, state_moves=[], observation_status='turning_start_frame'),
                dict(move, frame_index=1), dict(move, frame_index=2)])
@@ -124,6 +128,15 @@ def test_video_replays_consecutive_moves_once_and_freezes_solved_tail(m, tmp_pat
     assert records[3]['search']['status'] == 'solved_hold'
     assert records[1]['search']['soft_window_penalty'] == .5
     assert records[1]['search']['soft_window_penalty_until_frame'] == 1
+    assert records[1]['search']['ilds_budget'] == 2
+    assert records[1]['search']['ilds_discrepancies_used'] == 2
+    assert records[1]['search']['ilds_choice_index'] == 3
+    assert records[1]['search']['compensatory_beam_id'] == 1
+    assert records[1]['search']['compensatory_beam_level'] == 1
+    assert records[1]['search']['compensatory_beam_phase'] == 'local'
+    assert records[1]['search']['compensatory_beam_start_frame'] == 1
+    assert records[1]['search']['compensatory_beam_end_frame'] == 3
+    assert records[1]['search']['compensatory_beam_trigger'] == 'better_geometry_worse_color'
     assert records[1]['search']['supported_move_count'] == 5
     assert records[1]['color_scoring'] == 'directional_confusion_cost'
     assert records[1]['candidates'][0]['color_correct_count'] == 2
@@ -133,6 +146,30 @@ def test_video_replays_consecutive_moves_once_and_freezes_solved_tail(m, tmp_pat
 def test_unsolved_results_are_not_presented_as_winning_paths(m):
     with pytest.raises(ValueError, match='solved result'):
         video.render_result(m, {}, dict(status='exhausted'), 'missing.mp4')
+
+
+def test_render_handoff_uses_post_commit_colors_and_logs_move_once(m, tmp_path):
+    source = tmp_path / "input.avi"
+    writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*"MJPG"), 25., (256, 256))
+    assert writer.isOpened()
+    writer.write(np.zeros((256, 256, 3), dtype=np.uint8))
+    writer.release()
+    turn = dict(step(m, angle=33., offset=0.), frame_index=0, state_moves=["U'"],
+                handoff_commit=True, turn_handoff_bonus=.02, queue_priority=.08)
+    config = dict(initial_scramble="U", fps=25.)
+    before = m.CubeGeometryState.identity()
+    colors = video.replay.initial_sticker_colors(m, config["initial_scramble"])
+    candidate = video.candidate_for_step(m, record(m), turn, before, colors)
+    assert candidate.cube_geometry_state.signature() == before.apply_moves(("U'",)).signature()
+    assert candidate.sticker_layer_rotations[0].angle_degrees == 33.
+    log = tmp_path / "turns.jsonl"
+    result = dict(status="solved", solved_frame_index=0, config=config, steps=[turn])
+    report = video.render_result(m, {0: record(m)}, result, source, turn_log=log)
+    assert report["committed_moves"] == ["U'"]
+    logged = json.loads(log.read_text())
+    assert logged["cube_geometry_state_before"] == before.to_json()
+    assert logged["selected_committed_moves"] == ["U'"]
+    assert logged["search"]["handoff_commit"]
 
 
 def test_unobserved_bridge_move_keeps_video_and_log_state_in_sync(m, tmp_path, monkeypatch):

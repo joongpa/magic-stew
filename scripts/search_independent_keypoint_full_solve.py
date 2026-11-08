@@ -516,7 +516,7 @@ def add_nine_class_input_arguments(parser):
     source.add_argument("--log", type=Path, help="A nine-class turn/observation JSONL log, or its directory.")
     source.add_argument("--source", type=Path, help="Video to process with the landmark/color pose model.")
     parser.add_argument("--model", type=Path,
-                        default=ROOT / "runs/pose/runs/yoloPoseMedium/weights/best.pt")
+                        default=ROOT / "runs/pose/runs/26m-pose/weights/best.pt")
     parser.add_argument("--bbox-model", type=Path, default=ROOT / "runs/500ExamplesWeights.pt")
     parser.add_argument("--pose-class-conf", help="Per-class detection thresholds, e.g. red=0.35.")
     parser.add_argument("--keypoint-conf", type=float, default=.05,
@@ -648,7 +648,8 @@ class ReplayScorer:
                  turning_start_frame=None, balance_geometry_color=False, minimum_color_accuracy=None,
                  track_sticker_observations=False, joint_orientation_rescue=False,
                  color_confusion_pruning=False, color_confusion_cost=.5,
-                 color_confusion_scoring=False, preserve_layer_activity=False):
+                 color_confusion_scoring=False, preserve_layer_activity=False,
+                 tracked_color_confusions=None):
         import numpy as np
         self.np = np
         self.m = renderer
@@ -666,6 +667,7 @@ class ReplayScorer:
         self.color_confusion_scoring = color_confusion_scoring or color_confusion_pruning
         self.preserve_layer_activity = preserve_layer_activity
         self.color_confusion_cost = color_confusion_cost
+        self.tracked_color_confusions = tracked_color_confusions
         self.confusion_pruned_fits = 0
         self.confusion_dead_end_states = 0
         self.held_observations = {}
@@ -684,6 +686,13 @@ class ReplayScorer:
         labels = tuple(sorted(self.identity_indices, key=self.identity_indices.get))
         return self.m.CubeGeometryState({position: labels[index]
             for position,index in zip(self.positions,value,strict=True)})
+
+    def apply_moves(self, state, moves):
+        return state.apply_moves(moves)
+
+    def score_hold(self, frame, state):
+        return next((choice for choice in self(frame, state)
+                     if not choice.payload["state_moves"]), None)
 
     def solved_predicate(self, sticker_colors):
         return lambda state: state.is_solved(sticker_colors)
@@ -785,7 +794,8 @@ class ReplayScorer:
         for option in options:
             keypoint, sticker = metric(option["keypoint_mean_error"]), metric(option["heatmap_mean_error"])
             robust = option.get("global_robust_error", option.get("robust_error", keypoint+sticker))
-            geometry.append(dict(option, combined_mean_error=keypoint+sticker,
+            geometry_score = keypoint + sticker if m.turn_geometry_has_layer_support(option) else float("inf")
+            geometry.append(dict(option, combined_mean_error=geometry_score,
                 keypoint_error=keypoint, sticker_error=sticker, robust_error=metric(robust),
                 p90_error=metric(option["keypoint_p90_error"]),
                 layer_rotations=tuple(m.CubeLayerRotation(**rotation) for rotation in option["layer_rotations"]),
@@ -794,8 +804,10 @@ class ReplayScorer:
         geometry = tuple(geometry)
         projections = {}
         if self.color_confusion_scoring:
+            table = self.tracked_color_confusions
             projections['color_confusion_costs'] = m.turn_color_confusion_costs(
-                candidate, self.initial_colors or {}, self.color_confusion_cost)
+                candidate, self.initial_colors or {}, self.color_confusion_cost,
+                confusion_table=m.COLOR_CLASS_CONFUSIONS if table is None else table)
         result = (candidate, geometry, matrix,
                   m.PNP_FINAL_ASSIGNMENT_ERROR_FRACTION*m.projected_cube_diameter(candidate), projections)
         self.prepared[frame] = result
@@ -864,7 +876,8 @@ class PreparedReplayScorer(ReplayScorer):
                  turning_start_frame=None, balance_geometry_color=False, minimum_color_accuracy=None,
                  track_sticker_observations=False, joint_orientation_rescue=False,
                  color_confusion_pruning=False, color_confusion_cost=.5,
-                 color_confusion_scoring=False, preserve_layer_activity=False):
+                 color_confusion_scoring=False, preserve_layer_activity=False, track_color_confusions=False,
+                 tracked_color_confusions=None):
         if str(device) != "cpu":
             raise ValueError("Prepared replay scoring currently requires CPU")
         super().__init__(renderer, records, device, cache_size,
@@ -874,7 +887,9 @@ class PreparedReplayScorer(ReplayScorer):
                          joint_orientation_rescue=joint_orientation_rescue,
                          color_confusion_pruning=color_confusion_pruning, color_confusion_cost=color_confusion_cost,
                          color_confusion_scoring=color_confusion_scoring,
-                         preserve_layer_activity=preserve_layer_activity)
+                         preserve_layer_activity=preserve_layer_activity,
+                         tracked_color_confusions=tracked_color_confusions)
+        self.track_color_confusions = track_color_confusions
         self.compiled_frames = {}
         identities = renderer.canonical_sticker_identities()
         canonical_indices = renderer._turn_gpu_static_geometry()[-1]
@@ -1025,8 +1040,14 @@ class PreparedReplayScorer(ReplayScorer):
             matches = occupied.sum(axis=1).astype(np.int32)
             denominator = np.maximum(matches, 1)
             has_weight = matches > 0
+        confusion_costs = projections.get('color_confusion_costs')
+        if self.track_color_confusions and confusion_costs is None:
+            table = self.tracked_color_confusions
+            confusion_costs = m.turn_color_confusion_costs(
+                candidate, self.initial_colors or {}, self.color_confusion_cost,
+                confusion_table=m.COLOR_CLASS_CONFUSIONS if table is None else table)
         result = dict(nearest=nearest, weights=weights, match_matrix=match_matrix,
-            confusion_costs=projections.get('color_confusion_costs'),
+            confusion_costs=confusion_costs,
             denominator=denominator, has_weight=has_weight,
             observation_indices=None if nearest is None else np.arange(nearest.shape[1])[None, :],
             matches=matches, geometry_scores=np.asarray(geometry_scores),
@@ -1043,6 +1064,9 @@ class PreparedReplayScorer(ReplayScorer):
 
     def __call__(self, frame, state):
         return self._evaluate(frame, state, None)
+
+    def score_hold(self, frame, state):
+        return next(iter(self._evaluate(frame, state, False)), None)
 
     def for_update_context(self, frame, state, update, min_update_gap):
         if self.hold_reason(frame) is not None:
@@ -1220,7 +1244,7 @@ class PreparedReplayScorer(ReplayScorer):
                 correct = self.byte_popcounts[octets].sum(axis=2)
                 color_errors = np.where(selection['has_weight'][None, :],
                                        1.-correct/selection['denominator'][None, :], float('inf'))
-                if prepared['confusion_costs'] is not None:
+                if self.color_confusion_scoring:
                     confusion = self.m.sticker_color_confusion_metrics(identities, nearest,
                         selection['weights'], prepared['confusion_costs'], self.color_confusion_cost)
                     color_errors = confusion['error']
@@ -1260,7 +1284,9 @@ class PreparedReplayScorer(ReplayScorer):
             metrics = self.m.sticker_color_confusion_metrics(identities,
                 prepared['nearest'][index:index+1], prepared['weights'][index:index+1],
                 prepared['confusion_costs'], self.color_confusion_cost)
-        return self.m.color_confusion_trial_fields(metrics, 0, self.color_confusion_cost)
+        if self.color_confusion_scoring:
+            return self.m.color_confusion_trial_fields(metrics, 0, self.color_confusion_cost)
+        return dict(color_forbidden_count=int(metrics['forbidden'][0]))
 
     def _joint_transitions(self, prepared, state, encoded, restriction, diagnostic):
         winners = self._joint_winners(prepared, encoded, restriction)
@@ -1347,7 +1373,7 @@ class PreparedReplayScorer(ReplayScorer):
             correct = np.minimum(face_matches, 1.0).sum(axis=1)
             errors = np.where(selection["has_weight"],
                               1.0 - correct / selection["denominator"], float("inf"))
-            if prepared['confusion_costs'] is not None:
+            if self.color_confusion_scoring:
                 confusion = m.sticker_color_confusion_metrics(indices, selection['nearest'], selection['weights'],
                     prepared['confusion_costs'], self.color_confusion_cost)
                 errors = confusion['error']

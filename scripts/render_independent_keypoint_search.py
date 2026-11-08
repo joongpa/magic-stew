@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a saved full-search solution using its cached observations, without inference."""
+"""Render a saved search path using its cached observations, without inference."""
 from __future__ import annotations
 
 import argparse
@@ -49,6 +49,8 @@ def candidate_for_step(m, record, step, state, colors, *, after_solution=False):
         return None
     centers = {colors[i.label]: i.label for i in m.canonical_sticker_identities()
                if i.category == "center"}
+    if (step or {}).get("handoff_commit"):
+        state = state.apply_moves(tuple(step["state_moves"]))
     observed = np.asarray(pose.get("assignment_image_points") or [], dtype=float).reshape(-1, 2)
     candidate = m.StickerPnPCandidate(
         sticker_type=pose["sticker_type"], sticker_average_confidence=1.,
@@ -88,10 +90,13 @@ def candidate_for_step(m, record, step, state, colors, *, after_solution=False):
             # Materialize only the saved partial angle for diagnostic lines.
             # These display assignments do not alter its pose, state, or score.
             rotation = candidate.layer_rotations[0]
+            scoring_version = record.get("geometry_scoring_version", m.PNP_TURN_GEOMETRY_SCORE_VERSION)
+            seam_clearance = m.PNP_TURN_SEAM_CLEARANCE_MM if scoring_version >= 3 else 0.0
             options = m._score_turn_configurations_on_gpu(
                 base, m.PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * m.projected_cube_diameter(base),
                 "cpu", angle_values=np.asarray([rotation.angle_degrees]),
-                enforce_layer_observation_gate=False, enforce_validity_gate=False)
+                enforce_layer_observation_gate=False, enforce_validity_gate=False,
+                seam_clearance_mm=seam_clearance)
             chosen = next((o for o in options or [] if
                            (o["layer_axis"], o["layer_side"], o["layer_count"]) ==
                            (rotation.axis, rotation.side, rotation.layer_count)
@@ -124,8 +129,9 @@ def candidate_for_step(m, record, step, state, colors, *, after_solution=False):
 def render_result(m, records, result, source, *, output_path=None, display=False,
                   show_keypoints=True, show_orientation_axes=True, show_virtual_cube=True,
                   turn_log=None):
-    """Stream the source in order, replaying the winning path and its solved tail."""
-    if result.get("status") not in {"solved", "already_solved"}:
+    """Stream the source in order, stopping partial paths at their last saved frame."""
+    partial = result.get('status') == 'partial'
+    if not partial and result.get("status") not in {"solved", "already_solved"}:
         raise ValueError("Rendering requires a solved result with an accepted path")
     source = Path(source)
     if output_path is not None and Path(output_path).resolve() == source.resolve():
@@ -135,13 +141,16 @@ def render_result(m, records, result, source, *, output_path=None, display=False
     steps = {s["frame_index"]: s for s in result.get("steps", [])}
     if len(steps) != len(result.get("steps", [])):
         raise ValueError("Solution contains duplicate frame indices")
+    if partial and not steps:
+        raise ValueError('A partial replay requires saved path steps')
+    end_frame = max(steps) if partial else None
     config = result["config"]
     colors = replay.initial_sticker_colors(m, config["initial_scramble"])
     state = m.CubeGeometryState.identity()
     final_state = state
     for index in sorted(steps):
         final_state = final_state.apply_moves(tuple(steps[index].get("state_moves", ())))
-    if not final_state.is_solved(colors):
+    if not partial and not final_state.is_solved(colors):
         raise ValueError("Saved path does not solve the supplied scramble")
     accumulator = m.MoveAccumulator()
     capture = cv2.VideoCapture(str(source))
@@ -150,13 +159,13 @@ def render_result(m, records, result, source, *, output_path=None, display=False
     fps = float(capture.get(cv2.CAP_PROP_FPS)) or config["fps"]
     writer = None
     frame_index = 0
-    goal = result.get("solved_frame_index")
+    goal = None if partial else result.get("solved_frame_index")
     if turn_log is not None:
         Path(turn_log).parent.mkdir(parents=True, exist_ok=True)
     completed = True
     last_reliable_candidate = None
     try:
-        while True:
+        while end_frame is None or frame_index <= end_frame:
             ok, frame = capture.read()
             if not ok:
                 break
@@ -179,10 +188,12 @@ def render_result(m, records, result, source, *, output_path=None, display=False
                 ones = np.ones(len(points))
                 image, _ = m.draw_pose(image, points, ones, classes, ones, 0., {}, False, False)
             moves = tuple(step.get("state_moves", ())) if step else ()
+            observation = (replace(candidate, cube_geometry_state=state_before)
+                           if candidate is not None and step and step.get("handoff_commit") else candidate)
             if bridged:
                 accumulator.observe_unobserved_moves(moves, sticker_color_names=colors)
             else:
-                accumulator.observe(candidate, sticker_color_names=colors)
+                accumulator.observe(observation, sticker_color_names=colors)
             if candidate is not None and not bridged:
                 image = m.draw_sticker_pnp_candidate(image, candidate, False,
                                                     show_orientation_axes)
@@ -229,6 +240,20 @@ def render_result(m, records, result, source, *, output_path=None, display=False
                 label += f" | local rank {step['local_frame_rank']}/{step['local_candidate_count']}"
                 if step.get('outside_top_k_penalty'):
                     label += f" | outside top K +{step['outside_top_k_penalty']:.2f}"
+            if (step or {}).get('ilds_budget') is not None:
+                label += f" | ILDS {step['ilds_discrepancies_used']}/{step['ilds_budget']}"
+            if (step or {}).get('compensatory_beam_id') is not None:
+                label += (f" | local beam {step['compensatory_beam_id']}"
+                          f" frame {step['compensatory_beam_level']}"
+                          f" ({step['compensatory_beam_phase']})")
+            if (step or {}).get('bottom_quartile_match_rate') is not None:
+                label += f" | Q1 {step['bottom_quartile_match_rate']:.0%} | queue {step['queue_priority']:.3f}"
+            if step and 'turn_handoff_bonus' in step:
+                label += f" | turn bonus {step['turn_handoff_bonus']:.3f}"
+                if step.get('bottom_quartile_match_rate') is None:
+                    label += f" | queue {step['queue_priority']:.3f}"
+            if partial:
+                label = f"partial | {label}"
             (width, height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, .5, 1)
             cv2.rectangle(image, (4, 46-height), (min(image.shape[1]-1, width+12), 50+baseline),
                           (0, 0, 0), -1)
@@ -243,11 +268,16 @@ def render_result(m, records, result, source, *, output_path=None, display=False
                     'color_correct_count','color_confusion_count','color_forbidden_count',
                     'color_confusion_cost', 'local_frame_rank', 'local_candidate_count',
                     'outside_top_k_penalty', 'layer_activity', 'previous_layer_activity',
-                    'activity_evidence_status') if step and key in step}
+                    'activity_evidence_status', 'ilds_budget', 'ilds_choice_index',
+                    'ilds_discrepancy', 'ilds_discrepancies_used', 'compensatory_beam_id',
+                    'compensatory_beam_start_frame', 'compensatory_beam_end_frame',
+                    'compensatory_beam_trigger', 'compensatory_beam_phase',
+                    'compensatory_beam_level', 'bottom_quartile_match_rate',
+                    'bottom_quartile_penalty', 'handoff_commit', 'turn_handoff_bonus') if step and key in step}
                 forced_static = (step or {}).get("observation_status") == "turning_start_frame"
                 search_status = ('unreliable_frame_bridge' if bridged else
                                  "forced_static" if forced_static else
-                                 "full_search_winning_path" if step else
+                                 ("full_search_partial_path" if partial else "full_search_winning_path") if step else
                                  "solved_hold" if tail else "outside_search_interval")
                 if candidate is None and bridged:
                     row = dict(record, selected_committed_moves=list(moves),
@@ -257,7 +287,7 @@ def render_result(m, records, result, source, *, output_path=None, display=False
                     with Path(turn_log).open('a') as stream:
                         stream.write(json.dumps(row)+'\n')
                 else:
-                    m.append_turn_candidate_log(Path(turn_log), replace(candidate,
+                    m.append_turn_candidate_log(Path(turn_log), replace(observation,
                     turn_selected_trial_id=(step or {}).get("trial_id"),
                     turn_candidate_diagnostics=(dict(step),) if step and "trial_id" in step else (),
                     turn_search_diagnostics=dict(status=search_status,
@@ -287,12 +317,13 @@ def render_result(m, records, result, source, *, output_path=None, display=False
         else:
             print()
     if completed and any(index >= frame_index for index in steps):
-        raise ValueError("Source video ends before the saved solution path")
+        raise ValueError("Source video ends before the saved path")
     if writer is not None:
         m.add_quicktime_frame_counter(Path(output_path))
-        print(f"Saved full-search solution: {output_path}", flush=True)
+        print(f"Saved {'partial search replay' if partial else 'full-search solution'}: {output_path}", flush=True)
     return dict(source=str(source.resolve()), output=str(Path(output_path).resolve()) if output_path else None,
-                frames=frame_index, fps=fps, completed=completed, path="saved_full_search_solution",
+                frames=frame_index, fps=fps, completed=completed,
+                path="saved_partial_search_path" if partial else "saved_full_search_solution",
                 model_inference_used=False, move_search_used=False, solved_frame_index=goal,
                 virtual_cube_panel=show_virtual_cube,
                 committed_moves=list(accumulator.moves))

@@ -383,7 +383,7 @@ changes affect labels only, so the model must be retrained on regenerated data.
 
 Render independent-keypoint predictions with the bbox → padded square ROI →
 pose → ROI-tracking flow. The default checkpoint is the YOLO medium model in
-`runs/pose/runs/yoloPoseMedium/weights/best.pt`. It predicts three geometric
+`runs/pose/runs/26m-pose/weights/best.pt`. It predicts three geometric
 landmark classes (`corner`, `corner-edge`, `corner-edge-center`) and six sticker
 color classes (`white`, `yellow`, `orange`, `red`, `blue`, `green`) in one pass.
 Class IDs are resolved from the checkpoint's class names. No segmentation model
@@ -533,8 +533,7 @@ keypoints by their predicted class and shows the correct fraction and mismatch
 cost. Forced-static frames explicitly show that move search was skipped. Older
 probability logs remain viewable; regenerate logs to include the new color labels.
 
-For a full-solve search whose next branch has the fewest repeatedly incorrect
-physical stickers across the entire queue, use:
+To search the even and odd source frames independently:
 
 ```bash
 .venv/bin/python scripts/search_independent_keypoint_frame.py \
@@ -544,237 +543,77 @@ physical stickers across the entire queue, use:
   --output-dir runs/full-solve-frame/my_solve
 ```
 
-This uses the nine-class `yoloPoseMedium` checkpoint and ROI padding `0.4` by
-default; `--model PATH` and `--roi-padding RATIO` override them. The independent
-keypoint renderer also defaults to ROI padding `0.4`. The video pass caches landmarks, sticker color classes, and all
-retained geometric options in `observations.jsonl`. It performs no local move
-rollout or color calibration. Sticker color keypoints retain the `0.25`
-visibility floor. Frames through the turning boundary are static; neither turn
-geometry nor move alternatives are evaluated there. Source FPS is inferred
-from the video, with the existing move-spacing and double-turn rules retained.
+The two passes run sequentially at half the input FPS and share a single
+observation cache. With a full-rate cache, their paths retain the original
+source frame numbers. Use
+`--frame-parity odd` or `--frame-parity even` for a single pass, or
+`--frame-parity all` for a full-rate pass. Supply `--log PATH` in place of
+`--source` to reuse a nine-class observation cache. Older parity logs with
+`original_source_frame` fields are already sampled and keep their stored FPS.
 
-The default queue order is current `0.5 * normalized_geometry + 0.5 * color_error`,
-plus a soft local-rank penalty, then greater depth and insertion order. History ordering and soft backtracking
-penalties are off in this default `--queue-order frame-score` mode.
+Each pass takes the lowest current-frame score from its priority queue.
+The score is `0.5 * normalized_geometry + 0.5 * color_error`. Geometry uses
+the cached landmark and sticker-position fit across the projected cube.
+Color error averages the best detection cost for each observed projected
+sticker. Exact matches cost zero and mismatches cost one. For `26m-pose`,
+white → yellow, yellow → orange or white, orange → red, and red → orange
+cost 0.5. The arrows go from expected color to detected color. Pose and partial
+turn options compete using the same score. An identical cube state at the
+same frame keeps its best fit. Equal scores prefer deeper paths and then
+insertion order. The solved state is accepted when popped from the queue.
+`--queue-geometry-weight` changes the geometry coefficient for queue ordering.
+The queue's color coefficient stays at 0.5, and candidate fitting uses the
+50/50 score above. `--ignore-queue-geometry` sets the queue geometry coefficient
+to zero.
 
-`--soft-top-k 8` prefers the top eight physical successors for each parent/frame.
-Rank is determined by geometry + weighted color after move-spacing checks and
-before the activity check. Equal scores at the eighth-place boundary receive
-the same treatment. Multiple partial fits of the same cube successor count
-once, using its best fit to determine its rank. Choices outside the top eight
-receive `--outside-top-k-penalty 0.25`. They remain interleaved with the entire
-queue and can still win; they are never discarded or put behind a hard tier.
-The penalty applies only to the latest incoming choice, not the full path.
-Use `--soft-top-k 0` to disable it.
+The video pass uses the nine-class `26m-pose` model and ROI padding
+`0.4` by default. The last static frame is inclusive. Frames through that
+boundary hold the supplied scramble, and subsequent sampled frames each
+offer a hold or a scored turn. `--start-frame` and `--end-frame` select an
+interval before parity sampling. Observation caches with stale probability
+or geometry scoring must be regenerated.
 
-`--require-layer-activity` is on by default. A committed state change requires
-activity on the same physical axis, side and width in the immediately preceding
-frame. Activity is a nonzero fitted partial angle or a committed state change,
-including a change with zero residual misalignment. Direction is ignored by
-this activity check, while the existing move-spacing/double-turn rules still
-apply. A partial hold can supply evidence; an aligned hold clears it. The
-current change supplies the second activity frame and cannot supply both frames
-by itself. Static opening frames do not supply activity. Globally unobserved
-bridge frames retain their no-information policy and do not rule out layers.
-Use `--no-require-layer-activity` to disable the check.
+`--mismatch-window-weight 1` adds the pooled rate of out-of-table sticker
+color mismatches from the last eight sampled frames to the queue score.
+The same `26m-pose` pairs are excluded from this window term.
 
-Activity affects legal continuations, so the scorer keeps the best hold fit
-for each distinct active layer and for alignment. These contexts stay distinct
-when merging cube states. Equivalent quarter-turn successors still share their
-state object; pose alternatives do not create 24 copies of each branch.
+`--branch-widths 3 5 8` admits the top 3 distinct children per parent by
+candidate fit, then widens to 5 and 8. Widening releases saved children from
+previously expanded parents into the same priority queue. Each stage widens
+when the queue empties or after 100 expansions per sampled frame in the
+solve interval. The interval starts after the last static frame and ends at
+the selected end frame. Use `--branch-stage-expansions` for a fixed budget.
 
-Directional color-confusion scoring is on by default. Arrows mean **expected
-sticker color → predicted keypoint class**, using only these direct pairs:
+The bidirectional script accepts the same width schedule. Its two queues
+have separate expansion budgets and mismatch histories. A run joins when
+both sides reach the same cube state and compatible turn handoff at the
+same frame boundary. Supply a flat solved frame with `--end-frame` as the
+backward anchor.
 
-| Expected | Permitted incorrect predictions |
-|---|---|
-| red | orange |
-| orange | yellow, red |
-| yellow | orange, white, green |
-| white | blue, yellow |
-| green | yellow |
-| blue | none |
+`--search-seconds 300` sets a search-only time limit per pass.
+`--max-explored-states 20000` sets an exact expansion limit per pass.
+A two-pass run writes a `summary.json` and separate `even/` and `odd/`
+directories. Each pass saves `config.json`, `progress.jsonl`, `status.json`,
+`result.json`, and its SQLite search queue. A single pass writes directly
+to the output directory. Create an `OUTPUT_DIR/STOP` file to stop the run.
 
-Exact matches cost zero. A listed confusion costs `0.5`
-(`--color-confusion-cost`, strictly between zero and one). Any other mismatch
-costs `1`; it does not reject the branch. Pairs never chain: white → orange
-and orange → blue cost `1`. Reverse pairs receive reduced cost only if
-explicitly listed, so blue → white costs `1`.
-
-Each observed projected sticker contributes its **best** contained prediction:
-an exact match wins over duplicate incorrect points, and a permitted confusion
-wins over forbidden duplicates. Points outside the projected cube do not vote.
-`color_error = (confusion_cost * permitted_wrong_stickers + unlisted_wrong_stickers) / observed_stickers`.
-Counters log exact, permitted, and unlisted counts
-separately; the rendered output never presents weighted credit as an exact
-match count. Forced-static opening frames and unobserved bridge frames retain
-their existing behavior.
-
-Use `--no-color-confusion-scoring` for the old exact-match fraction. There is
-no percentage cutoff in either mode. The optional legacy
-`--color-confusion-pruning` flag restores rejection of unlisted mismatches;
-it is off by default. If every branch dies, the console reports no solution.
-
-The optional `--queue-order sticker-history` adds a graded history penalty.
-Each of the 54 physical stickers keeps its last **four observations**, including
-the current frame. Its penalty is `(wrong_observations_in_last_four / 4)^2`;
-the sum across stickers is multiplied by `--sticker-history-weight` (default
-`0.1`) and added to the fit. One through four wrong observations contribute
-`0.0625`, `0.25`, `0.5625`, and `1`. The denominator stays four for shorter
-histories, so errors cost something immediately without treating one early
-error as four. Unobserved stickers keep their histories without adding votes.
-The fixed opening poses also collect history, without performing move search
-or orientation rescue. Identities persist across moves and pose rescue.
-Multiple color keypoints inside one projected sticker contribute one
-observation, correct if any of those colors match. Histories can recover as
-older wrong observations leave the four-observation window.
-
-The existing fit score still chooses the best pose/partial-angle fit for each
-state, before incorporating its history into the queue priority:
-`0.5 * normalized_geometry + 0.5 * color_error`, where
-`color_error = 1 - correct / observed_stickers_inside_projected_cube` when
-confusion scoring is disabled, or the weighted confusion fraction above.
-Geometry averages two bounded costs: landmark error divided by the existing
-0.05 cube-size tolerance and sticker-position penalty divided by its 0.05
-maximum, each capped at 1. The coefficients are 25% landmarks, 25% sticker
-positions, and 50% color error; permitted color confusions reduce the color
-error's severity as specified above. Invalid fits remain invalid.
-Landmark error and validity use the whole projected cube after applying the
-candidate partial turn. Layer membership contributes diagnostic counts only;
-missing support on the proposed layer cannot erase the global landmark error.
-Nonfinite landmark costs remain invalid instead of becoming zero. Cached logs
-containing the former zero-keypoint fallback must be regenerated; replay rejects
-those stale geometry options. New observation logs record geometry scoring version 2.
-All pending branches compete globally. Static exact state agreement below 2/3 triggers
-orientation rescue. Frame search jointly scores all 24 orientations with the
-cached partial-turn geometry and discrete offsets, selecting the lowest
-geometry + color fit separately for each physical successor. History does not
-select the fit. This avoids committing to an orientation from the unturned
-cube while a layer is turning. Only the winning physical successors enter the
-queue, not 24 copies of each branch. The prepared CPU scorer batches the color
-checks and reuses its projections. `--no-joint-orientation-rescue` restores the
-previous static-only orientation choice. Use `--queue-order sticker-mismatches` to restore
-the earlier lexicographic binary mismatch ordering (three incorrect out of four,
-requiring four observations). No queue mode imposes the old 2/3 hard color cutoff.
-If no solution survives,
-the console reports that the search exhausted its branches and stops.
-There is no past-path mean, cumulative-cost priority, forecast, combined-score threshold,
-beam, or expansion budget. Solved branches are accepted when removed from the
-priority queue. In graded mode, equivalent frame/physical-sticker-arrangement/
-move-spacing contexts retain the complete path with the lowest current fit +
-history penalty. Better histories replace pending entries or reopen expanded
-ones; the histories and move logs of different paths are never mixed. This is
-an approximation because alternate histories can rank differently after future
-observations, though the merged state retains the same legal continuations.
-Use `--no-merge-sticker-histories` to retain separate histories. Legacy ordering
-modes retain their previous history behavior. Disk overflow preserves the
-ordering and the entire selected history.
-
-Graded mode also defaults to a soft four-supported-move window
-(`--soft-backtrack-moves 4`; use `0` to disable). Supported moves require
-normalized geometry at most `0.5`, at least `2/3` color agreement and no increase
-in history penalty on that move. Holds and weak observations earn no support.
-Move progress uses a loop-erased physical-state trail modulo whole-cube
-rotations, so canceling detours and rotations do not earn extra confidence.
-After an expanded path has more than four supported moves, newly generated
-nonbest children at or before its older boundary receive a temporary queue
-penalty (`--late-fork-penalty 0.5`). Existing branches and each parent's best
-continuation remain eligible without a new penalty. The penalty expires when
-the fork passes the boundary recorded at its creation. No fork is deleted.
-Only the selected complete path's history and support trail survive a merge.
-
-Winning-path logs retain hexadecimal observed/correct physical-sticker masks,
-the history penalty, combined queue score, diagnostic binary mismatch count,
-number of stickers with four observations, and mismatched identity mask.
-`config.json` supplies the history weight, 54 identity labels and their scramble
-colors. Console progress, rendered video and the turn reviewer show the history
-penalty and queue score. History adds no hard pruning.
-Soft-window boundaries, supported move counts, and old-fork penalties are also
-logged; console progress and the reviewer expose the scheduling penalty.
-
-The full-search replay scorers apply the rescue trigger separately to each
-queued state. In frame search, a triggered rescue jointly selects orientation
-and partial-turn fit per physical successor, using the same 50/50 score.
-Console JSON logs joint-rescue calls and color-configuration counts; winning
-trials record the selected symmetry and `joint_orientation_and_turn_fit` phase.
-The prepared scorer reuses
-cached static sticker assignments and cube-symmetry permutations; geometry
-does not need to be projected again for each state.
-
-Reuse cached nine-class observations with `--log /path/to/observations.jsonl`
-in place of `--source`; `--start-frame` and `--end-frame` select a consecutive
-source interval. Pose translations and projected geometry stay cached during full search, with categorical colors
-scored against each candidate state. Old RGB probability logs must be
-regenerated. The output directory contains the input provenance, `config.json`,
-`progress.jsonl`, `status.json`, `result.json`, and the SQLite search queue.
-Creating an `OUTPUT_DIR/STOP` file requests an orderly stop.
-
-For the experimental recovery across globally weak observations, add
-`--bridge-unreliable-frames`. A frame is reliable when at least one geometric
-hypothesis has whole-cube `REPROJ fit` at most `0.1` and explains
-at least half of the observed landmarks within the existing inlier tolerance.
-This is exactly the top-left display metric: median landmark residual plus
-half its 90th percentile, divided by projected cube diameter. It is separate
-from the clipped 0–1 geometry component used for 50/50 search ranking. This
-decision uses geometry and coverage only, independently of cube state or
-color agreement. The limits are configurable with `--bridge-max-reprojection`
-and `--bridge-min-inlier-fraction`. New observation caches store the display
-metric per geometric hypothesis; older caches recover it with one geometric
-projection pass per frame, without model inference or state/color scoring.
-
-Short weak gaps carry only legal discrete moves and holds. They do not run
-partial-angle fitting, orientation rescue, or color pruning. Equivalent
-physical states with equivalent move-spacing context merge inside the gap.
-Only reliable frames contribute sticker observations and the existing 50/50
-fit score. Weak frames
-preserve all sticker histories and inherit the last reliable combined queue
-score and fit tie-break. With
-`--queue-order frame-score`, the inherited fit plus local-rank penalty remains the priority.
-By default, one expansion batch covers at most two weak
-frames and 0.1 seconds (`--bridge-max-frames`, `--bridge-max-seconds`), with a
-minimum of one frame. Longer gaps continue in unscored batches, carrying the
-last reliable queue priority until another reliable observation is reached.
-No weak frame's geometry or colors narrow its alternatives, regardless of
-gap length. Weak frames cannot confirm a solved goal. Forced-static frames
-are never bridged.
-
-`frame_quality.json` records every frame's global reliability decision. The
-winning path retains individual source-frame moves inside bridged gaps, marked
-`bridge_inferred`, with null scores instead of fabricated zero errors. The
-virtual cube replays those inferred moves using the last reliable orientation;
-the camera pose overlay is hidden on those frames. The feature is off by
-default, so unmodified commands retain the original search behavior.
-
-Add `--save-final-video runs/my_solve.mp4` to the full-search command to render
-the accepted solution after the search finishes. `--display` opens the same
-replay interactively. The output uses the independent-keypoint renderer's
-landmarks, colored sticker keypoints, cube wireframe, moving-layer overlay,
-red/white/green axes, and accumulated moves. A colored virtual cube beside the
-camera view shows the winning state and partial turn, using the independent
-renderer's stationary side panel. The overlay includes the winning frame's combined
-score and correct/observed color count. Rendering replays the saved decisions;
-it does not run inference or select new moves. After the solved frame, the
-committed state stays fixed through the remaining video frames. An exhausted
-or interrupted search does not produce a winning-path video.
-
-To render an existing result without rerunning the search:
+Add `--save-final-video runs/my_solve.mp4` or `--display` to replay the first
+solved pass with its pose overlays and virtual cube. The replay uses the
+original video clock and holds the last committed state on unsampled frames.
+To render a saved solution later, pass the solved directory to the renderer:
 
 ```bash
 .venv/bin/python scripts/render_independent_keypoint_search.py \
-  --result runs/full-solve-frame/my_solve \
+  --result runs/full-solve-frame/my_solve/even \
   --save-final-video runs/full-solve-frame/my_solve/solution.mp4 \
   --turn-candidate-log runs/full-solve-frame/my_solve/rendered_turn_candidate_scores.jsonl
 ```
 
-The original video path comes from the cached input metadata; `--source PATH`
-overrides it (`--render-source PATH` in the search command). The automatic
-render also writes `rendered_turn_candidate_scores.jsonl` in the run directory
-for `review_turn_candidates.py`. This log contains the selected winning-path
-trial for each frame. `--no-show-keypoints` and `--no-show-orientation-axes`
-work with either render command. `--no-show-virtual-cube` hides the side panel;
-it is enabled by default for both saved output and interactive display.
-Saved videos preserve the source FPS, source
-frame indices, and QuickTime frame counter.
+The original video path comes from the input metadata. Override it with
+`--source PATH` for the renderer or `--render-source PATH` for the search.
+The turn log can be opened with `review_turn_candidates.py`.
+`--no-show-keypoints`, `--no-show-orientation-axes`, and
+`--no-show-virtual-cube` control the replay overlays.
 
 For ground-truth overlays on the prepared dataset, use
 `scripts/render_independent_keypoints.py`:

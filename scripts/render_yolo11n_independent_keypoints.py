@@ -15,13 +15,13 @@ Examples:
     .venv/bin/python scripts/render_yolo11n_independent_keypoints.py \
         --source data/independent_keypoints_dataset_v2/images/000000.png \
         --initial-scramble "" \
-        --model runs/pose/runs/yoloPoseMedium/weights/best.pt \
+        --model runs/pose/runs/26m-pose/weights/best.pt \
         --save runs/independent_keypoints_render.png \
         --no-display
 
     .venv/bin/python scripts/render_yolo11n_independent_keypoints.py \
         --source 0 --initial-scramble "" \
-        --model runs/pose/runs/yoloPoseMedium/weights/best.pt
+        --model runs/pose/runs/26m-pose/weights/best.pt
 """
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ WINDOW_NAME = "independent cube keypoints"
 DEFAULT_BBOX_MODEL = ROOT / "runs/500ExamplesWeights.pt"
 DEFAULT_POSE_MODEL = (
     ROOT
-    / "runs/pose/runs/yoloPoseMedium/weights/best.pt"
+    / "runs/pose/runs/26m-pose/weights/best.pt"
 )
 STICKER_COLORS_BGR = {
     "white": (255, 255, 255),
@@ -273,7 +273,8 @@ PNP_TURN_MASK_CENTER_WEIGHT = 1.0
 # ranking. Geometry is landmark error plus the sticker-point term; color is
 # one minus the fraction of observed projected stickers with matching colors.
 PNP_TURN_COLOR_WEIGHT = 1.0
-PNP_TURN_GEOMETRY_SCORE_VERSION = 2  # Whole-cube validity; invalid landmark costs remain invalid.
+PNP_TURN_GEOMETRY_SCORE_VERSION = 3  # Allow clearance at the seam of an articulated layer.
+PNP_TURN_SEAM_CLEARANCE_MM = 2.0
 # Check the unchanged state's colors before generating move alternatives.
 # Subtraction matches the categorical scorer exactly at the 2/3 boundary.
 PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR = 1.0 - 2.0 / 3.0
@@ -868,6 +869,11 @@ def turn_trial_has_invalid_color(trial: dict[str, object]) -> bool:
     """Missing color is neutral; an available nonfinite color fit is invalid."""
 
     return 'color_error' in trial and not np.isfinite(float(trial['color_error']))
+
+
+def turn_geometry_has_layer_support(option: dict[str, object]) -> bool:
+    """A flat fit needs no layer evidence; a partial turn needs an inlier."""
+    return not option.get("layer_rotations") or option.get("layer_inlier_count") != 0
 
 
 def turn_trial_activity_layer(trial: dict[str, object]) -> tuple | None:
@@ -5348,6 +5354,7 @@ def _score_turn_configurations_on_gpu(
     angle_values: np.ndarray | None = None,
     enforce_layer_observation_gate: bool = True,
     enforce_validity_gate: bool = True,
+    seam_clearance_mm: float = PNP_TURN_SEAM_CLEARANCE_MM,
 ) -> list[dict[str, object]] | None:
     """Batch exhaustive turn projection and scoring on a Torch device.
 
@@ -5484,7 +5491,8 @@ def _score_turn_configurations_on_gpu(
         ).any(dim=2)
 
         triangle_coordinates = triangle_centers_t[:, axes].T
-        triangle_boundary = CUBE_HALF_SIZE_MM - layer_counts * CUBE_LAYER_SIZE_MM + CUBE_LAYER_SIZE_MM / 2.0
+        layer_seam = CUBE_HALF_SIZE_MM - layer_counts * CUBE_LAYER_SIZE_MM
+        triangle_boundary = layer_seam + CUBE_LAYER_SIZE_MM / 2.0
         triangle_layer_mask = torch.where(
             sides[:, None] > 0.0,
             triangle_coordinates >= triangle_boundary[:, None] - 1e-4,
@@ -5537,6 +5545,16 @@ def _score_turn_configurations_on_gpu(
             & (distance > 1e-5)
             & (distance < 1.0 - 1e-4)
         )
+        if seam_clearance_mm > 0.0:
+            # The mesh has square, gapless cubies. Near a turning seam it
+            # can hide stationary landmarks visible through the real gap.
+            seam_vertices = (sides[:, None] * point_coordinates - layer_seam[:, None]).abs() <= 1e-4
+            camera_axis = camera_origin[0, 0, axes][:, None]
+            axial_ray_span = (point_coordinates - camera_axis).abs()
+            hit_gap_from_seam = (1.0 - distance) * axial_ray_span[:, :, None]
+            near_moving_edge = (seam_vertices[:, :, None] & triangle_layer_mask[:, None, :]
+                                & (hit_gap_from_seam < seam_clearance_mm))
+            triangle_hits &= ~near_moving_edge
         hidden_by_surface = torch.any(triangle_hits, dim=2)
         visible_points = front_facing & torch.where(active[:, None], ~hidden_by_surface, ~hidden_by_cube)
         projected = _torch_project_turn_points(
@@ -6027,14 +6045,22 @@ COLOR_CLASS_CONFUSIONS = {
     'green': frozenset(('yellow',)),
     'blue': frozenset(),
 }
+POSE_26M_COLOR_CONFUSIONS = {
+    **dict.fromkeys(COLOR_CLASS_CONFUSIONS, frozenset()),
+    'white': frozenset(('yellow',)),
+    'yellow': frozenset(('orange', 'white')),
+    'red': frozenset(('orange',)),
+    'orange': frozenset(('red',)),
+}
 _COLOR_MASK_POPCOUNTS = np.asarray([i.bit_count() for i in range(256)], dtype=np.uint8)
 
 
-def turn_color_confusion_costs(candidate, expected_color_by_label, confusion_cost=.5):
+def turn_color_confusion_costs(candidate, expected_color_by_label, confusion_cost=.5, *,
+                               confusion_table=COLOR_CLASS_CONFUSIONS):
     """Costs [physical sticker, predicted point]; arrows mean expected -> predicted.
 
     Lookup uses only direct pairs, never graph reachability or reverse edges.
-    Unlisted mismatches have cost one and are hard-rejected by the scorer.
+    Unlisted mismatches have cost one.
     """
     if not np.isfinite(confusion_cost) or not 0 < confusion_cost < 1:
         raise ValueError('Color confusion cost must be strictly between zero and one')
@@ -6042,10 +6068,10 @@ def turn_color_confusion_costs(candidate, expected_color_by_label, confusion_cos
     if len(predicted) != len(candidate.sticker_mask_centers):
         raise ValueError('Color confusion pruning requires one class per sticker keypoint')
     expected = [expected_color_by_label.get(i.label) for i in canonical_sticker_identities()]
-    if any(c not in COLOR_CLASS_CONFUSIONS for c in (*expected, *predicted)):
+    if any(c not in confusion_table for c in (*expected, *predicted)):
         raise ValueError('Color confusion pruning requires known scramble colors and six-class observations')
     return np.asarray([[0. if truth == observed else
-                        confusion_cost if observed in COLOR_CLASS_CONFUSIONS[truth] else 1.
+                        confusion_cost if observed in confusion_table[truth] else 1.
                         for observed in predicted] for truth in expected], dtype=np.float64).reshape(54, len(predicted))
 
 
@@ -6505,7 +6531,10 @@ def _score_turn_color_offsets_for_states_on_gpu(
         # keeps frontier/cache size bounded while retaining angle alternatives
         # through color scoring (e.g. Y--15 versus Y-+45).
         configured_options = [geometry_options[item[0]] for item in configurations]
-        geometry_scores = np.asarray([float(option["combined_mean_error"]) for option in configured_options])
+        geometry_scores = np.asarray([
+            float(option["combined_mean_error"]) if turn_geometry_has_layer_support(option) else float("inf")
+            for option in configured_options
+        ])
         if balance_geometry_color:
             geometry_scores = np.where(np.isfinite(geometry_scores), balanced_geometry_cost(
                 [option["keypoint_error"] for option in configured_options],

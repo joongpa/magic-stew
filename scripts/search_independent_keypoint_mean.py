@@ -493,7 +493,8 @@ class BufferedMeanQueue(MeanQueue):
         return True
 
     def pop_deferred(self, deserialize_state):
-        self.flush()
+        if self.dirty_deferred:
+            self.flush()
         row = self.connection.execute("""SELECT key,required,depth,total,payload,priority,secondary FROM deferred
             ORDER BY required,priority,secondary,depth DESC,serial LIMIT 1""").fetchone()
         key, required, depth, total, payload, priority, secondary = row

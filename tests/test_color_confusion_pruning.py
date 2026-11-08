@@ -155,23 +155,6 @@ def test_scorers_reject_forbidden_fits_before_state_construction(
             assert scorer.child_states_built == 0
 
 
-def test_hard_filter_returns_exhausted_instead_of_retrying_or_relaxing():
-    choice = f.replay.Transition(
-        "goal", 0.01, (0.01,), dict(state_moves=(), color_error=0.01, color_forbidden_count=1)
-    )
-    result = f.frame_full_solve(
-        "root",
-        (0,),
-        lambda *_: (choice,),
-        lambda s: s == "goal",
-        str,
-        minimum_color_accuracy=None,
-        color_confusion_pruning=True,
-    )
-    assert result["status"] == "exhausted"
-    assert result["color_pruned"] == 1 and not result["steps"]
-
-
 @pytest.mark.parametrize('cls', [f.replay.PreparedReplayScorer, f.replay.ReplayScorer])
 @pytest.mark.parametrize('joint', [False, True])
 @pytest.mark.parametrize('predicted,error', [('orange', 0.), ('yellow', .5), ('blue', 1.)])

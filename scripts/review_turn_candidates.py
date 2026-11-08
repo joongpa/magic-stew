@@ -1045,6 +1045,10 @@ async function loadFrame() {
     $('frameInfo').textContent+=` · history penalty ${scoreText(data.search.sticker_history_penalty)} · queue ${scoreText(data.search.queue_priority??data.search.inherited_queue_priority)}`;
   if(data.search?.soft_window_penalty)
     $('frameInfo').textContent+=` · old-fork penalty ${scoreText(data.search.soft_window_penalty)}`;
+  if(typeof data.search?.ilds_budget==='number')
+    $('frameInfo').textContent+=` · ILDS ${data.search.ilds_discrepancies_used}/${data.search.ilds_budget} discrepancies · choice ${data.search.ilds_choice_index}`;
+  if(typeof data.search?.compensatory_beam_id==='number')
+    $('frameInfo').textContent+=` · local beam ${data.search.compensatory_beam_id} · frame ${data.search.compensatory_beam_level} (${data.search.compensatory_beam_phase}) · window ${data.search.compensatory_beam_start_frame}–${data.search.compensatory_beam_end_frame}`;
   $('candidateTitle').textContent=staticOnly ? 'Static pose (turn search not tested)' : (count ? `Candidate ${candidateIndex+1}/${count}` : 'No tested candidate');
   $('layerInfo').textContent=activeLayer ? `${groupTitle(`${activeLayer.axis}:${activeLayer.side}:${activeLayer.width}`)} · sticker angle ${candidateAngle(candidates[candidateIndex])}° · , / . to adjust` : 'Click a layer; double-click for two layers. Use , / . to turn.';
   $('correct').disabled=!count; $('selectNext').disabled=!count;

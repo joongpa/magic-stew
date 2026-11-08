@@ -182,7 +182,7 @@ def test_inference_calls_only_pose_model():
     result = m.predict_pose_result(Pose(), np.zeros((32, 32, 3)), args)
     assert result == "pose-result"
     assert len(calls) == 1
-    assert "yoloPoseMedium" in str(args.model)
+    assert args.model == m.ROOT / "runs/pose/runs/26m-pose/weights/best.pt"
 
 
 def test_diagonal_center_error_beats_compactness_and_confidence():
