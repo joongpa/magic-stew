@@ -582,6 +582,15 @@ class CubeLayerRotation:
     side: int
     angle_degrees: float
     layer_count: int = 1
+    middle: bool = False
+
+
+def layer_rotation_payload(rotation: CubeLayerRotation) -> dict:
+    result = dict(axis=rotation.axis, side=rotation.side, angle_degrees=rotation.angle_degrees,
+                  layer_count=rotation.layer_count)
+    if rotation.middle:
+        result['middle'] = True
+    return result
 
 
 @dataclass(frozen=True)
@@ -717,7 +726,10 @@ def cube_rotation_to_notation(rotation: CubeLayerRotation) -> str | None:
         return None
     layer_count = int(rotation.layer_count)
     normal_quarter_turn = -1
-    if layer_count >= 3:
+    if rotation.middle:
+        base = ('M', 'S', 'E')[rotation.axis]
+        normal_quarter_turn = int(rotation.side)
+    elif layer_count >= 3:
         whole_cube_names = {0: "x", 1: "z", 2: "y"}
         base = whole_cube_names.get(int(rotation.axis))
         if base is None:
@@ -734,6 +746,52 @@ def cube_rotation_to_notation(rotation: CubeLayerRotation) -> str | None:
     if quarter_turns == 2:
         return f"{base}2"
     return base if quarter_turns == normal_quarter_turn % 4 else f"{base}'"
+
+
+def parallel_layer_rotations(axis, angles):
+    """Represent angles for the negative, middle and positive slabs on one axis."""
+    negative, middle, positive = angles
+    if negative == middle and negative and not positive:
+        return (CubeLayerRotation(axis, -1, -negative, 2),)
+    if positive == middle and positive and not negative:
+        return (CubeLayerRotation(axis, 1, positive, 2),)
+    return tuple(rotation for rotation in (
+        CubeLayerRotation(axis, -1, -negative),
+        CubeLayerRotation(axis, -1, -middle, middle=True),
+        CubeLayerRotation(axis, 1, positive),
+    ) if rotation.angle_degrees)
+
+
+def parallel_layer_angles(rotations):
+    angles = [0., 0., 0.]
+    for rotation in rotations:
+        if rotation.middle:
+            layers = (1,)
+        elif rotation.side < 0:
+            layers = range(rotation.layer_count)
+        else:
+            layers = range(3 - rotation.layer_count, 3)
+        for layer in layers:
+            angles[layer] += rotation.side * rotation.angle_degrees
+    return tuple(angles)
+
+
+@lru_cache(maxsize=3)
+def parallel_turn_actions(axis):
+    return {tuple(cube_rotation_to_notation(r) for r in parallel_layer_rotations(axis, offsets)): offsets
+            for offsets in product((-90., 0., 90.), repeat=3)}
+
+
+def transform_turn_action(action, symmetry):
+    """Relabel a same-axis action, including the order of commuting turns."""
+    if not action:
+        return action
+    axis, offsets = next((axis, parallel_turn_actions(axis)[action]) for axis in range(3)
+                         if action in parallel_turn_actions(axis))
+    target = int(np.argmax(np.abs(symmetry[:, axis])))
+    if symmetry[target, axis] < 0:
+        offsets = tuple(-angle for angle in reversed(offsets))
+    return tuple(cube_rotation_to_notation(r) for r in parallel_layer_rotations(target, offsets))
 
 
 def discrete_rotation_notation(rotation: CubeLayerRotation) -> str | None:
@@ -852,7 +910,7 @@ def turn_trial_log_payload(trial: dict[str, object]) -> dict[str, object]:
         'score_components', 'reprojection_fit_error',
         'sticker_observed_mask_hex', 'sticker_correct_mask_hex',
         'color_scoring', 'color_correct_count', 'color_confusion_count',
-        'color_forbidden_count', 'color_confusion_cost',
+        'color_forbidden_count', 'color_confusion_cost', 'parallel_layers', 'layer_support',
     )
     result = {name: trial[name] for name in names if name in trial}
     for output, source in (
@@ -861,11 +919,7 @@ def turn_trial_log_payload(trial: dict[str, object]) -> dict[str, object]:
         ('heatmap_match_count', 'sticker_match_count'), ('keypoint_p90_error', 'p90_error'),
     ):
         result[output] = trial.get(source)
-    result['layer_rotations'] = [
-        dict(axis=rotation.axis, side=rotation.side, angle_degrees=rotation.angle_degrees,
-             layer_count=rotation.layer_count)
-        for rotation in trial.get('layer_rotations', ())
-    ]
+    result['layer_rotations'] = [layer_rotation_payload(r) for r in trial.get('layer_rotations', ())]
     return result
 
 
@@ -902,6 +956,11 @@ def state_update_layer_direction(value: dict[str, object] | object) -> tuple | N
         axis = value.get("layer_axis")
         side = value.get("layer_side")
         layer_count = value.get("layer_count")
+        if moves and value.get('parallel_layers'):
+            rotations = parallel_layer_rotations(axis, parallel_turn_actions(axis)[moves])
+            if len(rotations) != 1 or rotations[0].middle:
+                return ('notation', moves)
+            side, layer_count = rotations[0].side, rotations[0].layer_count
     else:
         moves = completed_candidate_moves(value)
         rotations = tuple(getattr(value, "layer_rotations", ()))
@@ -1765,11 +1824,10 @@ def transform_layer_rotation_by_symmetry(
         return layer_rotation
     target_axis = int(np.argmax(np.abs(matrix[:, source_axis])))
     axis_sign = int(round(matrix[target_axis, source_axis]))
-    return CubeLayerRotation(
+    return replace(layer_rotation,
         axis=target_axis,
         side=int(layer_rotation.side) * axis_sign,
         angle_degrees=float(layer_rotation.angle_degrees),
-        layer_count=int(layer_rotation.layer_count),
     )
 
 
@@ -1811,7 +1869,7 @@ def layer_rotation_debug_label(
         side = "+" if int(rotation.side) > 0 else "-"
         angle = float(rotation.angle_degrees)
         width = int(rotation.layer_count)
-        parts.append(f"{axis}{side}{angle:+.0f}w{width}")
+        parts.append(f"{axis}mid{angle:+.0f}" if rotation.middle else f"{axis}{side}{angle:+.0f}w{width}")
     return "/".join(parts)
 
 
@@ -4597,12 +4655,13 @@ def apply_cube_layer_rotations(
         side = int(layer_rotation.side)
         if axis not in (0, 1, 2) or side not in (-1, 1):
             continue
-        mask = cube_layer_mask(
+        mask = (np.abs(base_points[:, axis]) <= CUBE_LAYER_SIZE_MM / 2 + 1e-4
+                if layer_rotation.middle else cube_layer_mask(
             base_points,
             axis,
             side,
             layer_rotation.layer_count,
-        )
+        ))
         if not np.any(mask):
             continue
         rotation_vector = np.zeros((3, 1), dtype=np.float64)
@@ -4632,9 +4691,8 @@ def orientation_anchor_for_candidate(
 ) -> OrientationAnchor:
     """Choose the layers unaffected by the selected turn hypothesis.
 
-    The turn search currently produces at most one new layer rotation.  The
-    complement of that layer is the rigid support for the global pose.  If no
-    meaningful turn was selected, all three layers remain the anchor.
+    The complement of the turned layers is the rigid support for the pose.
+    If no meaningful turn was selected, all three layers remain the anchor.
     """
 
     rotations = tuple(
@@ -4657,7 +4715,9 @@ def orientation_anchor_for_candidate(
     moved_layers: set[int] = set()
     for rotation in rotations:
         layer_count = int(np.clip(rotation.layer_count, 1, 3))
-        if int(rotation.side) > 0:
+        if rotation.middle:
+            moved_layers.add(1)
+        elif int(rotation.side) > 0:
             moved_layers.update(range(3 - layer_count, 3))
         else:
             moved_layers.update(range(layer_count))
@@ -5066,6 +5126,141 @@ def _torch_project_turn_points(
     )
 
 
+def _parallel_slab_entry(origin, directions, matrices, axis, layer):
+    """Return camera ray entry parameters for one rotated, closed slab."""
+    origin = np.einsum('i,bij->bj', origin, matrices)[:, None, :]
+    directions = np.einsum('bni,bij->bnj', directions, matrices)
+    lower = np.full(3, -CUBE_HALF_SIZE_MM)
+    upper = np.full(3, CUBE_HALF_SIZE_MM)
+    lower[axis] += layer * CUBE_LAYER_SIZE_MM
+    upper[axis] = lower[axis] + CUBE_LAYER_SIZE_MM
+    parallel = np.abs(directions) < 1e-12
+    inside = (origin >= lower - 1e-7) & (origin <= upper + 1e-7)
+    safe = np.where(parallel, 1., directions)
+    first, last = (lower - origin) / safe, (upper - origin) / safe
+    entry = np.maximum(0., np.where(parallel, -np.inf, np.minimum(first, last)).max(axis=-1))
+    exit = np.where(parallel, np.inf, np.maximum(first, last)).min(axis=-1)
+    return np.where((entry <= exit + 1e-7) & np.all(~parallel | inside, axis=-1), entry, np.inf)
+
+
+def parallel_turn_frame_geometry(candidate, limit, axis, *, angles=None):
+    """Assemble cached slab projections, then test rays against all three slabs.
+
+    The exhaustive grid covers the three disjoint layers on a single axis.
+    A surface lattice vertex on a seam belongs to both touching slabs, which
+    may expose distinct landmarks once the slabs turn independently.
+    """
+    import torch
+
+    observed = np.asarray(candidate.assignment_image_points, dtype=np.float64).reshape(-1, 2)
+    centers = np.asarray(candidate.sticker_mask_centers, dtype=np.float64).reshape(-1, 2)
+    scale = projected_cube_diameter(candidate)
+    if len(observed) < 3 or not len(centers) or not np.isfinite(scale) or scale <= 0.:
+        return [], np.empty((0, len(centers)), dtype=np.uint8), np.empty((0, len(centers)), dtype=bool)
+    lattice = CUBE_LATTICE_OBJECT_POINTS_MM
+    layers, vertices = np.nonzero(np.abs(lattice[None, :, axis] -
+        (np.arange(3)[:, None] - 1) * CUBE_LAYER_SIZE_MM) <= CUBE_LAYER_SIZE_MM / 2 + 1e-4)
+    faces = _turn_gpu_static_geometry()
+    polygons, cubies, normals = faces[2], faces[4], faces[5]
+    face_layers = np.rint(cubies[:, axis] / CUBE_LAYER_SIZE_MM + 1).astype(np.intp)
+    if angles is None:
+        values = np.arange(-45., 46., 15.)
+        grid = np.asarray(tuple(product(range(len(values)), repeat=3)))
+        grid = grid[np.any(values[grid] != 0., axis=1)]  # Flat geometry is shared with the legacy options.
+    else:
+        values, grid = np.unique(angles, return_inverse=True)
+        grid = grid.reshape(1, 3)
+    matrices = np.stack([cv2.Rodrigues(np.eye(3)[axis] * np.deg2rad(a))[0] for a in values])
+    camera = -cv2.Rodrigues(candidate.rvec)[0].T @ np.asarray(candidate.tvec).reshape(3)
+
+    def project(points):
+        shape = points.shape[:-1]
+        image, _ = cv2.projectPoints(points.reshape(-1, 3), candidate.rvec, candidate.tvec,
+                                     candidate.camera_matrix, candidate.dist_coeffs)
+        return image.reshape(*shape, 2)
+
+    def assemble(table, slab_ids):
+        return table[grid[:, slab_ids], np.arange(len(slab_ids))]
+
+    def entries(rays):
+        return np.stack([_parallel_slab_entry(camera, rays, matrices[grid[:, layer]], axis, layer)
+                         for layer in range(3)], axis=-1)
+
+    points = lattice[vertices][None] @ matrices.transpose(0, 2, 1)
+    objects = assemble(points, layers)
+    projected = assemble(project(points), layers)
+    point_normals = np.einsum('aij,nfj->anfi', matrices, CUBE_LATTICE_BOUNDARY_NORMALS[vertices])
+    front = np.any(CUBE_LATTICE_BOUNDARY_FACE_MASK[vertices][None] & (
+        np.sum(point_normals * (camera - points)[:, :, None, :], axis=-1) > 0), axis=-1)
+    visible = assemble(front, layers) & (entries(objects - camera).min(axis=-1) >= 1. - 1e-5)
+    classes = CUBE_LATTICE_CLASS_IDS[vertices]
+    observed_classes = candidate.assignment_observed_class_ids
+    distances = np.linalg.norm(projected[:, None] - observed[None, :, None], axis=-1)
+    distances = np.where(visible[:, None], distances, np.inf)
+    if PNP_ASSIGNMENT_MODE == 'class-aware' and observed_classes is not None:
+        observed_classes = np.asarray(observed_classes).reshape(-1)
+        mismatch = ((observed_classes[:, None] >= 0) & (classes >= 0)
+                    & (observed_classes[:, None] != classes))
+        distances = np.where(mismatch[None], np.inf, distances)
+    columns = distances.argmin(axis=-1)
+    distances = np.take_along_axis(distances, columns[..., None], axis=-1)[..., 0]
+    rows = np.arange(len(grid))[:, None]
+    assigned_layers = layers[columns]
+    active = values[grid] != 0.
+    key_mean, key_robust, p90, key_inliers, key_layer_inliers, _ = _gpu_keypoint_fit_metrics(
+        torch, torch.from_numpy(distances), None, torch.from_numpy(classes[columns]),
+        None, None, None, None, scale, limit, layer_mask=torch.from_numpy(active[rows, assigned_layers]))
+
+    face_objects = np.einsum('aij,nkj->anki', matrices, polygons)
+    face_polygons = assemble(project(face_objects), face_layers)
+    projected_centers = face_polygons.mean(axis=2)
+    face_objects = face_objects.mean(axis=2)
+    face_normals = np.einsum('aij,nj->ani', matrices, normals)
+    front_faces = assemble(np.sum(face_normals * (camera - face_objects), axis=-1) > 0, face_layers)
+    visible_centers = front_faces & (entries(assemble(face_objects, face_layers) - camera).min(axis=-1) >= 1. - 1e-5)
+    sticker_mean, sticker_robust, sticker_matches, sticker_layer_matches = _gpu_sticker_center_fit_metrics(
+        candidate, torch, torch.from_numpy(projected_centers), torch.from_numpy(visible_centers), scale, limit,
+        return_tensors=True, layer_mask=torch.from_numpy(active[:, face_layers]), return_layer_match_counts=True)
+
+    # Use the camera ray through each observation rather than the face center
+    # so a partially occluded sticker can still explain a visible keypoint.
+    normalized = cv2.undistortPoints(centers, candidate.camera_matrix, candidate.dist_coeffs).reshape(-1, 2)
+    rays = np.column_stack((normalized, np.ones(len(centers)))) @ cv2.Rodrigues(candidate.rvec)[0]
+    depths = entries(np.broadcast_to(rays, (len(grid), *rays.shape)))
+    nearest_depth = depths.min(axis=-1, keepdims=True)
+    exposed = np.isfinite(depths) & (depths <= nearest_depth + 1e-6)
+    cache = {}
+    _gpu_sticker_color_fit_metrics(candidate, torch, torch.from_numpy(projected_centers),
+        torch.from_numpy(face_polygons), torch.from_numpy(front_faces), faces[-1], scale, limit,
+        np.ones((54, len(centers))), assignment_cache=cache,
+        observation_visibility=torch.from_numpy(exposed[:, :, face_layers]))
+    nearest, valid, _ = cache['value']
+    nearby = np.linalg.norm(projected_centers[:, None] - centers[None, :, None], axis=-1) < limit
+    layer_support = tuple(
+        ((assigned_layers == layer) & (distances <= limit)).sum(axis=1) +
+        np.any(nearby & visible_centers[:, None] & (face_layers == layer), axis=2).sum(axis=1)
+        for layer in range(3))
+    options = []
+    for i, residuals in enumerate(values[grid]):
+        rotations = parallel_layer_rotations(axis, residuals)
+        keypoint, sticker = float(key_mean[i]), float(sticker_mean[i])
+        option = dict(parallel_layers=True, layer_axis=axis, layer_side=1, layer_count=1,
+            layer_rotations=rotations, label=layer_rotation_debug_label(rotations), is_baseline=not rotations,
+            layer_support=tuple(int(counts[i]) for counts in layer_support),
+            keypoint_error=keypoint, sticker_error=sticker, combined_mean_error=keypoint + sticker,
+            robust_error=float(key_robust[i]) + PNP_TURN_MASK_CENTER_WEIGHT * float(sticker_robust[i]),
+            inlier_count=int(key_inliers[i] + sticker_matches[i]), p90_error=float(p90[i]),
+            layer_inlier_count=int(key_layer_inliers[i] + sticker_layer_matches[i]),
+            keypoint_inlier_count=int(key_inliers[i]), keypoint_layer_inlier_count=int(key_layer_inliers[i]),
+            sticker_match_count=int(sticker_matches[i]))
+        if angles is not None:
+            option.update(assignment_projected_points=projected[i, columns[i]],
+                          assignment_object_points=objects[i, columns[i]],
+                          assignment_projected_class_ids=classes[columns[i]])
+        options.append(option)
+    return options, nearest.numpy().astype(np.uint8), valid.numpy()
+
+
 def _gpu_sticker_center_fit_metrics(
     candidate: StickerPnPCandidate,
     torch_module: object,
@@ -5219,6 +5414,7 @@ def _gpu_sticker_color_fit_metrics(
     color_matches: np.ndarray | None, *, return_tensors: bool = False,
     assignment_cache: dict | None = None,
     configuration_mapping: tuple[np.ndarray, np.ndarray] | None = None,
+    observation_visibility: object | None = None,
 ) -> tuple[object, object]:
     """Batch exact class matches, with one vote per observed projected sticker.
 
@@ -5250,7 +5446,10 @@ def _gpu_sticker_color_fit_metrics(
             distances = torch.linalg.vector_norm(
                 observed_t[None, :, None, :] - projected_face_centers[:, None, :, :], dim=-1,
             )
-            distances = torch.where(inside & visible_faces[:, None, :], distances,
+            visible = inside & visible_faces[:, None, :]
+            if observation_visibility is not None:
+                visible &= observation_visibility
+            distances = torch.where(visible, distances,
                                     torch.full_like(distances, float("inf")))
             nearest_distance, nearest = torch.min(distances, dim=2)
             valid = torch.isfinite(nearest_distance)
@@ -5306,19 +5505,22 @@ def _gpu_keypoint_fit_metrics(
     observed_classes: object | None,
     scale: float,
     assignment_error_limit: float,
+    *,
+    layer_mask: object | None = None,
 ) -> tuple[object, object, object, object, object, object]:
     """Score whole-cube matches; layer membership affects diagnostics only."""
 
     finite = torch.isfinite(distances)
-    coordinates = torch.gather(
-        objects, 2, axes[:, None, None].expand(-1, objects.shape[1], 1)
-    ).squeeze(-1)
-    boundary = CUBE_HALF_SIZE_MM - (layer_counts - 1.0) * CUBE_LAYER_SIZE_MM
-    layer_mask = torch.where(
-        sides[:, None] > 0.0,
-        coordinates >= boundary[:, None] - 1e-4,
-        coordinates <= -boundary[:, None] + 1e-4,
-    )
+    if layer_mask is None:
+        coordinates = torch.gather(
+            objects, 2, axes[:, None, None].expand(-1, objects.shape[1], 1)
+        ).squeeze(-1)
+        boundary = CUBE_HALF_SIZE_MM - (layer_counts - 1.0) * CUBE_LAYER_SIZE_MM
+        layer_mask = torch.where(
+            sides[:, None] > 0.0,
+            coordinates >= boundary[:, None] - 1e-4,
+            coordinates <= -boundary[:, None] + 1e-4,
+        )
     layer_finite = finite & layer_mask
     valid_trial = torch.any(finite, dim=1)
     if observed_classes is not None:
@@ -6007,6 +6209,17 @@ def _turn_trial_under_pose_symmetry(
     ), symmetry)
     rotations = tuple(transform_layer_rotation_by_symmetry(r, symmetry)
                       for r in trial['layer_rotations'])
+    if trial.get('parallel_layers'):
+        support = tuple(trial['layer_support'])
+        if symmetry[layer.axis, int(trial['layer_axis'])] < 0:
+            support = support[::-1]
+        moves = transform_turn_action(tuple(trial['state_moves']), symmetry)
+        return dict(trial, trial_id=f"{trial['trial_id']}@pose{symmetry_index}",
+                    layer_axis=layer.axis, layer_support=support,
+                    layer_rotations=rotations, state_moves=moves,
+                    orientation_symmetry_index=symmetry_index,
+                    orientation_symmetry=symmetry.astype(int).tolist(),
+                    label=f"{layer_rotation_debug_label(rotations)} · {' '.join(moves) or 'hold'} [pose {symmetry_index}]")
     offset = float(trial['color_offset'])
     move = cube_rotation_to_notation(replace(layer, angle_degrees=offset))
     geometry_label = (layer_rotation_debug_label(rotations) if rotations else
@@ -7233,7 +7446,12 @@ def _candidate_with_turn_trial(
     rotations = tuple(trial.get("layer_rotations", ()))
     sticker_rotations = rotations
     offset = float(trial.get("color_offset", 0.0))
-    if abs(offset) > 1e-6:
+    if trial.get('parallel_layers') and not trial.get('handoff_commit'):
+        axis = trial['layer_axis']
+        offsets = parallel_turn_actions(axis)[tuple(trial.get('state_moves', ()))]
+        sticker_rotations = parallel_layer_rotations(axis, tuple(
+            a + b for a, b in zip(parallel_layer_angles(rotations), offsets, strict=True)))
+    elif abs(offset) > 1e-6:
         # Color scoring rotates the identities by partial angle + offset.
         # Keep the committed state before this move for the accumulator, and
         # render those identities with that same full rotation on this frame.
@@ -8819,7 +9037,10 @@ def apply_cubelet_layer_rotations(
             - layer_count * CUBE_LAYER_SIZE_MM
             + CUBE_LAYER_SIZE_MM / 2.0
         )
-        if layer_count < 3 and side * original_center[axis] < layer_boundary - 1e-4:
+        if layer_rotation.middle:
+            if abs(original_center[axis]) > CUBE_LAYER_SIZE_MM / 2:
+                continue
+        elif layer_count < 3 and side * original_center[axis] < layer_boundary - 1e-4:
             continue
         rotation_vector = np.zeros((3, 1), dtype=np.float64)
         rotation_vector[axis, 0] = (
@@ -9271,19 +9492,7 @@ def turn_candidate_log_record(
         else None
     )
     rotations_for_log = tuple(candidate.layer_rotations) if candidate is not None else ()
-    selected_rotations = (
-        [
-            {
-                "axis": int(rotation.axis),
-                "side": int(rotation.side),
-                "angle_degrees": float(rotation.angle_degrees),
-                "layer_count": int(rotation.layer_count),
-            }
-            for rotation in rotations_for_log
-        ]
-        if candidate is not None
-        else []
-    )
+    selected_rotations = [layer_rotation_payload(r) for r in rotations_for_log]
     search_rvec = (
         getattr(candidate, "turn_fit_search_rvec", None)
         if candidate is not None
@@ -9432,12 +9641,7 @@ def turn_candidate_log_record(
         "selected_layer": None,
         "selected_layer_rotations": selected_rotations,
         "selected_sticker_layer_rotations": [
-            {
-                "axis": int(rotation.axis),
-                "side": int(rotation.side),
-                "angle_degrees": float(rotation.angle_degrees),
-                "layer_count": int(rotation.layer_count),
-            }
+            layer_rotation_payload(rotation)
             for rotation in (physical_sticker_rotations(candidate) if candidate is not None else ())
         ],
         "selected_committed_moves": list(completed_candidate_moves(candidate)),
@@ -12423,8 +12627,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--search-seconds", type=float, default=300.,
                         help="Search-only time limit per full-search pass (default: 300).")
-    parser.add_argument("--branch-widths", type=int, nargs="+", default=(3, 5, 8),
-                        help="Per-parent child cutoffs including ties (default: 3 5 8).")
+    parser.add_argument("--branch-widths", type=int, nargs="+", default=(3,),
+                        help="Per-parent child cutoffs including ties (default: 3).")
     parser.add_argument("--branch-stage-expansions", type=int,
                         help="Override the widening budget of 100 expansions per solving frame.")
     parser.add_argument("--frame-parity", choices=("auto", "all", "even", "odd", "both"), default="auto",

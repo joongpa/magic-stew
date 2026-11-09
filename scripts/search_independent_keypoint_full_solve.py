@@ -880,7 +880,7 @@ class PreparedReplayScorer(ReplayScorer):
                  track_sticker_observations=False, joint_orientation_rescue=False,
                  color_confusion_pruning=False, color_confusion_cost=.5,
                  color_confusion_scoring=False, preserve_layer_activity=False, track_color_confusions=False,
-                 tracked_color_confusions=None):
+                 tracked_color_confusions=None, parallel_layers=False):
         if str(device) != "cpu":
             raise ValueError("Prepared replay scoring currently requires CPU")
         super().__init__(renderer, records, device, cache_size,
@@ -893,6 +893,7 @@ class PreparedReplayScorer(ReplayScorer):
                          preserve_layer_activity=preserve_layer_activity,
                          tracked_color_confusions=tracked_color_confusions)
         self.track_color_confusions = track_color_confusions
+        self.parallel_layers = parallel_layers
         self.compiled_frames = {}
         identities = renderer.canonical_sticker_identities()
         canonical_indices = renderer._turn_gpu_static_geometry()[-1]
@@ -911,6 +912,7 @@ class PreparedReplayScorer(ReplayScorer):
             orientation_sources.append([position_indices[source_by_target[position]] for position in self.positions])
         self.orientation_sources = self.np.asarray(orientation_sources, dtype=self.np.intp)
         self.move_permutations = {}
+        self.oriented_actions = {}
         self.face_groups = tuple(tuple(index for index, position in enumerate(self.positions)
                                       if position[1:] == (axis, side))
                                  for axis in range(3) for side in (-1, 1))
@@ -930,15 +932,18 @@ class PreparedReplayScorer(ReplayScorer):
     def apply_moves(self, state, moves):
         if not isinstance(state, bytes):
             return state.apply_moves(moves)
+        moves = tuple(moves)
+        if not moves:
+            return state
         np = self.np
-        for move in moves:
-            if move not in self.move_permutations:
-                indices = {position: index for index, position in enumerate(self.positions)}
-                sources = dict(self.m._cube_geometry_move_permutation(move))
-                self.move_permutations[move] = np.asarray(
-                    [indices[sources[target]] for target in self.positions], dtype=np.intp)
-            state = np.frombuffer(state, dtype=np.uint8)[self.move_permutations[move]].tobytes()
-        return state
+        if moves not in self.move_permutations:
+            indices = {position: index for index, position in enumerate(self.positions)}
+            sources = self.m.CubeGeometryState.identity().apply_moves(moves).facelets
+            identity_sources = self.m.CubeGeometryState.identity().facelets
+            source_by_label = {label: indices[position] for position, label in identity_sources.items()}
+            self.move_permutations[moves] = np.asarray(
+                [source_by_label[sources[target]] for target in self.positions], dtype=np.intp)
+        return np.frombuffer(state, dtype=np.uint8)[self.move_permutations[moves]].tobytes()
 
     def solved_predicate(self, sticker_colors):
         valid_colors = set(self.m.CubeState.solved().colors.values())
@@ -981,65 +986,80 @@ class PreparedReplayScorer(ReplayScorer):
             (m.CubeGeometryState.identity(),), projection_cache=projections, color_offsets=(0.,))
         if batches is None:
             raise RuntimeError(f"Scoring preparation failed at frame {frame}")
-        group_ids, groups, templates, source_permutations, projection_rows = [], {}, [], [], []
+        assignments = projections.get("assignments", {}).get("value")
+        if self.parallel_layers and assignments is not None:
+            nearest_base, valid_base = (value.cpu().numpy() for value in assignments[:2])
+            extra, extra_nearest, extra_valid = self._parallel_geometry(frame, candidate, limit)
+            flat = next((i for i, option in enumerate(geometry) if option.get('is_baseline')), None)
+            flat_row = projection_indices[flat] if flat is not None else None
+            projection_indices.extend(range(len(projected_geometry), len(projected_geometry) + len(extra)))
+            geometry += tuple(extra)
+            projected_geometry.extend(extra)
+            if extra:
+                nearest_base = np.concatenate((nearest_base, extra_nearest))
+                valid_base = np.concatenate((valid_base, extra_valid))
+            if flat_row is not None:
+                geometry += tuple(dict(geometry[flat], parallel_layers=True, layer_axis=axis,
+                    layer_side=1, layer_count=1, layer_support=(0, 0, 0), label='static') for axis in range(3))
+                projection_indices.extend((flat_row,) * 3)
+        elif assignments is not None:
+            nearest_base, valid_base = (value.cpu().numpy() for value in assignments[:2])
+        group_ids, groups, action_specs = [], {}, []
+        templates, option_rows, source_permutations, projection_rows = [], [], [], []
         canonical_indices = m._turn_gpu_static_geometry()[-1]
         geometry_from_canonical = np.argsort(canonical_indices)
         permutations = {}
         geometry_scores, inliers, p90s, layer_inliers = [], [], [], []
+        static_row = None
         for option_index, option in enumerate(geometry):
             axis, side, width = (int(option[name]) for name in
                                  ("layer_axis", "layer_side", "layer_count"))
-            for offset in (-90., 0., 90.):
-                group_ids.append(groups.setdefault((axis, side, width, offset), len(groups)))
-                moves = ()
-                if offset:
+            if option.get('parallel_layers'):
+                actions = [(0., action, (axis, action)) for action in m.parallel_turn_actions(axis)]
+            else:
+                actions = []
+                for offset in (-90., 0., 90.):
                     notation = m.cube_rotation_to_notation(m.CubeLayerRotation(axis, side, offset, width))
-                    if notation is not None:
-                        moves = (notation,)
+                    actions.append((offset, (notation,) if notation is not None else (), (axis, side, width, offset)))
+            trial = dict(option, geometry_option_index=option_index, layer_axis=axis, layer_side=side, layer_count=width,
+                inlier_count=int(option.get('inlier_count', 0)), layer_inlier_count=int(option.get('layer_inlier_count', 0)),
+                keypoint_inlier_count=int(option.get('keypoint_inlier_count', 0)),
+                keypoint_layer_inlier_count=int(option.get('keypoint_layer_inlier_count', 0)),
+                sticker_match_count=int(option.get('sticker_match_count', 0)))
+            geometry_score = float(option['combined_mean_error'])
+            if self.balance_geometry_color and math.isfinite(geometry_score):
+                geometry_score = float(m.balanced_geometry_cost(option['keypoint_error'], option['sticker_error']))
+            templates.append((m.turn_trial_log_payload(trial), float(option.get('robust_error', float('inf')))))
+            for offset, moves, group in actions:
+                if group not in groups:
+                    groups[group] = len(groups)
+                    direction = m.state_update_layer_direction(dict(trial, state_moves=moves))
+                    action_specs.append((moves, offset, direction))
+                if static_row is None and option.get('is_baseline') and not moves:
+                    static_row = len(option_rows)
+                group_ids.append(groups[group])
+                option_rows.append(option_index)
                 if moves not in permutations:
                     moved_indices = m._turn_gpu_identity_indices_for_state(
                         m.CubeGeometryState.identity().apply_moves(moves), canonical_indices)
                     permutations[moves] = geometry_from_canonical[moved_indices]
                 source_permutations.append(permutations[moves])
                 projection_rows.append(projection_indices[option_index])
-                trial = dict(trial_id=f"{option_index}:{offset:+g}",
-                    label=f"{option['label']} offset {offset:+.0f}",
-                    is_baseline=bool(option.get("is_baseline", False) and not moves),
-                    geometry_option_index=option_index, layer_axis=axis, layer_side=side,
-                    layer_count=width, color_offset=offset, state_moves=moves,
-                    layer_rotations=option.get("layer_rotations", ()),
-                    inlier_count=int(option.get("inlier_count", 0)),
-                    layer_inlier_count=int(option.get("layer_inlier_count", 0)),
-                    keypoint_inlier_count=int(option.get("keypoint_inlier_count", 0)),
-                    keypoint_layer_inlier_count=int(option.get("keypoint_layer_inlier_count", 0)),
-                    keypoint_error=float(option.get("keypoint_error", float("inf"))),
-                    sticker_error=float(option.get("sticker_error", float("inf"))),
-                    sticker_match_count=int(option.get("sticker_match_count", 0)),
-                    p90_error=float(option.get("p90_error", float("inf"))))
-                payload = m.turn_trial_log_payload(trial)
-                templates.append((payload, m.state_update_layer_direction(trial),
-                                  float(option.get("robust_error", float("inf")))))
-                geometry_score = float(option["combined_mean_error"])
-                if self.balance_geometry_color and math.isfinite(geometry_score):
-                    geometry_score = float(m.balanced_geometry_cost(option["keypoint_error"], option["sticker_error"]))
                 geometry_scores.append(geometry_score)
                 inliers.append(trial["inlier_count"])
                 p90s.append(trial["p90_error"])
                 layer_inliers.append(m.turn_layer_inliers_for_ranking(trial))
-        assignments = projections.get("assignments", {}).get("value")
         if assignments is None:
             nearest = weights = match_matrix = denominator = has_weight = None
-            matches = np.zeros(len(templates), dtype=np.int32)
+            matches = np.zeros(len(option_rows), dtype=np.int32)
         else:
-            nearest_t, valid_t, _totals_t = assignments
             rows = np.asarray(projection_rows)
-            nearest_base = nearest_t.cpu().numpy()
             nearest = np.take_along_axis(np.asarray(source_permutations), nearest_base[rows], axis=1).astype(np.uint8)
-            weights = valid_t.cpu().numpy()[rows].copy()
+            weights = valid_base[rows].copy()
             count = nearest.shape[1]
             match_matrix = np.asarray(color_matches[:, :count], dtype=np.float64)
-            occupied = np.zeros((len(templates), 54), dtype=bool)
-            np.logical_or.at(occupied, (np.arange(len(templates))[:, None], nearest), weights)
+            occupied = np.zeros((len(option_rows), 54), dtype=bool)
+            np.logical_or.at(occupied, (np.arange(len(option_rows))[:, None], nearest), weights)
             matches = occupied.sum(axis=1).astype(np.int32)
             denominator = np.maximum(matches, 1)
             has_weight = matches > 0
@@ -1056,20 +1076,69 @@ class PreparedReplayScorer(ReplayScorer):
             matches=matches, geometry_scores=np.asarray(geometry_scores),
             inliers=np.asarray(inliers), p90s=np.asarray(p90s),
             layer_inliers=np.asarray(layer_inliers), group_ids=np.asarray(group_ids),
-            templates=templates, projection_count=len(projected_geometry),
-            source_geometry_count=len(geometry), configuration_count=len(templates))
-        result["static_row"] = next((index for index, (template, _direction, _robust) in enumerate(templates)
-                                     if template["is_baseline"] and not template["state_moves"]), None)
+            templates=templates, option_rows=np.asarray(option_rows), action_specs=action_specs,
+            projection_count=len(projected_geometry), static_row=static_row,
+            source_geometry_count=len(geometry), configuration_count=len(option_rows))
         self.compiled_frames[frame] = result
         result["selections"] = {}
         self.prepared.pop(frame, None)
         return result
+
+    @staticmethod
+    def _template(prepared, index):
+        option = int(prepared['option_rows'][index])
+        payload, robust = prepared['templates'][option]
+        moves, offset, direction = prepared['action_specs'][prepared['group_ids'][index]]
+        action = ' '.join(moves) or 'hold'
+        if payload.get('parallel_layers'):
+            trial_id, label = action, f"{payload['label']} · {action}"
+        else:
+            trial_id, label = f'{offset:+g}', f"{payload['label']} offset {offset:+.0f}"
+        return dict(payload, trial_id=f'{option}:{trial_id}', label=label,
+                    is_baseline=bool(payload.get('is_baseline') and not moves),
+                    state_moves=moves, color_offset=offset), direction, robust
+
+    def _parallel_geometry(self, frame, candidate, limit):
+        """Keep the best geometry for each identical set of color assignments."""
+        record = self.records[frame]
+        pose = record.get('search_pose') or record.get('selected_pose') or {}
+        image_points = pose.get('assignment_image_points')
+        if image_points is None:
+            return [], [], []
+        m, np = self.m, self.np
+        candidate = replace(candidate, assignment_image_points=np.asarray(image_points),
+                            assignment_observed_class_ids=pose.get('assignment_observed_class_ids'))
+        extra, nearest_rows, valid_rows = [], [], []
+        for axis in range(3):
+            options, nearest, valid = m.parallel_turn_frame_geometry(candidate, limit, axis)
+            unique = {}
+            for i, option in enumerate(options):
+                if not m.turn_geometry_has_layer_support(option):
+                    continue
+                keypoint, sticker = option['keypoint_error'], option['sticker_error']
+                geometry = m.balanced_geometry_cost(keypoint, sticker) if self.balance_geometry_color else keypoint + sticker
+                if not math.isfinite(geometry):
+                    continue
+                rank = (geometry, -option['inlier_count'], option['p90_error'],
+                        -m.turn_layer_inliers_for_ranking(option))
+                key = np.where(valid[i], nearest[i], 255).tobytes()
+                prior = unique.get(key)
+                if prior is None or rank < prior[0]:
+                    unique[key] = rank, i
+            rows = sorted(i for _, i in unique.values())
+            extra.extend(options[i] for i in rows)
+            nearest_rows.extend(nearest[rows])
+            valid_rows.extend(valid[rows])
+        return extra, nearest_rows, valid_rows
 
     def __call__(self, frame, state):
         return self._evaluate(frame, state, None)
 
     def score_hold(self, frame, state):
         return next(iter(self._evaluate(frame, state, False)), None)
+
+    def score_action(self, frame, state, action):
+        return self._evaluate(frame, state, ('action', action))
 
     def for_update_context(self, frame, state, update, min_update_gap):
         if self.hold_reason(frame) is not None:
@@ -1122,9 +1191,17 @@ class PreparedReplayScorer(ReplayScorer):
         return (encoded if selected is None else alternatives[selected].tobytes()), selected, diagnostic
 
     def _orientation_restriction(self, restriction, symmetry_index):
-        if symmetry_index is None or not restriction or restriction[0] != "layer":
+        if symmetry_index is None or not restriction:
             return restriction
         m = self.m
+        if restriction[0] == 'action':
+            key = (restriction[1], symmetry_index)
+            if key not in self.oriented_actions:
+                self.oriented_actions[key] = ('action', m.transform_turn_action(
+                    restriction[1], m.CUBE_SYMMETRY_MATRICES[symmetry_index].T))
+            return self.oriented_actions[key]
+        if restriction[0] != 'layer':
+            return restriction
         layer = m.transform_layer_rotation_by_symmetry(
             m.CubeLayerRotation(restriction[1], restriction[2], 0., restriction[3]),
             m.CUBE_SYMMETRY_MATRICES[symmetry_index].T,
@@ -1138,8 +1215,7 @@ class PreparedReplayScorer(ReplayScorer):
                 dict(template, layer_rotations=tuple(m.CubeLayerRotation(**r) for r in template["layer_rotations"])),
                 m.CUBE_SYMMETRY_MATRICES[symmetry_index], symmetry_index,
             )
-            template["layer_rotations"] = [dict(axis=r.axis, side=r.side, angle_degrees=r.angle_degrees,
-                                                layer_count=r.layer_count) for r in template["layer_rotations"]]
+            template["layer_rotations"] = [m.layer_rotation_payload(r) for r in template["layer_rotations"]]
             direction = m.state_update_layer_direction(template)
         if diagnostic is not None:
             template = dict(template, orientation_rescue=diagnostic)
@@ -1149,19 +1225,32 @@ class PreparedReplayScorer(ReplayScorer):
         if restriction in prepared["selections"]:
             return prepared["selections"][restriction]
         np = self.np
-        templates = prepared["templates"]
-        rows = np.asarray([index for index, (template, direction, _robust) in enumerate(templates)
-                           if restriction is None or not template["state_moves"] or direction == restriction],
-                          dtype=np.intp)
-        all_moves = {template["state_moves"] for template, _direction, _robust in templates}
-        kept_moves = {templates[index][0]["state_moves"] for index in rows}
+        if restriction is None:
+            rows = np.arange(prepared['configuration_count'])
+            skipped = 0
+        else:
+            specs = prepared['action_specs']
+            if restriction and restriction[0] == 'action':
+                allowed = [moves == restriction[1] for moves, _, _ in specs]
+            else:
+                allowed = [not moves or direction == restriction for moves, _, direction in specs]
+            rows = np.flatnonzero(np.asarray(allowed)[prepared['group_ids']])
+            skipped = len({moves for moves, _, _ in specs}) - len({
+                moves for keep, (moves, _, _) in zip(allowed, specs, strict=True) if keep})
         result = {name: prepared[name] if restriction is None or prepared[name] is None else prepared[name][rows]
                   for name in ("nearest", "weights", "denominator", "has_weight", "matches",
                                "geometry_scores", "inliers", "p90s", "layer_inliers", "group_ids")}
-        result.update(rows=rows, skipped_moves=len(all_moves-kept_moves))
+        result.update(rows=rows, skipped_moves=skipped)
+        if self.parallel_layers and result['nearest'] is not None:
+            # Color depends only on which observations were assigned to which
+            # positions, even if those assignments came from different angles.
+            assignment = np.where(result['weights'], result['nearest'], 255)
+            _, color_rows, color_inverse = np.unique(assignment, axis=0, return_index=True, return_inverse=True)
+            result.update(color_rows=color_rows, color_inverse=color_inverse.reshape(-1))
         if self.preserve_layer_activity:
-            active_holds = np.asarray([not templates[index][0]['state_moves'] and
-                self.m.turn_trial_activity_layer(templates[index][0]) is not None for index in rows])
+            templates = [self._template(prepared, index)[0] for index in rows]
+            active_holds = np.asarray([not template['state_moves'] and
+                self.m.turn_trial_activity_layer(template) is not None for template in templates])
             result['group_ids'] = 2*result['group_ids']+active_holds
         prepared["selections"][restriction] = result
         return result
@@ -1177,7 +1266,7 @@ class PreparedReplayScorer(ReplayScorer):
         mapped = np.empty((len(poses), len(first)), dtype=np.uint8)
         for pose_order, pose in enumerate(poses):
             for group, index in enumerate(first):
-                template, direction, _ = prepared['templates'][index]
+                template, direction, _ = self._template(prepared, index)
                 template, direction = self._oriented_template(template, direction, pose, None)
                 key = tuple(template['state_moves']), direction
                 if key not in codes:
@@ -1203,7 +1292,7 @@ class PreparedReplayScorer(ReplayScorer):
                         if pose is not None:
                             layer = m.transform_layer_rotation_by_symmetry(layer, m.CUBE_SYMMETRY_MATRICES[pose])
                         mapping[order, layer_index(axis, side, width)] = 1+layer_index(layer.axis, layer.side, layer.layer_count)
-        templates = [t for t, _, _ in prepared['templates']]
+        templates = [self._template(prepared, index)[0] for index in range(prepared['configuration_count'])]
         sources = np.asarray([layer_index(t['layer_axis'], t['layer_side'], t['layer_count']) for t in templates])
         active = np.asarray([not t['state_moves'] and m.turn_trial_activity_layer(t) is not None for t in templates])
         codes = mapping[:, sources]*active[None, :]
@@ -1231,33 +1320,38 @@ class PreparedReplayScorer(ReplayScorer):
             source_rows = selection['rows']
             if not len(source_rows):
                 continue
-            self.color_configurations_scored += len(orders)*len(source_rows)
+            color_rows = selection.get('color_rows', slice(None))
+            color_inverse = selection.get('color_inverse', slice(None))
+            self.color_configurations_scored += len(orders) * len(source_rows[color_rows])
             confusion = None
             if selection['nearest'] is None:
                 color_errors = np.zeros((len(orders), len(source_rows)))
             else:
                 identities = self.canonical_from_encoded[states[orders][:, self.geometry_positions]]
-                nearest = selection['nearest']
-                matches = selection['weights'][None, :, :] * prepared['match_matrix'][
-                    identities[:, nearest], prepared['observation_indices']]
-                bits = np.left_shift(np.uint64(1), nearest.astype(np.uint64))
-                masks = np.bitwise_or.reduce(np.where(matches > 0, bits[None, :, :], np.uint64(0)),
-                                            axis=2, initial=np.uint64(0))
-                octets = np.ascontiguousarray(masks).view(np.uint8).reshape((*masks.shape, 8))
-                correct = self.byte_popcounts[octets].sum(axis=2)
-                color_errors = np.where(selection['has_weight'][None, :],
-                                       1.-correct/selection['denominator'][None, :], float('inf'))
+                nearest = selection['nearest'][color_rows]
+                weights = selection['weights'][color_rows]
                 if self.color_confusion_scoring:
                     confusion = self.m.sticker_color_confusion_metrics(identities, nearest,
-                        selection['weights'], prepared['confusion_costs'], self.color_confusion_cost)
+                        weights, prepared['confusion_costs'], self.color_confusion_cost)
                     color_errors = confusion['error']
+                else:
+                    matches = weights[None, :, :] * prepared['match_matrix'][
+                        identities[:, nearest], prepared['observation_indices']]
+                    bits = np.left_shift(np.uint64(1), nearest.astype(np.uint64))
+                    masks = np.bitwise_or.reduce(np.where(matches > 0, bits[None, :, :], np.uint64(0)),
+                                                axis=2, initial=np.uint64(0))
+                    octets = np.ascontiguousarray(masks).view(np.uint8).reshape((*masks.shape, 8))
+                    correct = self.byte_popcounts[octets].sum(axis=2)
+                    color_errors = np.where(selection['has_weight'][color_rows][None, :],
+                                           1.-correct/selection['denominator'][color_rows][None, :], float('inf'))
+                color_errors = color_errors[:, color_inverse]
             costs = (0.5*selection['geometry_scores'][None, :]+0.5*color_errors
                      if self.balance_geometry_color else
                      selection['geometry_scores'][None, :]+self.m.PNP_TURN_COLOR_WEIGHT*color_errors)
             if self.minimum_color_accuracy is not None:
                 costs = np.where(color_errors <= 1.-self.minimum_color_accuracy, costs, float('inf'))
             if confusion is not None and self.color_confusion_pruning:
-                forbidden = confusion['forbidden'] > 0
+                forbidden = confusion['forbidden'][:, color_inverse] > 0
                 self.confusion_pruned_fits += int(forbidden.sum())
                 costs = np.where(forbidden, np.inf, costs)
             values.append(costs.ravel())
@@ -1272,6 +1366,10 @@ class PreparedReplayScorer(ReplayScorer):
             return ()
         costs, errors, rows, pose_orders, groups = map(np.concatenate, (values, errors, rows, pose_orders, groups))
         valid = np.flatnonzero(np.isfinite(costs))
+        if len(valid):
+            minimum = np.full(int(groups.max()) + 1, np.inf)
+            np.minimum.at(minimum, groups[valid], costs[valid])
+            valid = valid[costs[valid] == minimum[groups[valid]]]
         order = valid[np.lexsort((rows[valid], pose_orders[valid], -prepared['layer_inliers'][rows[valid]],
             prepared['p90s'][rows[valid]], -prepared['inliers'][rows[valid]], costs[valid], groups[valid]))]
         best = order[np.r_[True, groups[order][1:] != groups[order][:-1]]] if len(order) else ()
@@ -1299,7 +1397,7 @@ class PreparedReplayScorer(ReplayScorer):
         moved = {(): state}
         for index, pose, score, error in winners:
             rescue = m._joint_orientation_rescue_diagnostic(diagnostic['inherited_color_error'], error, 24, score)
-            template, direction, robust = prepared['templates'][index]
+            template, direction, robust = self._template(prepared, index)
             template, direction = self._oriented_template(template, direction, pose, rescue)
             moves = template['state_moves']
             if moves not in moved:
@@ -1360,7 +1458,9 @@ class PreparedReplayScorer(ReplayScorer):
             return result
         selection = self._selection(prepared, self._orientation_restriction(restriction, symmetry_index))
         self.scoring_calls += 1
-        self.color_configurations_scored += len(selection["rows"])
+        color_rows = selection.get('color_rows', slice(None))
+        color_inverse = selection.get('color_inverse', slice(None))
+        self.color_configurations_scored += len(selection["rows"][color_rows])
         indices = None
         confusion = None
         if selection["nearest"] is None:
@@ -1368,25 +1468,28 @@ class PreparedReplayScorer(ReplayScorer):
         else:
             indices = self.canonical_from_encoded[
                 np.frombuffer(oriented, dtype=np.uint8)[self.geometry_positions]]
-            observation_matches = selection["weights"] * prepared["match_matrix"][
-                indices[selection["nearest"]], prepared["observation_indices"]]
-            face_matches = np.zeros((len(selection["rows"]), 54), dtype=np.float64)
-            np.add.at(face_matches, (np.arange(len(selection["rows"]))[:, None],
-                                    selection["nearest"]), observation_matches)
-            correct = np.minimum(face_matches, 1.0).sum(axis=1)
-            errors = np.where(selection["has_weight"],
-                              1.0 - correct / selection["denominator"], float("inf"))
+            nearest = selection['nearest'][color_rows]
+            weights = selection['weights'][color_rows]
             if self.color_confusion_scoring:
-                confusion = m.sticker_color_confusion_metrics(indices, selection['nearest'], selection['weights'],
+                confusion = m.sticker_color_confusion_metrics(indices, nearest, weights,
                     prepared['confusion_costs'], self.color_confusion_cost)
                 errors = confusion['error']
+            else:
+                observation_matches = weights * prepared["match_matrix"][
+                    indices[nearest], prepared["observation_indices"]]
+                face_matches = np.zeros((len(nearest), 54), dtype=np.float64)
+                np.add.at(face_matches, (np.arange(len(nearest))[:, None], nearest), observation_matches)
+                correct = np.minimum(face_matches, 1.0).sum(axis=1)
+                errors = np.where(selection['has_weight'][color_rows],
+                                  1.0 - correct / selection['denominator'][color_rows], float('inf'))
+            errors = errors[color_inverse]
         costs = selection["geometry_scores"] + m.PNP_TURN_COLOR_WEIGHT * errors
         if self.balance_geometry_color:
             costs = .5 * selection["geometry_scores"] + .5 * errors
         if self.minimum_color_accuracy is not None:
             costs = np.where(errors <= 1. - self.minimum_color_accuracy, costs, float("inf"))
         if confusion is not None and self.color_confusion_pruning:
-            forbidden = confusion['forbidden'] > 0
+            forbidden = confusion['forbidden'][color_inverse] > 0
             self.confusion_pruned_fits += int(forbidden.sum())
             costs = np.where(forbidden, np.inf, costs)
         eligible = (np.flatnonzero(np.isfinite(costs)) if self.minimum_color_accuracy is not None or confusion is not None
@@ -1410,7 +1513,7 @@ class PreparedReplayScorer(ReplayScorer):
             score, color_error = float(costs[index]), float(errors[index])
             if not math.isfinite(score) or not math.isfinite(color_error):
                 continue
-            template, direction, robust = prepared["templates"][selection["rows"][index]]
+            template, direction, robust = self._template(prepared, selection['rows'][index])
             template, direction = self._oriented_template(template, direction, symmetry_index, diagnostic)
             moves = template["state_moves"]
             if moves not in moved:

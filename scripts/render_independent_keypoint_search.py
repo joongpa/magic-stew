@@ -86,7 +86,17 @@ def candidate_for_step(m, record, step, state, colors, *, after_solution=False):
         candidate = m._candidate_with_turn_trial(candidate, candidate, trial)
         base = static_assignments(m, replace(candidate, layer_rotations=(),
                                              sticker_layer_rotations=None))
-        if candidate.layer_rotations and base.assignment_object_points is not None:
+        if step.get('parallel_layers'):
+            options, _, _ = m.parallel_turn_frame_geometry(
+                base, m.PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * m.projected_cube_diameter(base),
+                step['layer_axis'], angles=m.parallel_layer_angles(candidate.layer_rotations))
+            if options:
+                chosen = options[0]
+                candidate = replace(candidate,
+                    assignment_object_points=chosen['assignment_object_points'],
+                    assignment_projected_points=chosen['assignment_projected_points'],
+                    assignment_projected_class_ids=chosen['assignment_projected_class_ids'])
+        elif candidate.layer_rotations and base.assignment_object_points is not None:
             # Materialize only the saved partial angle for diagnostic lines.
             # These display assignments do not alter its pose, state, or score.
             rotation = candidate.layer_rotations[0]

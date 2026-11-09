@@ -32,7 +32,7 @@ def search_cached_records(renderer, records, args, colors, source_fps):
     scorer_options = bidirectional.widening_scorer_options(
         renderer, colors, args.turning_start_frame, args.model,
     )
-    scorer = replay.PreparedReplayScorer(renderer, records, "cpu", **scorer_options)
+    scorer = replay.PreparedReplayScorer(renderer, records, "cpu", parallel_layers=True, **scorer_options)
     initial = scorer.key(renderer.CubeGeometryState.identity())
     solved = scorer.solved_predicate(colors)
     if solved(initial):

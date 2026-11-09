@@ -50,6 +50,21 @@ def test_wide_half_turn_is_its_own_inverse():
     assert state.colors == CubeState.solved().colors
 
 
+def test_slice_and_opposite_outer_updates_differ_by_only_the_anchor_rotation():
+    initial = CubeState.from_scramble('R U F2 D')
+    for slice_move, outer, anchor in (
+        ('M', "R L'", "x'"), ('E', "U D'", "y'"), ('S', "F' B", 'z'),
+    ):
+        middle = CubeState(dict(initial.colors))
+        middle.apply_move(slice_move)
+        outside = CubeState(dict(initial.colors))
+        for move in (*outer.split(), anchor):
+            outside.apply_move(move)
+        assert middle.colors == outside.colors
+        middle.apply_move(slice_move + "'")
+        assert middle.colors == initial.colors
+
+
 def test_solved_state_uses_kociemba_facelet_order():
     assert (
         CubeState.solved().to_kociemba_facelets()

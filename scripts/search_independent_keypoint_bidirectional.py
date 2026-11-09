@@ -36,7 +36,7 @@ def inverse(move):
 @dataclass(frozen=True, slots=True)
 class Link:
     state: bytes
-    cue: str | None = None
+    cue: str | tuple[str, ...] | None = None
     link: Link | None = None
     step: dict | None = None
     rank: tuple = ()
@@ -233,7 +233,15 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
                     rotation = scorer.m.CubeLayerRotation(axis, side, angle, count)
                     move = scorer.m.cube_rotation_to_notation(rotation)
                     if move:
-                        reverse_moves[move] = ("layer", axis, side, count, (-1 if move.endswith("'") else 1,))
+                        reverse_moves[(move,)] = ("layer", axis, side, count, (-1 if move.endswith("'") else 1,))
+    parallel_layers = getattr(scorer, 'parallel_layers', False)
+    if parallel_layers:
+        for axis in range(3):
+            for action in scorer.m.parallel_turn_actions(axis):
+                if action:
+                    reverse_moves.setdefault(action, None)
+    reverse_actions = tuple((action, direction, tuple(map(inverse, reversed(action))))
+                            for action, direction in reverse_moves.items())
     midpoint = len(frames) // 2
     bounds = (min(len(frames), midpoint + overlap), max(0, midpoint - overlap))
     attempted_retries = 0
@@ -262,7 +270,7 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
         return .5 * (choice.payload.get("color_error") or 0.)
 
     def step_for(choice, frame, cue):
-        bonus = handoff_bonus if cue and tuple(choice.payload["state_moves"]) == (cue,) else 0.
+        bonus = handoff_bonus if cue and tuple(choice.payload["state_moves"]) == frame_search.completion_moves(cue) else 0.
         step = dict(choice.payload, frame_index=frame, state_score=choice.score,
                     queue_priority=priority(choice)-bonus)
         if bonus:
@@ -295,20 +303,21 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
     def backward(node, depth):
         frame = frames[depth-1]
         hold = scorer.score_hold(frame, node.state)
-        possibilities = [(None, None, node.state)]
+        possibilities = [((), None, node.state)]
         if scorer.hold_reason(frame) is None:
-            possibilities.extend((move, direction, scorer.apply_moves(node.state, (inverse(move),)))
-                                 for move, direction in reverse_moves.items())
-        for move, direction, before in possibilities:
+            possibilities.extend((action, direction, scorer.apply_moves(node.state, undo))
+                                 for action, direction, undo in reverse_actions)
+        for action, direction, before in possibilities:
             check_budget()
-            action = (move,) if move else ()
-            if move:
+            if action and parallel_layers:
+                ordinary = scorer.score_action(frame, before, action)
+            elif action:
                 ordinary = scorer(frame, before) if branch_widths else scorer._evaluate(frame, before, direction)
             else:
                 ordinary = (hold,) if hold is not None else ()
             choices = [(choice, None) for choice in ordinary
                        if choice.state == node.state and tuple(choice.payload["state_moves"]) == action]
-            can_handoff = move and hold is not None and "geometry_option_index" in hold.payload and depth > 1
+            can_handoff = action and hold is not None and "geometry_option_index" in hold.payload and depth > 1
             if not choices and not can_handoff:
                 continue
             # Reverse alternatives can explain the same post-turn stickers. Use
@@ -318,10 +327,11 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
             earlier_cost = priority(earlier) if earlier is not None else 0.5
             # A speculative handoff can fill the beam with cheap predecessors
             # that have no way to supply the required cue on the previous frame.
-            if can_handoff and earlier and frame_search.supported_completion(scorer.m, earlier.payload) == move:
+            cue = frame_search.completion_cue(action)
+            if can_handoff and earlier and frame_search.supported_completion(scorer.m, earlier.payload) == cue:
                 step = dict(hold.payload, state_moves=action, handoff_commit=True, is_baseline=False,
-                            label=f"commit {move} then {hold.payload['label']}")
-                choices.append((replay.Transition(node.state, hold.score, hold.rank, step, None), move))
+                            label=f"commit {' '.join(action)} then {hold.payload['label']}")
+                choices.append((replay.Transition(node.state, hold.score, hold.rank, step, None), cue))
             for choice, need in choices:
                 if not math.isfinite(choice.score) or (node.cue is not None and
                         frame_search.supported_completion(scorer.m, choice.payload) != node.cue):
@@ -416,7 +426,7 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
             if step["frame_index"] != frame:
                 raise RuntimeError("Joined paths disagree about frame order")
             if step.get("handoff_commit"):
-                if not cue or tuple(step["state_moves"]) != (cue,):
+                if not cue or tuple(step["state_moves"]) != frame_search.completion_moves(cue):
                     raise RuntimeError("Joined path is missing a required handoff")
                 choices = (frame_search.score_handoff(scorer, frame, state, cue),)
             else:
@@ -535,7 +545,7 @@ def main():
         scorer_options = widening_scorer_options(m, colors, static_end, metadata.get("pose_model"))
         use_26m = scorer_options["color_confusion_scoring"]
         confusion_table = scorer_options["tracked_color_confusions"]
-    scorer = replay.PreparedReplayScorer(m, records, "cpu", **scorer_options)
+    scorer = replay.PreparedReplayScorer(m, records, "cpu", parallel_layers=bool(args.branch_widths), **scorer_options)
     initial = scorer.key(m.CubeGeometryState.identity())
     goals = solved_seeds(scorer, args.initial_scramble)
     solved = scorer.solved_predicate(colors)

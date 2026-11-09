@@ -34,11 +34,14 @@ FACE_AXES = {
     "D": ((0, 0, -1), 1),
     "F": ((0, -1, 0), 1),
     "B": ((0, 1, 0), 1),
+    "M": ((-1, 0, 0), 0),
+    "E": ((0, 0, -1), 0),
+    "S": ((0, -1, 0), 0),
     "x": ((1, 0, 0), None),
     "y": ((0, 0, 1), None),
     "z": ((0, -1, 0), None),
 }
-SCRAMBLE_MOVE_RE = re.compile(r"(?:[RLUDFB](?:w)?|[rludfb]|[xyz])(?:2|')?")
+SCRAMBLE_MOVE_RE = re.compile(r"(?:[RLUDFB](?:w)?|[rludfbMESxyz])(?:2|')?")
 
 
 def parse_scramble_moves(value: str) -> tuple[str, ...]:
@@ -225,7 +228,7 @@ class CubeState:
         return state
 
     def apply_move(self, move: str) -> None:
-        """Apply one face, wide, whole-cube, inverse, or half turn."""
+        """Apply a face, wide, slice, or whole-cube turn."""
 
         if SCRAMBLE_MOVE_RE.fullmatch(move) is None:
             raise ValueError(f"Invalid scramble move {move!r}")

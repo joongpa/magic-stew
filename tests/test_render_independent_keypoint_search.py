@@ -87,6 +87,78 @@ def test_static_frames_use_selected_pose_when_search_pose_is_not_populated(m):
     assert candidate.turn_state_moves == ()
 
 
+def test_parallel_sticker_assignment_uses_the_frontmost_slab(m):
+    state = m.CubeGeometryState.identity()
+    candidate = video.candidate_for_step(m, record(m), None, state, video.replay.initial_sticker_colors(m, ''))
+    angles = (0., 45., 0.)
+    turned = replace(candidate, layer_rotations=m.parallel_layer_rotations(0, angles))
+    faces = {identity.label: quad for identity, _, quad in m.projected_sticker_faces(
+        turned, turned.rvec, turned.tvec)}
+    hidden = faces['K02 UFR/F'].mean(axis=0)
+    observed = replace(candidate, sticker_mask_centers=(hidden,))
+    _, nearest, valid = m.parallel_turn_frame_geometry(observed, 20., 0, angles=angles)
+    assert valid[0, 0]
+    face = m._turn_gpu_static_geometry()[-1][nearest[0, 0]]
+    assert m.canonical_sticker_identities()[face].label == 'E02 UF/F'
+
+
+def test_parallel_actions_preserve_exact_sticker_identities_when_reoriented(m):
+    state = m.CubeGeometryState.identity().apply_moves(('R', 'U', 'F'))
+    actions = set().union(*(m.parallel_turn_actions(axis) for axis in range(3)))
+    for symmetry in m.CUBE_SYMMETRY_MATRICES:
+        reoriented = m._geometry_state_under_symmetry(state, symmetry)
+        for action in actions:
+            expected = m._geometry_state_under_symmetry(state.apply_moves(action), symmetry)
+            actual = reoriented.apply_moves(m.transform_turn_action(action, symmetry))
+            assert actual.facelets == expected.facelets
+
+
+def test_parallel_handoff_completes_only_supported_uncommitted_layers(m):
+    from scripts.search_independent_keypoint_frame import supported_completion
+
+    trial = dict(parallel_layers=True, layer_axis=2, state_moves=('E',), layer_support=(3, 3, 3),
+                 layer_rotations=[m.layer_rotation_payload(r) for r in
+                                  m.parallel_layer_rotations(2, (30., 30., -30.))])
+    assert supported_completion(m, trial) == ('D', 'U')
+    assert supported_completion(m, dict(trial, layer_support=(3, 3, 0))) == 'D'
+
+
+@pytest.mark.parametrize(('axis', 'outer_anchor', 'moving_anchor'), [
+    (0, (0., 60., 0.), (-60., 0., -60.)),   # M vs R L'
+    (1, (0., 60., 0.), (-60., 0., -60.)),   # S vs F' B
+    (2, (0., 60., 0.), (-60., 0., -60.)),   # E vs U D'
+    (2, (60., 0., 0.), (0., -60., -60.)),   # D vs Uw
+])
+def test_parallel_replay_preserves_sticker_projections_across_pose_anchors(m, axis, outer_anchor, moving_anchor):
+    state = m.CubeGeometryState.identity().apply_moves(('R', 'F', 'U'))
+    colors = video.replay.initial_sticker_colors(m, 'L U B')
+    fixed = record(m)
+    rvec = np.asarray(fixed['search_pose']['rvec'])
+    moving = record(m)
+    moving['search_pose']['rvec'] = cv2.Rodrigues(cv2.Rodrigues(rvec)[0] @
+        cv2.Rodrigues(np.eye(3)[axis] * np.deg2rad(60.))[0])[0].tolist()
+
+    def replay(source, actual):
+        offsets = tuple(np.copysign(90., angle) if abs(angle) > 45. else 0. for angle in actual)
+        residuals = tuple(a - b for a, b in zip(actual, offsets, strict=True))
+        moves = next(action for action, angles in m.parallel_turn_actions(axis).items() if angles == offsets)
+        trial = dict(step(m), parallel_layers=True, layer_axis=axis, color_offset=0., state_moves=moves,
+            layer_rotations=[m.layer_rotation_payload(r) for r in m.parallel_layer_rotations(axis, residuals)])
+        candidate = video.candidate_for_step(m, source, trial, state, colors)
+        assert m.parallel_layer_angles(candidate.sticker_layer_rotations) == actual
+        projected = {identity.label: polygon for identity, _, polygon in m.projected_sticker_faces(
+            candidate, candidate.rvec, candidate.tvec)}
+        return moves, projected
+
+    first, fixed_projection = replay(fixed, outer_anchor)
+    second, moving_projection = replay(moving, moving_anchor)
+    assert first != second
+    assert fixed_projection.keys() == moving_projection.keys()
+    for label in fixed_projection:
+        np.testing.assert_allclose(fixed_projection[label], moving_projection[label], atol=1e-4)
+    assert state.apply_moves(first).apply_move(('x', "z'", 'y')[axis]).facelets == state.apply_moves(second).facelets
+
+
 def test_video_replays_consecutive_moves_once_and_freezes_solved_tail(m, tmp_path, monkeypatch):
     source, output, log = (tmp_path / name for name in ('input.avi', 'output.avi', 'turns.jsonl'))
     writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*'MJPG'), 25., (256, 256))
@@ -185,10 +257,12 @@ def test_render_handoff_uses_post_commit_colors_and_logs_move_once(m, tmp_path):
 
 
 @pytest.mark.parametrize(("frame_count", "mode"), [(4, "forward"), (7, "bidirectional")])
-def test_cached_renderer_recognizes_a_complete_solve(m, tmp_path, monkeypatch, capsys, frame_count, mode):
+@pytest.mark.parametrize(('scramble', 'solution'), [('R', ("R'",)), ('M', ("M'",)), ('D U', ("D'", "U'"))])
+def test_cached_renderer_recognizes_a_complete_solve(m, tmp_path, monkeypatch, capsys, frame_count, mode,
+                                                    scramble, solution):
     monkeypatch.setattr(m, "recover_cached_pose_symmetries", lambda *args, **kwargs: None)
     args = m.build_parser().parse_args([
-        "--source", "unused.mp4", "--initial-scramble", "R", "--recognize-moves", "--no-display",
+        "--source", "unused.mp4", "--initial-scramble", scramble, "--recognize-moves", "--no-display",
         "--no-pose-smoothing", "--turning-start-frame", "1", "--search-seconds", "5",
     ])
     args.turn_candidate_log = tmp_path / "turns.jsonl"
@@ -197,7 +271,7 @@ def test_cached_renderer_recognizes_a_complete_solve(m, tmp_path, monkeypatch, c
     base = video.candidate_for_step(m, record(m), None, start, colors)
     cache = []
     for frame in range(frame_count):
-        state = start if frame < 3 else start.apply_moves(("R'",))
+        state = start if frame < 3 else start.apply_moves(solution)
         projected = m.projected_sticker_faces(replace(base, cube_geometry_state=state), base.rvec, base.tvec)
         candidate = m.attach_color_keypoints(base, np.asarray([quad.mean(axis=0) for _, _, quad in projected]),
                                              tuple(colors[identity.label] for identity, _, _ in projected))
@@ -206,11 +280,11 @@ def test_cached_renderer_recognizes_a_complete_solve(m, tmp_path, monkeypatch, c
     m.process_cached_poses(cache, args, colors, source_fps=25.)
 
     output = capsys.readouterr().out
-    assert f"({mode}" in output and "widths 3 → 5 → 8" in output
+    assert f"({mode}" in output and "widths 3)" in output
     accumulator = m.MoveAccumulator()
     for frame in cache:
         accumulator.observe(frame.pose_candidate, sticker_color_names=colors)
-    assert accumulator.moves == ["R'"]
+    assert tuple(accumulator.moves) == solution
     assert accumulator.solved_frame_index == 3
     rows = [json.loads(line) for line in args.turn_candidate_log.read_text().splitlines()]
     assert [row["frame_index"] for row in rows] == list(range(frame_count))

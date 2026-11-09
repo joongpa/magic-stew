@@ -582,6 +582,12 @@ or geometry scoring must be regenerated.
 color mismatches from the last eight sampled frames to the queue score.
 The same `26m-pose` pairs are excluded from this window term.
 
+The independent-keypoint renderer defaults to a fixed `--branch-widths 3`.
+The prepared search scores M, E, and S and simultaneous turns of parallel
+layers. It combines the three layer angles on a 15° grid from −45° to +45°
+and reuses each slab projection for that frame. The existing single and
+wide fits still use their finer grid.
+
 `--branch-widths 3 5 8` admits the top 3 distinct children per parent by
 candidate rank, then widens to 5 and 8. Each cutoff includes all children
 tied on the full ranking key. Use `--branch-widths 3` for a single stage.

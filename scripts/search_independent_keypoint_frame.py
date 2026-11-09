@@ -57,6 +57,16 @@ def update_bottom_quartile(recent, step, counter_dtype):
 
 def supported_completion(renderer, step):
     rotations = step.get('layer_rotations', ())
+    if step.get('parallel_layers'):
+        axis = step['layer_axis']
+        angles = renderer.parallel_layer_angles(tuple(renderer.CubeLayerRotation(**r) for r in rotations))
+        offsets = renderer.parallel_turn_actions(axis).get(tuple(step.get('state_moves', ())), (0., 0., 0.))
+        completion = renderer.parallel_layer_rotations(axis, tuple(
+            math.copysign(90., angle) if math.isfinite(angle) and abs(angle) > TURN_HANDOFF_MIN_DEGREES
+            and support and not offset else 0.
+            for angle, support, offset in zip(angles, step['layer_support'], offsets, strict=True)))
+        moves = tuple(renderer.cube_rotation_to_notation(r) for r in completion)
+        return completion_cue(moves) if moves else None
     if len(rotations) != 1 or step.get('layer_inlier_count', 0) <= 0:
         return None
     rotation = rotations[0]
@@ -71,20 +81,29 @@ def supported_completion(renderer, step):
     return move
 
 
+def completion_cue(moves):
+    return moves[0] if len(moves) == 1 else moves
+
+
+def completion_moves(cue):
+    return (cue,) if isinstance(cue, str) else cue
+
+
 def unsupported_state_update(step):
     """Distinguish a partial turn with no inliers from a flat fit."""
     return (bool(step.get("state_moves")) and step.get("layer_inlier_count") == 0
             and ("layer_rotations" not in step or bool(step["layer_rotations"])))
 
 
-def score_handoff(scorer, frame, state, move):
+def score_handoff(scorer, frame, state, cue):
     """Commit the previous layer, then fit the current observation from that state."""
-    after = scorer.apply_moves(state, (move,))
+    moves = completion_moves(cue)
+    after = scorer.apply_moves(state, moves)
     hold = scorer.score_hold(frame, after)
     if hold is None or 'geometry_option_index' not in hold.payload:
         return None
-    step = dict(hold.payload, state_moves=(move,), handoff_commit=True, is_baseline=False,
-                label=f"commit {move} then {hold.payload['label']}")
+    step = dict(hold.payload, state_moves=moves, handoff_commit=True, is_baseline=False,
+                label=f"commit {' '.join(moves)} then {hold.payload['label']}")
     return replay.Transition(after, hold.score, hold.rank, step, None)
 
 
@@ -339,7 +358,7 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
                 window = update_mismatch_window(window, step, mismatch_window_weight)
                 priority += step['window_mismatch_penalty']
                 recent = (recent, window)
-            if completion is not None and tuple(step.get('state_moves', ())) == (completion,):
+            if completion is not None and tuple(step.get('state_moves', ())) == completion_moves(completion):
                 priority -= turn_handoff_bonus
                 step['turn_handoff_bonus'] = turn_handoff_bonus
             step['queue_priority'] = priority
@@ -546,6 +565,8 @@ def main():
         use_26m_confusions = checkpoint and Path(checkpoint).resolve() == renderer.DEFAULT_POSE_MODEL.resolve()
         confusion_table = renderer.POSE_26M_COLOR_CONFUSIONS if use_26m_confusions else renderer.COLOR_CLASS_CONFUSIONS
         scorer_options = {}
+        if mode == 'prepared':
+            scorer_options['parallel_layers'] = bool(args.branch_widths)
         if use_26m_confusions:
             scorer_options.update(color_confusion_scoring=True, tracked_color_confusions=confusion_table)
         if args.mismatch_window_weight:
