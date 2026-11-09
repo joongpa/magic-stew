@@ -100,16 +100,26 @@ def test_color_thresholds_are_applied_before_candidates_and_scoring():
     assert valid.tolist() == [True, False, False, False]
 
 
-@pytest.mark.parametrize(("missing", "anchor_frames"), [(0, [101, 102]), (1, [100, 102])])
+@pytest.mark.parametrize(("missing", "fps", "stride"), [
+    (0, 60., 1), (0, 24., 1), (1, 60., 1), (1, 24., 1), (1, 60., 5), (1, 24., 2),
+])
 def test_cached_trajectory_recovers_missing_pose_from_current_detections(
-    monkeypatch, missing, anchor_frames,
+    monkeypatch, missing, fps, stride,
 ):
     # Exercise recovery when the single-frame proposal stage has no result.
     monkeypatch.setattr(m, "_mixed_rigid_baseline", lambda *_: None)
+    refit = m._refit_rigid_trajectory_pose
+    angle_sigmas = []
+
+    def capture_prior(obs, camera, center, rotation, seeds, sigma, angle_sigma, *rest):
+        angle_sigmas.append(angle_sigma)
+        return refit(obs, camera, center, rotation, seeds, sigma, angle_sigma, *rest)
+
+    monkeypatch.setattr(m, "_refit_rigid_trajectory_pose", capture_prior)
     args = m.build_parser().parse_args(["--source", "clip.mp4", "--initial-scramble", ""])
     records = []
     positions = (0., 0., 0.) if missing == 0 else (-5., 0., 5.)
-    for frame, tx in enumerate(positions, start=100):
+    for index, tx in enumerate(positions):
         pose = replace(cube(), tvec=np.array([[tx], [1.0], [230.0]]))
         objects, classes = m.visible_cube_lattice_points(pose.rvec, pose.tvec)
         landmarks = cv2.projectPoints(objects, pose.rvec, pose.tvec, pose.camera_matrix,
@@ -119,19 +129,21 @@ def test_cached_trajectory_recovers_missing_pose_from_current_detections(
         points = np.vstack((landmarks, stickers))
         confidences = np.ones(len(points))
         records.append(m.NeuralFrameData(
-            frame, np.zeros((256, 256, 3), dtype=np.uint8), (0, 0, 256, 256), "tracker", None,
+            100 + index * stride, np.zeros((256, 256, 3), dtype=np.uint8), (0, 0, 256, 256), "tracker", None,
             points, confidences, np.r_[classes, np.full(len(stickers), 4)], confidences,
-            pose_candidate=None if frame == 100 + missing else pose, pose_ready=True,
+            pose_candidate=None if index == missing else pose, pose_ready=True,
         ))
-    endpoints = [records[frame - 100].pose_candidate for frame in anchor_frames]
+    anchors = [record for index, record in enumerate(records) if index != missing]
+    endpoints = [record.pose_candidate for record in anchors]
 
-    assert m.smooth_cached_rigid_poses(records, args, 60.0, {}) == 1
+    assert m.smooth_cached_rigid_poses(records, args, fps, {}) == 1
+    seconds = stride / fps
+    assert angle_sigmas == pytest.approx([(.17 + (1 + missing) * seconds) * np.sqrt(60 * seconds)])
     result = records[missing].pose_candidate
     np.testing.assert_allclose(result.tvec.ravel(), [0, 1, 230], atol=.5)
     assert result.layer_rotations == ()
-    assert result.pose_continuity_diagnostics["anchor_frames"] == anchor_frames
-    assert all(records[frame - 100].pose_candidate is pose
-               for frame, pose in zip(anchor_frames, endpoints, strict=True))
+    assert result.pose_continuity_diagnostics["anchor_frames"] == [record.frame_index for record in anchors]
+    assert all(record.pose_candidate is pose for record, pose in zip(anchors, endpoints, strict=True))
 
 
 def test_render_confidence_override_retains_other_sticker_thresholds():

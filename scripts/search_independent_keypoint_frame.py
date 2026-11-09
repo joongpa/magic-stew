@@ -71,6 +71,12 @@ def supported_completion(renderer, step):
     return move
 
 
+def unsupported_state_update(step):
+    """Distinguish a partial turn with no inliers from a flat fit."""
+    return (bool(step.get("state_moves")) and step.get("layer_inlier_count") == 0
+            and ("layer_rotations" not in step or bool(step["layer_rotations"])))
+
+
 def score_handoff(scorer, frame, state, move):
     """Commit the previous layer, then fit the current observation from that state."""
     after = scorer.apply_moves(state, (move,))
@@ -195,6 +201,9 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
         # Identical states can have different next-frame handoff candidates.
         return pickle.dumps((*key, completion) if handoffs else key, protocol=5)
 
+    def sibling_order(choice):
+        return choice.score, unsupported_state_update(choice.payload), choice.rank[1:]
+
     def offer(key, child, step=None):
         status = queue.offer(key, child, serialize_state(child.state), step)
         if status is None:
@@ -283,13 +292,13 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
             handoff = score_handoff(transitions, frame, node.state, completion)
             if handoff is not None:
                 choices.append(handoff)
-        def unsupported_update(choice):
-            return bool(choice.payload.get('state_moves')) and choice.payload.get('layer_inlier_count') == 0
         if branch_widths:
-            choices.sort(key=lambda choice: (choice.score, unsupported_update(choice), choice.rank[1:]))
+            choices.sort(key=sibling_order)
             siblings = set()
+            previous_order = None
+            admission_rank = 0
         else:
-            choices.sort(key=unsupported_update)
+            choices.sort(key=lambda choice: unsupported_state_update(choice.payload))
         for choice in choices:
             stats['attempted_transitions'] += 1
             if not math.isfinite(choice.score):
@@ -303,7 +312,11 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
                     continue
                 siblings.add(key)
                 rank = len(siblings)
-                if rank > branch_widths[-1]:
+                order = sibling_order(choice)
+                if order != previous_order:
+                    admission_rank = rank
+                    previous_order = order
+                if admission_rank > branch_widths[-1]:
                     break
                 step['sibling_rank'] = rank
             recent = node.recent
@@ -332,10 +345,10 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
             step['queue_priority'] = priority
             child = storage.MeanNode(depth, choice.state, priority, empty_update,
                                      node.path_id, recent=recent, priority=priority)
-            if branch_widths and rank > width:
+            if branch_widths and admission_rank > width:
                 # The same state can become eligible at different widths.
-                deferred_key = pickle.dumps((rank, key), protocol=5)
-                queue.defer(deferred_key, rank, child, serialize_state(child.state), step)
+                deferred_key = pickle.dumps((admission_rank, key), protocol=5)
+                queue.defer(deferred_key, admission_rank, child, serialize_state(child.state), step)
             else:
                 offer(key, child, step)
         stats['peak_pending'] = max(stats['peak_pending'], queue.pending_count)
@@ -379,7 +392,7 @@ def build_parser():
     parser.add_argument("--search-seconds", type=float, help="Search-only time limit per pass.")
     parser.add_argument("--max-explored-states", type=int, help="Maximum expanded states per pass.")
     parser.add_argument("--branch-widths", type=int, nargs="+", default=(),
-                        help="Admit this many children per parent in each stage, e.g. 3 5 8.")
+                        help="Per-parent child cutoffs including ties, e.g. 3 5 8.")
     parser.add_argument("--branch-stage-expansions", type=int,
                         help=f"Override the stage budget of {BRANCH_STAGE_EXPANSIONS_PER_FRAME} expansions per solving frame.")
     queue_geometry = parser.add_mutually_exclusive_group()

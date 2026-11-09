@@ -3901,10 +3901,12 @@ def test_budget_stop_without_complete_path_is_not_reported_as_proven_failure():
 def test_search_budget_parser_and_validation():
     parser = render_script.build_parser()
     args = ['--source', 'frame.png', '--initial-scramble', '']
-    assert parser.parse_args(args).turn_search_state_budget == 4096
+    assert parser.parse_args(args).turn_search_state_budget is None
+    assert parser.parse_args(args).branch_widths == (3, 5, 8)
     assert parser.parse_args([*args, '--turn-search-state-budget', '256']).turn_search_state_budget == 256
-    assert parser.parse_args([*args, '--turn-search-state-budget', 'unlimited']).turn_search_state_budget is None
-    for bad in ('0', '10', '-1', '1.5', 'nan'):
+    assert parser.parse_args([*args, '--max-explored-states', '1']).turn_search_state_budget == 1
+    assert parser.parse_args([*args, '--max-explored-states', 'unlimited']).turn_search_state_budget is None
+    for bad in ('0', '-1', '1.5', 'nan'):
         with pytest.raises(SystemExit):
             parser.parse_args([*args, '--turn-search-state-budget', bad])
     with pytest.raises(ValueError, match='at least one state'):

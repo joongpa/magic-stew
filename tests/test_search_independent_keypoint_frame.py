@@ -93,6 +93,35 @@ def test_hold_wins_score_tie_with_unsupported_update():
     assert visited == [(0, "root"), (1, "held")]
 
 
+def test_flat_update_can_win_a_tie_without_layer_inliers():
+    flat_update = search.replay.Transition("goal", .2, (.2,), dict(
+        state_moves=("R",), layer_inlier_count=0, layer_rotations=[]), None)
+    result = search.frame_full_solve(
+        "root", (0,), lambda *_: (flat_update, edge("held", .2)),
+        lambda state: state == "goal", str, branch_widths=(1,),
+    )
+    assert result["status"] == "solved"
+    assert result["steps"][0]["sibling_rank"] == 1
+
+
+@pytest.mark.parametrize('widths', [(3,), (2, 3)])
+def test_branch_cutoff_keeps_all_distinct_children_tied_on_full_rank(widths):
+    choices = [edge('a', .1), edge('b', .1), edge('a', .1)]
+    choices += [search.replay.Transition(state, .2, (.2, tiebreak), dict(state_moves=()))
+                for state, tiebreak in (('c', 0), ('d', 0), ('goal', 0), ('worse', 1))]
+
+    def solve(target):
+        return search.frame_full_solve('root', (0,), lambda *_: choices,
+            lambda state: state == target, str, branch_widths=widths)
+
+    result = solve('goal')
+    assert result['status'] == 'solved'
+    assert result['steps'][0]['sibling_rank'] == 5
+    assert result['branch_width'] == 3
+    assert result['deferred_promoted'] == (3 if len(widths) > 1 else 0)
+    assert solve('worse')['status'] == 'exhausted'
+
+
 def test_bottom_quartile_orders_queue_using_the_complete_observed_history():
     def fitted(state, fit, matches):
         return search.replay.Transition(state, fit, (fit,), dict(
@@ -348,6 +377,21 @@ def test_handoff_keeps_distinct_cues_and_bonuses_only_the_next_commit(renderer):
     assert handoff['color_offset'] == 0.
     assert handoff['state_score'] == .18
     assert handoff['queue_priority'] == pytest.approx(.16)
+
+
+@pytest.mark.parametrize("cls", [search.replay.ReplayScorer, search.replay.PreparedReplayScorer])
+def test_flat_fits_rank_equally_despite_different_layer_coverage(renderer, cls):
+    record = observation_record(renderer)
+    options = record["search"]["geometry"]["options"]
+    options[0].update(inlier_count=12, layer_inlier_count=6)
+    options.append(dict(options[0], layer_count=2, layer_inlier_count=2, label="static Rw"))
+    record["turn_color_matches"] = np.ones_like(record["turn_color_matches"]).tolist()
+    scorer = cls(renderer, {0: record}, "cpu", balance_geometry_color=True)
+
+    choices = scorer(0, renderer.CubeGeometryState.identity())
+
+    assert {choice.payload["layer_inlier_count"] for choice in choices} == {2, 6}
+    assert {choice.rank for choice in choices} == {(0., -12., 0., 0.)}
 
 
 @pytest.mark.parametrize("cls", [search.replay.ReplayScorer, search.replay.PreparedReplayScorer])

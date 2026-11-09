@@ -880,6 +880,11 @@ def turn_geometry_has_layer_support(option: dict[str, object]) -> bool:
     return not option.get("layer_rotations") or option.get("layer_inlier_count") != 0
 
 
+def turn_layer_inliers_for_ranking(option: dict[str, object]) -> int:
+    """Only a fitted partial angle supplies layer evidence for ranking."""
+    return int(option.get("layer_inlier_count", 0)) if option.get("layer_rotations") else 0
+
+
 def turn_trial_activity_layer(trial: dict[str, object]) -> tuple | None:
     """Activity changes the legal next moves, so holds must retain this key."""
     rotations = trial.get('layer_rotations', ())
@@ -1626,17 +1631,19 @@ class MoveAccumulator:
             self._last_core_tvec = current_tvec.copy()
         if candidate is None:
             return
+        search = getattr(candidate, "turn_search_diagnostics", None) or {}
+        notations = completed_candidate_moves(candidate)
         candidate_geometry = getattr(candidate, "cube_geometry_state", None)
         if candidate_geometry is not None:
-            if self._geometry_state.signature() != candidate_geometry.signature():
+            expected_geometry = (self._geometry_state.apply_moves(notations)
+                                 if search.get("handoff_commit") else self._geometry_state)
+            if expected_geometry.signature() != candidate_geometry.signature():
                 # A candidate produced from a different committed state must
                 # never mutate the model or its displayed move history.
                 self.current_fit = "state-mismatch"
                 return
-        search = getattr(candidate, "turn_search_diagnostics", None) or {}
         if search.get("stop_reason") == "cube_solved":
             self.solved_frame_index = search["solved_frame_index"]
-        notations = completed_candidate_moves(candidate)
         if not notations:
             return
         signature = notations
@@ -6545,7 +6552,7 @@ def _score_turn_color_offsets_for_states_on_gpu(
                 [option["sticker_error"] for option in configured_options]), float("inf"))
         inliers = np.asarray([int(option.get("inlier_count", 0)) for option in configured_options])
         p90s = np.asarray([float(option.get("p90_error", float("inf"))) for option in configured_options])
-        layer_inliers = np.asarray([int(option.get("layer_inlier_count", 0)) for option in configured_options])
+        layer_inliers = np.asarray([turn_layer_inliers_for_ranking(option) for option in configured_options])
         results_by_state: list[list[dict[str, object]]] = []
         for state_index in range(len(geometry_states)):
             results: list[dict[str, object]] = []
@@ -6627,7 +6634,7 @@ def _score_turn_color_offsets_for_states_on_gpu(
                             state_score,
                             -float(inlier_count),
                             float(option.get("p90_error", float("inf"))),
-                            -float(layer_inlier_count),
+                            -float(layer_inliers[index]),
                         ),
                         "robust_error": (float(balanced_robust_cost(option.get("robust_error", float("inf")), color_error))
                                          if balance_geometry_color else
@@ -9176,12 +9183,11 @@ def draw_orientation_axes(
     return True
 
 
-def append_turn_candidate_log(
-    path: Path,
+def turn_candidate_log_record(
     candidate: StickerPnPCandidate | None,
     frame_index: int | None,
-) -> None:
-    """Append one complete turn-search record for one rendered frame."""
+) -> dict[str, object]:
+    """Build the serializable turn-search record for one frame."""
 
     def json_safe(value: object) -> object:
         if isinstance(value, dict):
@@ -9452,9 +9458,18 @@ def append_turn_candidate_log(
         "candidate_count": len(candidates),
         "candidates": candidates,
     }
+    return json_safe(record)
+
+
+def append_turn_candidate_log(
+    path: Path,
+    candidate: StickerPnPCandidate | None,
+    frame_index: int | None,
+) -> None:
+    """Append one complete turn-search record for one rendered frame."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as log_file:
-        json.dump(json_safe(record), log_file, separators=(",", ":"))
+        json.dump(turn_candidate_log_record(candidate, frame_index), log_file, separators=(",", ":"))
         log_file.write("\n")
 
 
@@ -11160,9 +11175,9 @@ def parse_turn_search_budget(value: str) -> int | None:
     try:
         result = int(value)
     except ValueError as error:
-        raise argparse.ArgumentTypeError('Use an integer >= 11, or unlimited') from error
-    if result < PNP_TURN_LOOKAHEAD_FRAMES + 1:
-        raise argparse.ArgumentTypeError('State budget must be at least 11, or unlimited')
+        raise argparse.ArgumentTypeError('Use a positive integer or unlimited') from error
+    if result < 1:
+        raise argparse.ArgumentTypeError('State budget must be positive, or unlimited')
     return result
 
 
@@ -11751,9 +11766,15 @@ class RigidTrajectoryRepair:
     outline_pixels: np.ndarray
 
 
+RIGID_POSE_REFERENCE_FPS = 60.0
+RIGID_SHORT_SUPPORT_SECONDS = .085
+RIGID_OUTLINE_MIN_SPAN_SECONDS = .05
+RIGID_OUTLINE_MAX_SPAN_SECONDS = .52
+
+
 def _smooth_rigid_outline_gap(
     gap: list[RigidTrajectoryRepair], observations: list[RigidPoseObservations],
-    frame_indices: list[int], endpoints: tuple[StickerPnPCandidate, StickerPnPCandidate] | None = None,
+    times: np.ndarray, endpoints: tuple[StickerPnPCandidate, StickerPnPCandidate] | None = None,
 ) -> list[RigidTrajectoryRepair]:
     """Fit contiguous two-face observations and a shared motion trajectory."""
     from scipy.optimize import least_squares
@@ -11770,9 +11791,12 @@ def _smooth_rigid_outline_gap(
         left_core, right_core = (_rigid_core_coordinates(pose) for pose in endpoints)
         right_rotation = _align_rigid_rotation(endpoints[1].rvec, reference)
     scale = float(np.median([obs.pixel_scale for obs in observations]))
-    dt = np.diff(frame_indices).astype(float)
+    dt = np.diff(times)
     if np.any(dt <= 0):
         return gap
+    # Normalize velocity and acceleration to the tolerances tuned at 60 fps.
+    rate_interval = dt[:, None] * RIGID_POSE_REFERENCE_FPS
+    acceleration_interval = (rate_interval[:-1] + rate_interval[1:]) / 2
     associations = []
     faces = _turn_gpu_static_geometry()[2]
     for fit, obs in zip(gap, observations, strict=True):
@@ -11790,15 +11814,16 @@ def _smooth_rigid_outline_gap(
             outlines.append({key: fit.outline_pixels[np.all(corners == key, axis=1)].mean(axis=0)
                              for key in {tuple(corner) for corner in corners}})
         still = []
-        for first, second in zip(outlines, outlines[1:]):
+        for first, second, seconds in zip(outlines[:-1], outlines[1:], dt, strict=True):
             shared = first.keys() & second.keys()
             steps = [np.linalg.norm(first[key] - second[key]) for key in shared]
-            still.append(len(steps) >= 5 and np.percentile(steps, 75) <= 3 * scale)
-        # Apply a hold only when several measured outline steps agree.
-        for i in range(len(still) - 2):
-            if all(still[i:i + 3]):
-                stationary.extend(range(i, i + 3))
-        stationary = sorted(set(stationary))
+            still.append(len(steps) >= 5
+                         and np.percentile(steps, 75) <= 3 * scale * seconds * RIGID_POSE_REFERENCE_FPS)
+        # Require both elapsed time and repeated measurements before applying a hold.
+        boundaries = np.flatnonzero(np.diff(np.r_[False, still, False]))
+        for start, stop in zip(boundaries[::2], boundaries[1::2], strict=True):
+            if stop - start >= 2 and times[stop] - times[start] >= RIGID_OUTLINE_MIN_SPAN_SECONDS - 1e-9:
+                stationary.extend(range(start, stop))
 
     def image_residual(fit, obs, rotation, core, associations):
         rvec, tvec = cv2.Rodrigues(rotation)[0], _rigid_translation(core, fit.camera)
@@ -11828,11 +11853,11 @@ def _smooth_rigid_outline_gap(
         if endpoints:
             cores = np.vstack([left_core, cores, right_core])
             aligned = [reference, *aligned, right_rotation]
-        steps = np.diff(cores, axis=0) / dt[:, None]
+        steps = np.diff(cores, axis=0) / rate_interval
         angles = np.array([cv2.Rodrigues(b @ a.T)[0].ravel()
-                           for a, b in zip(aligned, aligned[1:])]) / dt[:, None]
-        acceleration = np.diff(steps, axis=0) / [2 * scale, 2 * scale, 7]
-        angular_acceleration = np.diff(angles, axis=0) / .04
+                           for a, b in zip(aligned, aligned[1:])]) / rate_interval
+        acceleration = np.diff(steps, axis=0) / acceleration_interval / [2 * scale, 2 * scale, 7]
+        angular_acceleration = np.diff(angles, axis=0) / acceleration_interval / .04
         hold = steps[stationary] / [1.5 * scale, 1.5 * scale, 1.]
         return np.r_[image_errors, acceleration.ravel(), angular_acceleration.ravel(), hold.ravel()]
 
@@ -11881,19 +11906,33 @@ def _smooth_rigid_outline_gap(
     return refined
 
 
+def _rigid_anchors_near_time(
+    anchors: np.ndarray, times: np.ndarray, time: float, radius: float,
+) -> np.ndarray:
+    start = np.searchsorted(times, time - radius, side="left")
+    stop = np.searchsorted(times, time + radius, side="right")
+    a, b = np.searchsorted(anchors, [start, stop])
+    return anchors[a:b]
+
+
 def _local_rigid_depth(
-    i: int, anchors: np.ndarray, frames: np.ndarray, coordinates: dict[int, np.ndarray], fps: float,
+    i: int, anchors: np.ndarray, times: np.ndarray, coordinates: dict[int, np.ndarray],
 ) -> float | None:
-    k = int(np.searchsorted(anchors, i))
-    left = anchors[max(0, k - 3):k]
-    right = anchors[k:k + 4]
-    right = right[right != i][:3]
-    neighbors = np.r_[left, right]
-    elapsed = (frames[neighbors] - frames[i]) / fps
-    nearby = np.abs(elapsed) <= .18
-    neighbors, elapsed = neighbors[nearby], elapsed[nearby]
+    neighbors = _rigid_anchors_near_time(anchors, times, times[i], .18)
+    neighbors = neighbors[neighbors != i]
+    elapsed = times[neighbors] - times[i]
     if len(neighbors) < 2 or np.min(np.abs(elapsed)) > .06:
         return None
+    nearby = np.abs(elapsed) <= .055
+    # Keep the short time window when dense, and use sparse anchors to bracket
+    # the frame or to supply a second observation at a clip boundary.
+    nearest = np.argsort(np.abs(elapsed))
+    nearby[nearest[:2]] = True
+    for side in (elapsed < 0, elapsed > 0):
+        side_nearest = nearest[side[nearest]]
+        if side_nearest.size:
+            nearby[side_nearest[0]] = True
+    neighbors, elapsed = neighbors[nearby], elapsed[nearby]
     depth = np.asarray([coordinates[int(j)][2] for j in neighbors])
     bracketing = elapsed.min() < 0 < elapsed.max()
     trend = np.column_stack((np.ones(len(depth)), elapsed)) if bracketing else np.ones((len(depth), 1))
@@ -11946,7 +11985,7 @@ def _store_rigid_pose(
 
 def _smooth_visible_face_tracks(
     cache: list[NeuralFrameData], observations: list[RigidPoseObservations | None],
-    anchors: np.ndarray, fps: float,
+    anchors: np.ndarray, times: np.ndarray, *, progress: bool = False,
 ) -> set[int]:
     """Discover continuous outline tracks, including well-fitted frames and the clip ends."""
     samples = {}
@@ -11955,11 +11994,12 @@ def _smooth_visible_face_tracks(
     changed = set()
 
     def finish() -> None:
-        if len(pending) < 4:
+        if (len(pending) < 3
+                or times[pending[-1][0]] - times[pending[0][0]] < RIGID_OUTLINE_MIN_SPAN_SECONDS - 1e-9):
             return
         indices, fits = zip(*pending, strict=True)
         refined = _smooth_rigid_outline_gap(
-            list(fits), [observations[i] for i in indices], [cache[i].frame_index for i in indices],
+            list(fits), [observations[i] for i in indices], times[list(indices)],
         )
         for i, before, after in zip(indices, fits, refined, strict=True):
             if before is after:
@@ -11975,18 +12015,18 @@ def _smooth_visible_face_tracks(
                 })
                 changed.add(i)
 
+    total_frames = len(cache)
     for i, (obs, pose) in enumerate(zip(observations, poses, strict=True)):
+        if progress:
+            print_headless_progress("pose smoothing / face outlines", i, total_frames)
         fit = None
         if (obs is not None and cache[i].frame is not None and isinstance(pose, StickerPnPCandidate)
                 and not pose.layer_rotations and not physical_sticker_rotations(pose)
                 and pose.tvec.reshape(3)[2] > CUBE_SIZE_MM):
-            k = int(np.searchsorted(anchors, i))
-            nearby = anchors[max(0, k - 2):k + 3]
-            nearby = sorted(nearby, key=lambda j: abs(cache[j].frame_index - cache[i].frame_index))
+            nearby = _rigid_anchors_near_time(anchors, times, times[i], .10)
+            nearby = sorted(nearby, key=lambda j: abs(times[j] - times[i]))
             diameter = projected_cube_diameter(pose)
             for ref in nearby:
-                if abs(cache[ref].frame_index - cache[i].frame_index) > max(2, .10 * fps):
-                    break
                 reference = poses[ref]
                 if ref not in samples:
                     match = _match_rigid_pose(observations[ref], reference.rvec, reference.tvec, reference)
@@ -12002,24 +12042,29 @@ def _smooth_visible_face_tracks(
                     match = _match_rigid_pose(obs, rvec, pose.tvec, pose)
                     fit = RigidTrajectoryRepair(pose, rvec, pose.tvec, match, objects, pixels)
                     break
-        if (fit is None or len(pending) == 32 or (pending
-                and cache[i].frame_index != cache[pending[-1][0]].frame_index + 1)):
+        if (fit is None or (pending and (
+                times[i] - times[pending[0][0]] > RIGID_OUTLINE_MAX_SPAN_SECONDS
+                or cache[i].frame_index != cache[pending[-1][0]].frame_index + 1))):
             finish()
             pending.clear()
         if fit is not None:
             pending.append((i, fit))
     finish()
+    if progress:
+        print_headless_progress("pose smoothing / face outlines", total_frames, total_frames)
     return changed
 
 
 def smooth_cached_rigid_poses(
     cache: list[NeuralFrameData], args: argparse.Namespace, source_fps: float,
-    known_initial_colors: dict[str, str],
+    known_initial_colors: dict[str, str], *, progress: bool = False,
 ) -> int:
     """Fit the cached rigid trajectory from image evidence and local motion."""
     from scipy.interpolate import PchipInterpolator
 
     fps = source_fps if np.isfinite(source_fps) and source_fps > 0 else 30.0
+    frames = np.asarray([record.frame_index for record in cache])
+    times = frames / fps
     observations = [_rigid_pose_observations(record, args) for record in cache]
     poses = [record.pose_candidate for record in cache]
     matches: dict[int, RigidPoseMatches] = {}
@@ -12037,7 +12082,10 @@ def smooth_cached_rigid_poses(
             default_camera_matrix((width, height), args.pnp_focal_scale), np.zeros((4, 1)),
             np.zeros((3, 1)), np.zeros((3, 1)), float("inf"), image_size=(width, height),
         )
+    total_frames = len(cache)
     for i, (pose, obs) in enumerate(zip(poses, observations, strict=True)):
+        if progress:
+            print_headless_progress("pose smoothing / mixed seeds", i, total_frames)
         if obs is None or (isinstance(pose, StickerPnPCandidate)
                            and (pose.layer_rotations or physical_sticker_rotations(pose))):
             continue
@@ -12064,14 +12112,19 @@ def smooth_cached_rigid_poses(
         if _rigid_anchor_supported(match, obs.pixel_scale):
             supported.append(i)
 
+    if progress:
+        print_headless_progress("pose smoothing / mixed seeds", total_frames, total_frames)
+
     # Do not let an otherwise well-matched, isolated jump anchor its own
     # neighborhood. Require support on both sides before overruling it.
     isolated = set()
     for a, i, b in zip(supported, supported[1:], supported[2:]):
-        if cache[b].frame_index - cache[a].frame_index > max(3, .08 * fps):
+        gap_seconds = times[b] - times[a]
+        if not 0 < gap_seconds <= RIGID_SHORT_SUPPORT_SECONDS:
             continue
         left, current, right = (coordinates[k] for k in (a, i, b))
-        expected = (left + right) / 2
+        fraction = (times[i] - times[a]) / gap_seconds
+        expected = left + fraction * (right - left)
         diameter = projected_cube_diameter(poses[a])
         if (np.linalg.norm(left[:2] - right[:2]) < .16 * diameter
                 and abs(left[2] - right[2]) < .12 * expected[2]
@@ -12080,11 +12133,12 @@ def smooth_cached_rigid_poses(
             isolated.add(i)
     # At a clip boundary a short, stable one-sided neighborhood can still
     # expose a displaced first or last pose.
-    for order in (supported[:4], supported[-4:][::-1]):
-        if len(order) < 4:
-            continue
-        i, *nearby = order
-        if abs(cache[nearby[-1]].frame_index - cache[i].frame_index) > max(3, .08 * fps):
+    supported_indices = np.asarray(supported, dtype=int)
+    for i in supported[:1] + supported[-1:]:
+        nearby = _rigid_anchors_near_time(supported_indices, times, times[i],
+                                         RIGID_SHORT_SUPPORT_SECONDS)
+        nearby = nearby[nearby != i]
+        if len(nearby) < 2:
             continue
         values = np.asarray([coordinates[j] for j in nearby])
         center = np.median(values, axis=0)
@@ -12114,10 +12168,10 @@ def smooth_cached_rigid_poses(
         if k == 0 or k == len(strong):
             continue
         a, b = int(strong[k - 1]), int(strong[k])
-        t0, t1 = cache[a].frame_index, cache[b].frame_index
-        if t1 <= t0 or t1 - t0 > max(3, .40 * fps):
+        t0, t1 = times[a], times[b]
+        if t1 <= t0 or t1 - t0 > .40:
             continue
-        fraction = (cache[i].frame_index - t0) / (t1 - t0)
+        fraction = (times[i] - t0) / (t1 - t0)
         expected = (1 - fraction) * coordinates[a] + fraction * coordinates[b]
         if (abs(coordinates[i][2] - expected[2]) < .13 * expected[2]
                 and np.linalg.norm(coordinates[i][:2] - expected[:2])
@@ -12125,10 +12179,11 @@ def smooth_cached_rigid_poses(
             position_guides.add(i)
     anchors = np.asarray(sorted(strong_set | position_guides), dtype=int)
     anchor_set = set(anchors)
-    frames = np.asarray([record.frame_index for record in cache])
     repairs: dict[tuple[int, int], dict[int, RigidTrajectoryRepair]] = {}
     face_colors = {}
     for i, obs in enumerate(observations):
+        if progress:
+            print_headless_progress("pose smoothing / trajectory refit", i, total_frames)
         if obs is None or i in anchor_set:
             continue
         base = poses[i]
@@ -12137,12 +12192,12 @@ def smooth_cached_rigid_poses(
         k = int(np.searchsorted(anchors, i))
         if len(anchors) < 2:
             continue
-        frame = cache[i].frame_index
+        time = times[i]
         one_sided = k == 0 or k == len(anchors)
         if one_sided:
             nearby = anchors[:2] if k == 0 else anchors[-2:]
             a, b = (int(x) for x in nearby)
-            if max(abs(frame - cache[x].frame_index) for x in nearby) > max(2, .08 * fps):
+            if np.max(np.abs(time - times[nearby])) > RIGID_SHORT_SUPPORT_SECONDS:
                 continue
             diameter = projected_cube_diameter(poses[a])
             if (np.linalg.norm(coordinates[a][:2] - coordinates[b][:2]) > .10 * diameter
@@ -12152,23 +12207,28 @@ def smooth_cached_rigid_poses(
         else:
             a, b = int(anchors[k - 1]), int(anchors[k])
             neighbors = [int(x) for x in anchors[max(0, k - 2):k + 2]]
-        gap = cache[b].frame_index - cache[a].frame_index
-        if gap <= 0 or gap > max(3, round(.32 * fps)):
+        gap_seconds = times[b] - times[a]
+        if gap_seconds <= 0 or gap_seconds > .32:
             continue
-        times = [cache[x].frame_index for x in neighbors]
-        if any(x >= y for x, y in zip(times, times[1:])):
+        neighbor_times = times[neighbors]
+        if np.any(np.diff(neighbor_times) <= 0):
             continue
         if one_sided:
             center = (coordinates[a] + coordinates[b]) / 2
+            uncertainty_time = min(abs(time - times[a]), abs(time - times[b]))
         else:
-            center = PchipInterpolator(times, [coordinates[x] for x in neighbors], axis=0)(frame)
-        depth = _local_rigid_depth(i, anchors, frames, coordinates, fps)
+            center = PchipInterpolator(neighbor_times, [coordinates[x] for x in neighbors], axis=0)(time)
+            # A motion prediction between two anchors is least certain near
+            # the midpoint. Match the old prior for a one-frame gap at 60 fps.
+            uncertainty_time = 2 * (time - times[a]) * (times[b] - time) / gap_seconds
+        motion_scale = np.sqrt(max(1., uncertainty_time * RIGID_POSE_REFERENCE_FPS))
+        depth = _local_rigid_depth(i, anchors, times, coordinates)
         if depth is not None:
             center[2] = depth
         template = base if i in matches else poses[a]
         left_rotation = cv2.Rodrigues(poses[a].rvec)[0]
         right_rotation = _align_rigid_rotation(poses[b].rvec, left_rotation)
-        alpha = float(np.clip((frame - cache[a].frame_index) / gap, 0, 1))
+        alpha = float(np.clip((time - times[a]) / gap_seconds, 0, 1))
         relative = cv2.Rodrigues(right_rotation @ left_rotation.T)[0]
         rotation = cv2.Rodrigues(alpha * relative)[0] @ left_rotation
         diameter = projected_cube_diameter(template, cv2.Rodrigues(rotation)[0],
@@ -12176,7 +12236,7 @@ def smooth_cached_rigid_poses(
         if not np.isfinite(diameter):
             continue
         outline_objects, outline_pixels = np.empty((0, 3)), np.empty((0, 2))
-        for ref in sorted((a, b), key=lambda x: abs(cache[x].frame_index - frame)):
+        for ref in sorted((a, b), key=lambda x: abs(times[x] - time)):
             if ref not in face_colors:
                 face_colors[ref] = _rigid_face_colors(cache[ref], observations[ref], matches[ref])
             if not face_colors[ref]:
@@ -12189,13 +12249,13 @@ def smooth_cached_rigid_poses(
                 rotation = aligned
                 break
         sigma = np.array([max(3., .025 * diameter), max(3., .025 * diameter),
-                          max(8., .025 * center[2])]) * (1 + gap / fps)
+                          max(8., .025 * center[2])]) * (1 + gap_seconds) * motion_scale
+        angle_sigma = .17 + gap_seconds + (.09 if a in position_guides or b in position_guides else 0)
         seeds = [(poses[a].rvec, None), (poses[b].rvec, None)]
         if not outline_objects.size and (i not in matches or matches[i].sticker_count < 5):
             seeds.extend(_mixed_rigid_seeds(obs, template, center[2]))
         result = _refit_rigid_trajectory_pose(
-            obs, template, center, rotation, seeds, sigma,
-            .17 + gap / fps + (.09 if a in position_guides or b in position_guides else 0),
+            obs, template, center, rotation, seeds, sigma, angle_sigma * motion_scale,
             matches.get(i), outline_objects, outline_pixels,
         )
         if result is None:
@@ -12204,15 +12264,20 @@ def smooth_cached_rigid_poses(
         repairs.setdefault((a, b), {})[i] = RigidTrajectoryRepair(
             template, rvec, tvec, fit, outline_objects, outline_pixels)
 
+    if progress:
+        print_headless_progress("pose smoothing / trajectory refit", total_frames, total_frames)
+
     repaired = set()
-    for (a, b), group in repairs.items():
+    for index, ((a, b), group) in enumerate(repairs.items(), start=1):
+        if progress:
+            print_headless_progress("pose smoothing / fitting gaps", index, len(repairs))
         indices = list(group)
         fits = list(group.values())
         if (len(fits) >= 2 and indices == list(range(a + 1, b))
                 and all(fit.outline_objects.size for fit in fits)):
             fits = _smooth_rigid_outline_gap(
                 fits, [observations[i] for i in indices],
-                [cache[i].frame_index for i in range(a, b + 1)], (poses[a], poses[b]),
+                times[a:b + 1], (poses[a], poses[b]),
             )
         for i, fit in zip(indices, fits, strict=True):
             candidate = _candidate_from_rigid_trajectory(
@@ -12230,8 +12295,10 @@ def smooth_cached_rigid_poses(
         _store_rigid_pose(cache[i], poses[i], {
             "method": "mixed_rigid", "sticker_areas": matches[i].sticker_count,
         })
-    for i in anchors:
-        target = _local_rigid_depth(i, anchors, frames, coordinates, fps)
+    for index, i in enumerate(anchors, start=1):
+        if progress:
+            print_headless_progress("pose smoothing / depth trend", index, len(anchors))
+        target = _local_rigid_depth(i, anchors, times, coordinates)
         if target is None:
             continue
         pose, obs = cache[i].pose_candidate, observations[i]
@@ -12245,10 +12312,12 @@ def smooth_cached_rigid_poses(
                 "method": "rigid_depth_trend", "sticker_areas": fit.sticker_count,
             })
             repaired.add(i)
-    repaired.update(_smooth_visible_face_tracks(cache, observations, anchors, fps))
+    repaired.update(_smooth_visible_face_tracks(cache, observations, anchors, times, progress=progress))
     repaired.update(mixed_baselines)
     if known_initial_colors:
-        for i in sorted(repaired):
+        for index, i in enumerate(sorted(repaired), start=1):
+            if progress:
+                print_headless_progress("pose smoothing / orientation", index, len(repaired))
             candidate = cache[i].pose_candidate
             _store_rigid_pose(cache[i], match_orientation_to_colors(candidate, known_initial_colors),
                               candidate.pose_continuity_diagnostics)
@@ -12345,13 +12414,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--recognize-moves", action=argparse.BooleanOptionalAction, default=False,
-        help="Enable layer-turn search after pose and orientation recovery.",
+        help="Search for a complete solve after pose and orientation recovery.",
     )
     parser.add_argument(
-        "--turn-search-state-budget", type=parse_turn_search_budget,
-        default=PNP_TURN_LOOKAHEAD_STATE_BUDGET,
-        help="Maximum frame/state evaluations per decision, including seeds and retries (default: 4096; unlimited disables).",
+        "--max-explored-states", "--turn-search-state-budget", dest="turn_search_state_budget",
+        type=parse_turn_search_budget,
+        help="Maximum expanded states per full-search pass (default: unlimited).",
     )
+    parser.add_argument("--search-seconds", type=float, default=300.,
+                        help="Search-only time limit per full-search pass (default: 300).")
+    parser.add_argument("--branch-widths", type=int, nargs="+", default=(3, 5, 8),
+                        help="Per-parent child cutoffs including ties (default: 3 5 8).")
+    parser.add_argument("--branch-stage-expansions", type=int,
+                        help="Override the widening budget of 100 expansions per solving frame.")
+    parser.add_argument("--frame-parity", choices=("auto", "all", "even", "odd", "both"), default="auto",
+                        help="Frames for full search (auto tries both parities at 50 FPS or higher).")
+    parser.add_argument("--solved-anchor-frame", type=int,
+                        help="Override automatic selection of a flat solved frame for backward search.")
     parser.add_argument(
         "--turning-start-frame", type=parse_turning_start_frame, default=None,
         help="Force static holds with no layer offsets through this zero-based frame, inclusive; moves are allowed afterward (default: unrestricted).",
@@ -12372,8 +12451,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Output directory for turn scores and images; logging retains every "
-            "evaluated turn permutation (disabled by default)."
+            "Output directory for the per-frame turn geometry and accepted full-search path."
         ),
     )
     parser.add_argument(
@@ -12424,13 +12502,12 @@ def process_cached_poses(
     source_fps: float = PNP_TURN_LOOKAHEAD_REFERENCE_FPS,
 ) -> None:
     """Recover poses and optional moves directly from the cached model predictions."""
-    trace = StickerColorTrace.create()
     needs_pose = args.show_pnp or args.recognize_moves or args.show_colored_masks
     if needs_pose:
         print("Refining poses and matching observed sticker colors to the scramble...", flush=True)
-        trace = recover_cached_pose_symmetries(
+        recover_cached_pose_symmetries(
             cache,
-            trace,
+            StickerColorTrace.create(),
             progress=not args.display,
             refine_pose=True,
             recover_orientation=True,
@@ -12439,34 +12516,36 @@ def process_cached_poses(
         )
         if len(cache) >= 3 and getattr(args, "pose_smoothing", True):
             print("Refitting the cached rigid pose trajectory...", flush=True)
-            repaired = smooth_cached_rigid_poses(cache, args, source_fps, known_initial_colors)
+            repaired = smooth_cached_rigid_poses(
+                cache, args, source_fps, known_initial_colors, progress=not args.display,
+            )
+            if not args.display:
+                print()
             print(f"Refit {repaired} cached rigid poses.", flush=True)
     if args.recognize_moves:
-        if args.turning_start_frame is not None:
-            print(
-                f"Holding cube state static through frame {args.turning_start_frame} (inclusive).",
-                flush=True,
-            )
-        recover_cached_pose_symmetries(
-            cache,
-            trace,
-            progress=not args.display,
-            pose_prepared=True,
-            recover_orientation=False,
-            recognize_moves=True,
-            source_fps=source_fps,
-            known_initial_colors=known_initial_colors,
-            turning_start_frame=args.turning_start_frame,
-            record_all_turn_candidates=args.turn_candidate_log is not None,
-            turn_candidate_log=args.turn_candidate_log,
-        )
+        from scripts.independent_keypoint_video_search import run_cached_full_search
+
+        try:
+            run_cached_full_search(sys.modules[__name__], cache, args, known_initial_colors, source_fps)
+        except ValueError as error:
+            raise SystemExit(f"Full move search: {error}") from None
 
 
 def main() -> int:
-    args = build_parser().parse_args()
-    global PNP_ASSIGNMENT_MODE, PNP_TURN_LOOKAHEAD_STATE_BUDGET
+    parser = build_parser()
+    args = parser.parse_args()
+    if not np.isfinite(args.search_seconds) or args.search_seconds <= 0:
+        parser.error("--search-seconds must be positive and finite")
+    if any(width < 1 for width in args.branch_widths) or any(
+            b <= a for a, b in zip(args.branch_widths, args.branch_widths[1:])):
+        parser.error("--branch-widths must be positive and strictly increasing")
+    if args.branch_stage_expansions is not None and args.branch_stage_expansions < 1:
+        parser.error("--branch-stage-expansions must be positive")
+    if args.solved_anchor_frame is not None and (
+            args.solved_anchor_frame < 0 or _frame_forces_static_hold(args.solved_anchor_frame, args.turning_start_frame)):
+        parser.error("--solved-anchor-frame must be nonnegative and after --turning-start-frame")
+    global PNP_ASSIGNMENT_MODE
     PNP_ASSIGNMENT_MODE = args.pnp_assignment_mode
-    PNP_TURN_LOOKAHEAD_STATE_BUDGET = args.turn_search_state_budget
     initial_state = CubeState.from_scramble(args.initial_scramble)
     known_initial_colors = {
         identity.label: initial_state.color_at(
@@ -12492,8 +12571,6 @@ def main() -> int:
         args.turn_candidate_images.mkdir(parents=True, exist_ok=True)
         print(f"Turn candidate images: {args.turn_candidate_images}", flush=True)
     print(f"Inference device: {args.device}", flush=True)
-    if args.recognize_moves and _turn_torch_scoring_device("mps") is None:
-        raise SystemExit("Move recognition requires an available Apple MPS device")
     if args.pose_conf is not None and not 0.0 <= args.pose_conf <= 1.0:
         raise SystemExit("--pose-conf must be in [0, 1]")
     if args.pose_conf is not None and args.pose_conf > min(args.pose_class_conf.values()):

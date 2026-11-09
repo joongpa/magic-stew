@@ -5,7 +5,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from search_independent_keypoint_bidirectional import Link, bidirectional_search, replay
+from search_independent_keypoint_bidirectional import Link, bidirectional_search, replay, widening_join
 from independent_keypoint_window_forecast import WindowForecaster
 
 
@@ -87,6 +87,32 @@ def test_independent_widening_releases_prefix_and_verifies_handoff():
     widened = [row for row in events if row["event"] == "widened"]
     assert any(row["direction"] == "forward" and row["forward_expanded"] == 1 for row in widened)
     assert all(row[row["direction"] + "_expanded"] == 1 for row in widened)
+
+
+@pytest.mark.parametrize('direction', [0, 1])
+@pytest.mark.parametrize('widths', [(3,), (2, 3)])
+def test_widening_join_keeps_full_tie_at_branch_cutoff(direction, widths):
+    def expand(node, depth):
+        return [Link(state, step=dict(state_moves=(), state_score=score, queue_priority=score),
+                     rank=((tiebreak,),))
+                for state, score, tiebreak in (
+                    (b'a', .1, 0), (b'b', .1, 0), (b'a', .1, 0), (b'c', .2, 0),
+                    (b'd', .2, 0), (b'target', .2, 0), (b'worse', .2, 1))]
+
+    def join(target):
+        expansions = [expand, lambda *_: ()]
+        seeds = [b'root', target]
+        if direction == 1:
+            expansions.reverse()
+            seeds.reverse()
+        return widening_join(*expansions, seeds[0], (seeds[1],), 1,
+            widths=widths, stage_budget=1, mismatch_weight=0., expanded=[0, 0], reached=[0, 1],
+            time_limit_check=lambda: None, state_limit=10, report=lambda *_, **__: None)
+
+    match = join(b'target')
+    assert match is not None
+    assert match[direction + 1].step['sibling_rank'] == 5
+    assert join(b'worse') is None
 
 
 def test_lookahead_ranks_complete_windows_and_reuses_the_shifted_forecast():

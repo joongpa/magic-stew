@@ -533,6 +533,30 @@ def initial_sticker_colors(renderer, scramble):
             for position, label in renderer.CubeGeometryState.identity().facelets.items()}
 
 
+def prepare_search_record(renderer, record, colors, turning_start_frame, device):
+    """Prepare the same fixed-pose observation for cached and standalone search."""
+    candidate = record.pose_candidate
+    if candidate is not None:
+        if renderer._frame_forces_static_hold(record.frame_index, turning_start_frame):
+            candidate = renderer._hold_before_turning_start(
+                candidate, record.frame_index, turning_start_frame)
+        else:
+            limit = renderer.PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * renderer.projected_cube_diameter(candidate)
+            geometry = renderer._build_turn_geometry_frame(candidate, limit, device)
+            diagnostics = dict(status="unavailable_geometry", evaluated_states=0,
+                               turning_start_frame=turning_start_frame)
+            if geometry is not None:
+                diagnostics.update(status="prepared_full_search", geometry=dict(
+                    scoring_version=renderer.PNP_TURN_GEOMETRY_SCORE_VERSION,
+                    scope="whole_cube",
+                    options=[renderer.turn_trial_log_payload(option) for option in geometry["options"]]))
+            candidate = replace(candidate,
+                turn_color_matches=renderer.turn_color_match_matrix(candidate, expected_color_by_label=colors),
+                turn_search_diagnostics=diagnostics,
+                turn_fit_search_rvec=candidate.rvec.copy(), turn_fit_search_tvec=candidate.tvec.copy())
+    return renderer.turn_candidate_log_record(candidate, record.frame_index)
+
+
 def prepare_nine_class_video(args, renderer):
     """Cache nine-class observations and all geometric options, without local move rollout."""
     import torch
@@ -569,35 +593,13 @@ def prepare_nine_class_video(args, renderer):
         str(args.source), detector, model, render_args)
     colors = initial_sticker_colors(renderer, args.initial_scramble)
     renderer.process_cached_poses(cache, render_args, colors, source_fps=fps)
-    output.touch(exist_ok=False)
     device = torch.device(args.device)
-    search_announced = False
-    for index, record in enumerate(cache, start=1):
-        candidate = record.pose_candidate
-        static = renderer._frame_forces_static_hold(record.frame_index, args.turning_start_frame)
-        renderer.print_headless_progress("static holds" if static else "preparing search observations", index, count)
-        if candidate is not None:
-            if static:
-                candidate = renderer._hold_before_turning_start(
-                    candidate, record.frame_index, args.turning_start_frame)
-            else:
-                if not search_announced:
-                    print(f"\nPreparing turn geometry from frame {record.frame_index}.", flush=True)
-                    search_announced = True
-                geometry = renderer._build_turn_geometry_frame(candidate,
-                    renderer.PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * renderer.projected_cube_diameter(candidate), device)
-                diagnostics = dict(status="unavailable_geometry", evaluated_states=0,
-                                   turning_start_frame=args.turning_start_frame)
-                if geometry is not None:
-                    diagnostics.update(status="prepared_full_search", geometry=dict(
-                        scoring_version=renderer.PNP_TURN_GEOMETRY_SCORE_VERSION,
-                        scope="whole_cube",
-                        options=[renderer.turn_trial_log_payload(option) for option in geometry["options"]]))
-                candidate = replace(candidate,
-                    turn_color_matches=renderer.turn_color_match_matrix(candidate, expected_color_by_label=colors),
-                    turn_search_diagnostics=diagnostics,
-                    turn_fit_search_rvec=candidate.rvec.copy(), turn_fit_search_tvec=candidate.tvec.copy())
-        renderer.append_turn_candidate_log(output, candidate, record.frame_index)
+    with output.open("x", encoding="utf-8") as stream:
+        for index, record in enumerate(cache, start=1):
+            static = renderer._frame_forces_static_hold(record.frame_index, args.turning_start_frame)
+            renderer.print_headless_progress("static holds" if static else "preparing search observations", index, count)
+            observation = prepare_search_record(renderer, record, colors, args.turning_start_frame, device)
+            stream.write(json.dumps(observation, separators=(",", ":")) + "\n")
     if cache:
         print()
     metadata = dict(source=str(args.source.resolve()), pose_model=str(args.model.resolve()),
@@ -703,7 +705,8 @@ class ReplayScorer:
         record = self.records[frame]
         if self.m._frame_forces_static_hold(frame, self.turning_start_frame):
             return "turning_start_frame"
-        status = (record.get("search") or {}).get("status")
+        search = record.get("search") or {}
+        status = search.get("observation_status", search.get("status"))
         if status == "forced_static":
             return "turning_start_frame"
         if record.get("has_pose") is False or status == "unavailable_geometry":
@@ -1022,7 +1025,7 @@ class PreparedReplayScorer(ReplayScorer):
                 geometry_scores.append(geometry_score)
                 inliers.append(trial["inlier_count"])
                 p90s.append(trial["p90_error"])
-                layer_inliers.append(trial["layer_inlier_count"])
+                layer_inliers.append(m.turn_layer_inliers_for_ranking(trial))
         assignments = projections.get("assignments", {}).get("value")
         if assignments is None:
             nearest = weights = match_matrix = denominator = has_weight = None

@@ -1,7 +1,9 @@
+from dataclasses import replace
 import importlib.util
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -170,6 +172,50 @@ def test_render_handoff_uses_post_commit_colors_and_logs_move_once(m, tmp_path):
     assert logged["cube_geometry_state_before"] == before.to_json()
     assert logged["selected_committed_moves"] == ["U'"]
     assert logged["search"]["handoff_commit"]
+
+    from scripts.independent_keypoint_video_search import apply_search_result
+
+    base = video.candidate_for_step(m, record(m), None, before, colors)
+    cache = [SimpleNamespace(frame_index=0, pose_candidate=base)]
+    apply_search_result(m, cache, {0: record(m)}, result, colors, None, None)
+    accumulator = m.MoveAccumulator()
+    accumulator.observe(cache[0].pose_candidate, sticker_color_names=colors)
+    assert accumulator.moves == ["U'"]
+    assert accumulator.solved_frame_index == 0
+
+
+@pytest.mark.parametrize(("frame_count", "mode"), [(4, "forward"), (7, "bidirectional")])
+def test_cached_renderer_recognizes_a_complete_solve(m, tmp_path, monkeypatch, capsys, frame_count, mode):
+    monkeypatch.setattr(m, "recover_cached_pose_symmetries", lambda *args, **kwargs: None)
+    args = m.build_parser().parse_args([
+        "--source", "unused.mp4", "--initial-scramble", "R", "--recognize-moves", "--no-display",
+        "--no-pose-smoothing", "--turning-start-frame", "1", "--search-seconds", "5",
+    ])
+    args.turn_candidate_log = tmp_path / "turns.jsonl"
+    colors = video.replay.initial_sticker_colors(m, args.initial_scramble)
+    start = m.CubeGeometryState.identity()
+    base = video.candidate_for_step(m, record(m), None, start, colors)
+    cache = []
+    for frame in range(frame_count):
+        state = start if frame < 3 else start.apply_moves(("R'",))
+        projected = m.projected_sticker_faces(replace(base, cube_geometry_state=state), base.rvec, base.tvec)
+        candidate = m.attach_color_keypoints(base, np.asarray([quad.mean(axis=0) for _, _, quad in projected]),
+                                             tuple(colors[identity.label] for identity, _, _ in projected))
+        cache.append(SimpleNamespace(frame_index=frame, pose_candidate=candidate))
+
+    m.process_cached_poses(cache, args, colors, source_fps=25.)
+
+    output = capsys.readouterr().out
+    assert f"({mode}" in output and "widths 3 → 5 → 8" in output
+    accumulator = m.MoveAccumulator()
+    for frame in cache:
+        accumulator.observe(frame.pose_candidate, sticker_color_names=colors)
+    assert accumulator.moves == ["R'"]
+    assert accumulator.solved_frame_index == 3
+    rows = [json.loads(line) for line in args.turn_candidate_log.read_text().splitlines()]
+    assert [row["frame_index"] for row in rows] == list(range(frame_count))
+    assert rows[1]["search"]["status"] == "forced_static"
+    assert rows[3]["search"]["geometry"]["options"]
 
 
 def test_unobserved_bridge_move_keeps_video_and_log_state_in_sync(m, tmp_path, monkeypatch):

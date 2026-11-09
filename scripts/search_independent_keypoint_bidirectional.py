@@ -15,10 +15,16 @@ import time
 
 import numpy as np
 
-import search_independent_keypoint_frame as frame_search
-from independent_keypoint_window_forecast import WindowForecaster
+if __package__:
+    from . import search_independent_keypoint_frame as frame_search
+    from .independent_keypoint_window_forecast import WindowForecaster
+else:
+    import search_independent_keypoint_frame as frame_search
+    from independent_keypoint_window_forecast import WindowForecaster
 
 replay = frame_search.replay
+WIDENING_HANDOFF_BONUS = .02
+WIDENING_MISMATCH_WEIGHT = 1.
 
 
 def inverse(move):
@@ -43,7 +49,7 @@ class BudgetReached(Exception):
 
 def solved_seeds(scorer, scramble):
     identity = scorer.key(scorer.m.CubeGeometryState.identity())
-    moves = scorer.m.parse_scramble_moves(scramble)
+    moves = scorer.m.parse_scramble_moves(scramble) if isinstance(scramble, str) else scramble
     solved = scorer.apply_moves(identity, tuple(map(inverse, reversed(moves))))
     encoded = np.frombuffer(solved, dtype=np.uint8)
     return tuple(dict.fromkeys(encoded[sources].tobytes() for sources in scorer.orientation_sources))
@@ -64,6 +70,14 @@ def flat_solved_anchor(renderer, record, goals, **scorer_options):
                 and hold.payload.get("color_match_count", 0) >= 12
                 and hold.payload.get("color_error", 1.) <= .1),
                key=lambda hold: hold.rank, default=None)
+
+
+def widening_scorer_options(renderer, colors, static_end, checkpoint):
+    use_26m = checkpoint is not None and Path(checkpoint).resolve() == renderer.DEFAULT_POSE_MODEL.resolve()
+    table = renderer.POSE_26M_COLOR_CONFUSIONS if use_26m else renderer.COLOR_CLASS_CONFUSIONS
+    return dict(initial_colors=colors, turning_start_frame=static_end, balance_geometry_color=True,
+                joint_orientation_rescue=True, track_color_confusions=True,
+                color_confusion_scoring=use_26m, tracked_color_confusions=table)
 
 
 class WideningFrontier:
@@ -122,6 +136,9 @@ class WideningFrontier:
 
 def widening_join(forward, backward, initial, goals, length, *, widths, stage_budget,
                   mismatch_weight, expanded, reached, time_limit_check, state_limit, report):
+    def sibling_order(edge):
+        return edge.step['state_score'], frame_search.unsupported_state_update(edge.step), edge.rank[-1]
+
     sides = [WideningFrontier(direction, widths) for direction in range(2)]
     sides[0].offer(0, Link(initial))
     for goal in goals:
@@ -165,23 +182,28 @@ def widening_join(forward, backward, initial, goals, length, *, widths, stage_bu
         child_depth = depth + (1 if direction == 0 else -1)
         children = (forward if direction == 0 else backward)(node, depth)
         seen = set()
-        for edge in sorted(children, key=lambda edge: (edge.step['state_score'],
-                bool(edge.step['state_moves']) and edge.step.get('layer_inlier_count') == 0, edge.rank[-1])):
+        previous_order = None
+        admission_rank = 0
+        for edge in sorted(children, key=sibling_order):
             key = edge.state, edge.cue
             if key in seen:
                 continue
             seen.add(key)
             rank = len(seen)
-            if rank > widths[-1]:
+            order = sibling_order(edge)
+            if order != previous_order:
+                admission_rank = rank
+                previous_order = order
+            if admission_rank > widths[-1]:
                 break
             step = dict(edge.step, sibling_rank=rank)
             window = frame_search.update_mismatch_window(node.window, step, mismatch_weight)
             step['queue_priority'] += step['window_mismatch_penalty']
             child = Link(edge.state, edge.cue, node, step, window=window)
-            if rank <= side.width:
+            if admission_rank <= side.width:
                 side.offer(child_depth, child)
             else:
-                side.deferred[rank].append((child_depth, child))
+                side.deferred[admission_rank].append((child_depth, child))
         side.seconds += time.monotonic() - start
 
 
@@ -258,7 +280,7 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
             if math.isfinite(choice.score):
                 step = step_for(choice, frame, previous_cue)
                 cue = frame_search.supported_completion(scorer.m, step)
-                unsupported = bool(step["state_moves"]) and step.get("layer_inlier_count") == 0
+                unsupported = frame_search.unsupported_state_update(step)
                 yield Link(choice.state, cue, step=step, rank=(step["queue_priority"], unsupported, choice.rank))
 
     forecaster = (WindowForecaster(forward_options, scorer.m.move_lookahead_weights, len(frames),
@@ -464,11 +486,11 @@ def main():
     parser.add_argument("--search-seconds", type=float, default=300.)
     parser.add_argument("--max-explored-states", type=int)
     parser.add_argument("--branch-widths", type=int, nargs="+", default=(),
-                        help="Use independent best-first queues with these per-parent widths, e.g. 3 5 8.")
+                        help="Per-parent child cutoffs including ties for the best-first queues, e.g. 3 5 8.")
     parser.add_argument("--branch-stage-expansions", type=int,
                         help=f"Override the per-direction stage budget of "
                              f"{frame_search.BRANCH_STAGE_EXPANSIONS_PER_FRAME} expansions per solving frame.")
-    parser.add_argument("--mismatch-window-weight", type=float, default=1.,
+    parser.add_argument("--mismatch-window-weight", type=float, default=WIDENING_MISMATCH_WEIGHT,
                         help="Weight of the eight-frame mismatch history in the widening queues.")
     parser.add_argument("--lookahead-frames", type=int, default=0, help="Future sampled frames for forward ordering.")
     parser.add_argument("--lookahead-budget", type=int, default=384, help="New forecast expansions per forward layer.")
@@ -510,11 +532,9 @@ def main():
     scorer_options = dict(initial_colors=colors, turning_start_frame=static_end,
                           balance_geometry_color=True, joint_orientation_rescue=True)
     if args.branch_widths:
-        checkpoint = metadata.get("pose_model")
-        use_26m = checkpoint and Path(checkpoint).resolve() == m.DEFAULT_POSE_MODEL.resolve()
-        confusion_table = m.POSE_26M_COLOR_CONFUSIONS if use_26m else m.COLOR_CLASS_CONFUSIONS
-        scorer_options.update(track_color_confusions=True, color_confusion_scoring=bool(use_26m),
-                              tracked_color_confusions=confusion_table)
+        scorer_options = widening_scorer_options(m, colors, static_end, metadata.get("pose_model"))
+        use_26m = scorer_options["color_confusion_scoring"]
+        confusion_table = scorer_options["tracked_color_confusions"]
     scorer = replay.PreparedReplayScorer(m, records, "cpu", **scorer_options)
     initial = scorer.key(m.CubeGeometryState.identity())
     goals = solved_seeds(scorer, args.initial_scramble)
@@ -539,7 +559,7 @@ def main():
             "original_source_frame", args.end_frame), beam_width=args.beam_width, retries=args.retries,
         overlap=args.overlap, time_budget=args.search_seconds, state_limit=args.max_explored_states,
         score_weights=dict(geometry=.5,color=.5), queue_score_weights=dict(geometry=0.,color=.5),
-        turn_handoff_bonus=.02, reverse_handoff_requires_prior_hold=True,
+        turn_handoff_bonus=WIDENING_HANDOFF_BONUS, reverse_handoff_requires_prior_hold=True,
         preferred_orientations_per_physical_state=2, reference_solution_used=False,
         anchor_colors=dict(observed=anchor.payload["color_match_count"], error=anchor.payload["color_error"]))
     if args.branch_widths:
@@ -567,7 +587,7 @@ def main():
 
         result = bidirectional_search(scorer, frames, initial, goals, width=args.beam_width,
             retries=args.retries, overlap=args.overlap, time_limit=args.search_seconds,
-            state_limit=args.max_explored_states, handoff_bonus=.02, progress=progress,
+            state_limit=args.max_explored_states, handoff_bonus=WIDENING_HANDOFF_BONUS, progress=progress,
             physical_key=physical_key, lookahead_frames=args.lookahead_frames,
             lookahead_budget=args.lookahead_budget, branch_widths=args.branch_widths,
             branch_stage_expansions=stage_budget,

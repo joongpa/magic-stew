@@ -410,13 +410,14 @@ Detections are filtered by `boxes.conf` and keypoint confidence. Defaults are
 color. Override any class with `--pose-class-conf red=0.35,corner-edge=0.45`.
 `--min-keypoint-conf` filters point visibility (default `0.05` for landmarks);
 sticker color keypoints have a minimum of `0.25` for scoring, drawing, and ROI
-tracking. `--track-conf` controls ROI tracking. Neural inference runs on CPU. Move recognition uses Apple MPS and
-requires an available MPS device.
+tracking. `--track-conf` controls ROI tracking. Neural inference and the prepared
+full-search scorer run on CPU.
 
 The cached video pose pass also evaluates mixed landmark/sticker seeds, then
 refits weak rigid poses against nearby observations. It tracks image-plane
 position and depth separately and can jointly fit runs with two visible face
-outlines. Use `--no-pose-smoothing` to compare with the original single-frame
+outlines. Its motion priors and support windows use elapsed time from the source
+frame rate. Use `--no-pose-smoothing` to compare with the original single-frame
 pose pass.
 
 Each sticker color keypoint finds its closest class-valid three- and four-landmark
@@ -486,23 +487,21 @@ orientation corrections do not commit a cube move. Geometry projections and
 observation assignments are shared across states. They are rebuilt when pose,
 layer geometry, or observed positions change.
 
-The cached video search retains its adaptive branch-and-bound rollout over ten
-future frames at 30 FPS, scaled with source FPS. Each parent retains its best
-hold and top ten state changes. The front half of the window contributes 30%
-of the score and the back half 70%; each committed turn adds `0.01` outside
-those temporal weights. The default budget is 4096 frame/state evaluations per
-decision; use `--turn-search-state-budget N` or `unlimited` to change it. A
-budget stop returns the best complete forecast found. The existing move-spacing
-policy, state merging, root-return restriction, warm starts, and optimistic
-bounds remain in place. Color bounds relax identity constraints using binary
-matches, with the same projected-sticker denominator as actual state scores.
+With `--recognize-moves`, the cached video renderer calls the same
+full-solve search as the standalone scripts. It admits 3, then 5, then 8
+children per parent, keeps the eight-frame color mismatch history, and
+handles turn handoffs. It searches bidirectionally when it finds a flat solved
+anchor, and uses forward full search when it cannot find one. Override the
+automatic anchor with `--solved-anchor-frame N`.
 
-`--turning-start-frame N` forces frames **0 through N inclusive** to static
-holds; move search begins at N+1. Without this flag, move recognition is
-unrestricted. Search stops after the accepted current-frame state is solved
-and layers are aligned, retaining the final solving move. A solved future
-forecast alone does not stop current-frame search. Subsequent frames keep
-rendering with the solved state.
+`--turning-start-frame N` keeps frames **0 through N inclusive** static.
+By default, the renderer tries both parities at 50 FPS or higher and uses all
+frames below 50 FPS. Set `--frame-parity` to `all`, `even`, `odd`, or `both`
+to override. Each pass has a 300-second search budget. Use
+`--search-seconds`, `--max-explored-states`, or `--branch-stage-expansions`
+to tune the limits. `--turn-search-state-budget` is an alias for the per-pass
+`--max-explored-states` limit. The accepted path replays on the original video clock.
+Unsampled frames hold the last committed state, and the solved tail stays solved.
 
 Use `--show-colored-masks` to color observed projected stickers from the model's
 classes. Color predictions are always available directly from the pose model;
@@ -516,10 +515,10 @@ final cached video. QuickTime outputs
 receive a frame-counter track when `ffmpeg` is available.
 
 `--turn-candidate-log OUTPUT_DIR` writes one JSONL record per video frame,
-including camera inputs, geometric observations, retained turn options, state
-search diagnostics, and selected moves. New records use schema version 3,
-`color_scoring: "direct_match_fraction"`, and a binary `turn_color_matches`
-matrix indexed by physical sticker identity and observed color keypoint.
+including camera inputs, retained turn geometry, and steps from the accepted
+full-search path. Records use schema version 3 and retain the binary
+`turn_color_matches` matrix indexed by physical sticker identity and observed
+color keypoint. Selected steps also record the cost of allowed color confusions.
 The replay search scripts use this categorical schema; old probability logs
 must be regenerated before replaying with the updated scorer.
 
@@ -584,8 +583,10 @@ color mismatches from the last eight sampled frames to the queue score.
 The same `26m-pose` pairs are excluded from this window term.
 
 `--branch-widths 3 5 8` admits the top 3 distinct children per parent by
-candidate fit, then widens to 5 and 8. Widening releases saved children from
-previously expanded parents into the same priority queue. Each stage widens
+candidate rank, then widens to 5 and 8. Each cutoff includes all children
+tied on the full ranking key. Use `--branch-widths 3` for a single stage.
+Widening releases saved children from previously expanded parents into
+the same priority queue. Each stage widens
 when the queue empties or after 100 expansions per sampled frame in the
 solve interval. The interval starts after the last static frame and ends at
 the selected end frame. Use `--branch-stage-expansions` for a fixed budget.
