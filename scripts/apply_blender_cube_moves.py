@@ -7064,12 +7064,25 @@ def write_yolo_segmentation_label(
 
 
 def render_png(path: Path) -> None:
+    """Publish a still only after Blender has successfully written it."""
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    bpy.context.scene.render.filepath = str(path)
-    bpy.ops.render.render(write_still=True)
-    if not path.is_file():
-        raise RuntimeError(f"Blender did not write the expected render: {path}")
+    render_settings = bpy.context.scene.render
+    previous_filepath = render_settings.filepath
+    try:
+        with tempfile.TemporaryDirectory(prefix=".render-", dir=path.parent) as directory:
+            staged_path = Path(directory) / path.name
+            render_settings.filepath = str(staged_path)
+            result = bpy.ops.render.render(write_still=True)
+            if (
+                "FINISHED" not in result
+                or not staged_path.is_file()
+                or staged_path.stat().st_size == 0
+            ):
+                raise RuntimeError(f"Blender did not write the expected render: {path}")
+            staged_path.replace(path)
+    finally:
+        render_settings.filepath = previous_filepath
 
 
 def read_image_file(path: Path, cv2: object, np: object, flags: int) -> object | None:
@@ -7291,9 +7304,11 @@ def render_cube_rotational_blur_png(
     )
     base_transforms = object_transforms(objects)
     sample_paths = []
+    blur_error = None
 
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".blur-", dir=path.parent) as temp_dir:
             temp_path = Path(temp_dir)
             global_angles = rotational_blur_sample_angles(global_magnitude_degrees, samples)
             local_angles = rotational_blur_sample_angles(local_magnitude_degrees, samples)
@@ -7308,12 +7323,34 @@ def render_cube_rotational_blur_png(
                     local_pivot=local_pivot,
                 )
                 sample_path = temp_path / f"rotational_blur_{sample_index:03d}.png"
-                render_png(sample_path)
+                try:
+                    render_png(sample_path)
+                except (OSError, RuntimeError) as error:
+                    print(
+                        f"Blur subframe {sample_index + 1}/{samples} for {path.name} failed. "
+                        f"Retrying once. {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    render_png(sample_path)
                 sample_paths.append(sample_path)
 
-            average_rendered_pngs(sample_paths, path)
+            averaged_path = temp_path / "averaged.png"
+            average_rendered_pngs(sample_paths, averaged_path)
+            averaged_path.replace(path)
+    except (OSError, RuntimeError) as error:
+        blur_error = error
     finally:
         restore_object_transforms(objects, base_transforms)
+
+    if blur_error is not None:
+        print(
+            f"Rotational blur failed for {path.name}. Rendering the base pose. {blur_error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        render_png(path)
+        return None
 
     return {
         "axis": [axis.x, axis.y, axis.z],
