@@ -684,8 +684,13 @@ amber, and neutral white with magenta.
 ```bash
 blender --background syntheticAssets/cube.blend --python scripts/apply_blender_cube_moves.py -- \
   --count 1000 \
-  --output-dir data/synthetic_cube_dataset
+  --output-dir data/synthetic_cube_core_dataset
 ```
+
+The six physical center stickers form one `cube-core` instance with six
+color-ordered keypoints. The masks show those centers as diamonds and other
+stickers and landmarks as circles. Use a separate output directory for older
+datasets with one keypoint slot per row.
 
 Each completed image gets its own atomically written `metadata/<image-stem>.json`
 file with its lighting profile, sources, and labels. The generator exports the
