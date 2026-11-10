@@ -66,7 +66,7 @@ FRONT_AXIS = "-Y"
 
 # Random scene defaults for synthetic data generation.
 DEFAULT_SCRAMBLE_LENGTH = 30
-CAMERA_TARGET_JITTER = 0.25
+CAMERA_TARGET_JITTER = 0.10
 CAMERA_VIEWPOINT_WEIGHTS = (
     ("front", 0.24),
     ("front_diagonal", 0.28),
@@ -77,17 +77,20 @@ CAMERA_VIEWPOINT_WEIGHTS = (
     ("overhead", 0.12),
 )
 CAMERA_ROI_LENS_RANGE = (42.0, 49.0)
-# Keep close cubes at their existing framing, but progressively zoom farther
-# for distant cameras so those cubes still dominate the frame. The target
-# jitter and sensor shifts below still allow off-center and cropped examples.
-CAMERA_CUBE_ZOOM_SCALE_RANGE = (1.0, 1.45)
+# Keep close cubes at their existing framing, then ramp optical zoom from 1x
+# at six feet to 2x at fifteen feet without changing camera positions. Target
+# jitter and sensor shifts still allow modest off-center variation.
+CAMERA_CUBE_ZOOM_SCALE_RANGE = (1.0, 2.0)
 CAMERA_CUBE_ZOOM_DISTANCE_RANGE_FEET = (6.0, 15.0)
-CAMERA_ROI_SHIFT_X_RANGE = (-0.09, 0.09)
-CAMERA_ROI_SHIFT_Y_RANGE = (-0.07, 0.07)
+# The behind-palm hard case sits 14–18 scene units away. Compensate its lens
+# against this closer framing baseline even below the six-foot zoom threshold.
+CAMERA_BEHIND_PALM_REFERENCE_DISTANCE = 10.0
+CAMERA_ROI_SHIFT_X_RANGE = (-0.035, 0.035)
+CAMERA_ROI_SHIFT_Y_RANGE = (-0.03, 0.03)
 CAMERA_ROLL_DEGREES_RANGE = (-45.0, 45.0)
 # The existing framing is calibrated around four feet from the cube. Varying
-# distance and focal length together produces different perspective compression
-# without making the cube substantially larger or smaller in the image.
+# distance and focal length together preserves the base framing while varying
+# perspective compression; the extra distance-based zoom above tightens it.
 CAMERA_SCENE_UNITS_PER_FOOT = 3.0
 CAMERA_DISTANCE_BUCKETS_FEET = (
     ("near", 0.35, (3.0, 6.0)),
@@ -159,6 +162,42 @@ SOLVE_STATION_ASSET_BLEND_CANDIDATES = (
 )
 SOLVE_STATION_COLLECTION_NAME = "SolveStation_Complete"
 SOLVE_STATION_SCALE = 1.85
+SOLVE_STATION_MAT_PRINT_DIR = PROJECT / "syntheticAssets" / "stackmat_prints"
+SOLVE_STATION_MAT_PRINTS = (
+    "turn_trails",
+    "prism_grid",
+    "steel_cubes",
+    "pixel_orbit",
+    "lime_shift",
+    "cubicle_sakura",
+    "cubicle_aurora",
+    "cubicle_angstrom",
+    "scs_poly_dark",
+    "scs_cosmic",
+    "scs_strokes",
+)
+SOLVE_STATION_MAT_PRINT_PROBABILITY = 0.80
+SOLVE_STATION_SHIRT_PRINT_DIR = PROJECT / "syntheticAssets" / "shirt_prints"
+SOLVE_STATION_SHIRT_PRINTS = (
+    "championship_cube",
+    "yellow_grid_right",
+    "yellow_grid_left",
+    "yellow_isometric",
+    "hand_drawn_cube",
+    "cubing_fiesta",
+    "angular_cube",
+    "problem_solver",
+    "scs_graffiti",
+    "scs_vintage",
+    "scs_speed_cube",
+    "cubicle_embroidered",
+    "cubicle_nationals",
+    "cubicle_worlds",
+)
+SOLVE_STATION_SHIRT_PRINT_PROBABILITY = 0.60
+# Conditional on the shirt having a print.
+SOLVE_STATION_SHIRT_POCKET_PROBABILITY = 0.30
+SOLVE_STATION_SHIRT_PRINT_MATERIAL = "SyntheticSolveStationShirtPrint"
 SOLVE_STATION_LAPTOP_PROBABILITY = 0.48
 LAPTOP_GLOW_PROBABILITY = 0.10
 LAPTOP_GLOW_COLOR_PROFILES = (
@@ -335,6 +374,13 @@ STICKER_ROUGHNESS_RANGE = (0.18, 0.38)
 STICKER_SPECULAR_RANGE = (0.45, 0.75)
 STICKER_COAT_WEIGHT_RANGE = (0.08, 0.24)
 STICKER_COAT_ROUGHNESS_RANGE = (0.12, 0.32)
+CUBE_LOGO_DIR = PROJECT / "syntheticAssets" / "cube_logos"
+CUBE_LOGO_NAMES = ("gan", "dayan", "moyu", "geometric", "mgc", "mofangjiaoshi")
+# Roll independently for each cube across all presets and modes.
+CUBE_LOGO_PROBABILITY = 0.60
+CUBE_LOGO_ORIGINAL_COLOR_PROBABILITY = 0.25
+CUBE_LOGO_MATERIAL_NAME = "SyntheticCubeLogo"
+CUBE_LOGO_UV_NAME = "SyntheticCubeLogoUV"
 # Disable procedural scratches/dents; retain randomized sticker color and gloss.
 STICKER_IMPERFECTIONS_ENABLED = False
 STICKER_IMPERFECTION_FINE_SCALE_RANGE = (120.0, 240.0)
@@ -377,12 +423,13 @@ CUBE_HANDS_TABLE_LIFT = 0.35
 CUBE_TABLE_CLEARANCE_RANGE = (0.02, 0.18)
 CUBE_FLOAT_CLEARANCE_RANGE = (0.12, 0.55)
 CUBE_FLOAT_TILT_DEGREES = (-30.0, 30.0)
-CUBE_POSE_XY_JITTER_RANGE = (-0.50, 0.50)
+CUBE_POSE_XY_JITTER_RANGE = (-0.25, 0.25)
 CUBE_POSE_ROTATION_DEGREES = (-30.0, 30.0)
-# A small fraction of samples intentionally place the target at a frame edge.
+# Disable deliberate edge placement with the tighter framing. The optional
+# augmentation remains available by raising this probability explicitly.
 # The overshoot is measured in normalized image coordinates, so at 128x128 it
 # corresponds to roughly 1-3 pixels of cube geometry outside the frame.
-CUBE_EDGE_CLIP_PROBABILITY = 0.18
+CUBE_EDGE_CLIP_PROBABILITY = 0.0
 CUBE_EDGE_CLIP_OVERSHOOT_RANGE = (0.005, 0.025)
 DEFAULT_CUBE_ROTATIONAL_BLUR_PROBABILITY = 1.0
 DEFAULT_MAX_CUBE_ROTATIONAL_BLUR_DEGREES = 20.0
@@ -1260,6 +1307,52 @@ def randomize_camera(
     }
 
 
+def aim_camera_at_final_cube(
+    camera_randomization: dict[str, object],
+    cube_pose: dict[str, object],
+) -> None:
+    """Follow the known cube center with bounded, zoom-aware framing offsets.
+
+    This is a constant-time transform update, not a mesh projection or a
+    visibility check. It runs after hand lift, and again if camera recovery
+    replaces the sampled camera. Camera position, lens, and roll stay fixed.
+    """
+    camera = get_camera()
+    zoom = max(1.0, float(camera_randomization.get("cube_zoom_scale", 1.0)))
+    if camera_randomization.get("viewpoint") == "behind_palm":
+        zoom *= max(
+            1.0,
+            float(camera_randomization["distance"]) / CAMERA_BEHIND_PALM_REFERENCE_DISTANCE,
+        )
+    # Preserve the original draws so repeated calls don't compound offsets.
+    offsets = camera_randomization.setdefault("sampled_framing_offsets", {
+        "target": list(camera_randomization.get("target", (0.0, 0.0, 0.0))),
+        "shift_x": camera.data.shift_x,
+        "shift_y": camera.data.shift_y,
+    })
+    target_offset = Vector(tuple(
+        max(-CAMERA_TARGET_JITTER, min(CAMERA_TARGET_JITTER, float(value))) / zoom
+        for value in offsets["target"]
+    ))
+    target = Vector(cube_pose["translation"]) + target_offset
+    look_at(camera, target)
+    camera.rotation_quaternion = camera.rotation_quaternion @ Quaternion(
+        Vector((0.0, 0.0, -1.0)),
+        math.radians(float(camera_randomization.get("roll_degrees", 0.0))),
+    )
+    for axis, bounds in (("x", CAMERA_ROI_SHIFT_X_RANGE), ("y", CAMERA_ROI_SHIFT_Y_RANGE)):
+        value = max(bounds[0], min(bounds[1], float(offsets[f"shift_{axis}"]))) / zoom
+        setattr(camera.data, f"shift_{axis}", value)
+    camera_randomization["target"] = list(target)
+    camera_randomization["target_follows_final_cube"] = True
+    camera_randomization["framing_offset_scale"] = 1.0 / zoom
+    camera_randomization.setdefault("roi_crop", {}).update({
+        "shift_x": camera.data.shift_x,
+        "shift_y": camera.data.shift_y,
+    })
+    bpy.context.view_layer.update()
+
+
 def camera_cube_visibility_probe(objects: list[bpy.types.Object]) -> dict[str, object]:
     """Check whether room geometry blocks rays from the camera to the cube."""
     scene = bpy.context.scene
@@ -2002,6 +2095,122 @@ def randomize_sticker_material_gloss() -> dict[str, object]:
             "imperfections": imperfections,
         }
     return material_settings
+
+
+def add_cube_logo_uv(
+    obj: bpy.types.Object,
+    cubie: bpy.types.Object,
+    white_polygons: list[bpy.types.MeshPolygon],
+) -> bool:
+    """Map the white center's outward face onto a square in mesh space."""
+    mesh = obj.data
+    if mesh.uv_layers.get(CUBE_LOGO_UV_NAME) is not None:
+        return True
+
+    solved_location = Vector(cubie.get(SOLVED_LOCATION_PROP, cubie.location))
+    solved_rotation = Quaternion(cubie.get(SOLVED_ROTATION_PROP, cubie.rotation_quaternion))
+    relative_transform = cubie.matrix_world.inverted() @ obj.matrix_world
+    solved_transform = solved_rotation.to_matrix() @ relative_transform.to_3x3()
+    outward = (solved_transform.inverted() @ solved_location).normalized()
+    front = [polygon for polygon in white_polygons if polygon.normal.dot(outward) > 0.92]
+    if not front:
+        return False
+
+    up = Vector((0.0, 0.0, 1.0)) if abs(outward.z) < 0.9 else Vector((0.0, 1.0, 0.0))
+    right = up.cross(outward).normalized()
+    up = outward.cross(right)
+    coordinates = {
+        index: (mesh.vertices[index].co.dot(right), mesh.vertices[index].co.dot(up))
+        for polygon in front
+        for index in polygon.vertices
+    }
+    xs, ys = zip(*coordinates.values())
+    center_x = (min(xs) + max(xs)) / 2
+    center_y = (min(ys) + max(ys)) / 2
+    side = min(max(xs) - min(xs), max(ys) - min(ys))
+    if side <= 1e-6:
+        return False
+
+    uv = mesh.uv_layers.new(name=CUBE_LOGO_UV_NAME, do_init=False)
+    for polygon in white_polygons:
+        for loop_index in polygon.loop_indices:
+            uv.data[loop_index].uv = (-1.0, -1.0)
+    for polygon in front:
+        for loop_index, vertex_index in zip(polygon.loop_indices, polygon.vertices):
+            x, y = coordinates[vertex_index]
+            uv.data[loop_index].uv = (
+                (x - center_x) / side + 0.5,
+                (y - center_y) / side + 0.5,
+            )
+    return True
+
+
+def randomize_cube_logo(cubies: list[bpy.types.Object]) -> dict[str, object] | None:
+    """Print at most one logo, on this cube's physical white center."""
+    use_logo = random.random() < CUBE_LOGO_PROBABILITY
+    for cubie in center_cubie_objects(cubies):
+        # Prefer detached stickers. Older assets put the white face directly
+        # on the cubie mesh, so inspect that mesh last.
+        for obj in reversed(mesh_objects_in_roots([cubie])):
+            for index, material in enumerate(obj.data.materials):
+                if material is None or material.name != "White":
+                    continue
+                slot = obj.material_slots[index]
+                if slot.material and slot.material.name.startswith(CUBE_LOGO_MATERIAL_NAME):
+                    slot.link = "DATA"
+                if not use_logo or slot.material != material or not material.use_nodes:
+                    continue
+                bsdf = material.node_tree.nodes.get("Principled BSDF")
+                white_polygons = [
+                    polygon for polygon in obj.data.polygons if polygon.material_index == index
+                ]
+                if bsdf is None or not add_cube_logo_uv(obj, cubie, white_polygons):
+                    continue
+
+                logo_name = random.choice(CUBE_LOGO_NAMES)
+                image = bpy.data.images.load(
+                    str(CUBE_LOGO_DIR / f"{logo_name}.png"), check_existing=True
+                )
+                logo_material = material.copy()
+                logo_material.name = CUBE_LOGO_MATERIAL_NAME
+                nodes = logo_material.node_tree.nodes
+                links = logo_material.node_tree.links
+                uv = nodes.new("ShaderNodeUVMap")
+                uv.uv_map = CUBE_LOGO_UV_NAME
+                texture = nodes.new("ShaderNodeTexImage")
+                texture.image = image
+                texture.extension = "CLIP"
+                links.new(uv.outputs["UV"], texture.inputs["Vector"])
+
+                ink = texture.outputs["Color"]
+                metadata: dict[str, object] = {"name": logo_name, "color_mode": "original"}
+                if random.random() >= CUBE_LOGO_ORIGINAL_COLOR_PROBABILITY:
+                    tint = nodes.new("ShaderNodeHueSaturation")
+                    tint.inputs["Hue"].default_value = random.random()
+                    tint.inputs["Saturation"].default_value = random.uniform(0.5, 0.95)
+                    tint.inputs["Value"].default_value = random.uniform(0.12, 0.29)
+                    links.new(ink, tint.inputs["Color"])
+                    ink = tint.outputs["Color"]
+                    metadata["color_mode"] = "dark_tint"
+                    metadata["hsv_adjustment"] = {
+                        name.lower(): float(tint.inputs[name].default_value)
+                        for name in ("Hue", "Saturation", "Value")
+                    }
+
+                base_color = nodes["Principled BSDF"].inputs["Base Color"]
+                mix = nodes.new("ShaderNodeMixRGB")
+                mix.inputs["Color1"].default_value = base_color.default_value
+                if base_color.is_linked:
+                    links.new(base_color.links[0].from_socket, mix.inputs["Color1"])
+                links.new(texture.outputs["Alpha"], mix.inputs["Fac"])
+                links.new(ink, mix.inputs["Color2"])
+                links.new(mix.outputs["Color"], base_color)
+
+                # The mesh slot stays White for the sticker-label pipeline.
+                slot.link = "OBJECT"
+                slot.material = logo_material
+                return metadata
+    return None
 
 
 def runtime_random_seed() -> int:
@@ -3000,6 +3209,8 @@ def configure_station_color_pattern(
     base_color: tuple[float, float, float, float],
     accent_color: tuple[float, float, float, float],
     pattern: str,
+    *,
+    print_path: Path | None = None,
 ) -> None:
     material.use_nodes = True
     nodes = material.node_tree.nodes
@@ -3015,6 +3226,14 @@ def configure_station_color_pattern(
 
     texcoord = nodes.new("ShaderNodeTexCoord")
     texcoord.name = f"SolveStation.Pattern.{pattern}.Coordinates"
+    if print_path is not None:
+        texture = nodes.new("ShaderNodeTexImage")
+        texture.image = bpy.data.images.load(str(print_path), check_existing=True)
+        texture.extension = "EXTEND"
+        links.new(texcoord.outputs["Generated"], texture.inputs["Vector"])
+        links.new(texture.outputs["Color"], bsdf.inputs["Base Color"])
+        return
+
     ramp = nodes.new("ShaderNodeValToRGB")
     ramp.name = f"SolveStation.Pattern.{pattern}.Colors"
     ramp.color_ramp.elements[0].color = base_color
@@ -3048,6 +3267,89 @@ def configure_station_color_pattern(
         links.new(texcoord.outputs["Generated"], texture.inputs["Vector"])
         links.new(texture.outputs["Fac"], ramp.inputs["Fac"])
     links.new(ramp.outputs["Color"], bsdf.inputs["Base Color"])
+
+
+def configure_station_shirt_print(
+    asset_collection: bpy.types.Collection,
+    fabric: bpy.types.Material,
+    design: str | None,
+    *,
+    chest_pocket: bool = False,
+) -> bool:
+    """Alpha-blend a chest print into the torso's existing fabric shader."""
+    torso = next(
+        (obj for obj in asset_collection.all_objects
+         if obj.type == "MESH" and "SolveStation.Shirt.Torso" in obj.name),
+        None,
+    )
+    if torso is None:
+        return False
+    mesh = torso.data
+    slot = next(
+        (torso.material_slots[index] for index, material in enumerate(mesh.materials)
+         if material == fabric),
+        None,
+    )
+    if slot is None:
+        return False
+    if slot.material and slot.material.name.startswith(SOLVE_STATION_SHIRT_PRINT_MATERIAL):
+        slot.link = "DATA"
+    if design is None or slot.material != fabric or not fabric.use_nodes:
+        return False
+    if fabric.node_tree.nodes.get("Principled BSDF") is None:
+        return False
+
+    # The torso faces local -Y. Map the print in physical X/Z proportions
+    # so the artwork follows the shirt when the solve station is repositioned.
+    xs, _, zs = zip(*torso.bound_box)
+    width, height = max(xs) - min(xs), max(zs) - min(zs)
+    if chest_pocket:
+        # Local +X is the wearer's left on this front-facing torso.
+        side = 1.75 * min(width * random.uniform(0.17, 0.23), height * 0.30)
+        center_x = min(xs) + width * 0.66
+        center_z = min(zs) + height * 0.72
+    else:
+        side = min(width * random.uniform(0.48, 0.62), height * 0.70)
+        center_x = (min(xs) + max(xs)) * 0.5
+        center_z = min(zs) + height * 0.61
+    if side <= 1e-6 or not any(polygon.normal.y < -0.9 for polygon in mesh.polygons):
+        return False
+    uv_name = "SolveStationShirtPrintUV"
+    uv = mesh.uv_layers.get(uv_name)
+    if uv is None:
+        uv = mesh.uv_layers.new(name=uv_name, do_init=False)
+    for polygon in mesh.polygons:
+        for loop_index, vertex_index in zip(polygon.loop_indices, polygon.vertices):
+            x, _, z = mesh.vertices[vertex_index].co
+            uv.data[loop_index].uv = (
+                ((x - center_x) / side + 0.5, (z - center_z) / side + 0.5)
+                if polygon.normal.y < -0.9
+                else (-1.0, -1.0)
+            )
+
+    printed = fabric.copy()
+    printed.name = SOLVE_STATION_SHIRT_PRINT_MATERIAL
+    nodes = printed.node_tree.nodes
+    links = printed.node_tree.links
+    coords = nodes.new("ShaderNodeUVMap")
+    coords.uv_map = uv_name
+    texture = nodes.new("ShaderNodeTexImage")
+    texture.image = bpy.data.images.load(
+        str(SOLVE_STATION_SHIRT_PRINT_DIR / f"{design}.png"), check_existing=True
+    )
+    texture.extension = "CLIP"
+    links.new(coords.outputs["UV"], texture.inputs["Vector"])
+    color = nodes["Principled BSDF"].inputs["Base Color"]
+    mix = nodes.new("ShaderNodeMixRGB")
+    mix.inputs["Color1"].default_value = color.default_value
+    if color.is_linked:
+        links.new(color.links[0].from_socket, mix.inputs["Color1"])
+    links.new(texture.outputs["Alpha"], mix.inputs["Fac"])
+    links.new(texture.outputs["Color"], mix.inputs["Color2"])
+    links.new(mix.outputs["Color"], color)
+    slot.link = "OBJECT"
+    slot.material = printed
+    return True
 
 
 def randomize_solve_station_materials(asset_collection: bpy.types.Collection) -> dict[str, object]:
@@ -3089,33 +3391,16 @@ def randomize_solve_station_materials(asset_collection: bpy.types.Collection) ->
         ((0.055, 0.025, 0.09, 1.0), (0.36, 0.08, 0.58, 1.0)),
         ((0.055, 0.06, 0.065, 1.0), (0.3, 0.34, 0.38, 1.0)),
     ))
-    mat_pattern = random.choices(
+    mat_design = (
+        random.choice(SOLVE_STATION_MAT_PRINTS)
+        if random.random() < SOLVE_STATION_MAT_PRINT_PROBABILITY
+        else None
+    )
+    mat_pattern = "cube_print" if mat_design else random.choices(
         ("solid", "heather", "stripes", "mottled"),
         weights=(0.3, 0.2, 0.28, 0.22),
         k=1,
     )[0]
-    timer_color, timer_trim_color, sensor_color = random.choice((
-        (
-            (0.01, 0.012, 0.016, 1.0),
-            (0.025, 0.16, 0.31, 1.0),
-            (0.04, 0.22, 0.42, 1.0),
-        ),
-        (
-            (0.035, 0.038, 0.044, 1.0),
-            (0.32, 0.055, 0.035, 1.0),
-            (0.48, 0.085, 0.045, 1.0),
-        ),
-        (
-            (0.018, 0.022, 0.028, 1.0),
-            (0.06, 0.31, 0.16, 1.0),
-            (0.08, 0.46, 0.22, 1.0),
-        ),
-        (
-            (0.025, 0.022, 0.035, 1.0),
-            (0.28, 0.08, 0.4, 1.0),
-            (0.4, 0.13, 0.57, 1.0),
-        ),
-    ))
     phone_color = random.choice((
         (0.018, 0.021, 0.026, 1.0),
         (0.24, 0.25, 0.27, 1.0),
@@ -3153,9 +3438,6 @@ def randomize_solve_station_materials(asset_collection: bpy.types.Collection) ->
         "SolveStation.Material.Wall": wall_color,
         "SolveStation.Material.MatFabric": mat_color,
         "SolveStation.Material.MatPrint": mat_print_color,
-        "SolveStation.Material.TimerBody": timer_color,
-        "SolveStation.Material.TimerTrim": timer_trim_color,
-        "SolveStation.Material.Sensor": sensor_color,
         "SolveStation.Material.PhoneBody": phone_color,
         "SolveStation.Material.PhoneScreen": phone_screen_color,
         "SolveStation.Material.Metal": laptop_color,
@@ -3192,6 +3474,7 @@ def randomize_solve_station_materials(asset_collection: bpy.types.Collection) ->
                 set_principled_input(mat, "Emission", color)
             changed_materials.add(mat.name)
             randomized_materials[source_name] = mat
+    shirt_design = shirt_print_placement = None
     shirt_material = randomized_materials.get("SolveStation.Material.Shirt")
     if shirt_material is not None:
         configure_station_color_pattern(
@@ -3200,25 +3483,48 @@ def randomize_solve_station_materials(asset_collection: bpy.types.Collection) ->
             shirt_accent_color,
             shirt_pattern,
         )
+        if random.random() < SOLVE_STATION_SHIRT_PRINT_PROBABILITY:
+            shirt_design = random.choice(SOLVE_STATION_SHIRT_PRINTS)
+            shirt_print_placement = (
+                "chest_pocket" if random.random() < SOLVE_STATION_SHIRT_POCKET_PROBABILITY
+                else "center_chest"
+            )
+        if not configure_station_shirt_print(
+            asset_collection,
+            shirt_material,
+            shirt_design,
+            chest_pocket=shirt_print_placement == "chest_pocket",
+        ):
+            shirt_design = shirt_print_placement = None
     mat_material = randomized_materials.get("SolveStation.Material.MatFabric")
     if mat_material is not None:
+        print_path = (
+            SOLVE_STATION_MAT_PRINT_DIR / f"{mat_design}.jpg" if mat_design else None
+        )
         configure_station_color_pattern(
             mat_material,
             mat_color,
             mat_print_color,
             mat_pattern,
+            print_path=print_path,
         )
+        # The full-bleed print replaces the separate accents on the legacy mat.
+        for obj in list(asset_collection.all_objects):
+            if "SolveStation.Mat.CenterPrint" in obj.name or "SolveStation.Mat.Accent." in obj.name:
+                obj.hide_render = print_path is not None
+                obj.hide_viewport = print_path is not None
     return {
         "shirt_color": list(shirt_color),
         "shirt_accent_color": list(shirt_accent_color),
         "shirt_pattern": shirt_pattern,
+        "shirt_design": shirt_design,
+        "shirt_print_placement": shirt_print_placement,
         "skin_color": list(skin_color),
         "wall_color": list(wall_color),
         "mat_color": list(mat_color),
         "mat_print_color": list(mat_print_color),
         "mat_pattern": mat_pattern,
-        "timer_color": list(timer_color),
-        "timer_trim_color": list(timer_trim_color),
+        "mat_design": mat_design,
         "phone_color": list(phone_color),
         "phone_screen_color": list(phone_screen_color),
         "laptop_color": list(laptop_color),
@@ -3558,6 +3864,33 @@ def remove_solve_station_forearm_stubs(
     return removed
 
 
+def select_solve_station_timer(asset_collection: bpy.types.Collection) -> dict[str, object]:
+    """Keep one reference model before computing footprints or moving props.
+
+    Delete unused variants instead of hiding them: hidden meshes would still
+    enter placement bounds and later camera-facing transforms.
+    """
+    timers = solve_station_family_objects(asset_collection, ("Timer",))
+    variants = sorted({obj.get("timer_variant") for obj in timers if obj.get("timer_variant")})
+    if not variants:
+        raise RuntimeError(
+            "The solve-station library still contains the legacy timer. "
+            "Rebuild it with scripts/build_solve_station_assets.py."
+        )
+    selected = random.choice(variants)
+    reference = None
+    for obj in timers:
+        if obj.get("timer_variant") != selected:
+            bpy.data.objects.remove(obj, do_unlink=True)
+            continue
+        obj.hide_render = False
+        obj.hide_viewport = False
+        obj.hide_set(False)
+        reference = obj.get("timer_reference")
+    bpy.context.view_layer.update()
+    return {"variant": selected, "reference": reference, "asset_version": 2}
+
+
 def add_solve_station_background() -> dict[str, object]:
     path = solve_station_asset_blend_path()
     instance_name = f"{BACKGROUND_ASSET_COLLECTION_PREFIX}.SolveStation"
@@ -3590,6 +3923,7 @@ def add_solve_station_background() -> dict[str, object]:
     )
     bpy.context.view_layer.update()
 
+    timer_metadata = select_solve_station_timer(asset_collection)
     removed_forearm_stubs = remove_solve_station_forearm_stubs(asset_collection)
 
     laptop_glow_enabled = random.random() < LAPTOP_GLOW_PROBABILITY
@@ -3640,6 +3974,7 @@ def add_solve_station_background() -> dict[str, object]:
         "root": root.name,
         "object_count": len([obj for obj in objects if obj.type == "MESH"]),
         "removed_forearm_stubs": removed_forearm_stubs,
+        "timer": timer_metadata,
         "laptop_visible": laptop_visible,
         "laptop_glow_enabled": laptop_glow_enabled,
         "laptop_emission_strength": laptop_emission_strength,
@@ -4011,6 +4346,7 @@ def duplicate_secondary_cube(
     )
     metadata = {
         "model": "duplicate_of_main_cube",
+        "white_center_logo": randomize_cube_logo(duplicate_objects),
         "object_count": len(duplicate_objects),
         "core_object_count": len(duplicate_core_objects),
         "mesh_part_count": len(render_parts),
@@ -5237,13 +5573,14 @@ def build_controlled_cube_case(
     zoom_scale = camera_zoom_scale_for_distance(
         distance / CAMERA_SCENE_UNITS_PER_FOOT
     )
-    camera.data.lens = zoom_scale * (
-        random.uniform(34.0, 42.0)
-        if camera_mode == "behind_palm"
-        else random.uniform(41.0, 49.0)
+    framing_lens = random.uniform(41.0, 49.0)
+    reference_distance = (
+        CAMERA_BEHIND_PALM_REFERENCE_DISTANCE
+        if camera_mode == "behind_palm" else distance
     )
-    camera.data.shift_x = random.uniform(-0.035, 0.035)
-    camera.data.shift_y = random.uniform(-0.03, 0.03)
+    camera.data.lens = framing_lens * distance / reference_distance * zoom_scale
+    camera.data.shift_x = random.uniform(*CAMERA_ROI_SHIFT_X_RANGE)
+    camera.data.shift_y = random.uniform(*CAMERA_ROI_SHIFT_Y_RANGE)
     camera.rotation_quaternion = camera.rotation_quaternion @ Quaternion(
         Vector((0.0, 0.0, -1.0)),
         math.radians(camera_roll_degrees),
@@ -5474,10 +5811,10 @@ def build_controlled_cube_case(
         "distance": distance,
         "distance_feet": distance / CAMERA_SCENE_UNITS_PER_FOOT,
         "distance_bucket": "near",
-        "reference_distance": distance,
+        "reference_distance": reference_distance,
         "roll_degrees": camera_roll_degrees,
         "lens_mm": camera.data.lens,
-        "framing_lens_mm": camera.data.lens,
+        "framing_lens_mm": framing_lens,
         "cube_zoom_scale": zoom_scale,
         "roi_crop": {
             "method": "hard_case_controlled_camera",
@@ -7229,9 +7566,13 @@ def corner_cubie_objects() -> list[bpy.types.Object]:
     return sorted(corners, key=lambda obj: obj.name)
 
 
-def center_cubie_objects() -> list[bpy.types.Object]:
+def center_cubie_objects(
+    objects: list[bpy.types.Object] | None = None,
+) -> list[bpy.types.Object]:
+    if objects is None:
+        objects = cube_objects()
     centers = []
-    for obj in cube_objects():
+    for obj in objects:
         solved_location = Vector(obj.get(SOLVED_LOCATION_PROP, obj.location))
         outer_axis_count = sum(
             1
@@ -9868,6 +10209,8 @@ def generate_dataset(
                                 final_center[2] += palm_lift_delta
                             geometry["hand_lift_followed"] = palm_lift_delta
 
+        aim_camera_at_final_cube(camera_randomization, cube_pose)
+
         # Place distractor geometry only after the primary cube and hands have
         # their final world transforms.  Placement bounds are therefore in the
         # same coordinate system as the rendered scene, and visible hands are
@@ -9881,6 +10224,7 @@ def generate_dataset(
             )
             if secondary_cube is not None:
                 background_randomization["secondary_cube"] = secondary_cube
+        sticker_materials["white_center_logo"] = randomize_cube_logo(objects)
 
         # Hard-case builders use controlled cameras and therefore do not pass
         # through the ordinary pre-background camera probe.  Probe again after
@@ -9905,6 +10249,7 @@ def generate_dataset(
                 max_general_attempts=6,
                 max_fallback_attempts=6,
             )
+            aim_camera_at_final_cube(camera_randomization, cube_pose)
             final_visibility_probe = camera_cube_visibility_probe(objects)
         background_randomization["final_visibility_probe"] = final_visibility_probe
         if not final_visibility_probe["accepted"]:

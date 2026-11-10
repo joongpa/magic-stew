@@ -208,6 +208,29 @@ targets. `--workers` defaults to `0` to avoid CUDA shared-memory/event errors;
 for a CUDA out-of-memory failure, also lower `--batch` (for example,
 `--batch 1`) and use `--no-cache`.
 
+## Synthetic solve-station timers
+
+`apply_blender_cube_moves.py` selects one of five reference-based timer meshes
+per scene: Stackmat Gen 2, Gen 3 Pro, Gen 4, Gen 5, or GAN Timer 2. All retain
+the previous timer's approximately 7.84-unit width. Their molded housings,
+sensor artwork, buttons, logos, and LCDs are built into
+`syntheticAssets/SolveStationAssets.blend`; generation needs no Downloads files
+or external timer textures. The timer colors stay fixed to each reference design,
+and the selected model is recorded in the solve-station metadata's `timer` field.
+
+To rebuild the library after editing `scripts/stackmat_timer_assets.py`:
+
+```bash
+Blender --background --python scripts/build_solve_station_assets.py -- \
+  --output syntheticAssets/SolveStationAssets.blend
+Blender --background --python tests/blender_stackmat_timer_assets.py
+```
+
+The reference filenames are `gen2.jpg`, `gen3.webp`, `gen4.jpeg`, `gen5.webp`,
+and `images.jpeg` (GAN Timer 2) from the local `Downloads/solveVideos/timers`
+folder. The saved library shows Gen 5 by default; the generator removes unused
+variants before computing placement bounds.
+
 ## Automated whole-cube failure mining
 
 The Blender generator can be paired with the existing whole-cube model to

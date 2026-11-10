@@ -6,7 +6,7 @@ Run with Blender, for example:
         --output syntheticAssets/SolveStationAssets.blend
 
 The asset is authored around a three-unit cube at the world origin.  Local +Y points
-away from the camera, so the timer is on -Y and the solver's torso is on +Y.  Hands
+away from the camera; the timer and solver's torso are on +Y.  Hands
 are deliberately omitted; the forearms end at rounded wrists outside the cube.
 """
 
@@ -289,10 +289,6 @@ def create_materials() -> dict[str, bpy.types.Material]:
         "edge": material("SolveStation.Material.DeskEdge", (0.018, 0.02, 0.022, 1), roughness=0.34),
         "mat": material("SolveStation.Material.MatFabric", (0.025, 0.045, 0.075, 1), roughness=0.93),
         "mat_print": material("SolveStation.Material.MatPrint", (0.03, 0.2, 0.34, 1), roughness=0.76),
-        "timer": material("SolveStation.Material.TimerBody", (0.012, 0.014, 0.018, 1), roughness=0.3),
-        "timer_trim": material("SolveStation.Material.TimerTrim", (0.025, 0.16, 0.31, 1), roughness=0.28, specular=0.48),
-        "sensor": material("SolveStation.Material.Sensor", (0.04, 0.22, 0.42, 1), roughness=0.2, metallic=0.12),
-        "sensor_icon": material("SolveStation.Material.SensorIcon", (0.95, 0.72, 0.02, 1), roughness=0.42),
         "lcd": material("SolveStation.Material.LCD", (0.018, 0.038, 0.035, 1), roughness=0.16, specular=0.62),
         "lcd_digit": material(
             "SolveStation.Material.LCDDigit",
@@ -301,8 +297,6 @@ def create_materials() -> dict[str, bpy.types.Material]:
             emission=(0.16, 0.42, 0.22, 1),
             emission_strength=0.35,
         ),
-        "button_green": material("SolveStation.Material.ButtonGreen", (0.015, 0.42, 0.12, 1), roughness=0.3),
-        "button_red": material("SolveStation.Material.ButtonRed", (0.55, 0.025, 0.018, 1), roughness=0.3),
         "metal": material("SolveStation.Material.Metal", (0.21, 0.23, 0.26, 1), roughness=0.28, metallic=0.72),
         "keyboard": material("SolveStation.Material.Keyboard", (0.018, 0.019, 0.022, 1), roughness=0.35),
         "screen": material(
@@ -403,58 +397,14 @@ def build_room_background(collection, root, mats) -> None:
     )
 
 
-def add_seven_segment_digit(collection, root, mats, x: float, y: float, z: float, scale: float) -> None:
-    horizontal = (0.34 * scale, 0.07 * scale, 0.026)
-    vertical = (0.07 * scale, 0.24 * scale, 0.026)
-    # A zero: top and bottom bars plus four side bars.  The unlit middle segment
-    # keeps the display from reading as four solid figure-eights.
-    for index, dy in enumerate((0.22, -0.22)):
-        rounded_box(
-            f"SolveStation.Timer.Digit.{x:.2f}.H{index}",
-            (x, y + dy * scale, z), horizontal,
-            mats["lcd_digit"], collection, root,
-            bevel=0.018,
-        )
-    for index, (dx, dy) in enumerate(((-0.17, 0.11), (0.17, 0.11), (-0.17, -0.11), (0.17, -0.11))):
-        rounded_box(
-            f"SolveStation.Timer.Digit.{x:.2f}.V{index}",
-            (x + dx * scale, y + dy * scale, z), vertical,
-            mats["lcd_digit"], collection, root,
-            bevel=0.018,
-        )
-
-
 def build_timer(collection, root, mats) -> None:
-    z = -1.34
-    timer_y = 2.15
-    rounded_box("SolveStation.Timer.Center", (0, timer_y, z), (4.25, 1.1, 0.32), mats["timer"], collection, root, bevel=0.18, segments=7)
-    for side in (-1.0, 1.0):
-        x = side * 2.82
-        wing = rounded_box(
-            f"SolveStation.Timer.Wing.{'L' if side < 0 else 'R'}",
-            (x, timer_y, z - 0.005),
-            (2.2, 1.72, 0.3),
-            mats["timer_trim"], collection, root,
-            bevel=0.36, segments=9,
-        )
-        wing.rotation_euler.z = math.radians(-side * 7.0)
-        disc(
-            f"SolveStation.Timer.Sensor.{'L' if side < 0 else 'R'}",
-            (x, timer_y, z + 0.17),
-            0.54, 0.035, mats["sensor"], collection, root,
-        )
-        for dot_index, angle in enumerate((-0.48, 0.0, 0.48)):
-            disc(
-                f"SolveStation.Timer.SensorIcon.{'L' if side < 0 else 'R'}.{dot_index}",
-                (x + math.sin(angle) * 0.23, timer_y + math.cos(angle) * 0.12, z + 0.194),
-                0.055, 0.012, mats["sensor_icon"], collection, root,
-                vertices=32,
-            )
-    rounded_box("SolveStation.Timer.LCD", (0, timer_y - 0.16, z + 0.19), (2.05, 0.65, 0.035), mats["lcd"], collection, root, bevel=0.06)
-    for x in (-0.64, -0.19, 0.31, 0.76):
-        add_seven_segment_digit(collection, root, mats, x, timer_y - 0.16, z + 0.215, 0.55)
-    for x, mat in ((-1.5, mats["button_green"]), (1.5, mats["button_red"])):
-        disc(f"SolveStation.Timer.Button.{x}", (x, timer_y + 0.18, z + 0.19), 0.115, 0.045, mat, collection, root, vertices=48)
+    # Blender --python does not put the script directory on sys.path.
+    script_dir = str(Path(__file__).resolve().parent)
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    from stackmat_timer_assets import build_timer_variants
+
+    build_timer_variants(collection, root, material)
 
 
 def build_phone(collection, root, mats) -> None:
