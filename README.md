@@ -672,24 +672,29 @@ samples, and the pose trainer skips those files when building training pairs.
 Pass `--pose-label-mode ordered` to the Blender generator when creating this
 26-point target.
 
-## Hard color-recognition renders
+## Synthetic dataset lighting
 
-Pass `--hard-color-recognition` to `scripts/apply_blender_cube_moves.py` when
-you want sharp images that stress sticker-color recognition:
+The Blender generator samples saturated room lighting by default. Yellow and
+blue are the most common casts, with occasional red, magenta, cyan, and green.
+By default, 15% of lighting selections use a white key with a separately
+colored fill and a matching wash on the solve-station wall when available.
+The mixed profiles pair warm white with blue-violet or teal, cool white with
+amber, and neutral white with magenta.
 
 ```bash
-blender --background --python scripts/apply_blender_cube_moves.py -- \
+blender --background syntheticAssets/cube.blend --python scripts/apply_blender_cube_moves.py -- \
   --count 1000 \
-  --output-dir data/synthetic_cube_dataset_hard_color \
-  --hard-color-recognition
+  --output-dir data/synthetic_cube_dataset
 ```
 
-This mode disables cube rotational blur and post-render Gaussian/motion blur,
-while retaining rescaling, sensor noise, compression, camera variation, hand
-variation, and the other normal augmentations. Lighting uses a much more
-saturated distribution weighted toward yellow and blue, with occasional
-red, magenta, cyan, and green casts. The mode and blur policy are recorded in
-`sticker_keypoint_manifest.json` and each sample's `metadata.json` entry.
+Each completed image gets its own atomically written `metadata/<image-stem>.json`
+file with its lighting profile, sources, and labels. The generator exports the
+combined `metadata.json` array at the end of the run for existing readers.
+Generated images and visualization masks are 144 × 144 pixels.
+Set `--mixed-lighting-probability 1` to generate only mixed-lighting samples or
+`--mixed-lighting-probability 0` to use only the room-wide cast profiles.
+Rotational blur and post-render camera degradation use their regular probability
+settings for all lighting profiles.
 
 ## F-Clip cube-wireframe training
 

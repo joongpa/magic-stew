@@ -30,7 +30,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from itertools import permutations, product
+from collections.abc import Callable, Iterable, Iterator
+from itertools import chain, permutations, product
 from pathlib import Path
 
 import bpy
@@ -109,24 +110,8 @@ LIGHTING_SETUP_WEIGHTS = (
     ("desk_lamp", 0.24),
 )
 SUNLIGHT_WINDOW_PROBABILITY = 0.42
+# Yellow and blue dominate to stress discrimination between sticker colors.
 LIGHT_TEMPERATURE_PROFILES = (
-    # name, probability, indoor sources, window daylight, tint target, tint amount
-    # Tints are blended with the temperature-derived color rather than replacing
-    # it, keeping colored-light examples visible but still plausible.
-    ("warm_yellow", 0.22, (2700.0, 3600.0), (3500.0, 4800.0), (1.0, 0.72, 0.32), 0.08),
-    ("neutral_white", 0.32, (4000.0, 5600.0), (5000.0, 6500.0), (1.0, 1.0, 1.0), 0.0),
-    ("cool_blue", 0.16, (6500.0, 8500.0), (7000.0, 10000.0), (0.32, 0.72, 1.0), 0.08),
-    ("soft_amber", 0.12, (3000.0, 4300.0), (4000.0, 5600.0), (1.0, 0.38, 0.08), 0.28),
-    ("muted_cyan", 0.08, (4200.0, 6000.0), (5200.0, 7000.0), (0.12, 0.72, 1.0), 0.24),
-    ("dusty_rose", 0.06, (3400.0, 5000.0), (4500.0, 6200.0), (1.0, 0.32, 0.44), 0.20),
-    ("soft_sage", 0.04, (3600.0, 5200.0), (4800.0, 6400.0), (0.36, 1.0, 0.48), 0.16),
-)
-# The hard-color-recognition mode deliberately samples much stronger color
-# casts than the ordinary, plausible-lighting distribution. Yellow and blue
-# dominate because they are the most useful stress cases for distinguishing
-# adjacent sticker classes; the remaining profiles keep the mode from
-# becoming a two-color shortcut.
-HARD_COLOR_LIGHT_TEMPERATURE_PROFILES = (
     # name, probability, indoor sources, window daylight, tint target, tint amount
     ("hard_yellow", 0.38, (2400.0, 3400.0), (3000.0, 4300.0), (1.0, 0.52, 0.015), 0.72),
     ("hard_blue", 0.38, (7600.0, 12000.0), (8200.0, 14000.0), (0.015, 0.16, 1.0), 0.72),
@@ -134,6 +119,15 @@ HARD_COLOR_LIGHT_TEMPERATURE_PROFILES = (
     ("hard_magenta", 0.06, (3000.0, 5200.0), (4000.0, 6500.0), (1.0, 0.015, 0.48), 0.56),
     ("hard_cyan", 0.06, (5200.0, 8200.0), (6500.0, 10000.0), (0.01, 0.88, 1.0), 0.56),
     ("hard_green", 0.06, (3400.0, 6200.0), (4800.0, 7600.0), (0.025, 1.0, 0.10), 0.52),
+)
+DEFAULT_MIXED_LIGHTING_PROBABILITY = 0.15
+MIXED_LIGHTING_PROBABILITY = DEFAULT_MIXED_LIGHTING_PROBABILITY
+MIXED_LIGHTING_PROFILES = (
+    # Name, weight, key temperature range, accent RGB.
+    ("warm_key_blue_accent", 0.50, (3800.0, 4700.0), (0.30, 0.17, 1.0)),
+    ("cool_key_amber_accent", 0.20, (5600.0, 7200.0), (1.0, 0.35, 0.08)),
+    ("neutral_key_magenta_accent", 0.15, (4500.0, 5500.0), (0.82, 0.09, 0.68)),
+    ("warm_key_teal_accent", 0.15, (3200.0, 4300.0), (0.06, 0.66, 0.82)),
 )
 LIGHT_TARGET_JITTER_RANGE = (-0.35, 0.35)
 LIGHT_TEMPERATURE_KELVIN_RANGE = (2700.0, 7500.0)
@@ -515,12 +509,9 @@ HAND_ASSET_IMPORTED = False
 SOLVED_LOCATION_PROP = "synthetic_solved_location"
 SOLVED_ROTATION_PROP = "synthetic_solved_rotation"
 DEFAULT_OUTPUT_DIR = "data/synthetic_cube_dataset"
-# RF-DETR Keypoint Preview supports custom square resolutions as long as they
-# satisfy the selected model's block-size constraint. Use the requested pair
-# of dataset scales, corresponding to the former 128px and 256px outputs.
 RFDETR_KEYPOINT_NATIVE_INPUT_SIZE = (576, 576)
-RFDETR_KEYPOINT_DATASET_RESOLUTIONS = ((144, 144), (288, 288))
-DEFAULT_IMAGE_SIZE = RFDETR_KEYPOINT_DATASET_RESOLUTIONS[0][0]
+DEFAULT_IMAGE_SIZE = 144
+RFDETR_KEYPOINT_DATASET_RESOLUTIONS = ((DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE),)
 DEFAULT_HARD_CASE = "none"
 SOLID_BACKGROUND_PATCH_HARD_CASE = "solid_background_patch"
 DIAGONAL_CAMERA_ROLL_HARD_CASE = "diagonal_camera_roll"
@@ -568,10 +559,6 @@ SECONDARY_CUBE_SCALE_RANGE = (0.45, 0.65)
 # set only the requested scene variables and return the same scene metadata
 # tuple as randomize_scene().
 HARD_CASE_BUILDERS: dict[str, object] = {}
-# The larger dataset variant is used at the same probability as the previous
-# 256px high-resolution path.
-HIGH_RESOLUTION_IMAGE_SIZE = RFDETR_KEYPOINT_DATASET_RESOLUTIONS[1]
-HIGH_RESOLUTION_PROBABILITY = 0.25
 # Purging Blender's orphan-ID graph is more expensive than ordinary object
 # cleanup, so do it periodically during long-running generation.
 MEMORY_CLEANUP_INTERVAL = 32
@@ -1792,35 +1779,77 @@ def add_laptop_screen_glow(
     return source, metadata
 
 
-def randomize_light(
-    background_randomization: dict[str, object] | None = None,
-    *,
-    hard_color_recognition: bool = False,
-) -> dict[str, object]:
-    """Build room lighting, optionally using saturated color-recognition cases."""
-    clear_scene_lights()
-    setup = random.choices(
-        [name for name, _weight in LIGHTING_SETUP_WEIGHTS],
-        weights=[weight for _name, weight in LIGHTING_SETUP_WEIGHTS],
-        k=1,
-    )[0]
-    temperature_profiles = (
-        HARD_COLOR_LIGHT_TEMPERATURE_PROFILES
-        if hard_color_recognition
-        else LIGHT_TEMPERATURE_PROFILES
+def add_colored_wall_wash(
+    background_randomization: dict[str, object] | None,
+    color: tuple[float, float, float],
+) -> dict[str, object] | None:
+    """Aim a colored accent at the solve-station wall, away from the cube."""
+    station = solve_station_metadata(background_randomization)
+    collection_name = station.get("collection") if station else None
+    collection = bpy.data.collections.get(collection_name) if isinstance(collection_name, str) else None
+    if collection is None:
+        return None
+    wall = next(
+        (obj for obj in collection.all_objects
+         if obj.type == "MESH" and "SolveStation.Room.Wall" in obj.name and not obj.hide_render),
+        None,
     )
-    (
-        temperature_profile,
-        _profile_weight,
-        room_temperature_range,
-        window_temperature_range,
-        color_tint,
-        tint_amount,
-    ) = random.choices(
-        temperature_profiles,
-        weights=[weight for _name, weight, _room_range, _window_range, _tint, _amount in temperature_profiles],
-        k=1,
-    )[0]
+    if wall is None:
+        return None
+    interior_y = min(corner[1] for corner in wall.bound_box)
+    target = wall.matrix_world @ Vector((
+        random.uniform(-3.0, 3.0),
+        interior_y,
+        random.uniform(0.0, 1.5),
+    ))
+    outward = (wall.matrix_world.to_3x3() @ Vector((0.0, 1.0, 0.0))).normalized()
+    location = target - outward * random.uniform(2.3, 3.4)
+    location.z += random.uniform(0.5, 1.5)
+    return add_light_source(
+        "colored_wall_wash",
+        "AREA",
+        location,
+        target,
+        random.uniform(1150.0, 1950.0),
+        6500.0,
+        size=random.uniform(6.0, 9.0),
+        size_y=random.uniform(4.0, 6.0),
+        color_override=color,
+    )
+
+
+def randomize_light(background_randomization: dict[str, object] | None = None) -> dict[str, object]:
+    """Sample a room-wide cast or combine a white key with colored accents."""
+    clear_scene_lights()
+    accent_color = None
+    if random.random() < MIXED_LIGHTING_PROBABILITY:
+        setup = "ceiling_lights"
+        temperature_profile, _profile_weight, room_temperature_range, accent_color = random.choices(
+            MIXED_LIGHTING_PROFILES,
+            weights=[profile[1] for profile in MIXED_LIGHTING_PROFILES],
+            k=1,
+        )[0]
+        window_temperature_range = None
+        color_tint = None
+        tint_amount = 0.0
+    else:
+        setup = random.choices(
+            [name for name, _weight in LIGHTING_SETUP_WEIGHTS],
+            weights=[weight for _name, weight in LIGHTING_SETUP_WEIGHTS],
+            k=1,
+        )[0]
+        (
+            temperature_profile,
+            _profile_weight,
+            room_temperature_range,
+            window_temperature_range,
+            color_tint,
+            tint_amount,
+        ) = random.choices(
+            LIGHT_TEMPERATURE_PROFILES,
+            weights=[profile[1] for profile in LIGHT_TEMPERATURE_PROFILES],
+            k=1,
+        )[0]
     base_temperature = random.uniform(*room_temperature_range)
     target = lighting_target()
     sources: list[dict[str, object]] = []
@@ -1874,7 +1903,7 @@ def randomize_light(
         exposure_range = (-0.05, 0.28)
 
     window_metadata = None
-    if random.random() < SUNLIGHT_WINDOW_PROBABILITY:
+    if window_temperature_range is not None and random.random() < SUNLIGHT_WINDOW_PROBABILITY:
         side_angle = random.choice((0.0, math.pi / 2.0, math.pi, 3.0 * math.pi / 2.0))
         side_angle += math.radians(random.uniform(-10.0, 10.0))
         patch_target = Vector((
@@ -1912,6 +1941,31 @@ def randomize_light(
         world_ranges = ((0.14, 0.28), room_temperature_range)
         exposure_range = (exposure_range[0] - 0.16, exposure_range[1] - 0.08)
 
+    conditions = [setup]
+    if window_metadata:
+        conditions.append("sunlight_window")
+    if accent_color is not None:
+        # Place a weaker colored fill to the side and behind the cube so
+        # the overhead key still sets most of the foreground color.
+        table_forward, table_right = camera_table_basis()
+        fill_location = (
+            target + table_forward * random.uniform(1.8, 3.5)
+            + table_right * random.choice((-1.0, 1.0)) * random.uniform(3.5, 5.0)
+        )
+        fill_location.z = random.uniform(2.8, 4.6)
+        sources.append(add_light_source(
+            "colored_fill", "AREA", fill_location, target,
+            random.uniform(120.0, 205.0), 6500.0,
+            size=random.uniform(2.5, 4.0), size_y=random.uniform(2.5, 4.0),
+            color_override=accent_color,
+        ))
+        conditions.append("mixed_light_colors")
+        wall_wash = add_colored_wall_wash(background_randomization, accent_color)
+        if wall_wash is not None:
+            sources.append(wall_wash)
+            conditions.append("colored_wall_wash")
+        world_ranges = ((0.10, 0.18), (4500.0, 5600.0))
+
     laptop_source, laptop_glow_metadata = add_laptop_screen_glow(
         background_randomization,
         target,
@@ -1925,22 +1979,22 @@ def randomize_light(
     bpy.context.view_layer.update()
     primary = sources[0]
     return {
-        "mode": "hard_color_recognition" if hard_color_recognition else "standard",
+        "mode": "standard",
         "setup": setup,
         "source_count": len(sources),
         "sources": sources,
-        "conditions": [setup] + (["sunlight_window"] if window_metadata else []),
+        "conditions": conditions,
         "temperature_profile": {
             "name": temperature_profile,
             "base_kelvin": base_temperature,
             "room_range_kelvin": list(room_temperature_range),
-            "window_range_kelvin": list(window_temperature_range),
-            "tint_color": list(color_tint),
+            "window_range_kelvin": list(window_temperature_range) if window_temperature_range else None,
+            "tint_color": list(color_tint) if color_tint is not None else None,
             "tint_amount": tint_amount,
         },
         "sunlight_window": window_metadata or {
             "enabled": False,
-            "probability": SUNLIGHT_WINDOW_PROBABILITY,
+            "probability": SUNLIGHT_WINDOW_PROBABILITY if window_temperature_range is not None else 0.0,
         },
         "laptop_glow": laptop_glow_metadata,
         "world": world,
@@ -5018,7 +5072,6 @@ def randomize_scene(
     background_object_count: int = DEFAULT_BACKGROUND_OBJECT_COUNT,
     desk_no_hands: bool = False,
     solved: bool = False,
-    hard_color_recognition: bool = False,
 ) -> tuple[
     list[str],
     dict[str, object],
@@ -5046,10 +5099,7 @@ def randomize_scene(
     )
     # Build the rig after appending the background so lights bundled in an asset
     # cannot accidentally leak into, or conflict with, the selected setup.
-    light_randomization = randomize_light(
-        background_randomization,
-        hard_color_recognition=hard_color_recognition,
-    )
+    light_randomization = randomize_light(background_randomization)
     background_randomization["world_color"] = light_randomization["world"]["display_color"]
     background_randomization["world_lighting"] = light_randomization["world"]
     moves = scene_scramble_moves(scramble_length, solved)
@@ -5104,7 +5154,6 @@ def build_hard_case_scene(
     scramble_length: int,
     background_object_count: int,
     solved: bool = False,
-    hard_color_recognition: bool = False,
 ) -> tuple[
     list[str],
     dict[str, object],
@@ -5143,7 +5192,6 @@ def build_hard_case_scene(
         scramble_length=scramble_length,
         background_object_count=background_object_count,
         solved=solved,
-        hard_color_recognition=hard_color_recognition,
     )
 
 
@@ -5152,7 +5200,6 @@ def build_solid_background_patch_case(
     scramble_length: int,
     background_object_count: int,
     solved: bool = False,
-    hard_color_recognition: bool = False,
 ) -> tuple[
     list[str],
     dict[str, object],
@@ -5340,10 +5387,7 @@ def build_solid_background_patch_case(
         },
     }
 
-    light_randomization = randomize_light(
-        background_randomization,
-        hard_color_recognition=hard_color_recognition,
-    )
+    light_randomization = randomize_light(background_randomization)
     background_randomization["world_color"] = light_randomization["world"]["display_color"]
     background_randomization["world_lighting"] = light_randomization["world"]
 
@@ -5462,7 +5506,9 @@ def apply_hard_case_lighting_override(
     area_sources = [
         source
         for source in sources
-        if isinstance(source, dict) and source.get("type") == "AREA"
+        if isinstance(source, dict)
+        and source.get("type") == "AREA"
+        and source.get("role") not in {"colored_fill", "colored_wall_wash"}
     ]
     if not area_sources:
         return light_randomization
@@ -5511,7 +5557,6 @@ def build_controlled_cube_case(
     camera_mode: str,
     lighting_mode: str,
     forced_hand_visibility: str,
-    hard_color_recognition: bool = False,
     solved: bool = False,
     backdrop: bool = False,
 ) -> tuple[
@@ -5673,10 +5718,7 @@ def build_controlled_cube_case(
     # and split-shadow cases then apply a bounded override to that sampled rig,
     # so they retain variation in setup, color temperature, window light,
     # laptop glow, and world exposure.
-    light_randomization = randomize_light(
-        background_randomization,
-        hard_color_recognition=hard_color_recognition,
-    )
+    light_randomization = randomize_light(background_randomization)
     if lighting_mode in {"sharp", "split"}:
         light_randomization = apply_hard_case_lighting_override(
             light_randomization,
@@ -6063,29 +6105,33 @@ def camera_frame_bounds(
     return min(xs), max(xs), min(ys), max(ys), sum(zs) / len(zs)
 
 
-def camera_ray(
+def camera_ray_sampler(
     camera: bpy.types.Object,
     scene: bpy.types.Scene,
-    x: int,
-    y: int,
     width: int,
     height: int,
-) -> tuple[Vector, Vector]:
+) -> Callable[[int, int], tuple[Vector, Vector]]:
+    """Cache the camera projection for a visibility pass."""
     left, right, bottom, top, frame_z = camera_frame_bounds(camera, scene)
-    u = (x + 0.5) / width
-    v = 1.0 - ((y + 0.5) / height)
-    frame_x = left + u * (right - left)
-    frame_y = bottom + v * (top - bottom)
-    camera_matrix = camera.matrix_world
+    frame_x = [left + ((x + 0.5) / width) * (right - left) for x in range(width)]
+    frame_y = [bottom + (1.0 - ((y + 0.5) / height)) * (top - bottom) for y in range(height)]
+    camera_matrix = camera.matrix_world.copy()
+    rotation = camera_matrix.to_3x3()
 
     if camera.data.type == "ORTHO":
-        origin = camera_matrix @ Vector((frame_x, frame_y, 0.0))
-        direction = (camera_matrix.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
-        return origin, direction
+        direction = (rotation @ Vector((0.0, 0.0, -1.0))).normalized()
+
+        def orthographic_ray(x: int, y: int) -> tuple[Vector, Vector]:
+            return camera_matrix @ Vector((frame_x[x], frame_y[y], 0.0)), direction
+
+        return orthographic_ray
 
     origin = camera_matrix.translation
-    direction = (camera_matrix.to_3x3() @ Vector((frame_x, frame_y, frame_z))).normalized()
-    return origin, direction
+
+    def perspective_ray(x: int, y: int) -> tuple[Vector, Vector]:
+        return origin, (rotation @ Vector((frame_x[x], frame_y[y], frame_z))).normalized()
+
+    return perspective_ray
 
 
 def render_visibility_class_map(
@@ -6164,9 +6210,10 @@ def render_visibility_class_map(
         depsgraph = bpy.context.evaluated_depsgraph_get()
         camera = get_camera()
         scene = bpy.context.scene
+        sample_ray = camera_ray_sampler(camera, scene, width, height)
         for y in range(height):
             for x in range(width):
-                origin, direction = camera_ray(camera, scene, x, y, width, height)
+                origin, direction = sample_ray(x, y)
                 ray_origin = origin
                 hit = False
                 hit_object = None
@@ -6215,10 +6262,8 @@ def render_visibility_class_map(
                                         (object_name, material_name),
                                         f"{object_name}:{material_name}",
                                     )
-                                    sticker_masks.setdefault(
-                                        sticker_key,
-                                        np.zeros((height, width), dtype=np.uint8),
-                                    )
+                                    if sticker_key not in sticker_masks:
+                                        sticker_masks[sticker_key] = np.zeros((height, width), dtype=np.uint8)
                     if sticker_key is not None:
                         sticker_masks[sticker_key][y, x] = 1
                 elif object_name in hand_names:
@@ -6739,20 +6784,12 @@ def write_sticker_keypoint_mask(
         import numpy as np
     except ImportError:
         raise RuntimeError("OpenCV is required for sticker keypoint masks.") from None
-    if landmark_pose_objects:
-        write_pose_keypoint_mask(
-            path,
-            landmark_pose_objects,
-            width,
-            height,
-            image_path=image_path,
-        )
-        image = read_image_file(path, cv2, np, cv2.IMREAD_COLOR)
-    else:
-        image = read_image_file(image_path, cv2, np, cv2.IMREAD_COLOR)
+    image = read_image_file(image_path, cv2, np, cv2.IMREAD_COLOR)
     if image is None or image.shape[:2] != (height, width):
         raise RuntimeError(f"Could not read rendered image for sticker keypoint mask: {image_path}")
     output = image.copy()
+    if landmark_pose_objects:
+        draw_pose_keypoint_mask(output, landmark_pose_objects, width, height, cv2, np)
     point_radius = scaled_annotation_size(POSE_POINT_BASE_RADIUS + 1, width, height)
     outline_radius = point_radius + max(1, POSE_POINT_OUTLINE_WIDTH)
     for keypoint in keypoints:
@@ -7383,10 +7420,8 @@ def apply_video_compression(
 def apply_camera_degradation(
     path: Path,
     probability: float,
-    *,
-    disable_blur: bool = False,
 ) -> dict[str, object] | None:
-    """Apply post-render camera artifacts, optionally excluding blur operators."""
+    """Apply post-render camera artifacts."""
     if probability <= 0.0 or random.random() >= probability:
         return None
 
@@ -7421,23 +7456,17 @@ def apply_camera_degradation(
         frame = cv2.resize(small, (width, height), interpolation=cv2.INTER_LINEAR)
         metadata["rescale"] = {"scale": scale}
 
-    if not disable_blur and random.random() < DEGRADE_GAUSSIAN_BLUR_PROBABILITY:
+    if random.random() < DEGRADE_GAUSSIAN_BLUR_PROBABILITY:
         kernel = odd_kernel(random.choice((3, 3, 5)))
         sigma = random.uniform(0.25, 0.9)
         frame = cv2.GaussianBlur(frame, (kernel, kernel), sigmaX=sigma, sigmaY=sigma)
         metadata["gaussian_blur"] = {"kernel": kernel, "sigma": sigma}
 
-    if not disable_blur and random.random() < DEGRADE_MOTION_BLUR_PROBABILITY:
+    if random.random() < DEGRADE_MOTION_BLUR_PROBABILITY:
         kernel_size = odd_kernel(random.choice((3, 5, 7)))
         angle = random.uniform(0.0, 180.0)
         frame = cv2.filter2D(frame, -1, motion_blur_kernel(kernel_size, angle))
         metadata["motion_blur"] = {"kernel": kernel_size, "angle_degrees": angle}
-
-    if disable_blur:
-        metadata["blur_disabled"] = {
-            "gaussian_blur": True,
-            "motion_blur": True,
-        }
 
     if random.random() < DEGRADE_NOISE_PROBABILITY:
         sigma = random.uniform(1.0, 7.0)
@@ -9631,6 +9660,20 @@ def write_pose_keypoint_mask(
         # Preserve the rendered image at full brightness; the compact colored
         # dots provide the annotation without dimming the underlying scene.
         output = image.copy()
+    draw_pose_keypoint_mask(output, pose_objects, width, height, cv2, np)
+    if not write_image_file(path, output, cv2):
+        raise RuntimeError(f"Could not write keypoint visualization mask: {path}")
+
+
+def draw_pose_keypoint_mask(
+    output: object,
+    pose_objects: list[dict[str, object]],
+    width: int,
+    height: int,
+    cv2: object,
+    np: object,
+) -> None:
+    """Draw the landmark overlay into an existing BGR image."""
     fill_colors = INDEPENDENT_CLASS_MASK_FILL_COLORS
     point_colors = INDEPENDENT_CLASS_MASK_POINT_COLORS
     segment_fill_width = scaled_annotation_size(POSE_SEGMENT_FILL_BASE_WIDTH, width, height)
@@ -9690,9 +9733,6 @@ def write_pose_keypoint_mask(
                 thickness=-1,
                 lineType=cv2.LINE_AA,
             )
-
-    if not write_image_file(path, output, cv2):
-        raise RuntimeError(f"Could not write keypoint visualization mask: {path}")
 
 
 def write_ordered_keypoint_overlay(
@@ -9798,13 +9838,16 @@ def write_yolo_pose(path: Path, lines: list[str]) -> None:
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
-def atomic_write_text(path: Path, text: str) -> None:
+def atomic_write_text(path: Path, text: str | Iterable[str]) -> None:
     """Replace a text file without exposing a partially written document."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         with temporary_path.open("w", encoding="utf-8") as handle:
-            handle.write(text)
+            if isinstance(text, str):
+                handle.write(text)
+            else:
+                handle.writelines(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
@@ -9812,13 +9855,23 @@ def atomic_write_text(path: Path, text: str) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-def atomic_write_json(path: Path, value: object) -> None:
-    atomic_write_text(path, json.dumps(value, indent=2) + "\n")
+def write_metadata_snapshot(path: Path, records: Iterable[dict[str, object]]) -> None:
+    """Publish the existing JSON-array format with only one record encoded at a time."""
+
+    def chunks() -> Iterator[str]:
+        yield "["
+        separator = "\n"
+        for record in records:
+            yield separator + "  " + json.dumps(record, indent=2).replace("\n", "\n  ")
+            separator = ",\n"
+        yield "\n]\n" if separator == ",\n" else "]\n"
+
+    atomic_write_text(path, chunks())
 
 
 def sample_indices_in_output_dir(output_dir: Path) -> set[int]:
     indices: set[int] = set()
-    for directory_name in ("images", "masks", "labels", POSE_LABEL_DIRECTORY):
+    for directory_name in ("images", "masks", "labels", POSE_LABEL_DIRECTORY, "metadata"):
         directory = output_dir / directory_name
         if not directory.is_dir():
             continue
@@ -9870,7 +9923,7 @@ def load_metadata_records(path: Path) -> list[dict[str, object]]:
     return [item for item in value if isinstance(item, dict)]
 
 
-def metadata_sample_indices(records: list[dict[str, object]]) -> set[int]:
+def metadata_sample_indices(records: Iterable[dict[str, object]]) -> set[int]:
     indices: set[int] = set()
     for record in records:
         for key in ("image", "mask", "label", "pose_label"):
@@ -9895,7 +9948,6 @@ def generate_dataset(
     cube_rotational_blur_samples: int,
     degrade_probability: float,
     hard_case: str = DEFAULT_HARD_CASE,
-    hard_color_recognition: bool = False,
     nvidia_gpu: bool = False,
 ) -> None:
     if (width, height) not in RFDETR_KEYPOINT_DATASET_RESOLUTIONS:
@@ -9909,24 +9961,22 @@ def generate_dataset(
     images_dir = output_dir / "images"
     masks_dir = output_dir / "masks"
     pose_dir = output_dir / POSE_LABEL_DIRECTORY
+    metadata_dir = output_dir / "metadata"
     images_dir.mkdir(parents=True, exist_ok=True)
     masks_dir.mkdir(parents=True, exist_ok=True)
     pose_dir.mkdir(parents=True, exist_ok=True)
+    metadata_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_text(
         output_dir / "sticker_keypoint_manifest.json",
         json.dumps(
             {
                 "format": "combined_landmark_and_sticker_keypoints_v1",
                 "model": "RF-DETRKeypointPreview",
-                "generation_mode": (
-                    "hard_color_recognition"
-                    if hard_color_recognition
-                    else "standard"
-                ),
+                "generation_mode": "standard",
                 "blur_policy": {
-                    "cube_rotational_blur": not hard_color_recognition,
-                    "post_render_gaussian_blur": not hard_color_recognition,
-                    "post_render_motion_blur": not hard_color_recognition,
+                    "cube_rotational_blur": True,
+                    "post_render_gaussian_blur": True,
+                    "post_render_motion_blur": True,
                     "other_post_render_augmentations": [
                         "rescale",
                         "sensor_noise",
@@ -10047,15 +10097,12 @@ def generate_dataset(
         )
 
     ensure_hand_assets_loaded()
-    base_width, base_height = width, height
     metadata_path = output_dir / "metadata.json"
     metadata_records = load_metadata_records(metadata_path)
+    published_indices = metadata_sample_indices(metadata_records)
     existing_indices = sample_indices_in_output_dir(output_dir)
-    existing_indices.update(metadata_sample_indices(metadata_records))
+    existing_indices.update(published_indices)
     next_sample_index = max(existing_indices, default=-1) + 1
-    # Repair an interrupted/partial metadata file before generating anything.
-    # Every completed sample below replaces this file atomically as well.
-    atomic_write_json(metadata_path, metadata_records)
     for index in range(count):
         auto_sample_hard_case = (
             hard_case == DEFAULT_HARD_CASE
@@ -10071,15 +10118,8 @@ def generate_dataset(
         else:
             active_hard_case = hard_case
             cube_solved = hard_case == SOLVED_CUBE_HARD_CASE
-        use_high_resolution = (
-            (base_width, base_height) != HIGH_RESOLUTION_IMAGE_SIZE
-            and random.random() < HIGH_RESOLUTION_PROBABILITY
-        )
-        width, height = (
-            HIGH_RESOLUTION_IMAGE_SIZE
-            if use_high_resolution
-            else (base_width, base_height)
-        )
+        # Keep the seeded scene draws aligned with the former 144 px path.
+        random.random()
         configure_render(width, height)
         # Deliberate hard cases own their occlusion setup. Keep hands enabled
         # unless the case explicitly requests a hand-free scene through its
@@ -10103,7 +10143,6 @@ def generate_dataset(
                 background_object_count=background_object_count,
                 desk_no_hands=desk_no_hands,
                 solved=cube_solved,
-                hard_color_recognition=hard_color_recognition,
             )
         else:
             # Deliberate cases own their scene setup.  In particular, do not
@@ -10122,7 +10161,6 @@ def generate_dataset(
                 scramble_length=scramble_length,
                 background_object_count=background_object_count,
                 solved=cube_solved,
-                hard_color_recognition=hard_color_recognition,
             )
         base_cube_pose = cube_pose
         objects = cube_objects()
@@ -10274,11 +10312,7 @@ def generate_dataset(
             rotational_blur = render_cube_rotational_blur_png(
                 image_path,
                 render_objects,
-                probability=(
-                    0.0
-                    if hard_color_recognition
-                    else cube_rotational_blur_probability
-                ),
+                probability=cube_rotational_blur_probability,
                 max_degrees=max_cube_rotational_blur_degrees,
                 samples=cube_rotational_blur_samples,
                 local_object_axes=localized_blur_object_axes,
@@ -10287,7 +10321,6 @@ def generate_dataset(
             camera_degradation = apply_camera_degradation(
                 image_path,
                 probability=degrade_probability,
-                disable_blur=hard_color_recognition,
             )
             sticker_roots = list(objects) + core_objects
             cube_visibility_states = set_mesh_objects_render_visible(sticker_roots)
@@ -10321,15 +10354,11 @@ def generate_dataset(
         metadata_entry = {
             "active_random_seed": ACTIVE_RANDOM_SEED,
             "hard_case": active_hard_case,
-            "generation_mode": (
-                "hard_color_recognition"
-                if hard_color_recognition
-                else "standard"
-            ),
+            "generation_mode": "standard",
             "blur_policy": {
-                "cube_rotational_blur": not hard_color_recognition,
-                "post_render_gaussian_blur": not hard_color_recognition,
-                "post_render_motion_blur": not hard_color_recognition,
+                "cube_rotational_blur": True,
+                "post_render_gaussian_blur": True,
+                "post_render_motion_blur": True,
             },
             "hard_case_sampling": {
                 "mode": "automatic" if auto_sample_hard_case else "fixed",
@@ -10341,7 +10370,7 @@ def generate_dataset(
             "image_size": {
                 "width": width,
                 "height": height,
-                "variant": "high" if use_high_resolution else "base",
+                "variant": "base",
             },
             "mask": str(mask_path),
             "pose_label": str(pose_label_path),
@@ -10369,8 +10398,10 @@ def generate_dataset(
                 + len(sticker_keypoint_metadata.get("landmark_keypoints", []))
             ),
         }
-        metadata_records.append(metadata_entry)
-        atomic_write_json(metadata_path, metadata_records)
+        atomic_write_text(
+            metadata_dir / f"{stem}.json",
+            json.dumps(metadata_entry, separators=(",", ":")) + "\n",
+        )
         if (index + 1) % MEMORY_CLEANUP_INTERVAL == 0:
             cleanup_blender_memory()
         mask_message = f", {mask_path}"
@@ -10385,6 +10416,18 @@ def generate_dataset(
             f"and {'with' if camera_degradation else 'without'} camera degradation"
         )
 
+    # Existing datasets may have records only in the combined file. Include
+    # those records and any per-image files from this or an interrupted run.
+    unpublished_paths = sorted(
+        (path for path in metadata_dir.glob("*.json")
+         if path.stem.isdigit() and int(path.stem) not in published_indices),
+        key=lambda path: int(path.stem),
+    )
+    unpublished_records = (
+        json.loads(path.read_text(encoding="utf-8")) for path in unpublished_paths
+    )
+    write_metadata_snapshot(metadata_path, chain(metadata_records, unpublished_records))
+
     data_yaml = output_dir / "data.yaml"
     atomic_write_text(
         data_yaml,
@@ -10394,7 +10437,7 @@ def generate_dataset(
         + "pose: pose\n"
         + "kpt_shape: [1, 3]\n"
         + f"image_size: {DEFAULT_IMAGE_SIZE}\n"
-        + "available_image_sizes: [144, 288]\n"
+        + f"available_image_sizes: [{DEFAULT_IMAGE_SIZE}]\n"
         + "model: RF-DETRKeypointPreview\n"
         + "pose_label_mode: combined_keypoints\n"
         + "names:\n"
@@ -10416,8 +10459,8 @@ def cli_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int)
     parser.add_argument("--scramble-length", type=int, default=DEFAULT_SCRAMBLE_LENGTH)
-    parser.add_argument("--width", type=int, default=DEFAULT_IMAGE_SIZE)
-    parser.add_argument("--height", type=int, default=DEFAULT_IMAGE_SIZE)
+    parser.add_argument("--width", type=int, choices=(DEFAULT_IMAGE_SIZE,), default=DEFAULT_IMAGE_SIZE)
+    parser.add_argument("--height", type=int, choices=(DEFAULT_IMAGE_SIZE,), default=DEFAULT_IMAGE_SIZE)
     parser.add_argument(
         "--background-object-count",
         type=int,
@@ -10449,12 +10492,10 @@ def cli_args() -> argparse.Namespace:
         help="Probability of applying post-render blur, noise, rescale softness, and video codec artifacts.",
     )
     parser.add_argument(
-        "--hard-color-recognition",
-        action="store_true",
-        help=(
-            "Focus samples on saturated color casts (yellow/blue weighted), "
-            "disable rotational/Gaussian/motion blur, and keep other augmentations active."
-        ),
+        "--mixed-lighting-probability",
+        type=float,
+        default=DEFAULT_MIXED_LIGHTING_PROBABILITY,
+        help="Chance of combining a white key with colored fill and background lights (default: 0.15).",
     )
     parser.add_argument(
         "--enable-mid-turns",
@@ -10478,16 +10519,18 @@ def cli_args() -> argparse.Namespace:
     )
 
     argv = sys.argv
-    if "--" not in argv:
-        return parser.parse_args([])
-    return parser.parse_args(argv[argv.index("--") + 1 :])
+    args = parser.parse_args(argv[argv.index("--") + 1 :] if "--" in argv else [])
+    if not 0.0 <= args.mixed_lighting_probability <= 1.0:
+        parser.error("--mixed-lighting-probability must be between 0 and 1")
+    return args
 
 
 def main() -> None:
-    global ACTIVE_RANDOM_SEED, CUBE_MISALIGNMENT_ENABLED, SCRAMBLES_ENABLED
+    global ACTIVE_RANDOM_SEED, CUBE_MISALIGNMENT_ENABLED, SCRAMBLES_ENABLED, MIXED_LIGHTING_PROBABILITY
     args = cli_args()
     CUBE_MISALIGNMENT_ENABLED = bool(args.enable_mid_turns)
     SCRAMBLES_ENABLED = not args.no_scrambles
+    MIXED_LIGHTING_PROBABILITY = args.mixed_lighting_probability
     if args.seed is not None:
         ACTIVE_RANDOM_SEED = args.seed
     else:
@@ -10507,7 +10550,6 @@ def main() -> None:
         cube_rotational_blur_samples=args.cube_rotational_blur_samples,
         degrade_probability=args.degrade_probability,
         hard_case=DEFAULT_HARD_CASE,
-        hard_color_recognition=args.hard_color_recognition,
         nvidia_gpu=args.gpu,
     )
 
