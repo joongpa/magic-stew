@@ -19,6 +19,8 @@ red, blue, green order. Use visibility 2 for visible centers, 1 for hidden
 centers inside the crop, and 0 0 0 for centers outside it. Core targets do
 not use the sticker and landmark face-angle cutoff.
 
+Training uses the default Ultralytics pose loss for every class.
+
 The preparer pads one-keypoint rows to six slots for the shared YOLO head
 when the dataset includes cube cores. It also accepts already padded rows
 and legacy one-keypoint datasets.
@@ -32,7 +34,7 @@ Example:
     .venv/bin/python scripts/train_yolo11n_keypoints_local.py \
         --model-family yolo26 \
         --model-size small \
-        --source-dir data/keypoints_only_dataset \
+        --source-dir data/fixed_core_dataset \
         --device 0 \
         --batch 12 \
         --epochs 100
@@ -48,6 +50,7 @@ from collections import Counter
 from pathlib import Path
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+DEFAULT_SOURCE_DIR = Path("data/fixed_core_dataset")
 CUBE_CORE_CLASS = "cube-core"
 CUBE_CORE_COLORS = ("white", "yellow", "orange", "red", "blue", "green")
 VISIBILITY_VALUES = {0, 1, 2}
@@ -327,7 +330,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         nargs="+",
         action="append",
-        help="Dataset root(s) containing images/ and pose/; repeat to combine sources.",
+        help=(
+            "Dataset root(s) containing images/ and pose/; repeat to combine sources. "
+            f"Defaults to {DEFAULT_SOURCE_DIR}."
+        ),
     )
     parser.add_argument("--pose-subdir", default="pose")
     parser.add_argument(
@@ -379,7 +385,7 @@ def main() -> None:
 
     source_dirs = [
         path
-        for group in (args.source_dir_groups or [[Path("data/keypoints_only_dataset")]])
+        for group in (args.source_dir_groups or [[DEFAULT_SOURCE_DIR]])
         for path in group
     ]
     class_names = resolve_class_names(source_dirs, args.class_names)
