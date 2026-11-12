@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a YOLO pose model on cube landmarks, stickers, and cube cores.
+"""Train a YOLO pose model on the nine-class sticker/keypoint dataset.
 
 Expected source layout:
 
@@ -8,22 +8,9 @@ Expected source layout:
       pose/*.txt
       sticker_keypoint_manifest.json
 
-Landmark and sticker rows have one keypoint:
+Each pose row is one object with one keypoint:
 
     class cx cy width height keypoint_x keypoint_y visibility
-
-New Blender exports declare a keypoint shape of [6, 3] and include the
-`cube-core` class alongside the three landmark and six sticker classes.
-Each core row has six (x, y, visibility) triples in white, yellow, orange,
-red, blue, green order. Use visibility 2 for visible centers, 1 for hidden
-centers inside the crop, and 0 0 0 for centers outside it. Core targets do
-not use the sticker and landmark face-angle cutoff.
-
-Training uses the default Ultralytics pose loss for every class.
-
-The preparer pads one-keypoint rows to six slots for the shared YOLO head
-when the dataset includes cube cores. It also accepts already padded rows
-and legacy one-keypoint datasets.
 
 The training comparison intentionally disables mosaic, hue, and saturation
 augmentation while retaining value/brightness and ordinary geometric
@@ -34,7 +21,7 @@ Example:
     .venv/bin/python scripts/train_yolo11n_keypoints_local.py \
         --model-family yolo26 \
         --model-size small \
-        --source-dir data/fixed_core_dataset \
+        --source-dir data/keypoints_only_dataset \
         --device 0 \
         --batch 12 \
         --epochs 100
@@ -50,9 +37,8 @@ from collections import Counter
 from pathlib import Path
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
-DEFAULT_SOURCE_DIR = Path("data/fixed_core_dataset")
-CUBE_CORE_CLASS = "cube-core"
-CUBE_CORE_COLORS = ("white", "yellow", "orange", "red", "blue", "green")
+KEYPOINT_SHAPE = [1, 3]
+LABEL_FIELD_COUNT = 1 + 4 + KEYPOINT_SHAPE[0] * KEYPOINT_SHAPE[1]
 VISIBILITY_VALUES = {0, 1, 2}
 DEFAULT_CLASS_NAMES = ["corner", "corner-edge", "corner-edge-center"]
 YOLO_POSE_MODEL_FAMILIES = {
@@ -80,10 +66,6 @@ def parse_class_names(value: str) -> list[str]:
     return names
 
 
-def keypoint_shape(class_names: list[str]) -> list[int]:
-    return [len(CUBE_CORE_COLORS) if CUBE_CORE_CLASS in class_names else 1, 3]
-
-
 def source_class_names(source_dir: Path) -> list[str]:
     """Read the generator manifest before falling back to data.yaml."""
 
@@ -91,26 +73,23 @@ def source_class_names(source_dir: Path) -> list[str]:
         path = source_dir / filename
         if path.is_file():
             metadata = json.loads(path.read_text(encoding="utf-8"))
-            names = parse_class_names(",".join(metadata["class_names"]))
-            shape = keypoint_shape(names)
-            if metadata.get("keypoint_shape") != shape:
-                raise ValueError(f"{path}: expected keypoint_shape {shape}")
-            return names
+            if metadata.get("keypoint_shape") != KEYPOINT_SHAPE:
+                raise ValueError(f"{path}: expected keypoint_shape {KEYPOINT_SHAPE}")
+            return parse_class_names(",".join(metadata["class_names"]))
 
     data_yaml = source_dir / "data.yaml"
     if data_yaml.is_file():
         import yaml
 
         metadata = yaml.safe_load(data_yaml.read_text(encoding="utf-8"))
+        if metadata.get("kpt_shape") != KEYPOINT_SHAPE:
+            raise ValueError(f"{data_yaml}: expected kpt_shape {KEYPOINT_SHAPE}")
         names = metadata.get("names")
         if isinstance(names, dict):
             indexed = {int(index): str(name) for index, name in names.items()}
             names = [indexed[index] for index in range(len(indexed))]
-        names = parse_class_names(",".join(names)) if isinstance(names, list) else DEFAULT_CLASS_NAMES.copy()
-        shape = keypoint_shape(names)
-        if metadata.get("kpt_shape") != shape:
-            raise ValueError(f"{data_yaml}: expected kpt_shape {shape}")
-        return names
+        if isinstance(names, list):
+            return parse_class_names(",".join(names))
     return DEFAULT_CLASS_NAMES.copy()
 
 
@@ -125,59 +104,33 @@ def resolve_class_names(source_dirs: list[Path], override: list[str] | None) -> 
     return names
 
 
-def read_label_file(path: Path, class_names: list[str]) -> tuple[Counter[int], str]:
-    """Validate source rows and pad single points for a shared six-slot head."""
-
+def validate_label_file(path: Path, class_names: list[str]) -> Counter[int]:
     counts: Counter[int] = Counter()
-    source = path.read_text(encoding="utf-8")
-    rows = []
-    keypoint_count, dimensions = keypoint_shape(class_names)
-    single_field_count = 5 + dimensions
-    full_field_count = 5 + keypoint_count * dimensions
-    for line_number, raw_line in enumerate(source.splitlines(), 1):
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw_line.strip()
         if not line:
             continue
         fields = line.split()
         prefix = f"{path}:{line_number}"
-        if len(fields) not in (single_field_count, full_field_count):
-            expected = (
-                str(single_field_count) if keypoint_count == 1
-                else f"{single_field_count} or {full_field_count}"
-            )
-            raise ValueError(f"{prefix}: expected {expected} fields, got {len(fields)}")
+        if len(fields) != LABEL_FIELD_COUNT:
+            raise ValueError(f"{prefix}: expected {LABEL_FIELD_COUNT} fields, got {len(fields)}")
         try:
             values = [float(field) for field in fields]
         except ValueError as error:
             raise ValueError(f"{prefix}: all fields must be numeric") from error
 
-        if not values[0].is_integer() or not 0 <= values[0] < len(class_names):
-            raise ValueError(f"{prefix}: invalid class ID {values[0]}")
         class_id = int(values[0])
+        if values[0] != class_id or not 0 <= class_id < len(class_names):
+            raise ValueError(f"{prefix}: invalid class ID {values[0]}")
         if not all(0.0 <= value <= 1.0 for value in values[1:5]):
             raise ValueError(f"{prefix}: bounding-box values must be in [0, 1]")
-        is_core = class_names[class_id] == CUBE_CORE_CLASS
-        if is_core and len(fields) != full_field_count:
-            raise ValueError(f"{prefix}: {CUBE_CORE_CLASS} requires six keypoint triples")
-        if not is_core and any(values[single_field_count:]):
-            raise ValueError(f"{prefix}: unused keypoint slots must be 0 0 0")
-
-        point_fields = values[5:] if is_core else values[5:single_field_count]
-        for index, offset in enumerate(range(0, len(point_fields), dimensions), 1):
-            x, y, visibility = point_fields[offset:offset + dimensions]
-            if not 0.0 <= x <= 1.0 or not 0.0 <= y <= 1.0:
-                raise ValueError(f"{prefix}: keypoint {index} coordinates must be in [0, 1]")
-            if visibility not in VISIBILITY_VALUES:
-                raise ValueError(f"{prefix}: keypoint {index} visibility must be 0, 1, or 2")
-            if is_core and visibility == 0 and (x != 0.0 or y != 0.0):
-                raise ValueError(f"{prefix}: unlabeled core keypoint {index} must be 0 0 0")
+        keypoint_x, keypoint_y, visibility = values[5:8]
+        if not 0.0 <= keypoint_x <= 1.0 or not 0.0 <= keypoint_y <= 1.0:
+            raise ValueError(f"{prefix}: keypoint coordinates must be in [0, 1]")
+        if visibility != int(visibility) or int(visibility) not in VISIBILITY_VALUES:
+            raise ValueError(f"{prefix}: visibility must be 0, 1, or 2")
         counts[class_id] += 1
-        if keypoint_count > 1:
-            fields.extend(["0"] * (full_field_count - len(fields)))
-            rows.append(" ".join(fields))
-    if keypoint_count > 1:
-        source = "".join(f"{row}\n" for row in rows)
-    return counts, source
+    return counts
 
 
 def collect_pairs(source_dir: Path, pose_subdir: str) -> list[tuple[Path, Path]]:
@@ -213,8 +166,7 @@ def write_dataset(
 
     source_counts = Counter()
     for _, label_path in pairs:
-        label_counts, _ = read_label_file(label_path, class_names)
-        source_counts.update(label_counts)
+        source_counts.update(validate_label_file(label_path, class_names))
 
     random.Random(seed).shuffle(pairs)
     val_count = max(1, round(len(pairs) * val_fraction))
@@ -233,13 +185,13 @@ def write_dataset(
         labels_dir.mkdir(parents=True, exist_ok=True)
         counts = Counter()
         for index, (image_path, label_path) in enumerate(split_pairs):
-            label_counts, label_text = read_label_file(label_path, class_names)
+            label_counts = validate_label_file(label_path, class_names)
             counts.update(label_counts)
             stem = f"{split}_{index:06d}"
             target_image = images_dir / f"{stem}{image_path.suffix.lower()}"
             target_label = labels_dir / f"{stem}.txt"
             shutil.copy2(image_path, target_image)
-            target_label.write_text(label_text, encoding="utf-8")
+            shutil.copy2(label_path, target_label)
             manifest.append(
                 {
                     "split": split,
@@ -273,7 +225,7 @@ def write_dataset(
         "path: "
         + str(dataset_dir.resolve())
         + "\ntrain: images/train\nval: images/val\n"
-        + f"kpt_shape: {keypoint_shape(class_names)}\n"
+        + f"kpt_shape: [{KEYPOINT_SHAPE[0]}, {KEYPOINT_SHAPE[1]}]\n"
         + "names:\n"
         + "".join(f"  {index}: {name}\n" for index, name in enumerate(class_names)),
         encoding="utf-8",
@@ -330,16 +282,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         nargs="+",
         action="append",
-        help=(
-            "Dataset root(s) containing images/ and pose/; repeat to combine sources. "
-            f"Defaults to {DEFAULT_SOURCE_DIR}."
-        ),
+        help="Dataset root(s) containing images/ and pose/; repeat to combine sources.",
     )
     parser.add_argument("--pose-subdir", default="pose")
-    parser.add_argument(
-        "--class-names", type=parse_class_names, default=None,
-        help="Override the source class order. Include cube-core for six-center labels.",
-    )
+    parser.add_argument("--class-names", type=parse_class_names, default=None)
     parser.add_argument("--workdir", type=Path, default=Path("runs/yolo11n_keypoints_local"))
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=17)
@@ -385,7 +331,7 @@ def main() -> None:
 
     source_dirs = [
         path
-        for group in (args.source_dir_groups or [[DEFAULT_SOURCE_DIR]])
+        for group in (args.source_dir_groups or [[Path("data/keypoints_only_dataset")]])
         for path in group
     ]
     class_names = resolve_class_names(source_dirs, args.class_names)

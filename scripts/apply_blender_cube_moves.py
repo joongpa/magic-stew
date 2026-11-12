@@ -11,8 +11,8 @@ Assumptions:
 - Cubies are 1 meter wide, so cubie origins sit on the -1/0/1 grid.
 - Cubie objects use quaternion rotation mode.
 - Cubie object pass_index values identify physical cubies.
-- The six physical center stickers form one color-ordered cube-core instance.
-  Other qualifying stickers and landmarks have one keypoint per instance.
+- Pose labels contain one YOLO keypoint instance per qualifying sticker center,
+  with six sticker-color classes.
 - Blender axes are X=right, Z=up, and Y=front/back. Change FRONT_AXIS if needed.
 """
 
@@ -508,7 +508,7 @@ HAND_ASSET_IMPORTED = False
 
 SOLVED_LOCATION_PROP = "synthetic_solved_location"
 SOLVED_ROTATION_PROP = "synthetic_solved_rotation"
-DEFAULT_OUTPUT_DIR = "data/synthetic_cube_core_dataset"
+DEFAULT_OUTPUT_DIR = "data/synthetic_cube_dataset"
 RFDETR_KEYPOINT_NATIVE_INPUT_SIZE = (576, 576)
 DEFAULT_IMAGE_SIZE = 144
 RFDETR_KEYPOINT_DATASET_RESOLUTIONS = ((DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE),)
@@ -580,12 +580,9 @@ INDEPENDENT_CLASS_MASK_POINT_COLORS = {
     CORNER_EDGE_CLASS_ID: (0, 255, 255),
     CORNER_EDGE_CENTER_CLASS_ID: (255, 120, 255),
 }
-CUBE_CORE_CLASS_NAME = "cube-core"
-COMBINED_KEYPOINT_CLASS_NAMES = (
-    *INDEPENDENT_CLASS_NAMES, *STICKER_KEYPOINT_CLASS_NAMES, CUBE_CORE_CLASS_NAME,
+COMBINED_KEYPOINT_CLASS_NAMES = tuple(INDEPENDENT_CLASS_NAMES) + tuple(
+    STICKER_KEYPOINT_CLASS_NAMES
 )
-CUBE_CORE_CLASS_ID = COMBINED_KEYPOINT_CLASS_NAMES.index(CUBE_CORE_CLASS_NAME)
-CUBE_CORE_KEYPOINT_SHAPE = [len(STICKER_KEYPOINT_CLASS_NAMES), 3]
 STICKER_KEYPOINT_DATASET_CLASS_ID_OFFSET = len(INDEPENDENT_CLASS_NAMES)
 STICKER_KEYPOINT_DATASET_CLASS_ID_BY_MATERIAL = {
     material_name: STICKER_KEYPOINT_DATASET_CLASS_ID_OFFSET + class_id
@@ -6493,7 +6490,6 @@ def sticker_keypoint_specs(main_cube_roots: list[bpy.types.Object]) -> list[dict
             spec = dict(face_candidates[0])
             spec["name"] = obj.name
             spec["mask_key"] = obj.name
-            spec["source_cubie"] = obj.parent.name if obj.parent is not None else None
             spec["face_candidates"] = face_candidates
             spec["polygon_indices"] = [
                 int(polygon.index)
@@ -6540,7 +6536,6 @@ def sticker_keypoint_specs(main_cube_roots: list[bpy.types.Object]) -> list[dict
                 spec = dict(face_candidates[0])
                 spec["name"] = f"{obj.name}:{material_name}"
                 spec["mask_key"] = f"{obj.name}:{material_name}"
-                spec["source_cubie"] = obj.name
                 spec["face_candidates"] = face_candidates
                 spec["polygon_indices"] = [
                     int(polygon.index)
@@ -6651,14 +6646,14 @@ def render_sticker_keypoints(
     landmark_lines: list[str] | None = None,
     landmark_pose_objects: list[dict[str, object]] | None = None,
 ) -> tuple[list[str], dict[str, object]]:
-    """Write landmark, sticker and six-center cube-core instances."""
+    """Write combined landmark and sticker-center YOLO pose instances."""
     try:
         import numpy as np
     except ImportError:
         raise RuntimeError("NumPy is required for sticker keypoint labels.") from None
 
     specs = sticker_keypoint_specs(main_cube_roots)
-    visibility_map, sticker_masks = render_visibility_class_map(
+    _visibility, sticker_masks = render_visibility_class_map(
         main_cube_roots,
         hand_roots,
         width,
@@ -6669,9 +6664,6 @@ def render_sticker_keypoints(
     scene = bpy.context.scene
     lines = []
     keypoints = []
-    core_by_color: dict[int, dict[str, object]] = {}
-    center_cubies = {obj.name: obj for obj in center_cubie_objects()}
-    cube_center = cubie_world_center(list(center_cubies.values()))
     counts = {
         "visible": 0,
         "occluded": 0,
@@ -6680,39 +6672,6 @@ def render_sticker_keypoints(
         "angle_filtered": 0,
     }
     for base_spec in specs:
-        center_cubie = center_cubies.get(base_spec["source_cubie"])
-        if center_cubie is not None:
-            outward = center_cubie.matrix_world.translation - cube_center
-            spec = max(base_spec["face_candidates"], key=lambda face: face["normal"].dot(outward))
-            point = spec["point"]
-            projected = project_world_point(point, camera, scene)
-            occluded_by = None
-            visibility = POINT_VISIBILITY_UNLABELED
-            if projected is not None:
-                # A back-facing or occluded center still has a coordinate target.
-                occluded_by = object_occluding_point(point, depsgraph)
-                front_facing = spec["normal"].dot(camera.location - point) > 0.0
-                visibility = (
-                    POINT_VISIBILITY_VISIBLE if front_facing and occluded_by is None
-                    else POINT_VISIBILITY_LABELED_OCCLUDED
-                )
-            color_id = int(spec["class_id"])
-            if color_id in core_by_color:
-                raise ValueError(f"Multiple center stickers for {spec['class']}")
-            core_by_color[color_id] = {
-                "source_object": spec["source_object"],
-                "source_cubie": center_cubie.name,
-                "class": spec["class"],
-                "sticker_class_id": color_id,
-                "pixel_point": projected if projected is not None else (0.0, 0.0),
-                "normalized_point": (
-                    normalize_point(*projected, width, height)
-                    if projected is not None else (0.0, 0.0)
-                ),
-                "visibility": visibility,
-                "occluded_by": occluded_by,
-            }
-            continue
         visible_mask = sticker_masks.get(base_spec["mask_key"])
         spec = select_sticker_face_spec(base_spec, visible_mask, width, height)
         point = spec["point"]
@@ -6778,23 +6737,7 @@ def render_sticker_keypoints(
             "visible_area_ratio": area_ratio,
         })
 
-    missing = [
-        color for color_id, color in enumerate(STICKER_KEYPOINT_CLASS_NAMES)
-        if color_id not in core_by_color
-    ]
-    if missing:
-        raise ValueError(f"Missing cube-core center stickers: {', '.join(missing)}")
-    core_keypoints = [core_by_color[color_id] for color_id in range(CUBE_CORE_KEYPOINT_SHAPE[0])]
-    core_points = [(*item["pixel_point"], item["visibility"]) for item in core_keypoints]
-    cube_mask = visibility_map == 1
-    bbox = (
-        sticker_keypoint_bbox(cube_mask, (0.0, 0.0), width, height)
-        if np.any(cube_mask) else keypoint_bbox(core_points, width, height)
-    )
-    padding = " 0 0 0" * (CUBE_CORE_KEYPOINT_SHAPE[0] - 1)
-    combined_lines = [line + padding for line in chain(landmark_lines or (), lines)]
-    if bbox is not None:
-        combined_lines.append(yolo_pose_line(CUBE_CORE_CLASS_ID, *bbox, core_points, width, height))
+    combined_lines = [*(landmark_lines or []), *lines]
     label_path.parent.mkdir(parents=True, exist_ok=True)
     label_path.write_text(
         "\n".join(combined_lines) + ("\n" if combined_lines else ""),
@@ -6807,14 +6750,13 @@ def render_sticker_keypoints(
         width,
         height,
         landmark_pose_objects=landmark_pose_objects,
-        core_keypoints=core_keypoints,
     )
     return combined_lines, {
-        "format": "YOLO pose combined landmark, sticker-center and cube-core keypoints",
+        "format": "YOLO pose combined landmark and sticker-center keypoints",
         "class_names": list(COMBINED_KEYPOINT_CLASS_NAMES),
         "landmark_class_names": list(INDEPENDENT_CLASS_NAMES),
         "sticker_class_names": list(STICKER_KEYPOINT_CLASS_NAMES),
-        "keypoint_shape": CUBE_CORE_KEYPOINT_SHAPE,
+        "keypoint_shape": [1, 3],
         "min_face_plane_angle_degrees": STICKER_KEYPOINT_MIN_PLANE_ANGLE_DEGREES,
         "min_visible_area_ratio_for_occluded": STICKER_KEYPOINT_MIN_VISIBLE_AREA_RATIO,
         "keypoints": keypoints,
@@ -6824,8 +6766,6 @@ def render_sticker_keypoints(
             for keypoint in pose_object.get("keypoints", [])
         ],
         "landmark_pose_objects": landmark_pose_objects or [],
-        "cube_core_keypoints": core_keypoints,
-        "cube_core_labeled": bbox is not None,
         "counts": counts,
         "candidate_count": len(specs),
     }
@@ -6837,8 +6777,6 @@ def write_sticker_keypoint_mask(
     keypoints: list[dict[str, object]],
     width: int,
     height: int,
-    *,
-    core_keypoints: list[dict[str, object]],
     landmark_pose_objects: list[dict[str, object]] | None = None,
 ) -> None:
     try:
@@ -6861,18 +6799,6 @@ def write_sticker_keypoint_mask(
         center = (round(float(x)), round(float(y)))
         cv2.circle(output, center, outline_radius, (0, 0, 0), thickness=-1, lineType=cv2.LINE_AA)
         cv2.circle(output, center, point_radius, color, thickness=-1, lineType=cv2.LINE_AA)
-    diamond_radius = scaled_annotation_size(POSE_POINT_BASE_RADIUS + 3, width, height)
-    for keypoint in sorted(core_keypoints, key=lambda item: item["visibility"]):
-        if keypoint["visibility"] == POINT_VISIBILITY_UNLABELED:
-            continue
-        color = STICKER_KEYPOINT_MASK_COLORS[int(keypoint["sticker_class_id"])]
-        x, y = (round(float(value)) for value in keypoint["pixel_point"])
-        for radius, fill in ((diamond_radius + 1, (0, 0, 0)), (diamond_radius, color)):
-            vertices = np.asarray(
-                [(x, y - radius), (x + radius, y), (x, y + radius), (x - radius, y)],
-                dtype=np.int32,
-            )
-            cv2.fillConvexPoly(output, vertices, fill, lineType=cv2.LINE_AA)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not write_image_file(path, output, cv2):
         raise RuntimeError(f"Could not write sticker keypoint mask: {path}")
@@ -10073,30 +9999,15 @@ def generate_dataset(
     masks_dir = output_dir / "masks"
     pose_dir = output_dir / POSE_LABEL_DIRECTORY
     metadata_dir = output_dir / "metadata"
-    manifest_path = output_dir / "sticker_keypoint_manifest.json"
-    keypoint_shape = CUBE_CORE_KEYPOINT_SHAPE
-    metadata_path = output_dir / "metadata.json"
-    metadata_records = load_metadata_records(metadata_path)
-    published_indices = metadata_sample_indices(metadata_records)
-    existing_indices = sample_indices_in_output_dir(output_dir) | published_indices
-    if existing_indices:
-        previous_shape = [1, 3]
-        if manifest_path.is_file():
-            previous_shape = json.loads(manifest_path.read_text(encoding="utf-8"))["keypoint_shape"]
-        if previous_shape != keypoint_shape:
-            raise ValueError(
-                f"{output_dir} contains pose labels with shape {previous_shape}. "
-                f"Use a different --output-dir for shape {keypoint_shape}."
-            )
     images_dir.mkdir(parents=True, exist_ok=True)
     masks_dir.mkdir(parents=True, exist_ok=True)
     pose_dir.mkdir(parents=True, exist_ok=True)
     metadata_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_text(
-        manifest_path,
+        output_dir / "sticker_keypoint_manifest.json",
         json.dumps(
             {
-                "format": "combined_landmark_sticker_and_cube_core_keypoints_v1",
+                "format": "combined_landmark_and_sticker_keypoints_v1",
                 "model": "RF-DETRKeypointPreview",
                 "generation_mode": "standard",
                 "blur_policy": {
@@ -10117,9 +10028,7 @@ def generate_dataset(
                 "landmark_class_names": list(INDEPENDENT_CLASS_NAMES),
                 "sticker_class_names": list(STICKER_KEYPOINT_CLASS_NAMES),
                 "material_class_ids": STICKER_KEYPOINT_DATASET_CLASS_ID_BY_MATERIAL,
-                "keypoint_shape": keypoint_shape,
-                "cube_core_class_id": CUBE_CORE_CLASS_ID,
-                "cube_core_keypoint_order": list(STICKER_KEYPOINT_CLASS_NAMES),
+                "keypoint_shape": [1, 3],
                 "keypoints_per_sticker": 1,
                 "landmark_keypoint_classes": {
                     "corner": CORNER_CLASS_ID,
@@ -10135,8 +10044,8 @@ def generate_dataset(
                 },
                 "occluded_min_visible_sticker_area_ratio": STICKER_KEYPOINT_MIN_VISIBLE_AREA_RATIO,
                 "mask_output": (
-                    "Rendered image with circular landmark and sticker keypoints and "
-                    "color-coded cube-core diamonds."
+                    "Rendered image with landmark keypoints and color-coded "
+                    "sticker-center keypoints."
                 ),
             },
             indent=2,
@@ -10225,6 +10134,11 @@ def generate_dataset(
         )
 
     ensure_hand_assets_loaded()
+    metadata_path = output_dir / "metadata.json"
+    metadata_records = load_metadata_records(metadata_path)
+    published_indices = metadata_sample_indices(metadata_records)
+    existing_indices = sample_indices_in_output_dir(output_dir)
+    existing_indices.update(published_indices)
     next_sample_index = max(existing_indices, default=-1) + 1
     for index in range(count):
         auto_sample_hard_case = (
@@ -10456,7 +10370,7 @@ def generate_dataset(
                     cube_pose=cube_pose,
                     include_partial_turn_intersections=False,
                 )
-                combined_lines, sticker_keypoint_metadata = render_sticker_keypoints(
+                sticker_lines, sticker_keypoint_metadata = render_sticker_keypoints(
                     pose_label_path,
                     mask_path,
                     image_path,
@@ -10516,7 +10430,10 @@ def generate_dataset(
             "camera_degradation": camera_degradation,
             "hands": hand_randomization,
             "hand_attempts": hand_attempts,
-            "objects": len(combined_lines),
+            "objects": (
+                len(sticker_keypoint_metadata.get("keypoints", []))
+                + len(sticker_keypoint_metadata.get("landmark_keypoints", []))
+            ),
         }
         atomic_write_text(
             metadata_dir / f"{stem}.json",
@@ -10530,7 +10447,7 @@ def generate_dataset(
         print(
             f"Wrote {image_path}{mask_message}, "
             f"and {pose_label_path} "
-            f"with {metadata_entry['objects']} pose objects, "
+            f"with {metadata_entry['objects']} combined keypoints, "
             f"{blend_asset_count} blend background assets {blend_asset_sources}, "
             f"{'with' if rotational_blur else 'without'} rotational blur "
             f"and {'with' if camera_degradation else 'without'} camera degradation"
@@ -10555,7 +10472,7 @@ def generate_dataset(
         "train: images\n"
         "val: images\n"
         + "pose: pose\n"
-        + f"kpt_shape: {keypoint_shape}\n"
+        + "kpt_shape: [1, 3]\n"
         + f"image_size: {DEFAULT_IMAGE_SIZE}\n"
         + f"available_image_sizes: [{DEFAULT_IMAGE_SIZE}]\n"
         + "model: RF-DETRKeypointPreview\n"
