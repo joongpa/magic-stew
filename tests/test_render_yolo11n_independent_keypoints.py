@@ -4331,48 +4331,6 @@ def test_failed_future_color_does_not_trigger_evidence_omission(monkeypatch, tmp
     json.dumps(rows, allow_nan=False)
 
 
-@pytest.mark.parametrize('inherited_color', [0., .25, 1. - 2./3., 1. - 2./3. + 1e-9, 1.])
-def test_turn_orientation_rescue_threshold_is_per_state_and_strict(monkeypatch, inherited_color):
-    initial = render_script.CubeGeometryState.identity()
-    other = initial.apply_move('U')
-    calls = []
-
-    def trial(color, static=False):
-        return dict(trial_id='0:+0' if static else '0:-90', label='static R', is_baseline=static,
-                    layer_axis=0, layer_side=1, layer_count=1, layer_rotations=(),
-                    color_offset=0. if static else -90., state_moves=() if static else ('R',),
-                    color_error=color, color_match_count=3, state_score=color + .1, rank=(color + .1,))
-
-    def score(candidate, options, limit, device, likelihoods, states, **kwargs):
-        static = kwargs.get('color_offsets') == (0.,)
-        calls.append((states, static))
-        if len(calls) == 1:
-            assert static
-            return [[trial(inherited_color, True)], [trial(0., True)]]
-        # Even a perfect move cannot suppress rescue of the unchanged state.
-        return [[trial(0., static)] for _state in states]
-
-    monkeypatch.setattr(render_script, '_score_turn_color_offsets_for_states_on_gpu', score)
-    option = dict(is_baseline=True, layer_rotations=())
-    result = render_script._score_turn_color_offsets_with_orientation_rescue(
-        _lookahead_test_candidate(), (option,), 10., 'cpu', np.ones((54, 1)), (initial, other),
-    )
-    rescue = inherited_color > render_script.PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR
-    assert len(calls) == (25 if rescue else 2)
-    assert all(static for _states, static in calls[:-1])
-    assert not calls[-1][1]  # Move generation happens only after orientation is selected.
-    assert all(len(states) == 1 for states, _static in calls[1:-1])
-    assert result[1][0]['color_error'] == 0.
-    assert 'orientation_rescue' not in result[1][0]
-    if rescue:
-        assert min(t['state_score'] for t in result[0]) == pytest.approx(.1)
-        assert all(t['orientation_rescue']['inherited_color_error'] == inherited_color
-                   and t['orientation_rescue']['tested_orientations'] == 24
-                   and t['orientation_rescue']['phase'] == 'before_move_search' for t in result[0])
-    else:
-        assert 'orientation_rescue' not in result[0][0]
-
-
 @pytest.mark.parametrize('symmetry_index', range(24))
 @pytest.mark.parametrize('layer_count,offset', [(1, -90.), (1, 0.), (2, 90.)])
 def test_rescued_pose_projects_the_same_physical_identities_and_commits_only_the_mapped_move(

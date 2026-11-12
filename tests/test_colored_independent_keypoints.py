@@ -146,6 +146,80 @@ def test_cached_trajectory_recovers_missing_pose_from_current_detections(
     assert all(record.pose_candidate is pose for record, pose in zip(anchors, endpoints, strict=True))
 
 
+@pytest.mark.parametrize('smoothing', [False, True])
+def test_cached_orientation_runs_after_smoothing_and_before_search(monkeypatch, capsys, smoothing):
+    from scripts import independent_keypoint_video_search as video_search
+
+    args = m.build_parser().parse_args([
+        '--source', 'clip.mp4', '--initial-scramble', '', '--recognize-moves', '--no-display',
+    ])
+    args.pose_smoothing = smoothing
+    colors = initial_colors('')
+    cache = [SimpleNamespace(frame_index=i, pose_candidate=observed_cube(expected=colors))
+             for i in range(3)]
+    events = []
+    original_match = m.match_orientation_to_colors
+    smoothed_rvec = np.array([[.4], [-.3], [.1]])
+
+    def refine(records, trace, **kwargs):
+        assert kwargs['refine_pose']
+        assert not kwargs['recover_orientation']
+        assert not kwargs['collect_color_trace']
+        assert not events
+        events.append('refinement')
+        kwargs['progress']('pose refinement', len(records), len(records))
+
+    def smooth(records, *args, **kwargs):
+        assert events == ['refinement']
+        events.append('smoothing')
+        kwargs['progress']('pose smoothing / mixed seeds', len(records), len(records))
+        kwargs['progress']('pose smoothing / face outlines', len(records), len(records))
+        records[0].pose_candidate = observed_cube(
+            candidate=replace(cube(), rvec=smoothed_rvec), expected=colors)
+        return 1
+
+    def match(candidate, *args, **kwargs):
+        assert events[0] == 'refinement'
+        assert ('smoothing' in events) is smoothing
+        if smoothing and 'orientation' not in events:
+            np.testing.assert_array_equal(candidate.rvec, smoothed_rvec)
+        events.append('orientation')
+        return original_match(candidate, *args, **kwargs)
+
+    def search(*args):
+        assert events.count('orientation') == len(cache)
+        events.append('search')
+
+    monkeypatch.setattr(m, 'recover_cached_pose_symmetries', refine)
+    monkeypatch.setattr(m, 'smooth_cached_rigid_poses', smooth)
+    monkeypatch.setattr(m, 'match_orientation_to_colors', match)
+    monkeypatch.setattr(video_search, 'run_cached_full_search', search)
+    m.process_cached_poses(cache, args, colors, source_fps=24.)
+    expected = ['refinement', 'smoothing'] if smoothing else ['refinement']
+    assert events == expected + ['orientation'] * len(cache) + ['search']
+    output = capsys.readouterr().out
+    updates = [chunk.split('%')[0].strip() for chunk in output.split('\r') if '%' in chunk]
+    percentages = [float(update.removeprefix('Preparing poses ')) for update in updates]
+    assert percentages == sorted(percentages)
+    assert percentages[-1] == 100.
+    assert output.count('\n') == 1
+    assert 'Refitting' not in output and 'Aligning' not in output
+
+
+def test_refinement_can_skip_the_unused_color_trace(monkeypatch):
+    records = [SimpleNamespace(frame_index=i, pose_candidate=observed_cube(),
+                               pose_candidates=()) for i in range(3)]
+
+    def forbidden(*args):
+        pytest.fail('Pose preparation should defer color observations to orientation selection')
+
+    monkeypatch.setattr(m, 'projected_color_observations', forbidden)
+    monkeypatch.setattr(m, 'pose_reprojection_error_is_acceptable', lambda _: True)
+    m.recover_cached_pose_symmetries(records, m.StickerColorTrace.create(), pose_prepared=True,
+                                    recover_orientation=False, collect_color_trace=False)
+    assert all(record.pose_candidate is not None for record in records)
+
+
 def test_render_confidence_override_retains_other_sticker_thresholds():
     args = m.build_parser().parse_args([
         "--source", "clip.mp4", "--initial-scramble", "", "--pose-class-conf", "red=.8",
@@ -220,7 +294,7 @@ def test_no_containing_stickers_is_invalid_but_absent_colors_are_neutral():
     assert m.sticker_mask_color_turn_fit_metrics(candidate, candidate.rvec, candidate.tvec, (), 10, None) == (0., 0)
 
 
-def test_orientation_uses_all_colors_even_without_centers_and_ignores_continuity():
+def test_orientation_without_centers_uses_continuity():
     expected = initial_colors()
     candidate = observed_cube(expected=expected)
     faces = m.projected_sticker_faces(candidate, candidate.rvec, candidate.tvec)
@@ -228,12 +302,61 @@ def test_orientation_uses_all_colors_even_without_centers_and_ignores_continuity
     candidate = m.attach_color_keypoints(candidate,
         np.array(candidate.sticker_mask_centers)[keep], tuple(candidate.sticker_color_names[i] for i in keep))
     rotated = m.transform_candidate_by_symmetry(candidate, m.CUBE_SYMMETRY_MATRICES[8])
-    recovered = m.match_orientation_to_colors(rotated, expected)
+    tracker = m.CubeSymmetryTracker()
+    tracker.observe(candidate.rvec, 5)
+    recovered = m.match_orientation_to_colors(rotated, expected, tracker, frame_index=7, source_fps=60.)
     observations = m.projected_color_observations(recovered)
     assert observations
     assert all(expected[label] in colors for label, colors in observations.items())
     np.testing.assert_allclose(cv2.Rodrigues(recovered.rvec)[0], cv2.Rodrigues(candidate.rvec)[0], atol=1e-6)
-    assert recovered.pose_continuity_diagnostics is None
+    diagnostics = recovered.pose_continuity_diagnostics
+    assert diagnostics['center_observation_count'] == 0
+    assert diagnostics['color_weight'] == .2
+    assert diagnostics['angular_scale_degrees'] == 90.
+
+
+def test_initial_orientation_is_anchored_by_centers_only():
+    expected = initial_colors()
+    candidate = observed_cube(expected=expected)
+    faces = m.projected_sticker_faces(candidate, candidate.rvec, candidate.tvec)
+    centers = [index for index, (identity, _, _) in enumerate(faces) if identity.category == 'center']
+    assert len(centers) >= 2
+    colors = tuple(color if i in centers else 'orange'
+                   for i, color in enumerate(candidate.sticker_color_names))
+    candidate = m.attach_color_keypoints(candidate, np.array(candidate.sticker_mask_centers), colors)
+    rotated = m.transform_candidate_by_symmetry(candidate, m.CUBE_SYMMETRY_MATRICES[8])
+    recovered = m.match_orientation_to_colors(rotated, expected)
+    np.testing.assert_allclose(cv2.Rodrigues(recovered.rvec)[0], cv2.Rodrigues(candidate.rvec)[0], atol=1e-6)
+    assert recovered.pose_continuity_diagnostics['center_color_error'] == 0.
+
+
+def test_center_weight_breaks_an_angular_tie():
+    expected = initial_colors()
+    candidate = observed_cube(expected=expected)
+    rotation = cv2.Rodrigues(candidate.rvec)[0]
+    tracker = m.CubeSymmetryTracker()
+    tracker.observe(cv2.Rodrigues(rotation @ cv2.Rodrigues(np.array([0., 0., np.pi / 4]))[0])[0], 6)
+    recovered = m.match_orientation_to_colors(candidate, expected, tracker, frame_index=7)
+    np.testing.assert_allclose(cv2.Rodrigues(recovered.rvec)[0], rotation, atol=1e-6)
+    diagnostics = recovered.pose_continuity_diagnostics
+    assert diagnostics['selected_distance_degrees'] == pytest.approx(45.)
+    assert diagnostics['selected_score'] == pytest.approx(.5)
+
+
+@pytest.mark.parametrize('move', ['M', "E'", 'S', 'Rw'])
+def test_center_orientation_keeps_continuity_across_a_slice(move):
+    expected = initial_colors()
+    before = observed_cube(expected=expected)
+    state = m.CubeGeometryState.identity().apply_move(move)
+    candidate = replace(before, cube_geometry_state=state)
+    faces = m.projected_sticker_faces(candidate, candidate.rvec, candidate.tvec)
+    candidate = m.attach_color_keypoints(candidate, np.asarray([quad.mean(axis=0) for _, _, quad in faces]),
+                                        tuple(expected[identity.label] for identity, _, _ in faces))
+    tracker = m.CubeSymmetryTracker()
+    tracker.observe(before.rvec, 6)
+    recovered = m.match_orientation_to_colors(candidate, expected, tracker, frame_index=7)
+    np.testing.assert_allclose(cv2.Rodrigues(recovered.rvec)[0], cv2.Rodrigues(before.rvec)[0], atol=1e-6)
+    assert recovered.pose_continuity_diagnostics['center_color_error'] == 0.
 
 
 def test_inference_calls_only_pose_model():

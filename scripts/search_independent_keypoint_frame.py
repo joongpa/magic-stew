@@ -575,7 +575,7 @@ def main():
             scorer_options['track_color_confusions'] = True
         scorer = cls(renderer, records, args.device, cache_size=args.score_cache_size,
                      initial_colors=colors, turning_start_frame=args.turning_start_frame,
-                     balance_geometry_color=True, joint_orientation_rescue=True,
+                     balance_geometry_color=True,
                      track_sticker_observations=bool(args.bottom_quartile_weight), **scorer_options)
         initial = scorer.state_from_key(scorer.key(renderer.CubeGeometryState.identity()))
     except (ValueError, OSError, KeyError) as error:
@@ -590,7 +590,7 @@ def main():
         queue_score_weights=dict(geometry=queue_geometry_weight, color=.5),
         state_limit=args.max_explored_states, time_budget=args.search_seconds,
         input_fps=args.fps, video_frame_count=video_count, min_state_update_gap_frames=1,
-        scorer=mode, device=args.device, joint_orientation_rescue=True,
+        scorer=mode, device=args.device,
         merge_key='frame,physical_state', reference_solution_used=False,
         script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     if args.branch_widths:

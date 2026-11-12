@@ -273,6 +273,9 @@ STICKER_MASK_CONTAINMENT_THRESHOLD = 0.90
 # coverage penalty is converted to cube-normalized distance units before it is
 # combined with keypoint reprojection error.
 PNP_TURN_MASK_CENTER_WEIGHT = 1.0
+POSE_CONTINUITY_REFERENCE_FPS = 30.0
+POSE_CONTINUITY_ANGULAR_SCALE_DEGREES = 90.0
+POSE_CONTINUITY_COLOR_WEIGHT = 0.2
 # Color contributes the same weight as each geometric term in the final turn
 # ranking. Geometry is landmark error plus the sticker-point term; color is
 # one minus the fraction of observed projected stickers with matching colors.
@@ -281,7 +284,6 @@ PNP_TURN_GEOMETRY_SCORE_VERSION = 3  # Allow clearance at the seam of an articul
 PNP_TURN_SEAM_CLEARANCE_MM = 2.0
 # Check the unchanged state's colors before generating move alternatives.
 # Subtraction matches the categorical scorer exactly at the 2/3 boundary.
-PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR = 1.0 - 2.0 / 3.0
 MIN_TURN_LAYER_OBSERVATIONS = 3
 # A turn is eligible against static when it has more unified inliers or its
 # predictive color error is at least 2x better than the matching baseline.
@@ -2607,25 +2609,79 @@ def projected_color_observations(candidate: StickerPnPCandidate) -> dict[str, tu
 
 def match_orientation_to_colors(
     candidate: StickerPnPCandidate, expected_colors: dict[str, str],
+    symmetry_tracker: CubeSymmetryTracker | None = None, *,
+    frame_index: int | None = None, source_fps: float = POSE_CONTINUITY_REFERENCE_FPS,
 ) -> StickerPnPCandidate:
-    """Choose among all cube symmetries by direct sticker-color agreement only."""
-    best = candidate
-    best_score = (-1, -1, False)
+    """Choose a symmetry using angular continuity and observed center colors."""
+    identities = canonical_sticker_identities()
+    by_geometry = {(i.cubie_index, i.axis, i.side): i for i in identities}
+    centers = tuple(i for i in identities if i.category == 'center')
+    # Project once in position coordinates. Each symmetry only permutes the
+    # six center slots, including when a known slice has moved their identities.
+    observations = projected_color_observations(replace(candidate, cube_geometry_state=None))
+    expected = {by_geometry[sticker_geometry_key(candidate, center)].label: expected_colors[center.label]
+                for center in centers if center.label in expected_colors}
+    reference = None if symmetry_tracker is None else symmetry_tracker.rotation
+    angular_scale = POSE_CONTINUITY_ANGULAR_SCALE_DEGREES
+    if reference is not None:
+        fps = source_fps if np.isfinite(source_fps) and source_fps > 0 else POSE_CONTINUITY_REFERENCE_FPS
+        elapsed_frames = (max(frame_index - symmetry_tracker.frame_index, 1)
+                          if frame_index is not None and symmetry_tracker.frame_index is not None else 1)
+        angular_scale *= POSE_CONTINUITY_REFERENCE_FPS * elapsed_frames / fps
+    scores, angles, color_scores, counts = [], [], [], []
     for symmetry in CUBE_SYMMETRY_MATRICES:
-        transformed = transform_candidate_by_symmetry(candidate, symmetry)
-        observations = projected_color_observations(transformed)
-        correct = sum(expected_colors.get(label) in colors for label, colors in observations.items())
-        score = (correct, len(observations), bool(np.array_equal(symmetry, np.eye(3))))
-        if score > best_score:
-            best, best_score = transformed, score
+        rvec = transform_rvec_by_symmetry(candidate.rvec, symmetry)
+        angle = (0. if reference is None else float(np.degrees(np.linalg.norm(
+            cv2.Rodrigues(reference.T @ cv2.Rodrigues(rvec)[0])[0]))))
+        observed = []
+        for center in centers:
+            source = sticker_identity_label_under_symmetry(center, symmetry, by_geometry)
+            if center.label in expected and source in observations:
+                observed.append((expected[center.label], observations[source]))
+        count = len(observed)
+        color_score = sum(color not in detected for color, detected in observed) / max(count, 1)
+        angles.append(angle)
+        counts.append(count)
+        color_scores.append(color_score)
+        scores.append(angle / angular_scale + POSE_CONTINUITY_COLOR_WEIGHT * color_score)
+    selected = int(np.argmin(scores))
+    best = transform_candidate_by_symmetry(candidate, CUBE_SYMMETRY_MATRICES[selected])
     center_by_color = {
         expected_colors[identity.label]: identity.label
-        for identity in canonical_sticker_identities()
+        for identity in identities
         if identity.category == "center" and identity.label in expected_colors
     }
     axis_centers = (tuple(center_by_color[color] for color in ORIENTATION_AXIS_CENTER_COLORS)
                     if all(color in center_by_color for color in ORIENTATION_AXIS_CENTER_COLORS) else None)
-    return replace(best, pose_continuity_diagnostics=None, orientation_axis_center_labels=axis_centers)
+    diagnostics = dict(candidate.pose_continuity_diagnostics or {})
+    diagnostics.update(method='angular_and_center_color', selected_symmetry_index=selected,
+        reference_frame_index=None if symmetry_tracker is None else symmetry_tracker.frame_index,
+        selected_distance_degrees=angles[selected], angular_scale_degrees=angular_scale,
+        center_color_error=color_scores[selected], center_observation_count=counts[selected],
+        color_weight=POSE_CONTINUITY_COLOR_WEIGHT, selected_score=scores[selected],
+        runner_up_margin=float(np.sort(scores)[1] - scores[selected]))
+    return replace(best, pose_continuity_diagnostics=diagnostics, orientation_axis_center_labels=axis_centers)
+
+
+def orient_cached_poses(
+    cache: list[NeuralFrameData], expected_colors: dict[str, str], source_fps: float,
+    *, progress: Callable[[str, int, int], None] | None = None,
+) -> None:
+    """Finalize one continuous pose trajectory before preparing move-search geometry."""
+    tracker = CubeSymmetryTracker()
+    for index, record in enumerate(cache):
+        if progress is not None:
+            progress('orientation matching', index, len(cache))
+        candidate = record.pose_candidate
+        if candidate is None:
+            continue
+        candidate = match_orientation_to_colors(candidate, expected_colors, tracker,
+            frame_index=record.frame_index, source_fps=source_fps)
+        record.pose_candidate = candidate
+        record.pose_candidates = (candidate,)
+        tracker.observe(candidate.rvec, record.frame_index)
+    if progress is not None:
+        progress('orientation matching', len(cache), len(cache))
 
 
 def cube_lattice_point_mm(coord: tuple[int, int, int]) -> tuple[float, float, float]:
@@ -2786,7 +2842,7 @@ def recover_cached_pose_symmetries(
     cache: list[NeuralFrameData],
     trace: StickerColorTrace,
     *,
-    progress: bool = False,
+    progress: bool | Callable[[str, int, int], None] = False,
     refine_pose: bool = False,
     recover_orientation: bool = True,
     recognize_moves: bool = False,
@@ -2796,12 +2852,9 @@ def recover_cached_pose_symmetries(
     turn_candidate_log: Path | None = None,
     known_initial_colors: dict[str, str] | None = None,
     pose_prepared: bool = False,
+    collect_color_trace: bool = True,
 ) -> StickerColorTrace:
-    """Refine geometry, match categorical colors, and replay the existing move rollout.
-
-    Orientation is selected independently from observed color classes. No RGB
-    sampling, learned color profiles, or temporal orientation gate is involved.
-    """
+    """Refine poses using continuity and center colors, then replay move fitting."""
     if turning_start_frame is not None and turning_start_frame < 0:
         raise ValueError("Turning start frame must be nonnegative or None")
     lookahead_frames = turn_lookahead_frame_count(source_fps)
@@ -2826,7 +2879,9 @@ def recover_cached_pose_symmetries(
     lookahead_forecast_expected_state = None
     total_records = len(cache)
     previous_candidate = None
+    symmetry_tracker = CubeSymmetryTracker()
     move_search_started = False
+    report_progress = progress if callable(progress) else print_headless_progress
 
     def prepare_lookahead_geometry(
         cache_index: int,
@@ -2956,7 +3011,7 @@ def recover_cached_pose_symmetries(
             )
             if color_matches is None:
                 color_matches = getattr(frame_candidate, "turn_color_matches", None)
-            trials_by_state = _score_turn_color_offsets_with_orientation_rescue(
+            trials_by_state = _score_turn_color_offsets_for_states_on_gpu(
                 frame_candidate, tuple(geometry_frame["options"]),
                 PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * projected_cube_diameter(frame_candidate),
                 lookahead_scoring_device, color_matches, missing,
@@ -3006,7 +3061,6 @@ def recover_cached_pose_symmetries(
         started = perf_counter()
         search_debug = (
             dict(version=15, algorithm="adaptive_branch_and_bound", status="not_started",
-                 orientation_rescue_color_threshold=PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR,
                  turning_start_frame=turning_start_frame,
                  previous_move=last_committed_move, beam_width=None,
                  state_batch_size=PNP_TURN_LOOKAHEAD_STATE_BATCH_SIZE,
@@ -3224,7 +3278,7 @@ def recover_cached_pose_symmetries(
                     frame_label = "static holds"
                 elif solved_frame_index is not None:
                     frame_label = "solved replay"
-            print_headless_progress(frame_label, record_index, total_records)
+            report_progress(frame_label, record_index, total_records)
         committed_state_history[:] = [entry for entry in committed_state_history
                                       if record_index - 1 - entry[0] <= lookahead_frames]
         for past_index in tuple(lookahead_geometry_cache):
@@ -3269,7 +3323,8 @@ def recover_cached_pose_symmetries(
             )
         candidate = replace(candidate, cube_geometry_state=cube_geometry_state.copy())
         if (recover_orientation or recognize_moves) and known_initial_colors:
-            candidate = match_orientation_to_colors(candidate, known_initial_colors)
+            candidate = match_orientation_to_colors(candidate, known_initial_colors, symmetry_tracker,
+                frame_index=record.frame_index, source_fps=source_fps)
         if recognize_moves:
             static_candidate = candidate
             if solved_frame_index is not None:
@@ -3302,8 +3357,7 @@ def recover_cached_pose_symmetries(
                     candidate = _annotate_solved_search(candidate, record.frame_index)
                 else:
                     candidate = apply_move_lookahead(candidate, static_candidate, cube_geometry_state, record_index)
-        candidate = replace(candidate, orientation_anchor=orientation_anchor_for_candidate(candidate),
-                            pose_continuity_diagnostics=None)
+        candidate = replace(candidate, orientation_anchor=orientation_anchor_for_candidate(candidate))
         record.pose_diagnostic_candidate = None
         if motion_rejected or not pose_reprojection_error_is_acceptable(candidate):
             record.pose_candidate = None
@@ -3311,6 +3365,7 @@ def recover_cached_pose_symmetries(
             record.pose_diagnostic_candidate = candidate
         else:
             previous_candidate = candidate
+            symmetry_tracker.observe(candidate.rvec, record.frame_index)
             record.pose_candidate = candidate
             record.pose_candidates = (candidate,)
             if recognize_moves:
@@ -3342,10 +3397,11 @@ def recover_cached_pose_symmetries(
                     record.pose_candidate = candidate
                     action = "stopping move search" if move_search_started else "move search is not needed"
                     print(f"Cube solved at frame {solved_frame_index}; {action}.", flush=True)
-        corrected_trace.observe_colors(record.frame_index, projected_color_observations(candidate))
+        if collect_color_trace:
+            corrected_trace.observe_colors(record.frame_index, projected_color_observations(candidate))
         if turn_candidate_log is not None and recognize_moves:
             append_turn_candidate_log(turn_candidate_log, candidate, record.frame_index)
-    if progress:
+    if progress and not callable(progress):
         print()
     return corrected_trace
 
@@ -6171,7 +6227,7 @@ def _score_turn_color_offsets_on_gpu(
 ) -> list[dict[str, object]] | None:
     """Score only the -90/0/+90 color offsets for cached geometry options."""
 
-    results = _score_turn_color_offsets_with_orientation_rescue(
+    results = _score_turn_color_offsets_for_states_on_gpu(
         candidate, geometry_options, assignment_error_limit, scoring_device,
         color_matches, (getattr(candidate, "cube_geometry_state", None),), projection_cache=projection_cache,
     )
@@ -6237,19 +6293,6 @@ def _turn_trial_under_pose_symmetry(
             trial['assignment_object_points'], symmetry,
         )
     return transformed
-
-
-def _orientation_rescue_diagnostic(inherited_error: float, selected_error: float, tested: int) -> dict:
-    return dict(threshold=PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR,
-                minimum_color_accuracy=2.0 / 3.0, phase="before_move_search",
-                inherited_color_error=inherited_error, selected_color_error=selected_error,
-                tested_orientations=tested)
-
-
-def _joint_orientation_rescue_diagnostic(inherited_error, selected_error, tested, score):
-    return dict(_orientation_rescue_diagnostic(inherited_error, selected_error, tested),
-                phase='joint_orientation_and_turn_fit', selection='geometric_plus_color_fit',
-                selected_fit_score=score)
 
 
 def balanced_geometry_cost(keypoint_error, sticker_error):
@@ -6363,141 +6406,6 @@ def balanced_robust_cost(geometry_robust_error, color_error):
     geometry = np.where(np.isfinite(geometry), np.clip(
         geometry / (PNP_FINAL_ASSIGNMENT_ERROR_FRACTION + PNP_TURN_CENTER_PENALTY_SCALE), 0., 1.), float("inf"))
     return .5 * geometry + .5 * color_error
-
-
-def _score_turn_color_offsets_with_orientation_rescue(
-    candidate: StickerPnPCandidate,
-    geometry_options: tuple[dict[str, object], ...],
-    assignment_error_limit: float,
-    scoring_device: object,
-    color_matches: np.ndarray | None,
-    geometry_states: tuple[CubeGeometryState | None, ...],
-    *, projection_cache: dict | None = None, balance_geometry_color: bool = False,
-    minimum_color_accuracy: float | None = None,
-    include_sticker_observations: bool = False,
-    joint_orientation_rescue: bool = False,
-    confusion_costs: np.ndarray | None = None, confusion_cost: float = .5,
-    prune_color_confusions: bool = True,
-    preserve_layer_activity: bool = False,
-) -> list[list[dict[str, object]]] | None:
-    """Trigger rescue from each unchanged state's static color agreement.
-
-    With joint_orientation_rescue, fit all 24 orientations with partial turns
-    and offsets, retaining one combined-fit winner per physical successor.
-    Otherwise choose an orientation from static colors before fitting moves.
-    A pose correction never commits a move or changes the physical state.
-    """
-    static_options = tuple(option for option in geometry_options
-                           if option.get("is_baseline") and not option.get("layer_rotations"))[:1]
-    if color_matches is None or not static_options:
-        return _score_turn_color_offsets_for_states_on_gpu(
-            candidate, geometry_options, assignment_error_limit, scoring_device,
-            color_matches, geometry_states, projection_cache=projection_cache,
-            balance_geometry_color=balance_geometry_color, minimum_color_accuracy=minimum_color_accuracy,
-            include_sticker_observations=include_sticker_observations,
-            confusion_costs=confusion_costs, confusion_cost=confusion_cost,
-            prune_color_confusions=prune_color_confusions,
-            preserve_layer_activity=preserve_layer_activity,
-        )
-    static = _score_turn_color_offsets_for_states_on_gpu(
-        candidate, static_options, assignment_error_limit, scoring_device,
-        color_matches, geometry_states, projection_cache=projection_cache, color_offsets=(0.,),
-    )
-    if static is None:
-        return None
-    rescue_indices, inherited_errors, best_errors, selected = [], {}, {}, {}
-    for index, trials in enumerate(static):
-        observed = next((trial for trial in trials if int(trial.get("color_match_count", 0)) > 0), None)
-        if observed is None:
-            continue
-        error = float(observed["color_error"])
-        if np.isfinite(error) and error > PNP_TURN_ORIENTATION_RESCUE_COLOR_ERROR:
-            rescue_indices.append(index)
-            inherited_errors[index] = best_errors[index] = error
-    if joint_orientation_rescue and rescue_indices:
-        # The static check triggers rescue but does not choose its orientation.
-        # Every pose shares the same geometric projections; collapse physical
-        # successors before returning them to the search queue.
-        jobs, states = [], []
-        for index, state in enumerate(geometry_states):
-            jobs.append((index, None))
-            states.append(state)
-            if index in inherited_errors:
-                for pose_index, symmetry in enumerate(CUBE_SYMMETRY_MATRICES):
-                    if np.array_equal(symmetry, np.eye(3)):
-                        continue
-                    jobs.append((index, pose_index))
-                    states.append(_geometry_state_under_symmetry(
-                        state if state is not None else CubeGeometryState.identity(), symmetry.T))
-        batches = _score_turn_color_offsets_for_states_on_gpu(
-            candidate, geometry_options, assignment_error_limit, scoring_device,
-            color_matches, tuple(states), projection_cache=projection_cache,
-            balance_geometry_color=balance_geometry_color, minimum_color_accuracy=minimum_color_accuracy,
-            include_sticker_observations=include_sticker_observations,
-            confusion_costs=confusion_costs, confusion_cost=confusion_cost,
-            prune_color_confusions=prune_color_confusions,
-            preserve_layer_activity=preserve_layer_activity)
-        if batches is None:
-            return None
-        collapsed = [{} for _ in geometry_states]
-        for (index, pose_index), trials in zip(jobs, batches, strict=True):
-            for trial in trials:
-                if pose_index is not None:
-                    trial = _turn_trial_under_pose_symmetry(trial, CUBE_SYMMETRY_MATRICES[pose_index], pose_index)
-                if index in inherited_errors:
-                    trial = dict(trial, orientation_rescue=_joint_orientation_rescue_diagnostic(
-                        inherited_errors[index], trial['color_error'], 24, trial['state_score']))
-                key = (tuple(trial['state_moves']), state_update_layer_direction(trial),
-                       turn_trial_activity_layer(trial) if preserve_layer_activity else None)
-                prior = collapsed[index].get(key)
-                if prior is None or trial['rank'] < prior['rank']:
-                    collapsed[index][key] = trial
-        return [sorted(group.values(), key=lambda t:t['rank']) for group in collapsed]
-    tested = 1
-    for symmetry_index, symmetry in enumerate(CUBE_SYMMETRY_MATRICES):
-        if not rescue_indices or np.array_equal(symmetry, np.eye(3)):
-            continue
-        relabeled = tuple(_geometry_state_under_symmetry(
-            geometry_states[index] if geometry_states[index] is not None else CubeGeometryState.identity(),
-            symmetry.T,
-        ) for index in rescue_indices)
-        alternatives = _score_turn_color_offsets_for_states_on_gpu(
-            candidate, static_options, assignment_error_limit, scoring_device,
-            color_matches, relabeled, projection_cache=projection_cache, color_offsets=(0.,),
-        )
-        if alternatives is None:
-            continue
-        tested += 1
-        for index, trials in zip(rescue_indices, alternatives, strict=True):
-            error = min((float(trial["color_error"]) for trial in trials
-                         if int(trial.get("color_match_count", 0)) > 0), default=float("inf"))
-            # Ties retain the inherited orientation and deterministic symmetry order.
-            if error < best_errors[index]:
-                best_errors[index] = error
-                selected[index] = (symmetry_index, symmetry)
-    oriented_states = list(geometry_states)
-    for index, (_symmetry_index, symmetry) in selected.items():
-        oriented_states[index] = _geometry_state_under_symmetry(
-            geometry_states[index] if geometry_states[index] is not None else CubeGeometryState.identity(), symmetry.T,
-        )
-    results = _score_turn_color_offsets_for_states_on_gpu(
-        candidate, geometry_options, assignment_error_limit, scoring_device,
-        color_matches, tuple(oriented_states), projection_cache=projection_cache,
-        balance_geometry_color=balance_geometry_color, minimum_color_accuracy=minimum_color_accuracy,
-        include_sticker_observations=include_sticker_observations,
-        confusion_costs=confusion_costs, confusion_cost=confusion_cost,
-        prune_color_confusions=prune_color_confusions,
-        preserve_layer_activity=preserve_layer_activity,
-    )
-    if results is None:
-        return None
-    for index in rescue_indices:
-        diagnostic = _orientation_rescue_diagnostic(inherited_errors[index], best_errors[index], tested)
-        results[index] = [dict(
-            _turn_trial_under_pose_symmetry(trial, selected[index][1], selected[index][0])
-            if index in selected else trial, orientation_rescue=diagnostic,
-        ) for trial in results[index]]
-    return results
 
 
 def _score_turn_color_offsets_for_states_on_gpu(
@@ -10781,7 +10689,10 @@ def render_frame(
                               if move_accumulator is not None else CubeGeometryState.identity())
             selected_candidate = match_orientation_to_colors(
                 replace(selected_candidate, cube_geometry_state=geometry_state), expected_colors,
+                symmetry_tracker, frame_index=frame_index,
             )
+            if symmetry_tracker is not None:
+                symmetry_tracker.observe(selected_candidate.rvec, frame_index)
             if recognize_moves:
                 geometry_state = (
                     move_accumulator._geometry_state.copy()
@@ -11115,7 +11026,7 @@ def consume_neural_cache_for_pose(
         )
         processed_frames += 1
         if progress is not None:
-            progress.update("initial pose candidates", processed_frames, total_frames)
+            progress.update("pose seeds", processed_frames, total_frames)
 
 
 def run_neural_video_pass(
@@ -11141,7 +11052,7 @@ def run_neural_video_pass(
     cache: list[NeuralFrameData] = []
     records: SimpleQueue[NeuralFrameData | None] = SimpleQueue()
     progress = (
-        CombinedHeadlessProgress(("neural inference", "initial pose candidates"))
+        CombinedHeadlessProgress(("neural inference", "pose seeds"))
         if not args.display
         else None
     )
@@ -12189,13 +12100,15 @@ def _store_rigid_pose(
 
 def _smooth_visible_face_tracks(
     cache: list[NeuralFrameData], observations: list[RigidPoseObservations | None],
-    anchors: np.ndarray, times: np.ndarray, *, progress: bool = False,
+    anchors: np.ndarray, times: np.ndarray, *,
+    progress: bool | Callable[[str, int, int], None] = False,
 ) -> set[int]:
     """Discover continuous outline tracks, including well-fitted frames and the clip ends."""
     samples = {}
     poses = [record.pose_candidate for record in cache]
     pending = []
     changed = set()
+    report_progress = progress if callable(progress) else print_headless_progress
 
     def finish() -> None:
         if (len(pending) < 3
@@ -12222,7 +12135,7 @@ def _smooth_visible_face_tracks(
     total_frames = len(cache)
     for i, (obs, pose) in enumerate(zip(observations, poses, strict=True)):
         if progress:
-            print_headless_progress("pose smoothing / face outlines", i, total_frames)
+            report_progress("pose smoothing / face outlines", i, total_frames)
         fit = None
         if (obs is not None and cache[i].frame is not None and isinstance(pose, StickerPnPCandidate)
                 and not pose.layer_rotations and not physical_sticker_rotations(pose)
@@ -12255,17 +12168,19 @@ def _smooth_visible_face_tracks(
             pending.append((i, fit))
     finish()
     if progress:
-        print_headless_progress("pose smoothing / face outlines", total_frames, total_frames)
+        report_progress("pose smoothing / face outlines", total_frames, total_frames)
     return changed
 
 
 def smooth_cached_rigid_poses(
     cache: list[NeuralFrameData], args: argparse.Namespace, source_fps: float,
-    known_initial_colors: dict[str, str], *, progress: bool = False,
+    known_initial_colors: dict[str, str], *,
+    progress: bool | Callable[[str, int, int], None] = False,
 ) -> int:
     """Fit the cached rigid trajectory from image evidence and local motion."""
     from scipy.interpolate import PchipInterpolator
 
+    report_progress = progress if callable(progress) else print_headless_progress
     fps = source_fps if np.isfinite(source_fps) and source_fps > 0 else 30.0
     frames = np.asarray([record.frame_index for record in cache])
     times = frames / fps
@@ -12289,7 +12204,7 @@ def smooth_cached_rigid_poses(
     total_frames = len(cache)
     for i, (pose, obs) in enumerate(zip(poses, observations, strict=True)):
         if progress:
-            print_headless_progress("pose smoothing / mixed seeds", i, total_frames)
+            report_progress("pose smoothing / mixed seeds", i, total_frames)
         if obs is None or (isinstance(pose, StickerPnPCandidate)
                            and (pose.layer_rotations or physical_sticker_rotations(pose))):
             continue
@@ -12317,7 +12232,7 @@ def smooth_cached_rigid_poses(
             supported.append(i)
 
     if progress:
-        print_headless_progress("pose smoothing / mixed seeds", total_frames, total_frames)
+        report_progress("pose smoothing / mixed seeds", total_frames, total_frames)
 
     # Do not let an otherwise well-matched, isolated jump anchor its own
     # neighborhood. Require support on both sides before overruling it.
@@ -12387,7 +12302,7 @@ def smooth_cached_rigid_poses(
     face_colors = {}
     for i, obs in enumerate(observations):
         if progress:
-            print_headless_progress("pose smoothing / trajectory refit", i, total_frames)
+            report_progress("pose smoothing / trajectory refit", i, total_frames)
         if obs is None or i in anchor_set:
             continue
         base = poses[i]
@@ -12469,12 +12384,12 @@ def smooth_cached_rigid_poses(
             template, rvec, tvec, fit, outline_objects, outline_pixels)
 
     if progress:
-        print_headless_progress("pose smoothing / trajectory refit", total_frames, total_frames)
+        report_progress("pose smoothing / trajectory refit", total_frames, total_frames)
 
     repaired = set()
     for index, ((a, b), group) in enumerate(repairs.items(), start=1):
         if progress:
-            print_headless_progress("pose smoothing / fitting gaps", index, len(repairs))
+            report_progress("pose smoothing / fitting gaps", index, len(repairs))
         indices = list(group)
         fits = list(group.values())
         if (len(fits) >= 2 and indices == list(range(a + 1, b))
@@ -12501,7 +12416,7 @@ def smooth_cached_rigid_poses(
         })
     for index, i in enumerate(anchors, start=1):
         if progress:
-            print_headless_progress("pose smoothing / depth trend", index, len(anchors))
+            report_progress("pose smoothing / depth trend", index, len(anchors))
         target = _local_rigid_depth(i, anchors, times, coordinates)
         if target is None:
             continue
@@ -12518,13 +12433,6 @@ def smooth_cached_rigid_poses(
             repaired.add(i)
     repaired.update(_smooth_visible_face_tracks(cache, observations, anchors, times, progress=progress))
     repaired.update(mixed_baselines)
-    if known_initial_colors:
-        for index, i in enumerate(sorted(repaired), start=1):
-            if progress:
-                print_headless_progress("pose smoothing / orientation", index, len(repaired))
-            candidate = cache[i].pose_candidate
-            _store_rigid_pose(cache[i], match_orientation_to_colors(candidate, known_initial_colors),
-                              candidate.pose_continuity_diagnostics)
     return len(repaired)
 
 
@@ -12708,24 +12616,46 @@ def process_cached_poses(
     """Recover poses and optional moves directly from the cached model predictions."""
     needs_pose = args.show_pnp or args.recognize_moves or args.show_colored_masks
     if needs_pose:
-        print("Refining poses and matching observed sticker colors to the scramble...", flush=True)
+        smoothing = len(cache) >= 3 and getattr(args, "pose_smoothing", True)
+        stages = ['pose refinement']
+        if smoothing:
+            stages.extend(('pose smoothing / mixed seeds', 'pose smoothing / trajectory refit',
+                           'pose smoothing / fitting gaps', 'pose smoothing / depth trend',
+                           'pose smoothing / face outlines'))
+        stages.append('orientation matching')
+        last_update = 0.
+
+        def progress(label, completed, total):
+            nonlocal last_update
+            now = perf_counter()
+            if completed < total and now - last_update < .25:
+                return
+            fraction = completed / total if total else 1.
+            percent = 100. * (stages.index(label) + fraction) / len(stages)
+            print(f"\rPreparing poses {percent:5.1f}%".ljust(53), end='', flush=True)
+            last_update = now
+
+        if args.display:
+            print('Preparing poses...', flush=True)
+        reporter = False if args.display else progress
         recover_cached_pose_symmetries(
             cache,
             StickerColorTrace.create(),
-            progress=not args.display,
+            progress=reporter,
             refine_pose=True,
-            recover_orientation=True,
+            recover_orientation=False,
+            collect_color_trace=False,
             known_initial_colors=known_initial_colors,
             source_fps=source_fps,
         )
-        if len(cache) >= 3 and getattr(args, "pose_smoothing", True):
-            print("Refitting the cached rigid pose trajectory...", flush=True)
-            repaired = smooth_cached_rigid_poses(
-                cache, args, source_fps, known_initial_colors, progress=not args.display,
+        if smoothing:
+            smooth_cached_rigid_poses(
+                cache, args, source_fps, known_initial_colors, progress=reporter,
             )
-            if not args.display:
-                print()
-            print(f"Refit {repaired} cached rigid poses.", flush=True)
+        orient_cached_poses(cache, known_initial_colors, source_fps,
+                            progress=None if args.display else progress)
+        if not args.display:
+            print()
     if args.recognize_moves:
         from scripts.independent_keypoint_video_search import run_cached_full_search
 

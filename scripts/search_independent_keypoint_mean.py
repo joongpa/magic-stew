@@ -797,8 +797,7 @@ def main():
         duplicate_detection=not args.no_deduplicate,
         queue_key_format="unique insertion id" if args.no_deduplicate else "exact observation/update context",
         geometry_scope="all retained source-log options and discrete color offsets",
-        orientation_policy="24-way state-color rescue below 2/3 accuracy before move search",
-        orientation_rescue_minimum_color_accuracy=2./3.,
+        orientation_policy="supplied fixed pose",
         goal="physical cube colors solved in any whole-cube orientation",reference_solution_used=False)
     (args.output_dir/"config.json").write_text(json.dumps(config,indent=2))
     if args.queue_backend == "buffered":

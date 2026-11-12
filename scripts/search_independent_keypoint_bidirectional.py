@@ -76,7 +76,7 @@ def widening_scorer_options(renderer, colors, static_end, checkpoint):
     use_26m = checkpoint is not None and Path(checkpoint).resolve() == renderer.DEFAULT_POSE_MODEL.resolve()
     table = renderer.POSE_26M_COLOR_CONFUSIONS if use_26m else renderer.COLOR_CLASS_CONFUSIONS
     return dict(initial_colors=colors, turning_start_frame=static_end, balance_geometry_color=True,
-                joint_orientation_rescue=True, track_color_confusions=True,
+                track_color_confusions=True,
                 color_confusion_scoring=use_26m, tracked_color_confusions=table)
 
 
@@ -540,7 +540,7 @@ def main():
     stage_budget = frame_search.branch_stage_budget(len(frames), args.branch_stage_expansions)
     colors = replay.initial_sticker_colors(m, args.initial_scramble)
     scorer_options = dict(initial_colors=colors, turning_start_frame=static_end,
-                          balance_geometry_color=True, joint_orientation_rescue=True)
+                          balance_geometry_color=True)
     if args.branch_widths:
         scorer_options = widening_scorer_options(m, colors, static_end, metadata.get("pose_model"))
         use_26m = scorer_options["color_confusion_scoring"]

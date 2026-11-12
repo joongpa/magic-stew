@@ -115,12 +115,11 @@ def test_confusions_have_a_positive_cost_less_than_forbidden(m, penalty):
 
 
 @pytest.mark.parametrize("cls", [f.replay.PreparedReplayScorer, f.replay.ReplayScorer])
-@pytest.mark.parametrize("joint", [False, True])
 @pytest.mark.parametrize(
     "predicted,survives", [("yellow", True), ("blue", False), ("white", False)]
 )
 def test_scorers_reject_forbidden_fits_before_state_construction(
-    m, cls, joint, predicted, survives
+    m, cls, predicted, survives
 ):
     data = json.loads((ROOT / "tests/fixtures/nahm_frame_587_joint_orientation.json").read_text())
     record = copy.deepcopy(data["record"])
@@ -135,7 +134,6 @@ def test_scorers_reject_forbidden_fits_before_state_construction(
         balance_geometry_color=True,
         color_confusion_pruning=True,
         color_confusion_cost=0.5,
-        joint_orientation_rescue=joint,
     )
     state = scorer.state_from_key(bytes(data["encoded_parent_state"]))
     choices = scorer(587, state)
@@ -156,15 +154,14 @@ def test_scorers_reject_forbidden_fits_before_state_construction(
 
 
 @pytest.mark.parametrize('cls', [f.replay.PreparedReplayScorer, f.replay.ReplayScorer])
-@pytest.mark.parametrize('joint', [False, True])
 @pytest.mark.parametrize('predicted,error', [('orange', 0.), ('yellow', .5), ('blue', 1.)])
-def test_weighted_color_scoring_without_hard_rejection(m, cls, joint, predicted, error):
+def test_weighted_color_scoring_without_hard_rejection(m, cls, predicted, error):
     data = json.loads((ROOT/'tests/fixtures/nahm_frame_587_joint_orientation.json').read_text())
     record = copy.deepcopy(data['record'])
     record['search_pose']['sticker_color_names'] = [predicted]*len(record['search_pose']['sticker_mask_centers'])
     colors = {i.label: 'orange' for i in m.canonical_sticker_identities()}
     scorer = cls(m, {587: record}, 'cpu', initial_colors=colors, balance_geometry_color=True,
-                 color_confusion_scoring=True, joint_orientation_rescue=joint)
+                 color_confusion_scoring=True)
     choices = scorer(587, scorer.state_from_key(bytes(data['encoded_parent_state'])))
     assert choices
     assert all(t.payload['color_error'] == error for t in choices)
@@ -174,9 +171,8 @@ def test_weighted_color_scoring_without_hard_rejection(m, cls, joint, predicted,
     assert scorer.confusion_pruned_fits == scorer.confusion_dead_end_states == 0
 
 
-@pytest.mark.parametrize('joint', [False, True])
 @pytest.mark.parametrize('uniform', [False, True])
-def test_hold_activity_survives_fit_collapse_and_backends_agree(m, joint, uniform):
+def test_hold_activity_survives_fit_collapse_and_backends_agree(m, uniform):
     data = json.loads((ROOT/'tests/fixtures/nahm_frame_587_joint_orientation.json').read_text())
     record = copy.deepcopy(data['record'])
     if uniform:
@@ -186,7 +182,7 @@ def test_hold_activity_survives_fit_collapse_and_backends_agree(m, joint, unifor
     results = []
     for cls in (f.replay.PreparedReplayScorer, f.replay.ReplayScorer):
         scorer = cls(m, {587: record}, 'cpu', initial_colors=colors, balance_geometry_color=True,
-                     color_confusion_scoring=True, preserve_layer_activity=True, joint_orientation_rescue=joint)
+                     color_confusion_scoring=True, preserve_layer_activity=True)
         choices = scorer(587, scorer.state_from_key(bytes(data['encoded_parent_state'])))
         keys = [(tuple(t.payload['state_moves']), m.turn_trial_activity_layer(t.payload)) for t in choices]
         assert len(keys) == len(set(keys))

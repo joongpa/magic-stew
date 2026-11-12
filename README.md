@@ -474,17 +474,16 @@ eligible with landmarks outside the fitting gate, and those landmarks still
 contribute to the full-observation score.
 The three-seed limit and translation-based tracking selector are unchanged.
 
-Whole-cube orientation is chosen directly among the 24 proper cube symmetries
-by maximizing the number of matching observed sticker colors against the known
-scramble, or the committed state during move recognition. All available sticker
-colors participate, including edges and corners. There is no temporal angular
-continuity score or orientation continuity gate. Translation-based pose
-hypothesis selection and the existing geometric refinement remain available.
-Before move alternatives are evaluated, an unchanged state with less than 2/3
-correct observed sticker colors triggers an orientation rescue. All 24 cube
-orientations are compared using that state's colors; moves are then scored in
-the best orientation using the combined geometry and color cost. Exactly 2/3
-does not trigger rescue. An orientation correction does not commit a cube move.
+Whole-cube orientation is selected during pose preparation among the 24 proper
+cube symmetries. The score combines angular change from the previous accepted
+pose with 0.2 times the mismatch fraction of observed center colors. A 90°
+change over a 1/30-second interval contributes one point to the angular score,
+with the scale adjusted for elapsed time. The first pose uses center colors to
+anchor its orientation, and frames without observed centers use continuity.
+When the committed cube state is available, expected center locations follow
+its slice and wide turns. Orientation continuity runs in frame order after
+pose refinement and trajectory smoothing. Move search scores states using
+each frame's supplied pose.
 No RGB regressions, unsupervised color grouping, calibration sample banks, or
 ground-truth color-distance checks are performed. The former segmentation and
 RGB plotting CLI options have been removed.
