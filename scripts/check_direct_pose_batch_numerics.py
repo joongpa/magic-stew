@@ -21,6 +21,7 @@ from pathlib import Path
 import random
 import sys
 import traceback
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -46,6 +47,45 @@ REPORTED_KEYS = ("keypoints_only_dataset_part3__003592", "keypoints_only_dataset
 def inspect_tree(value):
     tree = value if isinstance(value, dict) else {"value": value}
     return attempt_diagnostics({"outputs": tree, "nonfinite": nonfinite_fields(tree)})
+
+
+@contextmanager
+def trace_forward(model, report):
+    """Find the first nonfinite leaf output; only the standalone probe scans."""
+    handles = []
+    report["first_nonfinite_module"] = None
+
+    def after(module, inputs, output, name):
+        if report["first_nonfinite_module"] is not None:
+            return
+        if nonfinite_fields({"output": output}):
+            report["first_nonfinite_module"] = {
+                "name": name, "type": type(module).__name__,
+                "inputs": inspect_tree(inputs), "outputs": inspect_tree(output),
+                "state": inspect_tree(dict(module.named_parameters()) | dict(module.named_buffers())),
+            }
+
+    for name, module in model.named_modules():
+        if not list(module.children()):
+            handles.append(module.register_forward_hook(
+                lambda module, inputs, output, name=name: after(module, inputs, output, name)))
+    try:
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def load_saved_batch(path):
+    """Read our tensor-only failure dump without executing pickled objects."""
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    batch, target, keys = payload["batch"], payload["target"], payload["keys"]
+    images = batch["img"]
+    if images.ndim != 4 or images.shape[1] != 3 or images.shape[-2] != images.shape[-1]:
+        raise ValueError("Saved batch must contain square BCHW RGB images")
+    if images.shape[0] != len(keys):
+        raise ValueError("Saved image count differs from sample keys")
+    return batch, target, keys
 
 
 def stage_hooks(criterion, direct, stages):
@@ -121,6 +161,7 @@ def main():
     parser.description = __doc__
     parser.add_argument("--keys", nargs="+", default=list(REPORTED_KEYS))
     parser.add_argument("--run-dir", type=Path, help="Read the failing run's exact settings from args.json")
+    parser.add_argument("--batch-file", type=Path, help="Replay an exact saved *_batch.pt failure dump")
     args = parser.parse_args()
     if args.run_dir:
         saved = json.loads((args.run_dir / "args.json").read_text())
@@ -140,11 +181,6 @@ def main():
     random.seed(args.seed)
     device = select_device(args.device)
     root = args.dataset.resolve()
-    by_key = {entry["key"]: entry for line in (root / "manifest.jsonl").read_text().splitlines()
-              if line.strip() and (entry := json.loads(line))["key"] in args.keys}
-    missing = set(args.keys) - set(by_key)
-    if missing:
-        raise ValueError(f"Missing diagnostic sample keys: {sorted(missing)}")
     if args.resume:
         model, checkpoint = load_direct_pose_checkpoint(args.resume, device)
         epoch = checkpoint["epoch"] + 1
@@ -153,14 +189,23 @@ def main():
         epoch = 1
     model.freeze_detector(epoch <= args.freeze_epochs)
     model.train()
-    dataset = DirectPoseDataset(root, [by_key[key] for key in args.keys], args.imgsz, args.augment)
     # The reported samples are the first batch from seed 17. Reproduce worker
     # zero's photometric RNG without spawning workers or reading all labels.
     if args.workers:
         generator = torch.Generator().manual_seed(args.seed)
         seed = int(torch.empty((), dtype=torch.int64).random_(generator=generator))
         np.random.seed(seed % (2 ** 32))
-    batch, target, keys = collate_direct_pose([dataset[index] for index in range(len(dataset))])
+    if args.batch_file:
+        batch, target, keys = load_saved_batch(args.batch_file)
+        args.imgsz = batch["img"].shape[-1]
+    else:
+        by_key = {entry["key"]: entry for line in (root / "manifest.jsonl").read_text().splitlines()
+                  if line.strip() and (entry := json.loads(line))["key"] in args.keys}
+        missing = set(args.keys) - set(by_key)
+        if missing:
+            raise ValueError(f"Missing diagnostic sample keys: {sorted(missing)}")
+        dataset = DirectPoseDataset(root, [by_key[key] for key in args.keys], args.imgsz, args.augment)
+        batch, target, keys = collate_direct_pose([dataset[index] for index in range(len(dataset))])
     batch = {key: value.to(device) for key, value in batch.items()}
     target = {key: value.to(device) for key, value in target.items()}
     criterion = independent_pose_criterion(model.detector)
@@ -179,12 +224,16 @@ def main():
               if Path(args.resume or args.model).is_file() else None,
               "input_sha256": [hashlib.sha256(image.detach().cpu().numpy().tobytes()).hexdigest() for image in batch["img"]],
               "image_size": args.imgsz, "keys": list(keys), "model": args.model,
+              "batch_file": str(args.batch_file.resolve()) if args.batch_file else None,
+              "inputs": inspect_tree({"batch": batch, "target": target}),
+              "nonfinite_model_state": nonfinite_fields(dict(model.named_parameters()) | dict(model.named_buffers())),
               "head_config": model.head_config, "loss_weights": weights,
               "detector_frozen": model.base_frozen, "detector_end2end": model.detector.end2end,
               "optimizer_steps": 0, "cases": {}}
     snapshot = batchnorm_snapshot(model)
     with torch.no_grad():
-        with torch.autocast(device_type=device.type, dtype=torch.float16):
+        report["amp_forward"] = {}
+        with trace_forward(model, report["amp_forward"]), torch.autocast(device_type=device.type, dtype=torch.float16):
             amp_prediction = model(batch["img"])
         for name, loss_amp, fp32_inputs in (("original_amp", True, False), ("amp_forward_fp32_losses", False, True)):
             report["cases"][name] = evaluate_case(amp_prediction, batch, target, criterion, direct, device,
@@ -195,7 +244,8 @@ def main():
             (output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
         del amp_prediction
         restore_batchnorm(snapshot)
-        with torch.autocast(device_type=device.type, enabled=False):
+        report["fp32_forward"] = {}
+        with trace_forward(model, report["fp32_forward"]), torch.autocast(device_type=device.type, enabled=False):
             fp32_prediction = model(batch["img"])
         report["cases"]["all_fp32"] = evaluate_case(fp32_prediction, batch, target, criterion, direct, device,
                                                        amp_loss=False, fp32_inputs=True,

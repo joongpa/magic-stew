@@ -16,7 +16,7 @@ from scripts.train_yolo26_direct_cube_pose import run_epoch  # noqa: E402
 from scripts import train_yolo26_direct_cube_pose as trainer  # noqa: E402
 from scripts.verify_hidden_layer_ambiguity import front_only_target, make_state  # noqa: E402
 from scripts.export_direct_cube_pose_dataset import symmetry_manifest  # noqa: E402
-from scripts.check_direct_pose_batch_numerics import classification, evaluate_case  # noqa: E402
+from scripts.check_direct_pose_batch_numerics import classification, evaluate_case, load_saved_batch, trace_forward  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 
 
@@ -154,3 +154,28 @@ def test_standalone_probe_isolates_loss_precision_on_identical_predictions():
     assert "AMP loss arithmetic" in classification({"original_amp": original,
                                                      "amp_forward_fp32_losses": loss32, "all_fp32": loss32})
     assert prediction["independent"]["scores"].dtype == torch.float16
+
+
+def test_probe_traces_first_failing_layer_and_removes_hooks():
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 1))
+    with torch.no_grad():
+        model[0].weight.fill_(float("nan"))
+    report = {}
+    with trace_forward(model, report):
+        model(torch.ones(1, 2))
+    first = report["first_nonfinite_module"]
+    assert first["name"] == "0"
+    assert first["inputs"]["nonfinite_fields"] == []
+    assert first["outputs"]["nonfinite_fields"]
+    assert first["state"]["nonfinite_fields"] == ["weight"]
+    assert all(not module._forward_hooks for module in model.modules())
+
+
+def test_probe_replays_exact_saved_batch(tmp_path):
+    batch, target, _ = loss_inputs()
+    path = tmp_path / "failed_batch.pt"
+    torch.save({"batch": batch, "target": target, "keys": ("a", "b")}, path)
+    restored, restored_target, keys = load_saved_batch(path)
+    assert keys == ("a", "b")
+    assert torch.equal(restored["img"], batch["img"])
+    assert all(torch.equal(restored_target[key], value) for key, value in target.items())

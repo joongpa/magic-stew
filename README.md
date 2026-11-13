@@ -870,7 +870,11 @@ the four reported first-batch samples and compares AMP loss math,
 FP32 loss math on identical AMP network outputs, and a full FP32 forward/loss.
 The report under `RUN_DIR/numeric_probe/report.json` includes individual
 loss components and assignment/keypoint/RLE stages. It performs no optimizer
-updates. Normal training has no additional scans, snapshots or retries; detailed
+updates. Add `--batch-file RUN_DIR/diagnostics/train_epoch_1_batch_000001_batch.pt`
+to replay the exact saved images and targets, including their original size and
+augmentation. The probe also reports invalid model parameters/buffers and the
+first network layer producing nonfinite outputs in AMP and FP32.
+Normal training has no additional scans, snapshots or retries; detailed
 diagnostics and the failed batch are saved only if its existing finite-loss
 check fails. These checks do not assume that AMP is the cause.
 
