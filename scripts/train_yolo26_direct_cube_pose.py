@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from importlib.metadata import version
 import json
 import math
 from pathlib import Path
@@ -261,6 +262,7 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
     device = select_device(args.device)
+    print(f"PyTorch {torch.__version__}; Ultralytics {version('ultralytics')}", flush=True)
     entries, manifest = read_manifest(args.dataset)
     args.dataset = str(args.dataset.resolve())
     checkpoint = None

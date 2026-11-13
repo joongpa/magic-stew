@@ -215,19 +215,68 @@ def make_detector(model_source, epochs=100):
     return detector
 
 
-def independent_pose_criterion(detector):
-    """Use the stock loss matching the actual head, including non-E2E Pose26.
+class IndependentPoseCriterion:
+    """Dispatch the shipped pose losses using the actual prediction structure.
 
-    Ultralytics 8.4.51's PoseModel.init_criterion selects v8PoseLoss whenever
-    end2end is false, even for Pose26. Its XY decoder differs from Pose26's.
-    Keep the shipped YOLO26 loss/gains/RLE, with consistent XY decoding.
+    Runtime head flags and checkpoint flags can disagree across Ultralytics
+    versions or change between warmup and fine-tuning. Never send a container
+    of one2many/one2one branches to the flat loss, which expects preds['kpts'].
     """
-    from ultralytics.nn.modules.head import Pose26
-    from ultralytics.utils.loss import E2ELoss, PoseLoss26
 
-    if isinstance(detector.model[-1], Pose26):
-        return E2ELoss(detector, PoseLoss26) if detector.end2end else PoseLoss26(detector)
-    return detector.init_criterion()
+    def __init__(self, detector):
+        from ultralytics.nn.modules.head import Pose26
+        from ultralytics.utils.loss import E2ELoss, PoseLoss26, v8PoseLoss
+
+        loss_class = PoseLoss26 if isinstance(detector.model[-1], Pose26) else v8PoseLoss
+        # Pose26's stock loss also keeps its matching XY decoder and RLE term
+        # when a loaded checkpoint disables end-to-end detection.
+        self.flat = loss_class(detector)
+        self.end_to_end = E2ELoss(detector, loss_class)
+        self.last_layout = None
+
+    @staticmethod
+    def raw_predictions(predictions):
+        while isinstance(predictions, tuple) and len(predictions) == 2:
+            predictions = predictions[1]
+        if not isinstance(predictions, dict):
+            raise ValueError(f"Expected raw YOLO pose dictionaries, got {type(predictions).__name__}")
+        return predictions
+
+    @staticmethod
+    def is_pose_branch(value):
+        return isinstance(value, dict) and all(key in value for key in ("kpts", "boxes", "scores", "feats"))
+
+    def __call__(self, predictions, batch):
+        raw = self.raw_predictions(predictions)
+        if self.is_pose_branch(raw):
+            criterion, inputs, layout = self.flat, raw, "flat pose output"
+        else:
+            many, one = raw.get("one2many"), raw.get("one2one")
+            if self.is_pose_branch(many) and self.is_pose_branch(one):
+                criterion, inputs, layout = self.end_to_end, raw, "one2many + one2one pose outputs"
+            elif self.is_pose_branch(many):
+                criterion, inputs, layout = self.flat, many, "one2many pose output"
+            elif self.is_pose_branch(one):
+                criterion, inputs, layout = self.flat, one, "one2one pose output"
+            else:
+                structure = {key: sorted(value) if isinstance(value, dict) else type(value).__name__
+                             for key, value in raw.items()}
+                raise ValueError(f"YOLO outputs contain no complete pose branch (need kpts/boxes/scores/feats): {structure}")
+        if layout != self.last_layout:
+            print(f"Independent pose loss: {type(criterion).__name__} ({layout})", flush=True)
+            self.last_layout = layout
+        return criterion(inputs, batch)
+
+    def update(self):
+        self.end_to_end.update()
+
+    def kpts_decode(self, *args, **kwargs):
+        return self.flat.kpts_decode(*args, **kwargs)
+
+
+def independent_pose_criterion(detector):
+    """Keep stock pose losses, dispatching flat versus E2E from real outputs."""
+    return IndependentPoseCriterion(detector)
 
 
 class SymmetryPoseLoss(nn.Module):

@@ -277,3 +277,46 @@ def test_non_end2end_pose26_stock_loss_uses_the_same_xy_formula_as_inference():
     inference = head.kpts_decode(raw[:, :, 0].transpose(1, 2))[:, :2].transpose(1, 2)
     training = criterion.kpts_decode(anchors, raw)[:, :, 0, :2]
     torch.testing.assert_close(training, inference)
+
+
+@pytest.mark.parametrize("initial_mode,actual_mode", [(False, False), (False, True), (True, False), (True, True)])
+@pytest.mark.parametrize("frozen", [False, True])
+def test_independent_loss_uses_real_output_layout_during_warmup_joint_and_validation(initial_mode, actual_mode, frozen):
+    from ultralytics.utils.loss import E2ELoss, PoseLoss26
+
+    detector = make_detector("yolo26n-pose.yaml")
+    detector.end2end = initial_mode
+    criterion = independent_pose_criterion(detector)
+    # Reproduce the reported failure: the forward output can differ from the
+    # mode seen when the criterion was constructed.
+    detector.end2end = actual_mode
+    model = DirectCubePoseModel(detector, width=8, topk=4)
+    model.freeze_detector(frozen)
+    model.train()
+    target = target_tensors(payload(RECORDS[0]))
+    labels = torch.tensor([[0., .5, .5, .4, .4, .5, .5, 2.], [3., .2, .3, .1, .1, .2, .3, 1.]])
+    batch, _, _ = collate_direct_pose([
+        (torch.rand(3, 64, 64), target, labels, f"sample{index}") for index in range(2)
+    ])
+    output = model(batch["img"])["independent"]
+    loss, items = criterion(output, batch)
+    stock = E2ELoss(detector, PoseLoss26) if actual_mode else PoseLoss26(detector)
+    expected_loss, expected_items = stock(output, batch)
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(items, expected_items)
+    assert torch.isfinite(loss).all()
+    if not frozen:
+        loss.sum().backward()
+        assert all(torch.isfinite(parameter.grad).all() for parameter in detector.parameters() if parameter.grad is not None)
+    model.eval()
+    with torch.no_grad():
+        validation_loss, _ = criterion(model(batch["img"])["independent"], batch)
+    assert torch.isfinite(validation_loss).all()
+    criterion.update()
+    assert criterion.end_to_end.updates == 1
+
+
+def test_incomplete_pose_output_reports_its_structure_instead_of_keyerror():
+    criterion = independent_pose_criterion(make_detector("yolo26n-pose.yaml"))
+    with pytest.raises(ValueError, match="no complete pose branch"):
+        criterion({"one2many": {"boxes": torch.zeros(1)}}, {})

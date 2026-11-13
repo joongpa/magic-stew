@@ -849,6 +849,12 @@ tested Ultralytics version, the generic non-end-to-end criterion otherwise uses
 the older XY decoder. Box/class/keypoint loss formulas and gains remain the
 provided YOLO26 defaults. Legacy prototype checkpoints lacking the detection
 mode are rejected instead of silently reloading different prediction branches.
+The independent criterion also checks each forward result's actual structure:
+flat dictionaries use the stock single-branch pose loss, and paired
+`one2many`/`one2one` dictionaries use the stock E2E loss. This prevents a
+`KeyError: 'kpts'` when a runtime prediction layout differs from the model flag
+seen at criterion construction. Package versions and selected loss layout are
+printed in the training log.
 
 ## Ordered cube pose labels
 
