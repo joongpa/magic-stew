@@ -725,6 +725,95 @@ For ground-truth overlays on the prepared dataset, use
   --output-dir runs/independent_keypoint_ground_truth
 ```
 
+## Direct pose and articulation head
+
+The additional targets in `data/direct_cube_pose_dataset/` support a structured
+head on the existing nine-class independent YOLO pose detector. Six centers in
+`U,D,F,B,R,L` order (white, yellow, green, blue, red, orange) supervise the rigid
+pose. The branch also predicts six clockwise face offsets in degrees, normalized
+image center/scale/perspective/principal point, and a continuous 6D rotation
+representation converted to a proper rotation matrix.
+
+```bash
+.venv/bin/python scripts/train_yolo26_direct_cube_pose.py \
+  --dataset data/direct_cube_pose_dataset \
+  --model runs/pose/runs/26m-pose/weights/best.pt \
+  --device 0 --imgsz 160 --batch 16 --epochs 100 \
+  --output-dir runs/direct_cube_pose
+```
+
+The default checkpoint is the trained YOLO26m independent detector. A stock
+pose `.pt` or `.yaml` can also initialize the detector; its classification and
+keypoint shapes are adapted to the nine classes and one keypoint per object.
+The original detector retains the installed Ultralytics default pose loss.
+The new branch first warms up for five epochs with that detector frozen, then
+jointly fine-tunes with a detector learning rate one tenth of the new head's.
+Use `--freeze-epochs 0` for joint training from the first epoch.
+
+Inputs to the branch are shared multiscale features and multiple predicted
+landmark/sticker points per class. Point weights come from the independent
+objects' detection/class logits, never their keypoint-presence channel.
+Ground-truth points are used only for supervision. Auxiliary center predictions
+and projected articulated landmarks guide the structured pose. The loss chooses
+one allowed symmetry jointly for rotation, ordered centers, turn channels, and
+the 56 projected landmark anchors. It cannot choose a different symmetry for
+each term. Historical sticker omissions make the allowed sets conservative.
+Slice targets use the verified frame rebase; corner cuts use the dominant angle.
+
+Empty-label images retain their independent detection supervision and have all
+direct geometric losses masked. Their pose-quality target is zero. The learned
+`quality` score estimates articulated projection accuracy relative to the best
+joint allowed target: `exp(-0.5 * (normalized_landmark_RMSE / 0.02)^2)` by default.
+Its error is the larger of full target-landmark RMSE and saved observed-landmark
+RMSE when observations exist, so a dominant-angle corner-cut approximation's
+residual also affects quality.
+This score is distinct from object detection and keypoint-presence scores and
+does not measure the probability that an orientation is unique or calibrated.
+
+`split.json` fixes the stratified train/validation split. Labels are cached once;
+training augmentation changes brightness, contrast, and blur while preserving
+color identities and geometry. `metrics.jsonl` records losses, center/landmark
+projection errors at the training resolution (both target and observed landmarks), rotation error, and face-angle
+error, including validation breakdowns by turn mode and allowed symmetry count.
+`weights/best.pt` and `weights/last.pt` contain the full detector and head,
+optimizer/scheduler/scaler state, random states, and configuration. Resume with
+`--resume runs/direct_cube_pose/weights/last.pt` and the same model/data/objective
+options; `--epochs` may be increased. Reuse the same output directory on resume.
+
+A short CPU wiring check, which does not establish pose accuracy:
+
+```bash
+.venv/bin/python scripts/train_yolo26_direct_cube_pose.py \
+  --model yolo26n-pose.yaml --limit 32 --epochs 1 --freeze-epochs 0 \
+  --imgsz 64 --batch 2 --workers 0 --device cpu --max-batches 2 \
+  --output-dir runs/direct_cube_pose_smoke
+```
+
+For inference, `live_recognition.direct_cube_pose.load_direct_pose_checkpoint`
+returns `(model, checkpoint)`. Pass square RGB `[B,3,H,W]` floats in `[0,1]` at
+the saved training size. `model(images)["pose"]` returns the structured pose,
+auxiliary `center_keypoints`, `projected_centers`, and `quality`;
+`model(images)["independent"]` preserves the raw YOLO outputs. No original base
+checkpoint is required to reload the saved model. This architecture still needs
+an accuracy comparison against the earlier six-point model on matching data and
+training budgets, especially for blur and occlusion.
+
+The current single-state objective does **not** yet handle hidden-layer
+articulation uncertainty. It still penalizes hidden face-angle and geometry
+differences even when the visible observations are identical. Reproduce this
+limitation before treating an overfit/smoke run as evidence of correctness:
+
+```bash
+.venv/bin/python scripts/verify_hidden_layer_ambiguity.py
+```
+
+The report in `runs/hidden_layer_ambiguity_verification/report.json` deliberately
+records `ambiguity_handled_by_current_loss: false`. This synthetic diagnostic
+uses a crop filled by an opaque front face; it does not discard silhouette/color
+evidence from existing images or infer hidden layers from missing old labels.
+Supporting the requested multiple explanations requires a joint multimodal
+pose/articulation model and uncertainty for continuously unconstrained angles.
+
 ## Ordered cube pose labels
 
 The ordered 26-point pose target represents one rigid cube transform. When

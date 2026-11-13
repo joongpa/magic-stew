@@ -245,11 +245,13 @@ def surface_quads(angles, *, operations=None):
 
 def error_summary(values):
     values = np.asarray(values, dtype=np.float64)
+    if not values.size:
+        return {"count": 0, "mean": None, "p95": None, "max": None}
     return {"count": int(values.size), "mean": float(values.mean()),
             "p95": float(np.percentile(values, 95)), "max": float(values.max())}
 
 
-def build_target(record, *, sensor_width_mm=36.0):
+def build_target(record, *, sensor_width_mm=36.0, allow_unobserved=False):
     angles, operations, rebase = articulation_parameters(record)
     camera_rotation, camera_location, intrinsics, size = camera_parameters(record, sensor_width_mm)
     transform = np.asarray(record["cube_pose"]["transform"], dtype=np.float64)
@@ -291,10 +293,10 @@ def build_target(record, *, sensor_width_mm=36.0):
                              "used_at_inference": False},
     }
     landmarks = record["sticker_keypoints"]["landmark_keypoints"]
-    if not landmarks:
+    if not landmarks and not allow_unobserved:
         raise ValueError("At least one saved landmark is required for verification")
-    world = np.asarray([point["world_point"] for point in landmarks])
-    observed = np.asarray([point["pixel_point"] for point in landmarks])
+    world = np.asarray([point["world_point"] for point in landmarks]).reshape(-1, 3)
+    observed = np.asarray([point["pixel_point"] for point in landmarks]).reshape(-1, 2)
     camera_points = (world - camera_location) @ camera_rotation.T
     reference_pixels = project_camera(camera_points, intrinsics)
     local = (world - transform[:3, 3]) @ core_to_world
