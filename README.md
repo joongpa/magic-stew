@@ -856,6 +856,24 @@ flat dictionaries use the stock single-branch pose loss, and paired
 seen at criterion construction. Package versions and selected loss layout are
 printed in the training log.
 
+For a nonfinite first-batch loss, run the standalone diagnostic on the same
+CUDA device and with the same model/image-size options:
+
+```bash
+.venv/bin/python scripts/check_direct_pose_batch_numerics.py \
+  --run-dir runs/direct_cube_pose --device 0
+```
+
+Use the failing run's output directory for `--run-dir` to reuse its saved model,
+image size, seed, augmentation and loss settings. The diagnostic defaults to
+the four reported first-batch samples and compares AMP loss math,
+FP32 loss math on identical AMP network outputs, and a full FP32 forward/loss.
+The report under `RUN_DIR/numeric_probe/report.json` includes individual
+loss components and assignment/keypoint/RLE stages. It performs no optimizer
+updates. Normal training has no additional scans, snapshots or retries; detailed
+diagnostics and the failed batch are saved only if its existing finite-loss
+check fails. These checks do not assume that AMP is the cause.
+
 ## Ordered cube pose labels
 
 The ordered 26-point pose target represents one rigid cube transform. When

@@ -49,6 +49,9 @@ from live_recognition.direct_cube_pose import (  # noqa: E402
 from live_recognition.direct_cube_pose_data import (  # noqa: E402
     DirectPoseDataset, collate_direct_pose, landmark_template, read_manifest, split_entries,
 )
+from live_recognition.direct_pose_training_numerics import (  # noqa: E402
+    attempt_diagnostics, nonfinite_fields,
+)
 
 
 def seed_worker(_worker_id):
@@ -123,7 +126,7 @@ def resolve_batch_size(batch, model, device, image_size, amp, max_objects, datas
 
 
 def run_epoch(model, loader, independent_loss, direct_loss, device, optimizer=None, scaler=None,
-              independent_weight=1., max_batches=None):
+              independent_weight=1., max_batches=None, diagnostic_dir=None, phase=None):
     training = optimizer is not None
     model.train(training)
     totals, denominators = {}, {}
@@ -139,17 +142,36 @@ def run_epoch(model, loader, independent_loss, direct_loss, device, optimizer=No
         with torch.set_grad_enabled(training):
             with torch.autocast(device_type=device.type, enabled=scaler is not None and scaler.is_enabled()):
                 prediction = model(batch["img"])
-                # Ultralytics returns component losses scaled by batch size.
-                # Preserve its criterion and gains, then average per image.
-                independent, _ = independent_loss(prediction["independent"], batch)
-                independent = independent.sum() / size
-            # Keep the geometry and symmetry selection in FP32 under CUDA AMP.
+                independent_components, _ = independent_loss(prediction["independent"], batch)
+                independent = independent_components.sum() / size
             pose = {key: value.float() for key, value in prediction["pose"].items()}
             losses, metrics, _ = direct_loss(pose, target, batch["img"].shape[-1])
             per_image = metrics.pop("per_image")
             total = losses["total"] + independent_weight * independent
             if not torch.isfinite(total):
-                raise FloatingPointError(f"Nonfinite loss for {keys}")
+                # Expensive inspection and batch serialization occur ONLY on
+                # failure. Normal training has no scans, snapshots or retries.
+                attempt = {"outputs": {"independent": independent_loss.raw_predictions(prediction["independent"]),
+                                       "pose": pose}, "independent_components": independent_components,
+                           "pose_losses": losses,
+                           "nonfinite": nonfinite_fields({"yolo": independent_components, "pose": losses, "total": total})}
+                details = attempt_diagnostics(attempt)
+                diagnostic = {"keys": list(keys), "phase": phase or ("train" if training else "val"),
+                              "batch_index": batch_index + 1,
+                              "amp_enabled": scaler is not None and scaler.is_enabled(), **details}
+                report_path = None
+                if diagnostic_dir is not None:
+                    diagnostic_dir = Path(diagnostic_dir)
+                    diagnostic_dir.mkdir(parents=True, exist_ok=True)
+                    stem = f"{diagnostic['phase']}_batch_{batch_index + 1:06d}"
+                    report_path = diagnostic_dir / f"{stem}.json"
+                    report_path.write_text(json.dumps(diagnostic, indent=2, allow_nan=False) + "\n")
+                    torch.save({"keys": keys, "batch": {key: value.detach().cpu() for key, value in batch.items()},
+                                "target": {key: value.detach().cpu() for key, value in target.items()}},
+                               diagnostic_dir / f"{stem}_batch.pt")
+                raise FloatingPointError(f"Nonfinite loss for {keys}; fields={details['nonfinite_fields']}; "
+                                         f"YOLO={details.get('yolo_components')}; pose={details.get('pose_components')}; "
+                                         f"diagnostics={report_path}")
             if training:
                 scaler.scale(total).backward()
                 scaler.unscale_(optimizer)
@@ -357,10 +379,11 @@ def main():
         frozen = epoch <= args.freeze_epochs
         model.freeze_detector(frozen)
         train = run_epoch(model, loaders[0], independent_loss, direct_loss, device, optimizer, scaler,
-                          args.independent_weight, args.max_batches)
+                          args.independent_weight, args.max_batches, output / "diagnostics", f"train_epoch_{epoch}")
         with torch.no_grad():
             val = run_epoch(model, loaders[1], independent_loss, direct_loss, device,
-                            independent_weight=args.independent_weight, max_batches=args.max_batches)
+                            independent_weight=args.independent_weight, max_batches=args.max_batches,
+                            diagnostic_dir=output / "diagnostics", phase=f"val_epoch_{epoch}")
         scheduler.step()
         improved = val["loss"] < best
         best = min(best, val["loss"])
