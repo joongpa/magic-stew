@@ -36,7 +36,7 @@ def inverse(move):
 @dataclass(frozen=True, slots=True)
 class Link:
     state: bytes
-    cue: str | tuple[str, ...] | None = None
+    cue: str | tuple[str, ...] | int | None = None
     link: Link | None = None
     step: dict | None = None
     rank: tuple = ()
@@ -77,7 +77,8 @@ def widening_scorer_options(renderer, colors, static_end, checkpoint):
     table = renderer.POSE_26M_COLOR_CONFUSIONS if use_26m else renderer.COLOR_CLASS_CONFUSIONS
     return dict(initial_colors=colors, turning_start_frame=static_end, balance_geometry_color=True,
                 track_color_confusions=True,
-                color_confusion_scoring=use_26m, tracked_color_confusions=table)
+                color_confusion_scoring=use_26m, tracked_color_confusions=table,
+                geometry_shortlist_size=replay.GEOMETRY_SHORTLIST_SIZE)
 
 
 class WideningFrontier:
@@ -170,7 +171,7 @@ def widening_join(forward, backward, initial, goals, length, *, widths, stage_bu
             match = matches.get(None) or matches.get(node.cue)
         else:
             reached[1] = min(reached[1], depth)
-            match = matches.get(node.cue) if node.cue else next(iter(matches.values()), None)
+            match = matches.get(node.cue) if node.cue is not None else next(iter(matches.values()), None)
         if match is not None:
             return (depth, node, match) if direction == 0 else (depth, match, node)
         if depth == (length if direction == 0 else 0):
@@ -228,13 +229,14 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
     reverse_moves = {}
     for axis in range(3):
         for side in (-1, 1):
-            for count in (1, 2):
+            for layer_count in (1, 2):
                 for angle in (-90., 90.):
-                    rotation = scorer.m.CubeLayerRotation(axis, side, angle, count)
+                    rotation = scorer.m.CubeLayerRotation(axis, side, angle, layer_count)
                     move = scorer.m.cube_rotation_to_notation(rotation)
                     if move:
-                        reverse_moves[(move,)] = ("layer", axis, side, count, (-1 if move.endswith("'") else 1,))
-    parallel_layers = getattr(scorer, 'parallel_layers', False)
+                        reverse_moves[(move,)] = ("layer", axis, side, layer_count, (-1 if move.endswith("'") else 1,))
+    parallel_layers = (getattr(scorer, 'parallel_layers', False)
+                       or getattr(scorer, 'geometry_shortlist_size', None) is not None)
     if parallel_layers:
         for axis in range(3):
             for action in scorer.m.parallel_turn_actions(axis):
@@ -245,6 +247,7 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
     midpoint = len(frames) // 2
     bounds = (min(len(frames), midpoint + overlap), max(0, midpoint - overlap))
     attempted_retries = 0
+    rotation_budget = getattr(scorer, 'rotation_budget_enabled', False)
 
     def evaluations():
         return sum(expanded) + (forecaster.expanded if forecaster else 0)
@@ -270,7 +273,8 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
         return .5 * (choice.payload.get("color_error") or 0.)
 
     def step_for(choice, frame, cue):
-        bonus = handoff_bonus if cue and tuple(choice.payload["state_moves"]) == frame_search.completion_moves(cue) else 0.
+        committed = frame_search.handoff_moves(choice.payload) or tuple(choice.payload['state_moves'])
+        bonus = handoff_bonus if not rotation_budget and cue and committed == frame_search.completion_moves(cue) else 0.
         step = dict(choice.payload, frame_index=frame, state_score=choice.score,
                     queue_priority=priority(choice)-bonus)
         if bonus:
@@ -279,15 +283,13 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
 
     def forward_options(depth, state, previous_cue):
         frame = frames[depth]
-        choices = list(scorer(frame, state))
-        if previous_cue:
-            handoff = frame_search.score_handoff(scorer, frame, state, previous_cue)
-            if handoff is not None:
-                choices.append(handoff)
+        choices = (scorer.rotation_choices(frame, state, previous_cue) if rotation_budget else
+                   frame_search.frame_choices(scorer, frame, state, previous_cue))
         for choice in choices:
             if math.isfinite(choice.score):
                 step = step_for(choice, frame, previous_cue)
-                cue = frame_search.supported_completion(scorer.m, step)
+                cue = (scorer.rotation_context(step, previous_cue) if rotation_budget else
+                       frame_search.supported_completion(scorer.m, step))
                 unsupported = frame_search.unsupported_state_update(step)
                 yield Link(choice.state, cue, step=step, rank=(step["queue_priority"], unsupported, choice.rank))
 
@@ -300,16 +302,44 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
         for edge in expand(depth, node.state, node.cue):
             yield Link(edge.state, edge.cue, node, edge.step, edge.rank)
 
+    @lru_cache(maxsize=None)
+    def previous_handoffs(depth):
+        if depth <= 1 or scorer.hold_reason(frames[depth-2]) is not None:
+            return ()
+        if hasattr(scorer, 'prepare'):
+            prepared = scorer.prepare(frames[depth-2])
+            if prepared is not None and 'selected_geometry_indices' in prepared:
+                cues = (frame_search.supported_completion(scorer.m, dict(prepared['templates'][index][0],
+                        state_moves=(), frame_state_moves=()))
+                        for index in prepared['selected_geometry_indices'])
+                return tuple(sorted({frame_search.completion_moves(cue) for cue in cues if cue}))
+        return tuple(action for action, _direction, _undo in reverse_actions)
+
     def backward(node, depth):
         frame = frames[depth-1]
+        if rotation_budget:
+            for before, context, choice, prior_color in scorer.rotation_predecessors(frame, node.state, node.cue):
+                check_budget()
+                step = step_for(choice, frame, None)
+                yield Link(before, context, node, step, (priority(choice), False, (prior_color, choice.rank)))
+            return
         hold = scorer.score_hold(frame, node.state)
         possibilities = [((), None, node.state)]
+        ordinary_actions = None
         if scorer.hold_reason(frame) is None:
+            allowed = None
+            if getattr(scorer, 'geometry_shortlist_size', None) is not None:
+                ordinary_actions = scorer.frame_actions(frame)
+                allowed = ordinary_actions
+                if hold is not None and 'geometry_option_index' in hold.payload and depth > 1:
+                    allowed |= frozenset(previous_handoffs(depth))
             possibilities.extend((action, direction, scorer.apply_moves(node.state, undo))
-                                 for action, direction, undo in reverse_actions)
+                                 for action, direction, undo in reverse_actions if allowed is None or action in allowed)
         for action, direction, before in possibilities:
             check_budget()
-            if action and parallel_layers:
+            if action and ordinary_actions is not None and action not in ordinary_actions:
+                ordinary = ()
+            elif action and parallel_layers:
                 ordinary = scorer.score_action(frame, before, action)
             elif action:
                 ordinary = scorer(frame, before) if branch_widths else scorer._evaluate(frame, before, direction)
@@ -325,19 +355,44 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
             earlier = (scorer.score_hold(frames[depth-2], before)
                        if depth > 1 and (not branch_widths or can_handoff) else None)
             earlier_cost = priority(earlier) if earlier is not None else 0.5
+            if (action and can_handoff and earlier and
+                    getattr(scorer, 'flat_turn_fallback', lambda _: False)(frame) and
+                    frame_search.supported_completion(scorer.m, earlier.payload)):
+                choices = [(choice, need) for choice, need in choices
+                           if any(rotation['angle_degrees'] for rotation in choice.payload.get('layer_rotations', ()))]
             # A speculative handoff can fill the beam with cheap predecessors
             # that have no way to supply the required cue on the previous frame.
             cue = frame_search.completion_cue(action)
             if can_handoff and earlier and frame_search.supported_completion(scorer.m, earlier.payload) == cue:
-                step = dict(hold.payload, state_moves=action, handoff_commit=True, is_baseline=False,
-                            label=f"commit {' '.join(action)} then {hold.payload['label']}")
-                choices.append((replay.Transition(node.state, hold.score, hold.rank, step, None), cue))
+                choices.append((frame_search.compose_handoff(hold, cue), cue))
             for choice, need in choices:
                 if not math.isfinite(choice.score) or (node.cue is not None and
                         frame_search.supported_completion(scorer.m, choice.payload) != node.cue):
                     continue
                 step = step_for(choice, frame, need)
                 yield Link(before, need, node, step, (earlier_cost, step["queue_priority"], choice.rank))
+            if not action or depth <= 1:
+                continue
+            # Undo the current frame's commit first, then the previous frame's
+            # completion. Its cue must be supplied by the actual predecessor.
+            current = [choice for choice in ordinary if choice.state == node.state
+                       and tuple(choice.payload['state_moves']) == action
+                       and (not getattr(scorer, 'flat_turn_fallback', lambda _: False)(frame)
+                            or any(r['angle_degrees'] for r in choice.payload.get('layer_rotations', ())))]
+            for prefix in previous_handoffs(depth) if current else ():
+                check_budget()
+                undo = tuple(map(inverse, reversed(prefix)))
+                parent = scorer.apply_moves(before, undo)
+                prior = scorer.score_hold(frames[depth-2], parent)
+                need = frame_search.completion_cue(prefix)
+                if prior is None or frame_search.supported_completion(scorer.m, prior.payload) != need:
+                    continue
+                for choice in current:
+                    composed = frame_search.compose_handoff(choice, need)
+                    if node.cue is not None and frame_search.supported_completion(scorer.m, composed.payload) != node.cue:
+                        continue
+                    step = step_for(composed, frame, need)
+                    yield Link(parent, need, node, step, (priority(prior), step['queue_priority'], composed.rank))
 
     def meeting(depth, direction, nodes):
         opposite = layers[1-direction].get(depth)
@@ -350,7 +405,7 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
                     return node, match
         else:
             for node in nodes:
-                if node.cue:
+                if node.cue is not None:
                     match = opposite.get((node.state, node.cue))
                 else:
                     match = next((entry for (state, _), entry in opposite.items() if state == node.state), None)
@@ -425,12 +480,14 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
             check_budget()
             if step["frame_index"] != frame:
                 raise RuntimeError("Joined paths disagree about frame order")
-            if step.get("handoff_commit"):
-                if not cue or tuple(step["state_moves"]) != frame_search.completion_moves(cue):
+            if rotation_budget:
+                choices = scorer.rotation_choices(frame, state, cue)
+            elif step.get("handoff_commit"):
+                if not cue or frame_search.handoff_moves(step) != frame_search.completion_moves(cue):
                     raise RuntimeError("Joined path is missing a required handoff")
-                choices = (frame_search.score_handoff(scorer, frame, state, cue),)
+                choices = frame_search.score_handoffs(scorer, frame, state, cue)
             else:
-                choices = scorer(frame, state)
+                choices = frame_search.frame_choices(scorer, frame, state, cue)
             match = next((choice for choice in choices if choice is not None and choice.state == after
                           and all(choice.payload.get(k) == step.get(k) for k in trial_key)), None)
             if match is None:
@@ -441,7 +498,8 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
                 verified_step['queue_priority'] += verified_step['window_mismatch_penalty']
                 verified_step['sibling_rank'] = step['sibling_rank']
             verified.append(verified_step)
-            state, cue = after, frame_search.supported_completion(scorer.m, verified[-1])
+            state, cue = after, (scorer.rotation_context(verified[-1], cue) if rotation_budget else
+                                frame_search.supported_completion(scorer.m, verified[-1]))
         if state not in goals:
             raise RuntimeError("Joined path failed to reach the solved anchor")
         return depth, verified
@@ -494,6 +552,10 @@ def main():
     parser.add_argument("--retries", type=int, default=4)
     parser.add_argument("--overlap", type=int, default=8, help="Frames each beam crosses past the middle.")
     parser.add_argument("--search-seconds", type=float, default=300.)
+    parser.add_argument('--max-tps', type=float, default=40.,
+                        help='Per-turn TPS limit, with simultaneous slabs measured independently (default: 40).')
+    parser.add_argument('--max-double-tps', type=float, default=50.,
+                        help='TPS limit for geometry-supported 180-degree spans (default: 50).')
     parser.add_argument("--max-explored-states", type=int)
     parser.add_argument("--branch-widths", type=int, nargs="+", default=(),
                         help="Per-parent child cutoffs including ties for the best-first queues, e.g. 3 5 8.")
@@ -507,7 +569,9 @@ def main():
     args = parser.parse_args()
     if (args.beam_width < 1 or args.max_explored_states is not None and args.max_explored_states < 1
             or min(args.retries, args.overlap, args.lookahead_frames) < 0 or args.lookahead_budget < 1
-            or not math.isfinite(args.search_seconds) or args.search_seconds <= 0):
+            or not math.isfinite(args.search_seconds) or args.search_seconds <= 0
+            or not math.isfinite(args.max_tps) or args.max_tps <= 0
+            or not math.isfinite(args.max_double_tps) or args.max_double_tps < args.max_tps):
         parser.error("Invalid beam or search budget")
     if (any(value < 1 for value in args.branch_widths)
             or any(b <= a for a, b in zip(args.branch_widths, args.branch_widths[1:]))
@@ -540,12 +604,13 @@ def main():
     stage_budget = frame_search.branch_stage_budget(len(frames), args.branch_stage_expansions)
     colors = replay.initial_sticker_colors(m, args.initial_scramble)
     scorer_options = dict(initial_colors=colors, turning_start_frame=static_end,
-                          balance_geometry_color=True)
+                          balance_geometry_color=True, geometry_shortlist_size=replay.GEOMETRY_SHORTLIST_SIZE)
     if args.branch_widths:
         scorer_options = widening_scorer_options(m, colors, static_end, metadata.get("pose_model"))
         use_26m = scorer_options["color_confusion_scoring"]
         confusion_table = scorer_options["tracked_color_confusions"]
     scorer = replay.PreparedReplayScorer(m, records, "cpu", parallel_layers=bool(args.branch_widths), **scorer_options)
+    scorer.configure_rotation_budget(frames, metadata.get('source_fps', args.fps), args.max_tps, args.max_double_tps)
     initial = scorer.key(m.CubeGeometryState.identity())
     goals = solved_seeds(scorer, args.initial_scramble)
     solved = scorer.solved_predicate(colors)
@@ -553,6 +618,7 @@ def main():
         parser.error("Scramble inversion did not produce solved states")
     for index in frames:
         scorer.prepare(index)
+    scorer.finalize_rotation_budgets()
     anchor = flat_solved_anchor(m, records[frames[-1]], goals, **scorer_options)
     if anchor is None:
         parser.error("The anchor needs a reliable flat solved fit with at least 12 color observations")
@@ -563,13 +629,20 @@ def main():
 
     config = dict(algorithm="bidirectional_bounded_beam_stack", log=str(args.log.resolve()),
         observation_input=metadata, initial_scramble=args.initial_scramble, turning_start_frame=static_end,
+        geometry_shortlist_size=scorer.geometry_shortlist_size,
+        geometry_tie_tolerance=replay.GEOMETRY_TIE_TOLERANCE,
         fps=search_fps, frame_parity=args.frame_parity, video_frame_count=args.video_frame_count,
         sampled_frame_indices=frames,
         solved_anchor_frame=args.end_frame, solved_anchor_source_frame=records[args.end_frame].get(
             "original_source_frame", args.end_frame), beam_width=args.beam_width, retries=args.retries,
         overlap=args.overlap, time_budget=args.search_seconds, state_limit=args.max_explored_states,
         score_weights=dict(geometry=.5,color=.5), queue_score_weights=dict(geometry=0.,color=.5),
-        turn_handoff_bonus=WIDENING_HANDOFF_BONUS, reverse_handoff_requires_prior_hold=True,
+        max_tps=args.max_tps, max_double_tps=args.max_double_tps,
+        rotation_degrees_per_second=90.*args.max_tps,
+        rotation_budgets_degrees=scorer.rotation_limits,
+        double_rotation_budgets_degrees=scorer.rotation_double_limits,
+        simultaneous_budget_policy="independent_relative_to_middle",
+        merge_key='frame,physical_state,residual_geometry',
         preferred_orientations_per_physical_state=2, reference_solution_used=False,
         anchor_colors=dict(observed=anchor.payload["color_match_count"], error=anchor.payload["color_error"]))
     if args.branch_widths:

@@ -25,7 +25,7 @@ storage = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = storage
 SPEC.loader.exec_module(storage)
 replay = storage.replay
-TURN_HANDOFF_MIN_DEGREES = 12.
+TURN_HANDOFF_MIN_DEGREES = 6.
 COLOR_MISMATCH_WINDOW_FRAMES = 8
 BRANCH_STAGE_EXPANSIONS_PER_FRAME = 100
 
@@ -57,13 +57,14 @@ def update_bottom_quartile(recent, step, counter_dtype):
 
 def supported_completion(renderer, step):
     rotations = step.get('layer_rotations', ())
+    moves = current_frame_moves(step)
     if step.get('parallel_layers'):
         axis = step['layer_axis']
         angles = renderer.parallel_layer_angles(tuple(renderer.CubeLayerRotation(**r) for r in rotations))
-        offsets = renderer.parallel_turn_actions(axis).get(tuple(step.get('state_moves', ())), (0., 0., 0.))
+        offsets = renderer.parallel_turn_actions(axis).get(moves, (0., 0., 0.))
         completion = renderer.parallel_layer_rotations(axis, tuple(
-            math.copysign(90., angle) if math.isfinite(angle) and abs(angle) > TURN_HANDOFF_MIN_DEGREES
-            and support and not offset else 0.
+            math.copysign(90., angle) if math.isfinite(angle) and abs(angle) >= TURN_HANDOFF_MIN_DEGREES
+            and support and (not offset or angle * offset > 0.) else 0.
             for angle, support, offset in zip(angles, step['layer_support'], offsets, strict=True)))
         moves = tuple(renderer.cube_rotation_to_notation(r) for r in completion)
         return completion_cue(moves) if moves else None
@@ -71,12 +72,12 @@ def supported_completion(renderer, step):
         return None
     rotation = rotations[0]
     angle = rotation['angle_degrees']
-    if not math.isfinite(angle) or abs(angle) <= TURN_HANDOFF_MIN_DEGREES:
+    if not math.isfinite(angle) or abs(angle) < TURN_HANDOFF_MIN_DEGREES:
         return None
     move = renderer.cube_rotation_to_notation(renderer.CubeLayerRotation(
         rotation['axis'], rotation['side'], math.copysign(90., angle), rotation['layer_count']))
-    if move is None or any(committed.rstrip("'2") == move.rstrip("'2")
-                           for committed in step.get('state_moves', ())):
+    if move is None or (any(committed.rstrip("'2") == move.rstrip("'2") for committed in moves)
+                        and angle * float(step.get('color_offset', 0.)) <= 0.):
         return None
     return move
 
@@ -89,9 +90,26 @@ def completion_moves(cue):
     return (cue,) if isinstance(cue, str) else cue
 
 
+def handoff_moves(step):
+    return tuple(step.get('handoff_moves', step.get('state_moves', ()))) if step.get('handoff_commit') else ()
+
+
+def current_frame_moves(step):
+    return tuple(step.get('frame_state_moves', () if step.get('handoff_commit') else step.get('state_moves', ())))
+
+
+def compose_handoff(choice, cue):
+    prefix = completion_moves(cue)
+    current = tuple(choice.payload['state_moves'])
+    step = dict(choice.payload, state_moves=prefix + current, handoff_moves=prefix,
+                frame_state_moves=current, handoff_commit=True, is_baseline=False,
+                label=f"commit {' '.join(prefix)} then {choice.payload['label']}")
+    return replay.Transition(choice.state, choice.score, choice.rank, step, choice.update_key)
+
+
 def unsupported_state_update(step):
     """Distinguish a partial turn with no inliers from a flat fit."""
-    return (bool(step.get("state_moves")) and step.get("layer_inlier_count") == 0
+    return (not step.get('rotation_budget') and bool(step.get("state_moves")) and step.get("layer_inlier_count") == 0
             and ("layer_rotations" not in step or bool(step["layer_rotations"])))
 
 
@@ -102,9 +120,41 @@ def score_handoff(scorer, frame, state, cue):
     hold = scorer.score_hold(frame, after)
     if hold is None or 'geometry_option_index' not in hold.payload:
         return None
-    step = dict(hold.payload, state_moves=moves, handoff_commit=True, is_baseline=False,
-                label=f"commit {' '.join(moves)} then {hold.payload['label']}")
-    return replay.Transition(after, hold.score, hold.rank, step, None)
+    return compose_handoff(hold, cue)
+
+
+def score_handoffs(scorer, frame, state, cue):
+    """Complete the preceding turn, then score the current residual and commits."""
+    after = scorer.apply_moves(state, completion_moves(cue))
+    if getattr(scorer, 'flat_turn_fallback', lambda _: False)(frame):
+        options = list(scorer.without_flat_turns(frame, after))
+    else:
+        options = list(scorer(frame, after))
+    hold = scorer.score_hold(frame, after)
+    if hold is not None:
+        options.append(hold)
+    unique = {}
+    for choice in options:
+        if 'geometry_option_index' not in choice.payload:
+            continue
+        state_key = (scorer.key(choice.state) if hasattr(scorer, 'key') else
+                     choice.state.signature() if hasattr(choice.state, 'signature') else choice.state)
+        key = (state_key, tuple(choice.payload['state_moves']),
+               choice.payload['geometry_option_index'], choice.payload.get('color_offset'))
+        if key not in unique or choice.rank < unique[key].rank:
+            unique[key] = choice
+    return [compose_handoff(choice, cue) for choice in unique.values()]
+
+
+def frame_choices(scorer, frame, state, cue=None):
+    """Use flat-frame turn candidates only when no handoff is available."""
+    handoffs = score_handoffs(scorer, frame, state, cue) if cue else []
+    if handoffs and getattr(scorer, 'flat_turn_fallback', lambda _: False)(frame):
+        choices = list(scorer.without_flat_turns(frame, state))
+    else:
+        choices = list(scorer(frame, state))
+    choices.extend(handoffs)
+    return choices
 
 
 def update_mismatch_window(window, step, weight):
@@ -156,10 +206,11 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
     branch_stage_expansions = branch_stage_budget(len(frames) - static_count, branch_stage_expansions)
     if ignore_queue_geometry:
         queue_geometry_weight = 0.
-    handoffs = turn_handoff_bonus is not None
+    rotation_budget = getattr(transitions, 'rotation_budget_enabled', False)
+    handoffs = turn_handoff_bonus is not None and not rotation_budget
     if handoffs and (not math.isfinite(turn_handoff_bonus) or turn_handoff_bonus < 0):
         raise ValueError("Turn handoff bonus must be finite and nonnegative")
-    track_priority = bool(bottom_quartile_weight or mismatch_window_weight) or handoffs or queue_geometry_weight != .5
+    track_priority = bool(bottom_quartile_weight or mismatch_window_weight) or handoffs or rotation_budget or queue_geometry_weight != .5
     if queue is None:
         if resume_from is not None:
             raise ValueError("Resume requires the saved search queue")
@@ -218,7 +269,7 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
     def context(depth, state, completion=None):
         key = ('latest-frame', depth, state_key(state))
         # Identical states can have different next-frame handoff candidates.
-        return pickle.dumps((*key, completion) if handoffs else key, protocol=5)
+        return pickle.dumps((*key, completion) if handoffs or rotation_budget else key, protocol=5)
 
     def sibling_order(choice):
         return choice.score, unsupported_state_update(choice.payload), choice.rank[1:]
@@ -269,7 +320,8 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
                 while queue.deferred_count and queue.minimum_deferred() <= width:
                     _, child = queue.pop_deferred(deserialize_state)
                     step = queue.last_step(child.path_id)
-                    cue = supported_completion(transitions.m, step) if handoffs else None
+                    cue = (transitions.rotation_context(step) if rotation_budget else
+                           supported_completion(transitions.m, step) if handoffs else None)
                     if offer(context(child.depth, child.state, cue), child):
                         stats['deferred_promoted'] += 1
                     if time.monotonic() - last_heartbeat >= progress_seconds:
@@ -305,12 +357,10 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
         frame = frames[node.depth]
         depth = node.depth + 1
         # A hold wins an equal-score tie with an unsupported state update.
-        choices = list(transitions(frame, node.state))
-        completion = supported_completion(transitions.m, incoming) if handoffs else None
-        if completion is not None:
-            handoff = score_handoff(transitions, frame, node.state, completion)
-            if handoff is not None:
-                choices.append(handoff)
+        completion = (transitions.rotation_context(incoming) if rotation_budget else
+                      supported_completion(transitions.m, incoming) if handoffs else None)
+        choices = (list(transitions.rotation_choices(frame, node.state, completion)) if rotation_budget else
+                   frame_choices(transitions, frame, node.state, completion))
         if branch_widths:
             choices.sort(key=sibling_order)
             siblings = set()
@@ -324,7 +374,8 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
                 stats['invalid_pruned'] += 1
                 continue
             step = dict(choice.payload, frame_index=frame, state_score=choice.score)
-            next_completion = supported_completion(transitions.m, step) if handoffs else None
+            next_completion = (transitions.rotation_context(step, completion) if rotation_budget else
+                               supported_completion(transitions.m, step) if handoffs else None)
             key = context(depth, choice.state, next_completion)
             if branch_widths:
                 if key in siblings:
@@ -358,7 +409,7 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
                 window = update_mismatch_window(window, step, mismatch_window_weight)
                 priority += step['window_mismatch_penalty']
                 recent = (recent, window)
-            if completion is not None and tuple(step.get('state_moves', ())) == completion_moves(completion):
+            if handoffs and completion is not None and (handoff_moves(step) or tuple(step.get('state_moves', ()))) == completion_moves(completion):
                 priority -= turn_handoff_bonus
                 step['turn_handoff_bonus'] = turn_handoff_bonus
             step['queue_priority'] = priority
@@ -393,6 +444,10 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     replay.add_nine_class_input_arguments(parser)
     parser.add_argument("--initial-scramble", required=True)
+    parser.add_argument('--max-tps', type=float, default=40.,
+                        help='Per-turn TPS limit, with simultaneous slabs measured independently (default: 40).')
+    parser.add_argument('--max-double-tps', type=float, default=50.,
+                        help='TPS limit for geometry-supported 180-degree spans (default: 50).')
     parser.add_argument("--frame-parity", choices=("both", "even", "odd", "all"), default="both",
                         help="Search both parities independently, one parity, or all input frames (default: both).")
     parser.add_argument("--start-frame", type=int, default=0)
@@ -423,9 +478,7 @@ def build_parser():
                         help="Add this weight times the mismatch rate of the lowest quartile of sticker histories.")
     parser.add_argument("--mismatch-window-weight", type=float, default=0.,
                         help="Weight for the pooled out-of-table mismatch rate over eight sampled frames.")
-    parser.add_argument("--turn-handoff-bonus", type=float, nargs="?", const=.02,
-                        help="Enable next-frame handoffs from supported partial turns over 12 degrees. "
-                             "Subtract the given bonus from matching commits (default when enabled: 0.02).")
+    parser.set_defaults(turn_handoff_bonus=None)
     parser.add_argument("--save-final-video", type=Path, help="Render the first solved pass.")
     parser.add_argument("--display", action="store_true", help="Display the first solved pass.")
     parser.add_argument("--render-source", type=Path, help="Override the original video for rendering.")
@@ -507,7 +560,9 @@ def main():
             or args.frontier_cache_size < 1 or args.cost_cache_size < 0 or args.score_cache_size < 0
             or args.sqlite_cache_mib < 1 or not math.isfinite(args.progress_seconds) or args.progress_seconds <= 0
             or args.search_seconds is not None and (not math.isfinite(args.search_seconds) or args.search_seconds <= 0)
-            or args.max_explored_states is not None and args.max_explored_states < 1):
+            or args.max_explored_states is not None and args.max_explored_states < 1
+            or not math.isfinite(args.max_tps) or args.max_tps <= 0
+            or not math.isfinite(args.max_double_tps) or args.max_double_tps < args.max_tps):
         parser.error("Invalid frame interval, cache size, or search limit")
     if not math.isfinite(args.bottom_quartile_weight) or args.bottom_quartile_weight < 0:
         parser.error("--bottom-quartile-weight must be finite and nonnegative")
@@ -567,6 +622,7 @@ def main():
         scorer_options = {}
         if mode == 'prepared':
             scorer_options['parallel_layers'] = bool(args.branch_widths)
+            scorer_options['geometry_shortlist_size'] = replay.GEOMETRY_SHORTLIST_SIZE
         if use_26m_confusions:
             scorer_options.update(color_confusion_scoring=True, tracked_color_confusions=confusion_table)
         if args.mismatch_window_weight:
@@ -591,6 +647,8 @@ def main():
         state_limit=args.max_explored_states, time_budget=args.search_seconds,
         input_fps=args.fps, video_frame_count=video_count, min_state_update_gap_frames=1,
         scorer=mode, device=args.device,
+        geometry_shortlist_size=getattr(scorer, 'geometry_shortlist_size', None),
+        geometry_tie_tolerance=replay.GEOMETRY_TIE_TOLERANCE,
         merge_key='frame,physical_state', reference_solution_used=False,
         script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     if args.branch_widths:
@@ -624,9 +682,20 @@ def main():
     summaries = {}
     winner = None
     for name, selected, fps in passes:
+        if mode == 'prepared':
+            scorer.configure_rotation_budget(selected, metadata.get('source_fps', args.fps), args.max_tps, args.max_double_tps)
         directory = args.output_dir / name if len(passes) > 1 else args.output_dir
         config = dict(common_config, frame_parity=name, sampled_frame_indices=selected,
                       start_frame=selected[0], end_frame=selected[-1], fps=fps)
+        if mode == 'prepared':
+            config.update(max_tps=args.max_tps, max_double_tps=args.max_double_tps,
+                rotation_degrees_per_second=90.*args.max_tps,
+                rotation_budgets_degrees=scorer.rotation_limits,
+                double_rotation_budgets_degrees=scorer.rotation_double_limits,
+                simultaneous_budget_policy="independent_relative_to_middle",
+                merge_key='frame,physical_state,residual_geometry')
+            config.pop('turn_handoff_bonus', None)
+            config.pop('turn_handoff_min_degrees', None)
         if args.branch_widths:
             static_count = bisect_right(selected, args.turning_start_frame) if args.turning_start_frame is not None else 0
             config['branch_stage_expansions'] = branch_stage_budget(
@@ -635,6 +704,8 @@ def main():
         try:
             for frame in selected:
                 scorer.prepare(frame)
+            if mode == 'prepared':
+                scorer.finalize_rotation_budgets()
         except (ValueError, OSError, KeyError) as error:
             parser.error(str(error))
         result = run_pass(args, directory, selected, scorer, initial, colors, config)

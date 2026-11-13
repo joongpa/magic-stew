@@ -275,7 +275,7 @@ STICKER_MASK_CONTAINMENT_THRESHOLD = 0.90
 PNP_TURN_MASK_CENTER_WEIGHT = 1.0
 POSE_CONTINUITY_REFERENCE_FPS = 30.0
 POSE_CONTINUITY_ANGULAR_SCALE_DEGREES = 90.0
-POSE_CONTINUITY_COLOR_WEIGHT = 0.2
+POSE_CONTINUITY_COLOR_WEIGHT = 0.8
 # Color contributes the same weight as each geometric term in the final turn
 # ranking. Geometry is landmark error plus the sticker-point term; color is
 # one minus the fraction of observed projected stickers with matching colors.
@@ -531,6 +531,10 @@ class StickerPnPCandidate:
     # Persistent center identities for display X+/Y+/Z+, including a rotated
     # initial scramble's color layout. These do not change solver coordinates.
     orientation_axis_center_labels: tuple[str, str, str] | None = None
+    # Retained geometry hypotheses include their own middle-frame camera pose
+    # and sticker assignments. State exploration only permutes these caches.
+    joint_geometry_candidates: tuple[dict, ...] = ()
+    joint_pose_diagnostics: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -913,6 +917,12 @@ def turn_trial_log_payload(trial: dict[str, object]) -> dict[str, object]:
         'sticker_observed_mask_hex', 'sticker_correct_mask_hex',
         'color_scoring', 'color_correct_count', 'color_confusion_count',
         'color_forbidden_count', 'color_confusion_cost', 'parallel_layers', 'layer_support',
+        'rotation_budget', 'rotation_context', 'previous_geometry_index',
+        'angular_travel_degrees', 'rotation_budget_degrees',
+        'joint_pose_fit', 'pose_rvec', 'pose_tvec',
+        'raw_keypoint_error', 'keypoint_scoring', 'keypoint_outlier_count',
+        'depth_fallback', 'recovery_source', 'recovery_score',
+        'pose_proposal_source',
     )
     result = {name: trial[name] for name in names if name in trial}
     for output, source in (
@@ -1697,7 +1707,7 @@ class MoveAccumulator:
         candidate_geometry = getattr(candidate, "cube_geometry_state", None)
         if candidate_geometry is not None:
             expected_geometry = (self._geometry_state.apply_moves(notations)
-                                 if search.get("handoff_commit") else self._geometry_state)
+                                 if search.get("handoff_commit") or search.get('rotation_budget') else self._geometry_state)
             if expected_geometry.signature() != candidate_geometry.signature():
                 # A candidate produced from a different committed state must
                 # never mutate the model or its displayed move history.
@@ -5199,8 +5209,38 @@ def _parallel_slab_entry(origin, directions, matrices, axis, layer):
     return np.where((entry <= exit + 1e-7) & np.all(~parallel | inside, axis=-1), entry, np.inf)
 
 
-def parallel_turn_frame_geometry(candidate, limit, axis, *, angles=None):
-    """Assemble cached slab projections, then test rays against all three slabs.
+@lru_cache(maxsize=3)
+def _parallel_slab_geometry(axis):
+    """Index slab landmarks and the quarter-turn aliases of their geometry."""
+    lattice = CUBE_LATTICE_OBJECT_POINTS_MM
+    layers, vertices = np.nonzero(np.abs(lattice[None, :, axis] -
+        (np.arange(3)[:, None] - 1) * CUBE_LAYER_SIZE_MM) <= CUBE_LAYER_SIZE_MM / 2 + 1e-4)
+    faces = _turn_gpu_static_geometry()
+    polygons, cubies = faces[2], faces[4]
+    face_layers = np.rint(cubies[:, axis] / CUBE_LAYER_SIZE_MM + 1).astype(np.intp)
+    quarter = np.rint(cv2.Rodrigues(np.eye(3)[axis] * np.pi / 2.)[0])
+    points = lattice[vertices]
+    distances = np.linalg.norm((points @ quarter.T)[:, None] - points[None], axis=-1)
+    distances = np.where(layers[:, None] == layers[None], distances, np.inf)
+    vertex_sources = distances.argmin(axis=1)
+    centers = polygons.mean(axis=1)
+    face_sources = np.linalg.norm((centers @ quarter.T)[:, None] - centers[None], axis=-1).argmin(axis=1)
+    return layers, vertices, face_layers, vertex_sources, face_sources
+
+
+def _torch_sticker_assignment_distances(torch, observed, centers, polygons, front_faces):
+    """Cache point containment and center distances for one set of projected slabs."""
+    edges = torch.roll(polygons, shifts=-1, dims=2) - polygons
+    relative = observed[None, None, :, None, :] - polygons[:, :, None, :, :]
+    cross = (edges[:, :, None, :, 0] * relative[..., 1]
+             - edges[:, :, None, :, 1] * relative[..., 0])
+    inside = (torch.all(cross >= -1e-4, dim=3) | torch.all(cross <= 1e-4, dim=3)).permute(0, 2, 1)
+    distances = torch.linalg.vector_norm(observed[None, :, None, :] - centers[:, None], dim=-1)
+    return torch.where(inside & front_faces[:, None], distances, torch.full_like(distances, float('inf')))
+
+
+def parallel_turn_frame_geometry(candidate, limit, axis, *, angles=None, middle_frame=False):
+    """Combine slab projections, pairwise occlusion, and cached observation fits.
 
     The exhaustive grid covers the three disjoint layers on a single axis.
     A surface lattice vertex on a seam belongs to both touching slabs, which
@@ -5213,20 +5253,21 @@ def parallel_turn_frame_geometry(candidate, limit, axis, *, angles=None):
     scale = projected_cube_diameter(candidate)
     if len(observed) < 3 or not len(centers) or not np.isfinite(scale) or scale <= 0.:
         return [], np.empty((0, len(centers)), dtype=np.uint8), np.empty((0, len(centers)), dtype=bool)
-    lattice = CUBE_LATTICE_OBJECT_POINTS_MM
-    layers, vertices = np.nonzero(np.abs(lattice[None, :, axis] -
-        (np.arange(3)[:, None] - 1) * CUBE_LAYER_SIZE_MM) <= CUBE_LAYER_SIZE_MM / 2 + 1e-4)
+    layers, vertices, face_layers, vertex_sources, face_sources = _parallel_slab_geometry(axis)
     faces = _turn_gpu_static_geometry()
-    polygons, cubies, normals = faces[2], faces[4], faces[5]
-    face_layers = np.rint(cubies[:, axis] / CUBE_LAYER_SIZE_MM + 1).astype(np.intp)
+    polygons, normals = faces[2], faces[5]
     if angles is None:
         values = np.arange(-45., 46., 15.)
+        projection_values = values[:-1]
+        shape_rows = np.r_[np.arange(len(projection_values)), 0]
         grid = np.asarray(tuple(product(range(len(values)), repeat=3)))
         grid = grid[np.any(values[grid] != 0., axis=1)]  # Flat geometry is shared with the legacy options.
     else:
         values, grid = np.unique(angles, return_inverse=True)
+        projection_values = values
+        shape_rows = np.arange(len(values))
         grid = grid.reshape(1, 3)
-    matrices = np.stack([cv2.Rodrigues(np.eye(3)[axis] * np.deg2rad(a))[0] for a in values])
+    matrices = np.stack([cv2.Rodrigues(np.eye(3)[axis] * np.deg2rad(a))[0] for a in projection_values])
     camera = -cv2.Rodrigues(candidate.rvec)[0].T @ np.asarray(candidate.tvec).reshape(3)
 
     def project(points):
@@ -5238,20 +5279,51 @@ def parallel_turn_frame_geometry(candidate, limit, axis, *, angles=None):
     def assemble(table, slab_ids):
         return table[grid[:, slab_ids], np.arange(len(slab_ids))]
 
-    def entries(rays):
-        return np.stack([_parallel_slab_entry(camera, rays, matrices[grid[:, layer]], axis, layer)
-                         for layer in range(3)], axis=-1)
+    def angle_aliases(table, sources):
+        # +45 and -45 share a surface. Keep both interpretations in physical
+        # sticker order so their discrete moves and handoff cues stay available.
+        return np.concatenate((table, table[0, sources][None])) if angles is None else table
 
-    points = lattice[vertices][None] @ matrices.transpose(0, 2, 1)
-    objects = assemble(points, layers)
-    projected = assemble(project(points), layers)
+    def visibility(objects, slab_ids, sources):
+        count, points = objects.shape[:2]
+        if angles is not None:
+            rays = assemble(objects, slab_ids) - camera
+            visible = np.ones((1, points), dtype=bool)
+            for layer in range(3):
+                entries = _parallel_slab_entry(camera, rays, matrices[grid[:, layer]], axis, layer)
+                visible &= entries >= 1. - 1e-5
+            return visible
+        rays = np.broadcast_to(objects[None] - camera, (count, count, points, 3)).reshape(count * count, points, 3)
+        blockers = np.repeat(matrices, count, axis=0)
+        visible = np.ones((len(grid), points), dtype=bool)
+        for layer in range(3):
+            entries = _parallel_slab_entry(camera, rays, blockers, axis, layer)
+            clear = entries.reshape(count, count, points) >= 1. - 1e-5
+            if angles is None:
+                clear = np.concatenate((clear, clear[:, 0, sources][:, None]), axis=1)
+            visible &= clear[shape_rows[grid[:, layer, None]], grid[:, slab_ids], np.arange(points)]
+        return visible
+
+    points = CUBE_LATTICE_OBJECT_POINTS_MM[vertices][None] @ matrices.transpose(0, 2, 1)
+    projected_points = project(points)
+    point_distances = np.linalg.norm(projected_points[:, :, None] - observed[None, None], axis=-1)
+    point_distances = angle_aliases(point_distances, vertex_sources)
+    if angles is None:
+        # Coincident seam landmarks can differ at roundoff scale under the
+        # quarter-turn permutation. Preserve their original inlier ownership.
+        endpoint = cv2.Rodrigues(np.eye(3)[axis] * np.deg2rad(values[-1]))[0]
+        endpoint_points = project(CUBE_LATTICE_OBJECT_POINTS_MM[vertices] @ endpoint.T)
+        point_distances[-1] = np.linalg.norm(endpoint_points[:, None] - observed[None], axis=-1)
+    distances = assemble(point_distances, layers).transpose(0, 2, 1)
+    visible = visibility(points, layers, vertex_sources)
+    objects = assemble(angle_aliases(points, vertex_sources), layers) if angles is not None else None
+    projected = assemble(angle_aliases(projected_points, vertex_sources), layers) if angles is not None else None
     point_normals = np.einsum('aij,nfj->anfi', matrices, CUBE_LATTICE_BOUNDARY_NORMALS[vertices])
     front = np.any(CUBE_LATTICE_BOUNDARY_FACE_MASK[vertices][None] & (
         np.sum(point_normals * (camera - points)[:, :, None, :], axis=-1) > 0), axis=-1)
-    visible = assemble(front, layers) & (entries(objects - camera).min(axis=-1) >= 1. - 1e-5)
+    visible &= assemble(angle_aliases(front, vertex_sources), layers)
     classes = CUBE_LATTICE_CLASS_IDS[vertices]
     observed_classes = candidate.assignment_observed_class_ids
-    distances = np.linalg.norm(projected[:, None] - observed[None, :, None], axis=-1)
     distances = np.where(visible[:, None], distances, np.inf)
     if PNP_ASSIGNMENT_MODE == 'class-aware' and observed_classes is not None:
         observed_classes = np.asarray(observed_classes).reshape(-1)
@@ -5263,35 +5335,59 @@ def parallel_turn_frame_geometry(candidate, limit, axis, *, angles=None):
     rows = np.arange(len(grid))[:, None]
     assigned_layers = layers[columns]
     active = values[grid] != 0.
-    key_mean, key_robust, p90, key_inliers, key_layer_inliers, _ = _gpu_keypoint_fit_metrics(
-        torch, torch.from_numpy(distances), None, torch.from_numpy(classes[columns]),
-        None, None, None, None, scale, limit, layer_mask=torch.from_numpy(active[rows, assigned_layers]))
-
     face_objects = np.einsum('aij,nkj->anki', matrices, polygons)
-    face_polygons = assemble(project(face_objects), face_layers)
+    face_polygons = project(face_objects)
     projected_centers = face_polygons.mean(axis=2)
     face_objects = face_objects.mean(axis=2)
     face_normals = np.einsum('aij,nj->ani', matrices, normals)
-    front_faces = assemble(np.sum(face_normals * (camera - face_objects), axis=-1) > 0, face_layers)
-    visible_centers = front_faces & (entries(assemble(face_objects, face_layers) - camera).min(axis=-1) >= 1. - 1e-5)
-    sticker_mean, sticker_robust, sticker_matches, sticker_layer_matches = _gpu_sticker_center_fit_metrics(
-        candidate, torch, torch.from_numpy(projected_centers), torch.from_numpy(visible_centers), scale, limit,
-        return_tensors=True, layer_mask=torch.from_numpy(active[:, face_layers]), return_layer_match_counts=True)
+    front_faces = np.sum(face_normals * (camera - face_objects), axis=-1) > 0
+    visible_centers = (assemble(angle_aliases(front_faces, face_sources), face_layers)
+                       & visibility(face_objects, face_layers, face_sources))
+    center_distances = np.linalg.norm(projected_centers[:, :, None] - centers[None, None], axis=-1)
+    center_distances = assemble(angle_aliases(center_distances, face_sources), face_layers).transpose(0, 2, 1)
+    assembled_centers = assemble(angle_aliases(projected_centers, face_sources), face_layers)
+    # The joint fitter absorbs each middle angle into its rigid pose. Normalize
+    # these rows using that pose's diameter too, without repeating projections.
+    groups = [(np.arange(len(grid)), scale, limit)]
+    if middle_frame:
+        rotation = cv2.Rodrigues(candidate.rvec)[0]
+        groups = []
+        for value in np.unique(values[grid[:, 1]]):
+            rvec = cv2.Rodrigues(rotation @ cv2.Rodrigues(np.eye(3)[axis]*np.deg2rad(value))[0])[0]
+            diameter = projected_cube_diameter(candidate, rvec=rvec)
+            groups.append((np.flatnonzero(values[grid[:, 1]] == value), diameter, limit*diameter/scale))
+    metrics = [np.empty(len(grid)) for _ in range(9)]
+    for indices, diameter, error_limit in groups:
+        key = _gpu_keypoint_fit_metrics(
+            torch, torch.from_numpy(distances[indices]), None, torch.from_numpy(classes[columns[indices]]),
+            None, None, None, None, diameter, error_limit,
+            layer_mask=torch.from_numpy(active[rows, assigned_layers][indices]))
+        sticker = _gpu_sticker_center_fit_metrics(
+            candidate, torch, torch.from_numpy(assembled_centers[indices]),
+            torch.from_numpy(visible_centers[indices]), diameter, error_limit,
+            return_tensors=True, layer_mask=torch.from_numpy(active[indices][:, face_layers]),
+            return_layer_match_counts=True, projected_distances=torch.from_numpy(center_distances[indices]))
+        for output, result in zip(metrics, (*key[:5], *sticker), strict=True):
+            output[indices] = result.numpy()
+    key_mean, key_robust, p90, key_inliers, key_layer_inliers, sticker_mean, sticker_robust, sticker_matches, sticker_layer_matches = metrics
 
     # Use the camera ray through each observation rather than the face center
     # so a partially occluded sticker can still explain a visible keypoint.
     normalized = cv2.undistortPoints(centers, candidate.camera_matrix, candidate.dist_coeffs).reshape(-1, 2)
     rays = np.column_stack((normalized, np.ones(len(centers)))) @ cv2.Rodrigues(candidate.rvec)[0]
-    depths = entries(np.broadcast_to(rays, (len(grid), *rays.shape)))
+    depths = np.stack([_parallel_slab_entry(camera, np.broadcast_to(rays, (len(matrices), *rays.shape)),
+                                          matrices, axis, layer)[shape_rows[grid[:, layer]]]
+                       for layer in range(3)], axis=-1)
     nearest_depth = depths.min(axis=-1, keepdims=True)
     exposed = np.isfinite(depths) & (depths <= nearest_depth + 1e-6)
-    cache = {}
-    _gpu_sticker_color_fit_metrics(candidate, torch, torch.from_numpy(projected_centers),
-        torch.from_numpy(face_polygons), torch.from_numpy(front_faces), faces[-1], scale, limit,
-        np.ones((54, len(centers))), assignment_cache=cache,
-        observation_visibility=torch.from_numpy(exposed[:, :, face_layers]))
-    nearest, valid, _ = cache['value']
-    nearby = np.linalg.norm(projected_centers[:, None] - centers[None, :, None], axis=-1) < limit
+    assignment_distances = _torch_sticker_assignment_distances(torch, torch.from_numpy(centers),
+        torch.from_numpy(projected_centers), torch.from_numpy(face_polygons), torch.from_numpy(front_faces))
+    assignment_distances = angle_aliases(assignment_distances.numpy().transpose(0, 2, 1), face_sources)
+    assignment_distances = assemble(assignment_distances, face_layers).transpose(0, 2, 1)
+    assignment_distances = np.where(exposed[:, :, face_layers], assignment_distances, np.inf)
+    nearest = assignment_distances.argmin(axis=2)
+    valid = np.isfinite(np.take_along_axis(assignment_distances, nearest[:, :, None], axis=2)[:, :, 0])
+    nearby = center_distances < limit
     layer_support = tuple(
         ((assigned_layers == layer) & (distances <= limit)).sum(axis=1) +
         np.any(nearby & visible_centers[:, None] & (face_layers == layer), axis=2).sum(axis=1)
@@ -5314,7 +5410,7 @@ def parallel_turn_frame_geometry(candidate, limit, axis, *, angles=None):
                           assignment_object_points=objects[i, columns[i]],
                           assignment_projected_class_ids=classes[columns[i]])
         options.append(option)
-    return options, nearest.numpy().astype(np.uint8), valid.numpy()
+    return options, nearest.astype(np.uint8), valid
 
 
 def _gpu_sticker_center_fit_metrics(
@@ -5328,6 +5424,7 @@ def _gpu_sticker_center_fit_metrics(
     return_tensors: bool = False,
     layer_mask: object | None = None,
     return_layer_match_counts: bool = False,
+    projected_distances: object | None = None,
 ) -> tuple[object, ...]:
     """Score batched sticker centers with accelerator-resident nearest matching.
 
@@ -5363,10 +5460,11 @@ def _gpu_sticker_center_fit_metrics(
     observed_t = torch.as_tensor(observed, dtype=projected_face_centers.dtype, device=projected_face_centers.device)
     uncertainty_t = torch.as_tensor(uncertainties, dtype=projected_face_centers.dtype, device=projected_face_centers.device)
     weight_t = torch.as_tensor(weights, dtype=projected_face_centers.dtype, device=projected_face_centers.device)
-    distances = torch.linalg.vector_norm(
-        observed_t[None, :, None, :] - projected_face_centers[:, None, :, :],
-        dim=-1,
-    )
+    distances = projected_distances
+    if distances is None:
+        distances = torch.linalg.vector_norm(
+            observed_t[None, :, None, :] - projected_face_centers[:, None, :, :], dim=-1,
+        )
     distances = torch.where(visible_faces[:, None, :], distances, torch.full_like(distances, float("inf")))
     gate = max_error / scale
     tolerance = torch.minimum(
@@ -5492,21 +5590,10 @@ def _gpu_sticker_color_fit_metrics(
         if cached is None:
             observed_t = torch.as_tensor(observed, dtype=projected_face_centers.dtype,
                                          device=projected_face_centers.device)
-            polygons = projected_face_polygons
-            edges = torch.roll(polygons, shifts=-1, dims=2) - polygons
-            relative = observed_t[None, None, :, None, :] - polygons[:, :, None, :, :]
-            cross = (edges[:, :, None, :, 0] * relative[..., 1]
-                     - edges[:, :, None, :, 1] * relative[..., 0])
-            inside = (torch.all(cross >= -1e-4, dim=3)
-                      | torch.all(cross <= 1e-4, dim=3)).permute(0, 2, 1)
-            distances = torch.linalg.vector_norm(
-                observed_t[None, :, None, :] - projected_face_centers[:, None, :, :], dim=-1,
-            )
-            visible = inside & visible_faces[:, None, :]
+            distances = _torch_sticker_assignment_distances(torch, observed_t, projected_face_centers,
+                                                            projected_face_polygons, visible_faces)
             if observation_visibility is not None:
-                visible &= observation_visibility
-            distances = torch.where(visible, distances,
-                                    torch.full_like(distances, float("inf")))
+                distances = torch.where(observation_visibility, distances, torch.full_like(distances, float('inf')))
             nearest_distance, nearest = torch.min(distances, dim=2)
             valid = torch.isfinite(nearest_distance)
             if configuration_mapping is not None:
@@ -7347,6 +7434,10 @@ def _candidate_with_turn_trial(
 ) -> StickerPnPCandidate:
     """Apply one cached geometry/color trial to a diagnostic candidate."""
 
+    if trial.get('pose_rvec') is not None:
+        static_candidate = replace(static_candidate,
+            rvec=np.asarray(trial['pose_rvec'], dtype=float).reshape(3, 1),
+            tvec=np.asarray(trial['pose_tvec'], dtype=float).reshape(3, 1))
     if trial.get('orientation_symmetry') is not None:
         static_candidate = transform_candidate_by_symmetry(
             static_candidate, np.asarray(trial['orientation_symmetry'], dtype=np.float64),
@@ -9186,6 +9277,7 @@ def draw_projected_cube_pose(
     thickness: int,
     outline: bool = False,
     image_offset: tuple[int, int] = (0, 0),
+    uniform_color: bool = False,
 ) -> bool:
     """Draw a corrected 3x3 Rubik's-cube wireframe."""
 
@@ -9198,7 +9290,7 @@ def draw_projected_cube_pose(
     image_offset_array = np.asarray(image_offset, dtype=np.float32).reshape(1, 2)
     for _depth, projected_face, anchor in projected_faces:
         projected_face = np.round(projected_face + image_offset_array).astype(np.int32)
-        face_color = projected_cube_layer_color(candidate, anchor, color)
+        face_color = color if uniform_color else projected_cube_layer_color(candidate, anchor, color)
         for index in range(4):
             start = tuple(int(value) for value in projected_face[index])
             end = tuple(int(value) for value in projected_face[(index + 1) % 4])
@@ -9566,6 +9658,7 @@ def turn_candidate_log_record(
         ),
         "search_pose": search_pose,
         "selected_pose": selected_pose,
+        "joint_pose": getattr(candidate, 'joint_pose_diagnostics', None),
         "pose_continuity": getattr(candidate, "pose_continuity_diagnostics", None),
         "candidate_count": len(candidates),
         "candidates": candidates,
@@ -10344,6 +10437,13 @@ def render_frame(
     move_accumulator: MoveAccumulator | None = None,
 ) -> tuple[np.ndarray, str, int]:
     height, width = frame.shape[:2]
+    if cached_final_only and neural_data is not None and neural_data.pose_ready and getattr(args, 'wireframe_only', False):
+        output = frame.copy()
+        pose = neural_data.pose_candidate
+        if pose is not None:
+            draw_projected_cube_pose(output, pose, pose.rvec, pose.tvec,
+                                     (255, 255, 0), 1, outline=True, uniform_color=True)
+        return output, neural_data.roi_source, len(neural_data.local_points)
 
     def overlay_sticker_masks(output: np.ndarray, pose: StickerPnPCandidate | None = None) -> np.ndarray:
         if not getattr(args, "show_colored_masks", False) or pose is None:
@@ -10932,7 +11032,7 @@ def draw_fps_counter(
 ) -> np.ndarray:
     """Draw the processing/loop FPS indicator in the upper-left corner."""
 
-    if not args.show_fps:
+    if not args.show_fps or getattr(args, 'wireframe_only', False):
         return image
     fps_y = 44 if args.show_status else 22
     cv2.putText(
@@ -11178,7 +11278,7 @@ def run_cached_video_pass(
     smoothed_loop_fps = None
     smoothed_processing_fps = None
     completed = True
-    move_accumulator = MoveAccumulator()
+    move_accumulator = MoveAccumulator() if args.recognize_moves else None
     try:
         total_frames = len(cache)
         for record_index, record in enumerate(cache, start=1):
@@ -11340,7 +11440,7 @@ class RigidPoseMatches:
 def _rigid_pose_observations(
     record: NeuralFrameData, args: argparse.Namespace,
 ) -> RigidPoseObservations | None:
-    if record.roi_xyxy is None:
+    if getattr(record, 'roi_xyxy', None) is None:
         return None
     use = usable_pose_points(record.local_points, record.point_confidences, record.class_ids,
                             record.box_confidences, args.keypoint_conf, args.pose_class_conf)
@@ -12503,8 +12603,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Draw the cube pose during the final cached pass.",
     )
     parser.add_argument(
+        '--joint-pose-geometry', action=argparse.BooleanOptionalAction, default=True,
+        help='Refine the middle-frame pose together with relative outer-slab angles.',
+    )
+    parser.add_argument('--wireframe-only', action='store_true',
+        help='Draw only the fitted cube wireframe in the final video.')
+    parser.add_argument('--joint-depth-fallback', action=argparse.BooleanOptionalAction, default=True,
+        help='Recover sparse joint fits with implausible depth jumps after the baseline pass.')
+    parser.add_argument(
         "--pose-smoothing", action=argparse.BooleanOptionalAction, default=True,
-        help="Use mixed seeds, nearby poses, and face evidence to fit the cached video trajectory.",
+        help="Refit articulated measurements with nearby middle-frame pose priors.",
     )
     parser.add_argument(
         "--show-orientation-axes",
@@ -12535,6 +12643,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--search-seconds", type=float, default=300.,
                         help="Search-only time limit per full-search pass (default: 300).")
+    parser.add_argument('--max-tps', type=float, default=40.,
+                        help='Per-turn TPS limit, with simultaneous slabs measured independently (default: 40).')
+    parser.add_argument('--max-double-tps', type=float, default=50.,
+                        help='TPS limit for geometry-supported 180-degree spans (default: 50).')
     parser.add_argument("--branch-widths", type=int, nargs="+", default=(3,),
                         help="Per-parent child cutoffs including ties (default: 3).")
     parser.add_argument("--branch-stage-expansions", type=int,
@@ -12615,7 +12727,29 @@ def process_cached_poses(
 ) -> None:
     """Recover poses and optional moves directly from the cached model predictions."""
     needs_pose = args.show_pnp or args.recognize_moves or args.show_colored_masks
-    if needs_pose:
+    if needs_pose and getattr(args, 'joint_pose_geometry', True):
+        from scripts.independent_keypoint_pose_geometry import process_pose_geometry
+
+        stages = ['joint pose/geometry refinement']
+        if getattr(args, 'pose_smoothing', True):
+            stages.append('joint trajectory refit')
+        stages.append('orientation matching')
+        last_update = 0.
+
+        def progress(label, completed, total):
+            nonlocal last_update
+            now = perf_counter()
+            if completed < total and now - last_update < .5:
+                return
+            fraction = completed / total if total else 1.
+            percent = 100. * (stages.index(label) + fraction) / len(stages)
+            print(f'\rPreparing poses {percent:5.1f}%'.ljust(53), end='', flush=True)
+            last_update = now
+
+        process_pose_geometry(sys.modules[__name__], cache, args, known_initial_colors,
+                              source_fps, progress=progress)
+        print()
+    elif needs_pose:
         smoothing = len(cache) >= 3 and getattr(args, "pose_smoothing", True)
         stages = ['pose refinement']
         if smoothing:
@@ -12657,7 +12791,8 @@ def process_cached_poses(
         if not args.display:
             print()
     if args.recognize_moves:
-        from scripts.independent_keypoint_video_search import run_cached_full_search
+        from scripts.independent_keypoint_video_search import \
+            run_cached_full_search
 
         try:
             run_cached_full_search(sys.modules[__name__], cache, args, known_initial_colors, source_fps)
@@ -12668,6 +12803,9 @@ def process_cached_poses(
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if (not np.isfinite(args.max_tps) or args.max_tps <= 0
+            or not np.isfinite(args.max_double_tps) or args.max_double_tps < args.max_tps):
+        parser.error('TPS limits must be finite, positive, and double TPS must be at least single TPS')
     if not np.isfinite(args.search_seconds) or args.search_seconds <= 0:
         parser.error("--search-seconds must be positive and finite")
     if any(width < 1 for width in args.branch_widths) or any(

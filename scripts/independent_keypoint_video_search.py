@@ -81,11 +81,15 @@ def search_cached_records(renderer, records, args, colors, source_fps):
         print(f"Full search {name} pass ({mode}, {len(search_frames)} frames at {fps:.3f} fps, "
               f"widths {schedule})", flush=True)
         for index, frame in enumerate(search_frames, start=1):
+            if index == 1:
+                scorer.configure_rotation_budget(search_frames, source_fps, getattr(args, 'max_tps', 40.),
+                    getattr(args, 'max_double_tps', 50.))
             scorer.prepare(frame)
             if not args.display:
                 renderer.print_headless_progress("compiling search observations", index, len(search_frames))
         if not args.display:
             print()
+        scorer.finalize_rotation_budgets()
         if anchor is not None:
             result = bidirectional.bidirectional_search(
                 scorer, search_frames, initial, goals, width=16, retries=0, overlap=0,
@@ -142,6 +146,12 @@ def apply_search_result(renderer, cache, records, result, colors, turning_start_
                 candidate = playback.candidate_for_step(renderer, source, step, state, colors)
                 diagnostics.update(handoff_commit=bool(step.get("handoff_commit")),
                                    sibling_rank=step.get("sibling_rank"), queue_priority=step["queue_priority"])
+                if step.get('handoff_commit'):
+                    diagnostics.update(handoff_moves=frame_search.handoff_moves(step),
+                                       frame_state_moves=frame_search.current_frame_moves(step))
+                if step.get('rotation_budget'):
+                    diagnostics.update({key: step[key] for key in ('rotation_budget', 'rotation_context',
+                        'previous_geometry_index', 'angular_travel_degrees', 'rotation_budget_degrees') if key in step})
                 candidate = replace(candidate, turn_fit_evaluated=True, turn_candidate_diagnostics=(dict(step),))
             elif goal is not None and frame > goal:
                 candidate = renderer.match_orientation_to_colors(candidate, colors)

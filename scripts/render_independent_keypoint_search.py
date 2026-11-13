@@ -49,7 +49,7 @@ def candidate_for_step(m, record, step, state, colors, *, after_solution=False):
         return None
     centers = {colors[i.label]: i.label for i in m.canonical_sticker_identities()
                if i.category == "center"}
-    if (step or {}).get("handoff_commit"):
+    if (step or {}).get("handoff_commit") or (step or {}).get('rotation_budget'):
         state = state.apply_moves(tuple(step["state_moves"]))
     observed = np.asarray(pose.get("assignment_image_points") or [], dtype=float).reshape(-1, 2)
     candidate = m.StickerPnPCandidate(
@@ -83,10 +83,22 @@ def candidate_for_step(m, record, step, state, colors, *, after_solution=False):
                      keypoint_error=step.get("keypoint_mean_error", float("inf")),
                      sticker_error=step.get("heatmap_mean_error", float("inf")),
                      combined_mean_error=step["state_score"])
+        if step.get('handoff_commit') or step.get('rotation_budget'):
+            # Both commits are already in the displayed state. Keep only the
+            # current residual rotation; never apply its color offset twice.
+            trial['color_offset'] = 0.
+            trial['parallel_layers'] = False
         candidate = m._candidate_with_turn_trial(candidate, candidate, trial)
         base = static_assignments(m, replace(candidate, layer_rotations=(),
                                              sticker_layer_rotations=None))
-        if step.get('parallel_layers'):
+        if step.get('joint_pose_fit'):
+            options = record['search']['geometry']['options']
+            cached = options[step['geometry_option_index']]
+            candidate = replace(candidate,
+                assignment_object_points=np.asarray(cached['assignment_object_points']),
+                assignment_projected_points=np.asarray(cached['assignment_projected_points']),
+                assignment_projected_class_ids=np.asarray(cached['assignment_projected_class_ids']))
+        elif step.get('parallel_layers'):
             options, _, _ = m.parallel_turn_frame_geometry(
                 base, m.PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * m.projected_cube_diameter(base),
                 step['layer_axis'], angles=m.parallel_layer_angles(candidate.layer_rotations))
@@ -199,7 +211,8 @@ def render_result(m, records, result, source, *, output_path=None, display=False
                 image, _ = m.draw_pose(image, points, ones, classes, ones, 0., {}, False, False)
             moves = tuple(step.get("state_moves", ())) if step else ()
             observation = (replace(candidate, cube_geometry_state=state_before)
-                           if candidate is not None and step and step.get("handoff_commit") else candidate)
+                           if candidate is not None and step and
+                           (step.get("handoff_commit") or step.get('rotation_budget')) else candidate)
             if bridged:
                 accumulator.observe_unobserved_moves(moves, sticker_color_names=colors)
             else:
@@ -283,7 +296,9 @@ def render_result(m, records, result, source, *, output_path=None, display=False
                     'compensatory_beam_start_frame', 'compensatory_beam_end_frame',
                     'compensatory_beam_trigger', 'compensatory_beam_phase',
                     'compensatory_beam_level', 'bottom_quartile_match_rate',
-                    'bottom_quartile_penalty', 'handoff_commit', 'turn_handoff_bonus') if step and key in step}
+                    'bottom_quartile_penalty', 'handoff_commit', 'handoff_moves',
+                    'frame_state_moves', 'turn_handoff_bonus', 'rotation_budget', 'rotation_context',
+                    'previous_geometry_index', 'angular_travel_degrees', 'rotation_budget_degrees') if step and key in step}
                 forced_static = (step or {}).get("observation_status") == "turning_start_frame"
                 search_status = ('unreliable_frame_bridge' if bridged else
                                  "forced_static" if forced_static else

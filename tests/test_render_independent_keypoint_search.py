@@ -102,6 +102,59 @@ def test_parallel_sticker_assignment_uses_the_frontmost_slab(m):
     assert m.canonical_sticker_identities()[face].label == 'E02 UF/F'
 
 
+@pytest.mark.parametrize('axis', range(3))
+@pytest.mark.parametrize('camera_x', [0., 9.166666666666666, 75.])
+def test_parallel_grid_matches_individual_fits_with_side_on_and_oblique_views(m, axis, camera_x):
+    fixed = record(m)
+    fixed['search_pose']['rvec'] = [[0.], [0.], [0.]]
+    fixed['search_pose']['tvec'] = [[camera_x], [0.], [200.]]
+    candidate = video.candidate_for_step(m, fixed, None, m.CubeGeometryState.identity(),
+                                         video.replay.initial_sticker_colors(m, ''))
+    objects, classes = m.visible_cube_lattice_points(candidate.rvec, candidate.tvec)
+    observed, _ = cv2.projectPoints(objects, candidate.rvec, candidate.tvec,
+                                    candidate.camera_matrix, candidate.dist_coeffs)
+    faces = m.projected_sticker_faces(candidate, candidate.rvec, candidate.tvec)
+    candidate = replace(candidate, assignment_image_points=observed.reshape(-1, 2),
+                        assignment_observed_class_ids=classes,
+                        sticker_mask_centers=tuple(quad.mean(axis=0) for _, _, quad in faces))
+    limit = .05 * m.projected_cube_diameter(candidate)
+    options, nearest, valid = m.parallel_turn_frame_geometry(candidate, limit, axis)
+    assert len(options) == 7 ** 3 - 1
+    indices = {m.parallel_layer_angles(option['layer_rotations']): i for i, option in enumerate(options)}
+    for angles in ((-45., 0., 45.), (30., -15., -45.), (-45., -45., -45.),
+                   (0., 45., 0.), (15., -30., 30.), (45., 45., 0.)):
+        single, single_nearest, single_valid = m.parallel_turn_frame_geometry(candidate, limit, axis, angles=angles)
+        index = indices[angles]
+        np.testing.assert_array_equal(nearest[index], single_nearest[0])
+        np.testing.assert_array_equal(valid[index], single_valid[0])
+        for key, expected in single[0].items():
+            if key.startswith('assignment_'):
+                continue
+            if isinstance(expected, float):
+                assert options[index][key] == pytest.approx(expected, abs=2e-12)
+            else:
+                assert options[index][key] == expected
+
+
+def test_parallel_ray_intersections_scale_with_angle_pairs(m, monkeypatch):
+    candidate = video.candidate_for_step(m, record(m), None, m.CubeGeometryState.identity(),
+                                         video.replay.initial_sticker_colors(m, ''))
+    faces = m.projected_sticker_faces(candidate, candidate.rvec, candidate.tvec)
+    candidate = replace(candidate, sticker_mask_centers=tuple(quad.mean(axis=0) for _, _, quad in faces))
+    batches = []
+    intersect = m._parallel_slab_entry
+
+    def counted(origin, directions, matrices, axis, layer):
+        batches.append(len(matrices))
+        return intersect(origin, directions, matrices, axis, layer)
+
+    monkeypatch.setattr(m, '_parallel_slab_entry', counted)
+    m.parallel_turn_frame_geometry(candidate, .05 * m.projected_cube_diameter(candidate), 0)
+    assert len(batches) == 9
+    assert max(batches) <= 6 ** 2
+    assert batches[-3:] == [6] * 3
+
+
 def test_parallel_actions_preserve_exact_sticker_identities_when_reoriented(m):
     state = m.CubeGeometryState.identity().apply_moves(('R', 'U', 'F'))
     actions = set().union(*(m.parallel_turn_actions(axis) for axis in range(3)))
@@ -113,14 +166,15 @@ def test_parallel_actions_preserve_exact_sticker_identities_when_reoriented(m):
             assert actual.facelets == expected.facelets
 
 
-def test_parallel_handoff_completes_only_supported_uncommitted_layers(m):
+def test_parallel_handoff_keeps_same_direction_continuations_and_checks_support(m):
     from scripts.search_independent_keypoint_frame import supported_completion
 
     trial = dict(parallel_layers=True, layer_axis=2, state_moves=('E',), layer_support=(3, 3, 3),
                  layer_rotations=[m.layer_rotation_payload(r) for r in
                                   m.parallel_layer_rotations(2, (30., 30., -30.))])
-    assert supported_completion(m, trial) == ('D', 'U')
-    assert supported_completion(m, dict(trial, layer_support=(3, 3, 0))) == 'D'
+    assert supported_completion(m, trial) == ('D', 'E', 'U')
+    assert supported_completion(m, dict(trial, state_moves=("E'",))) == ('D', 'U')
+    assert supported_completion(m, dict(trial, layer_support=(3, 0, 0))) == 'D'
 
 
 @pytest.mark.parametrize(('axis', 'outer_anchor', 'moving_anchor'), [
@@ -256,6 +310,40 @@ def test_render_handoff_uses_post_commit_colors_and_logs_move_once(m, tmp_path):
     assert accumulator.solved_frame_index == 0
 
 
+@pytest.mark.parametrize('mode', ['legacy_handoff', 'parallel_handoff', 'rotation_budget'])
+def test_composed_commits_render_once_and_only_the_residual(m, tmp_path, mode):
+    source = tmp_path / 'input.avi'
+    writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*'MJPG'), 25., (256, 256))
+    writer.write(np.zeros((256, 256, 3), dtype=np.uint8))
+    writer.release()
+    turn = dict(step(m, angle=33., offset=-90.), frame_index=0, state_moves=['F', 'D'],
+        handoff_commit=True, handoff_moves=['F'], frame_state_moves=['D'], queue_priority=.08,
+        layer_axis=2, layer_side=-1, layer_rotations=[dict(axis=2, side=-1, angle_degrees=33., layer_count=1)])
+    if mode != 'legacy_handoff':
+        turn.update(parallel_layers=True, layer_support=(3, 0, 0), color_offset=0.)
+    if mode == 'rotation_budget':
+        for name in ('handoff_commit', 'handoff_moves', 'frame_state_moves'):
+            turn.pop(name)
+        turn.update(rotation_budget=True, rotation_context=0, previous_geometry_index=0,
+                    angular_travel_degrees=120., rotation_budget_degrees=120.)
+    config = dict(initial_scramble="D' F'", fps=25.)
+    colors = video.replay.initial_sticker_colors(m, config['initial_scramble'])
+    before = m.CubeGeometryState.identity()
+    candidate = video.candidate_for_step(m, record(m), turn, before, colors)
+    assert candidate.cube_geometry_state.signature() == before.apply_moves(('F', 'D')).signature()
+    assert candidate.sticker_layer_rotations[0].angle_degrees == 33.
+    assert candidate.turn_state_moves == ('F', 'D')
+    result = dict(status='solved', solved_frame_index=0, config=config, steps=[turn])
+    report = video.render_result(m, {0: record(m)}, result, source, turn_log=tmp_path / 'turns.jsonl')
+    assert report['committed_moves'] == ['F', 'D']
+    from scripts.independent_keypoint_video_search import apply_search_result
+    cache = [SimpleNamespace(frame_index=0, pose_candidate=video.candidate_for_step(m, record(m), None, before, colors))]
+    apply_search_result(m, cache, {0: record(m)}, result, colors, None, None)
+    accumulator = m.MoveAccumulator()
+    accumulator.observe(cache[0].pose_candidate, sticker_color_names=colors)
+    assert accumulator.moves == ['F', 'D']
+
+
 @pytest.mark.parametrize(("frame_count", "mode"), [(4, "forward"), (7, "bidirectional")])
 @pytest.mark.parametrize(('scramble', 'solution'), [('R', ("R'",)), ('M', ("M'",)), ('D U', ("D'", "U'"))])
 def test_cached_renderer_recognizes_a_complete_solve(m, tmp_path, monkeypatch, capsys, frame_count, mode,
@@ -266,25 +354,42 @@ def test_cached_renderer_recognizes_a_complete_solve(m, tmp_path, monkeypatch, c
         "--no-pose-smoothing", "--turning-start-frame", "1", "--search-seconds", "5",
     ])
     args.turn_candidate_log = tmp_path / "turns.jsonl"
+    args.joint_pose_geometry = False  # This test supplies already fitted rigid poses.
     colors = video.replay.initial_sticker_colors(m, args.initial_scramble)
     start = m.CubeGeometryState.identity()
     base = video.candidate_for_step(m, record(m), None, start, colors)
     cache = []
     for frame in range(frame_count):
-        state = start if frame < 3 else start.apply_moves(solution)
+        # Two complete quarters need separate intervals under the 120° bound.
+        completed = max(0, frame - 3 + len(solution))
+        state = start.apply_moves(solution[:completed])
         projected = m.projected_sticker_faces(replace(base, cube_geometry_state=state), base.rvec, base.tvec)
         candidate = m.attach_color_keypoints(base, np.asarray([quad.mean(axis=0) for _, _, quad in projected]),
                                              tuple(colors[identity.label] for identity, _, _ in projected))
         cache.append(SimpleNamespace(frame_index=frame, pose_candidate=candidate))
 
-    m.process_cached_poses(cache, args, colors, source_fps=25.)
+    # Slice-relative slab motions now have independent budgets, so the same
+    # source interval accommodates face, slice and simultaneous quarters.
+    source_fps = 25.
+    m.process_cached_poses(cache, args, colors, source_fps=source_fps)
 
     output = capsys.readouterr().out
     assert f"({mode}" in output and "widths 3)" in output
     accumulator = m.MoveAccumulator()
     for frame in cache:
         accumulator.observe(frame.pose_candidate, sticker_color_names=colors)
-    assert tuple(accumulator.moves) == solution
+    expected = m.CubeGeometryState.identity().apply_moves(solution)
+    actual = m.CubeGeometryState.identity().apply_moves(accumulator.moves)
+    assert actual.is_solved(colors)
+    assert any(m._geometry_state_under_symmetry(actual, symmetry).facelets == expected.facelets
+               for symmetry in m.CUBE_SYMMETRY_MATRICES)
+    # Assigning a slice's middle-frame orientation can express the same update
+    # as two opposing face turns. They consume the same relative-angle budget.
+    def quarter_cost(moves):
+        return sum((2 if move[0] in 'MES' else 1) * (2 if move.endswith('2') else 1)
+                   for move in moves)
+
+    assert quarter_cost(accumulator.moves) == quarter_cost(solution)
     assert accumulator.solved_frame_index == 3
     rows = [json.loads(line) for line in args.turn_candidate_log.read_text().splitlines()]
     assert [row["frame_index"] for row in rows] == list(range(frame_count))

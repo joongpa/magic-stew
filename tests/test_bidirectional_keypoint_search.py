@@ -89,6 +89,87 @@ def test_independent_widening_releases_prefix_and_verifies_handoff():
     assert all(row[row["direction"] + "_expanded"] == 1 for row in widened)
 
 
+def test_geometry_shortlist_keeps_a_handoff_missing_from_current_frame_actions():
+    class GeometryRenderer(Renderer):
+        @staticmethod
+        def parallel_turn_actions(axis):
+            return {('R',): (0., 0., 90.), ("R'",): (0., 0., -90.)} if axis == 0 else {}
+
+    class GeometryScorer(Scorer):
+        m = GeometryRenderer()
+        geometry_shortlist_size = 3
+
+        @staticmethod
+        def frame_actions(frame):
+            return frozenset({('R',)}) if frame == 0 else frozenset()
+
+        def score_action(self, frame, state, action):
+            assert action in self.frame_actions(frame)
+            return tuple(choice for choice in self(frame, state) if choice.payload['state_moves'] == action)
+
+    result = bidirectional_search(GeometryScorer(), (0, 1), b'\x00', (b'\x01',), width=1,
+        retries=0, overlap=0, time_limit=5, state_limit=20, handoff_bonus=.02,
+        branch_widths=(1, 2), branch_stage_expansions=1, progress=lambda row: None)
+    assert result['status'] == 'solved'
+    assert result['steps'][1]['handoff_commit']
+    assert result['steps'][1]['state_moves'] == ('R',)
+
+
+@pytest.mark.parametrize('widths', [(), (3,)])
+def test_reverse_search_and_join_compose_a_handoff_with_the_current_turn(widths):
+    m = replay.load_renderer()
+
+    class ComposedScorer:
+        parallel_layers = True
+        geometry_shortlist_size = 5
+
+        @staticmethod
+        def hold_reason(frame):
+            return None
+
+        @staticmethod
+        def frame_actions(frame):
+            return frozenset({('F',), ("F'",)}) if frame == 0 else frozenset({('D',), ("D'",)})
+
+        @staticmethod
+        def apply_moves(state, moves):
+            value = list(state)
+            for move in moves:
+                axis = 0 if move.startswith('F') else 1
+                value[axis] = (value[axis] + (-1 if move.endswith("'") else 1)) % 4
+            return bytes(value)
+
+        def __call__(self, frame, state):
+            if frame == 0 and state == b'\0\0':
+                return (replay.Transition(state, 0., (0.,), dict(state_moves=(), color_error=0.,
+                    layer_inlier_count=3, geometry_option_index=0, label='partial F',
+                    layer_rotations=[dict(axis=1, side=-1, angle_degrees=-30., layer_count=1)])),)
+            if frame == 1 and state == b'\1\0':
+                return (replay.Transition(b'\1\1', .1, (.1,), dict(state_moves=('D',), color_error=0.,
+                    layer_inlier_count=3, geometry_option_index=1, label='partial D', color_offset=-90.,
+                    layer_rotations=[dict(axis=2, side=-1, angle_degrees=33., layer_count=1)])),)
+            return ()
+
+        def score_hold(self, frame, state):
+            return next((choice for choice in self(frame, state) if not choice.payload['state_moves']), None)
+
+        def score_action(self, frame, state, action):
+            return tuple(choice for choice in self(frame, state) if choice.payload['state_moves'] == action)
+
+    scorer = ComposedScorer()
+    scorer.m = m
+    result = bidirectional_search(scorer, (0, 1), b'\0\0', (b'\1\1',), width=3,
+        retries=0, overlap=0, time_limit=5, state_limit=20, handoff_bonus=.02,
+        branch_widths=widths, progress=lambda row: None)
+    assert result['status'] == 'solved'
+    step = result['steps'][1]
+    assert step['state_moves'] == ('F', 'D')
+    assert step['handoff_moves'] == ('F',)
+    assert step['frame_state_moves'] == ('D',)
+    assert step['queue_priority'] == pytest.approx(-.02)
+    assert result['join_depth'] == 1
+
+
 @pytest.mark.parametrize('direction', [0, 1])
 @pytest.mark.parametrize('widths', [(3,), (2, 3)])
 def test_widening_join_keeps_full_tie_at_branch_cutoff(direction, widths):

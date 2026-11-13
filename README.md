@@ -428,20 +428,51 @@ rotations (`x/y/z`), in the white-top/U, green-front/F frame. `--known-scramble`
 is an alias. Use `--model PATH` to override the checkpoint; it must predict the
 three landmark classes and six colors.
 
-Detections are filtered by `boxes.conf` and keypoint confidence. Defaults are
+Detections are filtered by pose-model object scores (`boxes.conf`) and keypoint
+presence scores (`keypoints.conf`). Object-score defaults are
 `corner=0.25`, `corner-edge=0.40`, `corner-edge-center=0.25`, and `0.90` for each
 color. Override any class with `--pose-class-conf red=0.35,corner-edge=0.45`.
-`--min-keypoint-conf` filters point visibility (default `0.05` for landmarks);
+`--min-keypoint-conf` filters keypoint presence (default `0.05` for landmarks);
 sticker color keypoints have a minimum of `0.25` for scoring, drawing, and ROI
 tracking. `--track-conf` controls ROI tracking. Neural inference and the prepared
 full-search scorer run on CPU.
 
-The cached video pose pass also evaluates mixed landmark/sticker seeds, then
-refits weak rigid poses against nearby observations. It tracks image-plane
-position and depth separately and can jointly fit runs with two visible face
-outlines. Its motion priors and support windows use elapsed time from the source
-frame rate. Use `--no-pose-smoothing` to compare with the original single-frame
-pose pass.
+The cached pose pass exhaustively scores every 15-degree slab-angle combination
+on all three axes using shared slab projections and visibility tables. It then
+refines diverse candidates for each axis and active-slab combination, keeping
+inactive outer slabs fixed. The best unrefined sweep results also remain eligible.
+The middle angle becomes part of the rigid camera rotation; the two outer offsets
+are measured relative to it. Five distinct pose/angle solutions are retained,
+including fits less than 0.01 above the fifth score, with their own cached
+landmark/sticker assignments. The optional temporal pass runs the same sweep
+and refinement on the previous and next cameras from an immutable pose snapshot;
+it preserves the existing candidates without repeating their fits. Orientation
+continuity and center-color matching run afterward. State exploration reuses
+the projection bank. Use `--no-pose-smoothing` to skip the neighboring cameras, or
+`--no-joint-pose-geometry` to compare with the older rigid-pose pipeline.
+The original geometry score remains in use. A recovery pass
+only runs when both observation sets are sparse (fewer than 12 landmarks and
+10 stickers), with either a depth jump beyond three prior sigmas or at least
+two landmarks outside the cube volume supported by the depth prior.
+It compares the original candidates with depth-constrained
+rigid and articulated proposals using capped residuals, pose priors, and a cost
+for extra slab parameters. Original candidates are saved in recovery diagnostics.
+Recovery runs after the baseline trajectory and orientation passes and cannot
+change neighboring frames. Use `--no-joint-depth-fallback` for the baseline alone.
+
+For a pose-only video, omit `--recognize-moves` and add `--wireframe-only`.
+To recompute joint poses from previously filtered observations without running
+inference or move search:
+
+```bash
+python scripts/render_independent_keypoint_geometry.py \
+  --log runs/previous-run/observations.jsonl \
+  --output-dir runs/joint-pose-wireframe
+```
+
+The log's `.meta.json` supplies the source video, scramble, FPS, and static-frame
+boundary. Add `--render-refined` when the input is already a joint-fit log to
+render its saved geometries without fitting again.
 
 Each sticker color keypoint finds its closest class-valid three- and four-landmark
 groups by expanding the nearest-landmark neighborhood. Cyclic classes must match
@@ -476,7 +507,7 @@ The three-seed limit and translation-based tracking selector are unchanged.
 
 Whole-cube orientation is selected during pose preparation among the 24 proper
 cube symmetries. The score combines angular change from the previous accepted
-pose with 0.2 times the mismatch fraction of observed center colors. A 90°
+pose with 10 times the mismatch fraction of observed center colors. A 90°
 change over a 1/30-second interval contributes one point to the angular score,
 with the scale adjusted for elapsed time. The first pose uses center colors to
 anchor its orientation, and frames without observed centers use continuity.
@@ -607,8 +638,42 @@ The same `26m-pose` pairs are excluded from this window term.
 The independent-keypoint renderer defaults to a fixed `--branch-widths 3`.
 The prepared search scores M, E, and S and simultaneous turns of parallel
 layers. It combines the three layer angles on a 15° grid from −45° to +45°
-and reuses each slab projection for that frame. The existing single and
-wide fits still use their finer grid.
+using six distinct surface geometries per slab. The ±45° endpoints share
+their surface projections while retaining their physical sticker identities.
+Ray intersections, pairwise slab occlusion, landmark distances, and sticker
+containment are cached before combining the slabs. The endpoint landmark
+fit preserves the existing seam tie-breaking. Single and wide fits use
+their finer grid.
+
+Before color scoring, the prepared frame and video searches select the five
+best distinct misalignment geometries. A flat hold counts once. Fits less than
+0.01 above the fifth-best geometry score are included as ties.
+The prepared search uses `--max-tps 40` for ordinary turns and
+`--max-double-tps 50` for 180-degree turns, including doubles spanning multiple
+frames. At 60 fps these allow 60° and 75° per interval respectively. The actual
+source-frame spacing determines each interval, including skipped observations.
+For each pair of shortlisted geometries, the search precomputes routes that
+continue a parallel rotation or resolve it to an aligned boundary before
+switching axes. Every outer-slab angle is measured relative to the middle slab,
+where the axes are anchored; common rigid rotation consumes no turn budget.
+Simultaneous slabs have independent limits, so two ordinary turns each traveling
+50° fit a 60° interval. A slice also checks its two relative angles independently.
+Sequential turns on different axes share the interval's time budget: finishing
+45° on one axis and entering a 15° residual on another uses 60° at the same rate.
+A geometry-only reachability pass identifies monotone 180-degree spans and
+marks their intervals, including motion before the second quarter commit.
+Ambiguous intervals that also fit an ordinary 90-degree span keep the 40 TPS
+limit; merely having a possible double in the bank cannot raise a single’s rate.
+An isolated single does not qualify, and a simultaneous ordinary turn keeps
+its own 40 TPS limit even when the other slab is part of a double. Hidden moves
+are added only when their full time fits after the residual travel.
+Crossing ±45° uses the unwrapped angular distance.
+This replaces handoff thresholds and bonuses. No geometry, visibility, or route
+enumeration runs during state expansion: legal routes use cached sticker
+permutations and batched color scoring. Temporal contexts retain the selected
+residual geometry so the next interval uses the correct starting angles.
+The default top-three child cutoff still ranks the resulting transitions by
+the combined score, with equal geometry and color weights.
 
 `--branch-widths 3 5 8` admits the top 3 distinct children per parent by
 candidate rank, then widens to 5 and 8. Each cutoff includes all children

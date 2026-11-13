@@ -328,6 +328,33 @@ def test_26m_confusion_scoring_uses_only_direct_pairs(renderer, expected, predic
     assert payload['color_forbidden_count'] == (observed if cost == 1. else 0)
 
 
+@pytest.mark.parametrize('parallel', [False, True])
+@pytest.mark.parametrize('angle', [-9., -6., -5.999, 0., 5.999, 6., 9.])
+def test_handoff_threshold_is_six_degrees_inclusive(renderer, parallel, angle):
+    step = dict(layer_rotations=[dict(axis=1, side=-1, angle_degrees=angle, layer_count=1)],
+                layer_inlier_count=3, state_moves=())
+    if parallel:
+        step.update(parallel_layers=True, layer_axis=1, layer_support=(3, 0, 0))
+    expected = (renderer.cube_rotation_to_notation(renderer.CubeLayerRotation(1, -1, np.sign(angle)*90.))
+                if abs(angle) >= 6. else None)
+    assert search.supported_completion(renderer, step) == expected
+    step.update(layer_inlier_count=0, layer_support=(0, 0, 0))
+    assert search.supported_completion(renderer, step) is None
+
+
+@pytest.mark.parametrize('parallel', [False, True])
+@pytest.mark.parametrize(('angle', 'offset', 'continuing'), [(30., 90., True), (-30., -90., True),
+                                                           (30., -90., False), (-30., 90., False)])
+def test_completion_after_commit_distinguishes_continuing_turn_from_early_commit(renderer, parallel, angle, offset, continuing):
+    rotation = dict(axis=1, side=-1, angle_degrees=angle, layer_count=1)
+    move = renderer.cube_rotation_to_notation(renderer.CubeLayerRotation(1, -1, offset))
+    step = dict(layer_rotations=[rotation], layer_inlier_count=3, state_moves=(move,), color_offset=offset)
+    if parallel:
+        step.update(parallel_layers=True, layer_axis=1, layer_support=(3, 0, 0))
+    expected = renderer.cube_rotation_to_notation(renderer.CubeLayerRotation(1, -1, np.sign(angle)*90.))
+    assert search.supported_completion(renderer, step) == (expected if continuing else None)
+
+
 def test_handoff_keeps_distinct_cues_and_bonuses_only_the_next_commit(renderer):
     initial = renderer.CubeGeometryState.identity()
     previous_rotation = dict(axis=1, side=-1, angle_degrees=39., layer_count=1)
@@ -336,7 +363,7 @@ def test_handoff_keeps_distinct_cues_and_bonuses_only_the_next_commit(renderer):
         layer_rotations=[previous_rotation], layer_inlier_count=1))
     assert move == "F'"
     assert search.supported_completion(renderer, dict(
-        layer_rotations=[dict(previous_rotation, angle_degrees=12.)], layer_inlier_count=1)) is None
+        layer_rotations=[dict(previous_rotation, angle_degrees=5.999)], layer_inlier_count=1)) is None
     assert search.supported_completion(renderer, dict(
         layer_rotations=[previous_rotation], layer_inlier_count=0)) is None
     assert search.supported_completion(renderer, dict(

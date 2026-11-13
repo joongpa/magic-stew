@@ -154,6 +154,7 @@ def test_cached_orientation_runs_after_smoothing_and_before_search(monkeypatch, 
         '--source', 'clip.mp4', '--initial-scramble', '', '--recognize-moves', '--no-display',
     ])
     args.pose_smoothing = smoothing
+    args.joint_pose_geometry = False  # Exercise the retained legacy pipeline.
     colors = initial_colors('')
     cache = [SimpleNamespace(frame_index=i, pose_candidate=observed_cube(expected=colors))
              for i in range(3)]
@@ -311,7 +312,7 @@ def test_orientation_without_centers_uses_continuity():
     np.testing.assert_allclose(cv2.Rodrigues(recovered.rvec)[0], cv2.Rodrigues(candidate.rvec)[0], atol=1e-6)
     diagnostics = recovered.pose_continuity_diagnostics
     assert diagnostics['center_observation_count'] == 0
-    assert diagnostics['color_weight'] == .2
+    assert diagnostics['color_weight'] == 0.8
     assert diagnostics['angular_scale_degrees'] == 90.
 
 

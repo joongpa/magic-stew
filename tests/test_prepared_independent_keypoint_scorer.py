@@ -62,6 +62,218 @@ def observation_record(m, kind="normal"):
         search=dict(geometry=dict(options=options)), turn_color_matches=likelihoods.tolist())
 
 
+@pytest.mark.parametrize(('size', 'expected'), [(3, tuple(range(6))), (5, tuple(range(8)))])
+def test_geometry_shortlist_counts_hold_once_and_includes_strict_cutoff_ties(renderer, size, expected):
+    scorer = search.PreparedReplayScorer(renderer, {}, 'cpu', geometry_shortlist_size=size)
+    flat = dict(layer_axis=0, layer_rotations=(), combined_mean_error=0.)
+    geometry = [dict(flat, layer_axis=axis) for axis in range(3)]
+    for axis, side, score in ((0, 1, .01), (1, -1, .02), (0, -1, .029), (2, 1, .03),
+                             (1, 1, .039), (2, -1, .04)):
+        geometry.append(dict(layer_axis=axis, combined_mean_error=score,
+                             layer_rotations=(renderer.CubeLayerRotation(axis, side, 15.),)))
+    assert scorer._geometry_shortlist(geometry) == expected
+
+
+def test_shortlisted_hold_r_and_f_only_score_those_layer_updates(renderer):
+    record = observation_record(renderer)
+    flat = dict(record['search']['geometry']['options'][0], keypoint_mean_error=.025, heatmap_mean_error=0.)
+    options = [flat]
+    for axis, side, error in ((0, 1, .01), (1, -1, .02), (2, 1, .2)):
+        options.append(dict(flat, layer_axis=axis, layer_side=side, is_baseline=False,
+            keypoint_mean_error=error, layer_inlier_count=4,
+            layer_rotations=[dict(axis=axis, side=side, angle_degrees=15., layer_count=1)]))
+    record['search']['geometry']['options'] = options
+    scorer = search.PreparedReplayScorer(renderer, {7: record}, 'cpu', geometry_shortlist_size=3)
+    state = scorer.key(renderer.CubeGeometryState.identity())
+    choices = scorer(7, state)
+    assert scorer.frame_actions(7) == {('R',), ("R'",), ('F',), ("F'",)}
+    assert {tuple(choice.payload['state_moves']) for choice in choices} == {
+        (), ('R',), ("R'",), ('F',), ("F'",)}
+    assert scorer.prepare(7)['configuration_count'] == 7
+    assert scorer.score_action(7, state, ('U',)) == ()
+    assert {choice.payload['geometry_option_index'] for choice in choices} <= {0, 1, 2}
+
+
+def test_shortlisted_wide_fit_admits_every_subset_of_its_moving_slabs(renderer):
+    record = observation_record(renderer, 'empty')
+    option = dict(record['search']['geometry']['options'][0], is_baseline=False, layer_side=1,
+        layer_count=2, layer_rotations=[dict(axis=0, side=1, layer_count=2, angle_degrees=15.)])
+    record['search']['geometry']['options'] = [option]
+    scorer = search.PreparedReplayScorer(renderer, {7: record}, 'cpu', geometry_shortlist_size=3)
+    state = scorer.key(renderer.CubeGeometryState.identity())
+    choices = scorer(7, state)
+    expected = {action for action, offsets in renderer.parallel_turn_actions(0).items() if not offsets[0]}
+    assert {tuple(choice.payload['state_moves']) for choice in choices} == expected
+    assert len(expected) == 9
+    assert all(choice.payload['parallel_layers'] for choice in choices)
+
+
+def test_shortlisted_flat_geometry_checks_between_frame_turns_on_every_axis(renderer):
+    record = observation_record(renderer)
+    record['search']['geometry']['options'] = record['search']['geometry']['options'][:1]
+    scorer = search.PreparedReplayScorer(renderer, {7: record}, 'cpu', geometry_shortlist_size=3)
+    choices = scorer(7, scorer.key(renderer.CubeGeometryState.identity()))
+    expected = {action for axis in range(3) for action in renderer.parallel_turn_actions(axis)}
+    assert {choice.payload['state_moves'] for choice in choices} == expected
+    assert scorer.frame_actions(7) == expected - {()}
+    assert scorer.flat_turn_fallback(7)
+
+
+@pytest.mark.parametrize('balance', [False, True])
+@pytest.mark.parametrize('difference', [0., .00035, .009999, .01, .010001])
+def test_flat_turn_fallback_includes_strict_geometry_ties(renderer, balance, difference):
+    record = observation_record(renderer)
+    error = difference * 2 * renderer.PNP_FINAL_ASSIGNMENT_ERROR_FRACTION if balance else difference
+    flat = dict(record['search']['geometry']['options'][0], keypoint_mean_error=error, heatmap_mean_error=0.)
+    partial = dict(flat, is_baseline=False, keypoint_mean_error=0.,
+        layer_rotations=[dict(axis=0, side=1, angle_degrees=15., layer_count=1)])
+    record['search']['geometry']['options'] = [flat, partial]
+    scorer = search.PreparedReplayScorer(renderer, {7: record}, 'cpu', geometry_shortlist_size=3,
+                                         balance_geometry_color=balance)
+    expected = difference < search.GEOMETRY_TIE_TOLERANCE
+    assert scorer.flat_turn_fallback(7) == expected
+    assert (('U',) in scorer.frame_actions(7)) == expected
+    state = scorer.key(renderer.CubeGeometryState.identity())
+    assert bool(scorer.score_action(7, state, ('U',))) == expected
+
+
+@pytest.mark.parametrize('handoff_available', [False, True])
+def test_flat_best_fit_uses_broad_turns_only_without_a_handoff(renderer, monkeypatch, handoff_available):
+    from scripts import search_independent_keypoint_frame as frame_search
+
+    record = observation_record(renderer)
+    flat = dict(record['search']['geometry']['options'][0], keypoint_mean_error=0., heatmap_mean_error=0.)
+    record['search']['geometry']['options'] = [flat] + [dict(flat, layer_axis=axis, layer_side=side,
+        is_baseline=False, keypoint_mean_error=error,
+        layer_rotations=[dict(axis=axis, side=side, angle_degrees=15., layer_count=1)])
+        for axis, side, error in ((0, 1, .01), (1, -1, .02))]
+    scorer = search.PreparedReplayScorer(renderer, {7: record}, 'cpu', geometry_shortlist_size=3)
+    state = scorer.key(renderer.CubeGeometryState.identity())
+    if not handoff_available:
+        monkeypatch.setattr(frame_search, 'score_handoffs', lambda *args: [])
+    choices = frame_search.frame_choices(scorer, 7, state, 'U')
+    moves = {choice.payload['state_moves'] for choice in choices}
+    assert scorer.flat_turn_fallback(7)
+    if handoff_available:
+        base = {(), ('R',), ("R'",), ('F',), ("F'",)}
+        assert moves == base | {('U',) + action for action in base}
+        assert any(choice.payload.get('handoff_commit') for choice in choices)
+    else:
+        assert moves == {action for axis in range(3) for action in renderer.parallel_turn_actions(axis)}
+
+
+@pytest.mark.parametrize('kind', ['normal', 'empty'])
+def test_shortlist_without_finite_geometry_returns_no_moves(renderer, kind):
+    record = observation_record(renderer, kind)
+    for option in record['search']['geometry']['options']:
+        option['keypoint_mean_error'] = None
+    scorer = search.PreparedReplayScorer(renderer, {7: record}, 'cpu', geometry_shortlist_size=3)
+    assert scorer(7, scorer.key(renderer.CubeGeometryState.identity())) == ()
+    assert scorer.frame_actions(7) == frozenset()
+
+
+@pytest.mark.parametrize(('fps', 'moving'), [(24., True), (60., False)])
+def test_rotation_budget_flat_frames_compile_only_affordable_updates(renderer, fps, moving):
+    record = observation_record(renderer)
+    record['search']['geometry']['options'] = record['search']['geometry']['options'][:1]
+    scorer = search.PreparedReplayScorer(renderer, {7: record}, 'cpu', geometry_shortlist_size=5)
+    scorer.configure_rotation_budget((7,), fps, 32.)
+    state = scorer.key(renderer.CubeGeometryState.identity())
+    choices = scorer.rotation_choices(7, state)
+    assert any(choice.payload['state_moves'] for choice in choices) == moving
+    assert all(choice.payload['angular_travel_degrees'] <= 2880./fps for choice in choices)
+    assert all(choice.payload['rotation_context'] == choices[0].payload['rotation_context'] for choice in choices)
+    if not moving:
+        assert scorer.child_states_built == 0
+        assert scorer.prepare(7)['configuration_count'] == 2  # Legal hold and endpoint-only row.
+
+
+@pytest.mark.parametrize('confusion', [False, True])
+def test_rotation_budget_forward_and_reverse_agree_on_hidden_turn_between_wide_residuals(renderer, confusion):
+    records = {}
+    for frame, angle in ((7, 3.), (8, 14.)):
+        record = observation_record(renderer)
+        option = dict(record['search']['geometry']['options'][0], layer_axis=2, layer_side=1,
+            layer_count=2, is_baseline=False, layer_rotations=[dict(
+                axis=2, side=1, layer_count=2, angle_degrees=angle)])
+        record['search']['geometry']['options'] = [option]
+        if confusion:
+            count = len(record['search_pose']['sticker_mask_centers'])
+            record['search_pose']['sticker_color_names'] = ['red', 'green', 'white'] * (count//3) + ['red'] * (count%3)
+        records[frame] = record
+    scorer = search.PreparedReplayScorer(renderer, records, 'cpu', geometry_shortlist_size=5,
+        color_confusion_scoring=confusion, initial_colors=search.initial_sticker_colors(renderer, 'R U') if confusion else None)
+    scorer.configure_rotation_budget((7, 8), 24., 32.)
+    state = scorer.key(renderer.CubeGeometryState.identity())
+    before_context = scorer.prepare(7)['selected_geometry_indices'][0]
+    choices = scorer.rotation_choices(8, state, before_context)
+    forward = next(choice for choice in choices if choice.payload['state_moves'] == ("F'",))
+    assert forward.payload['angular_travel_degrees'] == 107.
+    reverse = next((before, context, choice, prior) for before, context, choice, prior in
+        scorer.rotation_predecessors(8, forward.state, forward.payload['rotation_context'])
+        if before == state and choice.payload['state_moves'] == ("F'",))
+    before, context, choice, prior = reverse
+    assert context == before_context
+    assert choice.score == pytest.approx(forward.score)
+    assert choice.payload['angular_travel_degrees'] == 107.
+    expected_prior = scorer.score_geometry_hold(7, before, context).payload['color_error']
+    assert prior == pytest.approx(expected_prior)
+
+
+@pytest.mark.parametrize('angle', [30., 45.])
+def test_rotation_budget_finishes_d_relative_to_aligned_middle_and_upper(renderer, angle):
+    records = {frame: observation_record(renderer) for frame in (7, 8)}
+    for frame, rotation in ((7, dict(axis=2, side=1, angle_degrees=-angle, layer_count=2)),
+                            (8, dict(axis=1, side=-1, angle_degrees=-15., layer_count=1))):
+        flat = records[frame]['search']['geometry']['options'][0]
+        records[frame]['search']['geometry']['options'] = [dict(flat,
+            layer_axis=rotation['axis'], layer_side=rotation['side'],
+            layer_count=rotation['layer_count'], is_baseline=False, layer_rotations=[rotation])]
+    scorer = search.PreparedReplayScorer(renderer, records, 'cpu', geometry_shortlist_size=5)
+    scorer.configure_rotation_budget((7, 8), 24., 32.)
+    context = scorer.prepare(7)['selected_geometry_indices'][0]
+    state = scorer.key(renderer.CubeGeometryState.identity())
+    forward = next(choice for choice in scorer.rotation_choices(8, state, context)
+                   if choice.payload['state_moves'] == ('D',))
+    assert forward.payload['angular_travel_degrees'] == 90. - angle + 15.
+    backward = next(choice for before, previous, choice, _ in
+        scorer.rotation_predecessors(8, forward.state, forward.payload['rotation_context'])
+        if before == state and previous == context and choice.payload['state_moves'] == ('D',))
+    assert backward.score == pytest.approx(forward.score)
+    assert backward.payload['angular_travel_degrees'] == forward.payload['angular_travel_degrees']
+
+
+def test_rotation_context_does_not_reuse_a_route_that_only_fits_another_start_angle(renderer):
+    records = {7: observation_record(renderer), 8: observation_record(renderer)}
+    flat = records[7]['search']['geometry']['options'][0]
+    partial = dict(flat, layer_axis=0, layer_side=1, is_baseline=False,
+        layer_rotations=[dict(axis=0, side=1, angle_degrees=40., layer_count=1)])
+    records[7]['search']['geometry']['options'] = [flat, partial]
+    records[8]['search']['geometry']['options'] = [dict(partial,
+        layer_rotations=[dict(axis=0, side=1, angle_degrees=-40., layer_count=1)])]
+    scorer = search.PreparedReplayScorer(renderer, records, 'cpu', geometry_shortlist_size=5)
+    scorer.configure_rotation_budget((7, 8), 24., 32.)
+    contexts = scorer.prepare(7)['rotation_geometries']
+    flat_context = next(index for index, geometry in contexts.items() if geometry.axis is None)
+    partial_context = next(index for index, geometry in contexts.items() if geometry.axis is not None)
+    state = scorer.key(renderer.CubeGeometryState.identity())
+    assert not any(choice.payload['state_moves'] == ('R2',) for choice in scorer.rotation_choices(8, state, flat_context))
+    choice = next(choice for choice in scorer.rotation_choices(8, state, partial_context)
+                  if choice.payload['state_moves'] == ('R2',))
+    assert choice.payload['angular_travel_degrees'] == 100.
+
+
+def test_rotation_budget_uses_source_time_and_spans_unavailable_observations(renderer):
+    records = {index: observation_record(renderer) for index in (7, 8, 9)}
+    for index, source in ((7, 100), (8, 102), (9, 105)):
+        records[index]['original_source_frame'] = source
+    records[8]['has_pose'] = False
+    scorer = search.PreparedReplayScorer(renderer, records, 'cpu')
+    scorer.configure_rotation_budget((7, 8, 9), 60., 32.)
+    assert scorer.rotation_limits == {7: 48., 9: 240.}
+    assert scorer.rotation_previous == {7: None, 9: 7}
+
+
 @pytest.mark.parametrize("kind", ["normal", "zero", "outside", "empty"])
 @pytest.mark.parametrize('track', [False, True])
 def test_base_pose_projection_and_move_permutations_match_legacy(renderer, kind, track):
@@ -245,3 +457,34 @@ def test_replay_preserves_nonfinite_geometry_serialized_as_null(renderer, cls):
         option.update(keypoint_mean_error=None, keypoint_p90_error=None, global_robust_error=None)
     scorer = cls(renderer, {7: record}, 'cpu', balance_geometry_color=True, minimum_color_accuracy=2/3)
     assert scorer(7, renderer.CubeGeometryState.identity()) == ()
+
+
+def test_split_tps_double_span_has_matching_forward_and_reverse_routes(renderer):
+    records = {frame: observation_record(renderer) for frame in (7, 8, 9, 10)}
+    for frame, angle in ((8, 20.), (9, -20.)):
+        flat = records[frame]['search']['geometry']['options'][0]
+        records[frame]['search']['geometry']['options'] = [dict(flat, layer_axis=0,
+            is_baseline=False, parallel_layers=True, layer_rotations=[dict(
+                axis=0, side=-1, angle_degrees=angle, layer_count=1)])]
+    for frame in (7, 10):
+        records[frame]['search']['geometry']['options'] = records[frame]['search']['geometry']['options'][:1]
+    scorer = search.PreparedReplayScorer(renderer, records, 'cpu', geometry_shortlist_size=5)
+    scorer.configure_rotation_budget((7, 8, 9, 10), 60., 40., 50.)
+    state = scorer.key(renderer.CubeGeometryState.identity())
+    before_context = scorer.prepare(7)['selected_geometry_indices'][0]
+    choices = scorer.rotation_choices(8, state, before_context)
+    fast = next(c for c in choices if c.payload['angular_travel_degrees'] == 70.)
+    assert fast.payload['rotation_budget_degrees'] == pytest.approx(75.)
+    reverse = next(c for prior, context, c, _ in scorer.rotation_predecessors(
+        8, fast.state, fast.payload['rotation_context'])
+        if prior == state and context == before_context and c.payload['state_moves'] == fast.payload['state_moves'])
+    assert reverse.score == pytest.approx(fast.score)
+    assert reverse.payload['angular_travel_degrees'] == fast.payload['angular_travel_degrees']
+    assert reverse.payload['rotation_budget_degrees'] == fast.payload['rotation_budget_degrees']
+    # Without the second part of the double, the exact same first 70 degrees
+    # must be rejected; changing the TPS settings also invalidates caches.
+    records[9]['search']['geometry']['options'] = records[10]['search']['geometry']['options']
+    single = search.PreparedReplayScorer(renderer, records, 'cpu', geometry_shortlist_size=5)
+    single.configure_rotation_budget((7, 8, 9), 60., 40., 50.)
+    assert all(c.payload['angular_travel_degrees'] <= 60.
+               for c in single.rotation_choices(8, state, before_context))
