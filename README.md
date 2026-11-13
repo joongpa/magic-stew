@@ -814,6 +814,30 @@ evidence from existing images or infer hidden layers from missing old labels.
 Supporting the requested multiple explanations requires a joint multimodal
 pose/articulation model and uncertainty for continuously unconstrained angles.
 
+For the first experiment, only the existing cube-frame symmetries are handled.
+To verify that the current head can memorize its supplied targets, run:
+
+```bash
+.venv/bin/python scripts/overfit_direct_cube_pose.py \
+  --samples 24 --steps 600 --output-dir runs/my_direct_pose_overfit
+```
+
+This samples parts 1/3/5/7, all five turn modes, and 1/4/24-symmetry cases.
+Augmentation and weight decay are disabled. The pretrained detector is frozen,
+so its predicted inputs can be cached without changing the head's training
+objective. The final result is replayed through the full image-to-pose path and
+again after checkpoint reload. Reports, target/before/after wireframe overlays,
+and an inference-only `overfit.pt` checkpoint are written to the output folder.
+This diagnostic is training-set memorization, not held-out evaluation.
+
+Checkpoint v2 explicitly preserves the detector's runtime `end2end` flag, which
+can differ from its YAML architecture setting. The independent loss uses the
+shipped `PoseLoss26` for a `Pose26` head even in non-end-to-end mode: in the
+tested Ultralytics version, the generic non-end-to-end criterion otherwise uses
+the older XY decoder. Box/class/keypoint loss formulas and gains remain the
+provided YOLO26 defaults. Legacy prototype checkpoints lacking the detection
+mode are rejected instead of silently reloading different prediction branches.
+
 ## Ordered cube pose labels
 
 The ordered 26-point pose target represents one rigid cube transform. When

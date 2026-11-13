@@ -97,6 +97,11 @@ def evaluate(head, encoded, target, criterion, image_size):
                                    for name in ("rotation", "projection", "angles", "centers", "geometry"))
     result["per_image"] = per_image
     result["selected_symmetries"] = selected.cpu().tolist()
+    rows = torch.arange(len(selected), device=selected.device)
+    matched_angles = target["angles"][:, criterion.center_inverse][rows, selected]
+    angle_error = (prediction["angles"] - matched_angles).abs()
+    result["max_face_angle_error_deg"] = float(angle_error.max())
+    result["per_image"]["max_face_angle_error_deg"] = angle_error.amax(-1).cpu().tolist()
     return prediction, result
 
 
@@ -241,7 +246,8 @@ def main():
     with torch.no_grad():
         reloaded_prediction = reloaded(images)["pose"]
     reload_max_error = max(float((reloaded_prediction[key] - replay[key]).abs().max()) for key in replay)
-    limits = {"center_rmse_px": 1., "landmark_rmse_px": 1.5, "rotation_deg": 3., "angle_mae_deg": 1.5}
+    limits = {"center_rmse_px": 1., "landmark_rmse_px": 1.5, "rotation_deg": 3., "angle_mae_deg": 1.5,
+              "max_face_angle_error_deg": 1.}
     per_image_maxima = {name: max(final_metrics["per_image"][name]) for name in limits}
     passed = all(per_image_maxima[name] <= limit for name, limit in limits.items()) and replay_max_error < 1e-4 and reload_max_error < 1e-4
     report = {"passed": passed, "purpose": "memorization of the SAME training images, not held-out accuracy",

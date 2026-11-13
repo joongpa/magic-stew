@@ -43,7 +43,7 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 from live_recognition.direct_cube_pose import (  # noqa: E402
     CHECKPOINT_FORMAT, CLASS_NAMES, FACE_ORDER, DirectCubePoseModel, SymmetryPoseLoss,
-    load_direct_pose_checkpoint, make_detector,
+    independent_pose_criterion, load_direct_pose_checkpoint, make_detector,
 )
 from live_recognition.direct_cube_pose_data import (  # noqa: E402
     DirectPoseDataset, collate_direct_pose, landmark_template, read_manifest, split_entries,
@@ -248,7 +248,7 @@ def main():
     loaders = [DataLoader(dataset, batch_size=args.batch, shuffle=index == 0, num_workers=args.workers,
                           collate_fn=collate_direct_pose, worker_init_fn=seed_worker, generator=generator if index == 0 else None,
                           pin_memory=device.type == "cuda") for index, dataset in enumerate(datasets)]
-    independent_loss = model.detector.init_criterion()
+    independent_loss = independent_pose_criterion(model.detector)
     rest, owners = landmark_template()
     direct_loss = SymmetryPoseLoss(manifest, rest, owners, **weights, quality_sigma=args.quality_sigma).to(device)
     optimizer = torch.optim.AdamW([

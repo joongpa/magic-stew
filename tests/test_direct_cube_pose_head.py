@@ -14,7 +14,7 @@ for path in (ROOT, ROOT / "src"):
 
 from live_recognition.direct_cube_pose import (  # noqa: E402
     CHECKPOINT_FORMAT, DirectCubePoseModel, DirectPoseHead, SymmetryPoseLoss,
-    load_direct_pose_checkpoint, make_detector, project_points, rotation_from_6d,
+    independent_pose_criterion, load_direct_pose_checkpoint, make_detector, project_points, rotation_from_6d,
 )
 from live_recognition.direct_cube_pose_data import (  # noqa: E402
     collate_direct_pose, landmark_template, split_entries, target_tensors,
@@ -214,7 +214,7 @@ def test_actual_yolo_loss_and_direct_head_train_on_an_all_empty_batch():
         (torch.rand(3, 64, 64), target, torch.empty(0, 8), f"empty{index}") for index in range(2)
     ])
     output = model(batch["img"])
-    independent_loss, _ = model.detector.init_criterion()(output["independent"], batch)
+    independent_loss, _ = independent_pose_criterion(model.detector)(output["independent"], batch)
     direct_loss, _, _ = SymmetryPoseLoss(MANIFEST, *landmark_template())(output["pose"], direct)
     total = independent_loss.sum() / 2 + direct_loss["total"]
     assert torch.isfinite(total)
@@ -264,3 +264,16 @@ def test_checkpoint_restores_runtime_detection_mode_and_exact_predictions(tmp_pa
         actual = restored(image)["pose"]
     for name in expected:
         torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+
+
+def test_non_end2end_pose26_stock_loss_uses_the_same_xy_formula_as_inference():
+    detector = make_detector("yolo26n-pose.yaml")
+    detector.end2end = False
+    head = detector.model[-1]
+    criterion = independent_pose_criterion(detector)
+    anchors = torch.tensor([[.5, .5], [1.5, .5]])
+    raw = torch.tensor([[[[.2, .3, 1.]], [[.4, .6, 1.]]]])
+    head.anchors, head.strides = anchors.T, torch.ones(1, 2)
+    inference = head.kpts_decode(raw[:, :, 0].transpose(1, 2))[:, :2].transpose(1, 2)
+    training = criterion.kpts_decode(anchors, raw)[:, :, 0, :2]
+    torch.testing.assert_close(training, inference)

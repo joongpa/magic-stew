@@ -215,6 +215,21 @@ def make_detector(model_source, epochs=100):
     return detector
 
 
+def independent_pose_criterion(detector):
+    """Use the stock loss matching the actual head, including non-E2E Pose26.
+
+    Ultralytics 8.4.51's PoseModel.init_criterion selects v8PoseLoss whenever
+    end2end is false, even for Pose26. Its XY decoder differs from Pose26's.
+    Keep the shipped YOLO26 loss/gains/RLE, with consistent XY decoding.
+    """
+    from ultralytics.nn.modules.head import Pose26
+    from ultralytics.utils.loss import E2ELoss, PoseLoss26
+
+    if isinstance(detector.model[-1], Pose26):
+        return E2ELoss(detector, PoseLoss26) if detector.end2end else PoseLoss26(detector)
+    return detector.init_criterion()
+
+
 class SymmetryPoseLoss(nn.Module):
     """Choose a single allowed symmetry for all structured losses together."""
 
