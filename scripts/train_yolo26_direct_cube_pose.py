@@ -65,6 +65,62 @@ def select_device(value):
     return torch.device(value)
 
 
+def normalize_training_arguments(args):
+    """Match YOLO's stride rounding and accept its -1 automatic batch request."""
+    for name in ("epochs", "imgsz", "threads", "topk"):
+        if getattr(args, name) < 1:
+            raise ValueError(f"--{name} must be positive, got {getattr(args, name)}")
+    if args.batch != -1 and args.batch < 1:
+        raise ValueError(f"--batch must be -1 (automatic) or a positive integer, got {args.batch}")
+    requested = args.imgsz
+    args.imgsz = max(64, math.ceil(requested / 32) * 32)
+    if args.imgsz != requested:
+        print(f"Adjusting --imgsz {requested} to {args.imgsz} (stride 32, minimum 64)", flush=True)
+    return args
+
+
+class BatchSizeProbe(torch.nn.Module):
+    """Give the Ultralytics profiler a scalar output with a backward graph.
+
+    The real wrapper returns nested dictionaries, which profile_ops cannot
+    backpropagate directly. Profiling uses a deep copy of the whole unfrozen
+    model, so the estimate includes the later joint-training phase.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.yaml = model.detector.yaml
+        self.stride = model.detector.stride
+
+    def forward(self, images):
+        def tensors(value):
+            if isinstance(value, torch.Tensor):
+                yield value
+            elif isinstance(value, dict):
+                for item in value.values():
+                    yield from tensors(item)
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    yield from tensors(item)
+        return sum(value.float().mean() for value in tensors(self.model(images)) if value.requires_grad)
+
+
+def resolve_batch_size(batch, model, device, image_size, amp, max_objects, dataset_size):
+    if batch != -1:
+        return batch
+    if device.type != "cuda":
+        print(f"--batch -1: CUDA auto-sizing is unavailable on {device.type}; using batch 16", flush=True)
+        return 16
+    from ultralytics.utils.autobatch import check_train_batch_size
+
+    result = check_train_batch_size(BatchSizeProbe(model), imgsz=image_size, amp=amp,
+                                    batch=-1, max_num_obj=max_objects, dataset_size=dataset_size)
+    if result < 1:
+        raise ValueError(f"Automatic batch sizing returned an invalid value: {result}")
+    return int(result)
+
+
 def run_epoch(model, loader, independent_loss, direct_loss, device, optimizer=None, scaler=None,
               independent_weight=1., max_batches=None):
     training = optimizer is not None
@@ -125,8 +181,14 @@ def run_epoch(model, loader, independent_loss, direct_loss, device, optimizer=No
                         field = f"{group}/{name}"
                         totals[field] = totals.get(field, 0.) + float(value[index])
                         denominators[field] = denominators.get(field, 0) + 1
-        if training and (batch_index + 1) % 50 == 0:
-            print(f"  batch {batch_index + 1}/{len(loader)} loss={float(total.detach()):.4f}", flush=True)
+        if training and (batch_index == 0 or (batch_index + 1) % 50 == 0):
+            print(f"  batch {batch_index + 1}/{len(loader)} total={float(total.detach()):.4f} "
+                  f"yolo={float(independent.detach()):.4f} pose={float(losses['total'].detach()):.4f} "
+                  f"centers={float(metrics['center_rmse_px']):.2f}px "
+                  f"landmarks={float(metrics['landmark_rmse_px']):.2f}px "
+                  f"rotation={float(metrics['rotation_deg']):.2f}deg turns={float(metrics['angle_mae_deg']):.2f}deg "
+                  f"pose_quality={float(metrics['quality_predicted']):.3f} "
+                  f"quality_target={float(metrics['quality_target']):.3f}", flush=True)
     if not totals:
         raise ValueError("No batches were processed")
     return {name: value / max(1, denominators[name]) for name, value in totals.items()}
@@ -156,8 +218,8 @@ def build_parser():
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch", type=int, default=16)
-    parser.add_argument("--imgsz", type=int, default=160)
+    parser.add_argument("--batch", type=int, default=16, help="Batch size; -1 estimates CUDA memory use (CPU/MPS fallback: 16)")
+    parser.add_argument("--imgsz", "--resolution", type=int, default=160, help="Square input size, rounded up to stride 32 (minimum 64)")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--threads", type=int, default=4)
@@ -182,9 +244,7 @@ def build_parser():
 
 
 def main():
-    args = build_parser().parse_args()
-    if min(args.epochs, args.batch, args.threads, args.topk) < 1 or args.imgsz < 64 or args.imgsz % 32:
-        raise ValueError("Epochs/batch/threads/topk must be positive; imgsz must be a multiple of 32 and at least 64")
+    args = normalize_training_arguments(build_parser().parse_args())
     if args.workers < 0 or args.freeze_epochs < 0 or args.width < 8 or args.width % 8:
         raise ValueError("Workers/freeze epochs must be nonnegative; head width must be a positive multiple of 8")
     if args.lr <= 0 or args.detector_lr_factor <= 0 or args.quality_sigma <= 0:
@@ -210,6 +270,9 @@ def main():
             raise ValueError("This checkpoint is an overfit diagnostic; start a normal run with --model instead of --resume")
         previous = checkpoint["train_args"]
         args.model = previous["model"]
+        if args.batch == -1:
+            args.batch = previous["batch"]
+            print(f"--batch -1: restoring checkpoint batch {args.batch}", flush=True)
         # These settings define the model/data/objective. Resume is deliberately
         # strict; changing them silently would not continue the same experiment.
         immutable = ("dataset", "imgsz", "batch", "seed", "val_fraction", "freeze_epochs", "augment", "limit",
@@ -244,6 +307,9 @@ def main():
     print(f"Device: {device}; train={len(train_entries)} val={len(val_entries)}; caching labels", flush=True)
     datasets = [DirectPoseDataset(args.dataset, train_entries, args.imgsz, args.augment),
                 DirectPoseDataset(args.dataset, val_entries, args.imgsz)]
+    args.batch = resolve_batch_size(args.batch, model, device, args.imgsz, args.amp,
+                                   max(len(label) for dataset in datasets for label in dataset.labels), len(train_entries))
+    print(f"Training input: {args.imgsz}x{args.imgsz}; batch={args.batch}", flush=True)
     generator = torch.Generator().manual_seed(args.seed)
     loaders = [DataLoader(dataset, batch_size=args.batch, shuffle=index == 0, num_workers=args.workers,
                           collate_fn=collate_direct_pose, worker_init_fn=seed_worker, generator=generator if index == 0 else None,
@@ -308,9 +374,11 @@ def main():
                             args, epoch, best, bad_epochs, manifest, generator)
         print(f"Epoch {epoch}/{args.epochs} {'head-only' if frozen else 'joint'} "
               f"train={train['loss']:.4f} val={val['loss']:.4f} "
+              f"pose_train={train['direct_total']:.4f} pose_val={val['direct_total']:.4f} "
               f"centers={val['center_rmse_px']:.2f}px landmarks={val['landmark_rmse_px']:.2f}px "
               f"observed={val['observed_landmark_rmse_px']:.2f}px "
               f"rotation={val['rotation_deg']:.2f}deg turns={val['angle_mae_deg']:.2f}deg "
+              f"pose_quality={val['quality_predicted']:.3f} quality_target={val['quality_target']:.3f} "
               f"({record['seconds']:.1f}s)", flush=True)
         if hasattr(independent_loss, "update"):
             independent_loss.update()

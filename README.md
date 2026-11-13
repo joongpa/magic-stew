@@ -750,6 +750,18 @@ The new branch first warms up for five epochs with that detector frozen, then
 jointly fine-tunes with a detector learning rate one tenth of the new head's.
 Use `--freeze-epochs 0` for joint training from the first epoch.
 
+`--imgsz` (also `--resolution`) rounds up to the model's stride of 32, with a
+minimum of 64; for example, `--imgsz 144` trains at 160. `--batch -1` estimates
+the full model's CUDA memory use, including backward through the new head.
+On CPU or MPS, automatic batch sizing uses the standard fallback of 16. Resuming
+with `--batch -1` restores the checkpoint's effective batch size. The resolved
+image and batch sizes are printed at startup.
+
+Progress prints on the first batch and every 50 batches: total loss, independent
+YOLO loss, custom pose loss, center/landmark error in pixels, rotation and mean
+face-angle error in degrees, and predicted pose quality versus its target.
+Epoch summaries report train/validation losses and validation pose metrics.
+
 Inputs to the branch are shared multiscale features and multiple predicted
 landmark/sticker points per class. Point weights come from the independent
 objects' detection/class logits, never their keypoint-presence channel.
