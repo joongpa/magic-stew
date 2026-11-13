@@ -6465,6 +6465,7 @@ def sticker_keypoint_specs(main_cube_roots: list[bpy.types.Object]) -> list[dict
     """Return one center spec for every physical sticker in the cube."""
     specs = []
     covered_parent_materials: set[tuple[str, str]] = set()
+    cube_center = cubie_world_center(main_cube_roots)
     sticker_names = sticker_render_mesh_names(main_cube_roots)
     for sticker_name in sorted(sticker_names):
         obj = bpy.data.objects.get(sticker_name)
@@ -6488,6 +6489,14 @@ def sticker_keypoint_specs(main_cube_roots: list[bpy.types.Object]) -> list[dict
                 face_candidates.append(candidate)
         if face_candidates:
             spec = dict(face_candidates[0])
+            source_cubie = obj.parent if obj.parent is not None else obj
+            vertex_center = sum(
+                (obj.matrix_world @ vertex.co for vertex in obj.data.vertices),
+                Vector((0.0, 0.0, 0.0)),
+            ) / max(1, len(obj.data.vertices))
+            normal_hint = vertex_center - source_cubie.matrix_world.translation
+            spec["surface_normal_hint"] = normal_hint.normalized() if normal_hint.length > 1e-6 else None
+            spec["source_cubie"] = source_cubie.name
             spec["name"] = obj.name
             spec["mask_key"] = obj.name
             spec["face_candidates"] = face_candidates
@@ -6534,6 +6543,17 @@ def sticker_keypoint_specs(main_cube_roots: list[bpy.types.Object]) -> list[dict
                     face_candidates.append(candidate)
             if face_candidates:
                 spec = dict(face_candidates[0])
+                solved_location = Vector(obj.get(SOLVED_LOCATION_PROP, obj.location))
+                is_center = sum(abs(round(value)) == 1 for value in solved_location) == 1
+                normal_hint = sum(
+                    (polygon.normal * max(float(polygon.area), 1e-6) for polygon in material_polygons),
+                    Vector((0.0, 0.0, 0.0)),
+                )
+                normal_hint = obj.matrix_world.to_3x3() @ normal_hint
+                if is_center or normal_hint.length <= 1e-6:
+                    normal_hint = obj.matrix_world.translation - cube_center
+                spec["surface_normal_hint"] = normal_hint.normalized() if normal_hint.length > 1e-6 else None
+                spec["source_cubie"] = obj.name
                 spec["name"] = f"{obj.name}:{material_name}"
                 spec["mask_key"] = f"{obj.name}:{material_name}"
                 spec["face_candidates"] = face_candidates
@@ -6574,6 +6594,30 @@ def projected_sticker_area_mask(
     return mask
 
 
+def physical_sticker_face_candidates(spec: dict[str, object]) -> list[dict[str, object]]:
+    """Keep the outward sticker surface before image-overlap scoring.
+
+    Solid-colored center cubies have the same material on all six sides.
+    An interior/back face can overlap more visible pixels in projection,
+    so overlap alone cannot identify the physical sticker face. Detached
+    sticker meshes likewise have front/back thickness surfaces.
+    """
+    candidates = spec.get("face_candidates", [])
+    if not isinstance(candidates, list) or not candidates:
+        return []
+    hint = spec.get("surface_normal_hint")
+    if hint is None:
+        return candidates
+    best_alignment = max(candidate["normal"].dot(hint) for candidate in candidates)
+    candidates = [candidate for candidate in candidates
+                  if candidate["normal"].dot(hint) >= best_alignment - 1e-4]
+    # sticker_surface_spec orients detached back-face normals outward too;
+    # choose the outermost plane to avoid a point buried inside the cubie.
+    outermost = max(candidate["point"].dot(hint) for candidate in candidates)
+    return [candidate for candidate in candidates
+            if candidate["point"].dot(hint) >= outermost - 1e-5]
+
+
 def select_sticker_face_spec(
     spec: dict[str, object],
     visible_mask: object,
@@ -6585,8 +6629,8 @@ def select_sticker_face_spec(
         import numpy as np
     except ImportError:
         raise RuntimeError("NumPy is required for sticker keypoint labels.") from None
-    candidates = spec.get("face_candidates", [])
-    if not isinstance(candidates, list) or not candidates:
+    candidates = physical_sticker_face_candidates(spec)
+    if not candidates:
         return spec
     if not isinstance(visible_mask, np.ndarray) or not np.any(visible_mask):
         return {**spec, **candidates[0], "name": spec["name"], "mask_key": spec["mask_key"]}
@@ -6605,6 +6649,15 @@ def select_sticker_face_spec(
         "mask_key": spec["mask_key"],
         "face_candidates": candidates,
     }
+
+
+def sticker_point_visibility(is_occluded: bool, visible_area_ratio: float) -> int:
+    """A labeled occluded sticker still supplies color evidence at >=10% area."""
+    if not is_occluded:
+        return POINT_VISIBILITY_VISIBLE
+    if visible_area_ratio >= STICKER_KEYPOINT_MIN_VISIBLE_AREA_RATIO:
+        return POINT_VISIBILITY_LABELED_OCCLUDED
+    return POINT_VISIBILITY_UNLABELED
 
 
 def sticker_keypoint_bbox(
@@ -6699,11 +6752,10 @@ def render_sticker_keypoints(
             continue
         occluded_by = object_occluding_point(point, depsgraph)
         is_occluded = occluded_by is not None
-        if not is_occluded:
-            visibility = POINT_VISIBILITY_VISIBLE
+        visibility = sticker_point_visibility(is_occluded, area_ratio)
+        if visibility == POINT_VISIBILITY_VISIBLE:
             counts["visible"] += 1
-        elif area_ratio > STICKER_KEYPOINT_MIN_VISIBLE_AREA_RATIO:
-            visibility = POINT_VISIBILITY_LABELED_OCCLUDED
+        elif visibility == POINT_VISIBILITY_LABELED_OCCLUDED:
             counts["occluded"] += 1
         else:
             counts["excluded"] += 1
@@ -6723,6 +6775,7 @@ def render_sticker_keypoints(
         keypoints.append({
             "name": spec["name"],
             "source_object": spec["source_object"],
+            "source_cubie": base_spec["source_cubie"],
             "material": spec["material_name"],
             "class": spec["class"],
             "class_id": STICKER_KEYPOINT_DATASET_CLASS_ID_OFFSET + int(spec["class_id"]),
