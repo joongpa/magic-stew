@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from scripts.train_yolo26_direct_cube_pose import (  # noqa: E402
-    BatchSizeProbe, build_parser, normalize_training_arguments, resolve_batch_size,
+    BatchSizeProbe, build_parser, normalize_training_arguments, resolve_batch_size, resolve_training_amp,
 )
 
 
@@ -71,3 +71,38 @@ def test_cuda_auto_batch_profiles_the_custom_wrapper(monkeypatch):
     result = resolve_batch_size(-1, TinyNestedModel(), torch.device("cuda:0"), 160, True, 57, 120)
     assert result == 7
     assert captured == {"imgsz": 160, "amp": True, "batch": -1, "max_num_obj": 57, "dataset_size": 120}
+
+
+def test_stock_amp_check_rejects_reported_gtx_1660_super_without_forward(monkeypatch):
+    # Exercise the actual installed Ultralytics blacklist without CUDA hardware.
+    detector = SimpleNamespace(parameters=lambda: iter([SimpleNamespace(device=torch.device('cuda:0'))]))
+    monkeypatch.setattr(torch.cuda, 'get_device_name', lambda device: 'NVIDIA GeForce GTX 1660 SUPER')
+    assert not resolve_training_amp(True, detector, torch.device('cuda:0'))
+
+
+@pytest.mark.parametrize('requested,device', [(False, 'cuda:0'), (True, 'cpu'), (True, 'mps')])
+def test_disabled_or_non_cuda_amp_skips_compatibility_probe(monkeypatch, requested, device):
+    from ultralytics.utils import checks
+
+    def forbidden(_model):
+        raise AssertionError('No compatibility probe needed')
+
+    monkeypatch.setattr(checks, 'check_amp', forbidden)
+    assert not resolve_training_amp(requested, None, torch.device(device))
+
+
+@pytest.mark.parametrize('supported', [True, False])
+def test_amp_uses_stock_check_result_and_restores_callbacks(monkeypatch, supported):
+    from ultralytics.utils import checks, callbacks
+
+    detector = object()
+    original = callbacks.default_callbacks.copy()
+
+    def check(model):
+        assert model is detector
+        callbacks.default_callbacks = {}
+        return supported
+
+    monkeypatch.setattr(checks, 'check_amp', check)
+    assert resolve_training_amp(True, detector, torch.device('cuda:0')) == supported
+    assert callbacks.default_callbacks == original

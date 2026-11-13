@@ -125,6 +125,22 @@ def resolve_batch_size(batch, model, device, image_size, amp, max_objects, datas
     return int(result)
 
 
+def resolve_training_amp(requested, detector, device):
+    """Apply the stock trainer's one-time hardware/AMP compatibility check."""
+    if not requested or device.type != "cuda":
+        return False
+    from ultralytics.utils import callbacks
+    from ultralytics.utils.checks import check_amp
+
+    # Older check_amp implementations construct a YOLO model and reset the
+    # global callbacks. Preserve them as Ultralytics' own trainer does.
+    previous_callbacks = callbacks.default_callbacks.copy()
+    try:
+        return bool(check_amp(detector))
+    finally:
+        callbacks.default_callbacks = previous_callbacks
+
+
 def run_epoch(model, loader, independent_loss, direct_loss, device, optimizer=None, scaler=None,
               independent_weight=1., max_batches=None, diagnostic_dir=None, phase=None):
     training = optimizer is not None
@@ -311,6 +327,8 @@ def main():
     output = (args.output_dir or (args.resume.resolve().parent.parent if args.resume else Path("runs/direct_cube_pose"))).resolve()
     if output.exists() and any(output.iterdir()) and not args.resume:
         raise ValueError(f"Output already exists; use --resume or a new --output-dir: {output}")
+    args.amp = resolve_training_amp(args.amp, model.detector, device)
+    print(f"Training precision: {'AMP' if args.amp else 'FP32'}", flush=True)
     (output / "weights").mkdir(parents=True, exist_ok=True)
     args.output_dir = str(output)
     args.resume = str(args.resume.resolve()) if args.resume else None

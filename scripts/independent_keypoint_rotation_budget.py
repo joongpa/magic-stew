@@ -116,7 +116,14 @@ def routes_between(previous, current, budget, double_budget=None, double_support
     def phase(axis, start, end, offsets, kind):
         delta = tuple(b-a for a, b in zip(_relative(start), _relative(end), strict=True))
         quarters = _relative(offsets)
-        double = tuple(abs(q) >= 2 or (kind, component, q) in double_support
+        # A half-turn move is not enough evidence to grant itself the faster
+        # half-turn rate.  In particular, a residual seam route can contain a
+        # q=2 state permutation while its observed geometry moved only part of
+        # that turn in this interval.  The higher rate is valid only when the
+        # geometry span explicitly witnesses the double (or while the caller
+        # is deliberately compiling optimistic routes before that witness is
+        # available).
+        double = tuple((kind, component, q) in double_support
                        or (optimistic_doubles and kind != 'hidden')
                        for component, q in enumerate(quarters))
         return axis, delta, quarters, double
@@ -128,8 +135,7 @@ def routes_between(previous, current, budget, double_budget=None, double_support
                 _, old_delta, old_quarters, old_double = merged.pop()
                 delta = tuple(a+b for a, b in zip(old_delta, delta, strict=True))
                 quarters = tuple(a+b for a, b in zip(old_quarters, quarters, strict=True))
-                double = tuple(a or b or abs(q) >= 2 for a, b, q in
-                               zip(old_double, double, quarters, strict=True))
+                double = tuple(a or b for a, b in zip(old_double, double, strict=True))
             merged.append((axis, delta, quarters, double))
         degrees, fraction = 0., 0.
         for _axis, delta, _quarters, double in merged:

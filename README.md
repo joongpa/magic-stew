@@ -878,6 +878,15 @@ Normal training has no additional scans, snapshots or retries; detailed
 diagnostics and the failed batch are saved only if its existing finite-loss
 check fails. These checks do not assume that AMP is the cause.
 
+The trainer applies Ultralytics' stock AMP compatibility check once at startup,
+before automatic batch sizing, and prints the effective training precision.
+Ultralytics disables AMP on the GTX 1660 family because FP16 convolution can
+produce NaNs. A CUDA report on the GTX 1660 SUPER confirmed finite inputs and
+weights entering a nonfinite FP16 detector convolution, while the FP32 forward
+and both losses passed. This hardware therefore trains in FP32, matching the
+standard YOLO trainer. Compatible CUDA devices retain AMP. No compatibility
+checks or retry passes run inside the training loop.
+
 ## Ordered cube pose labels
 
 The ordered 26-point pose target represents one rigid cube transform. When

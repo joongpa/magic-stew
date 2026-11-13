@@ -138,8 +138,10 @@ def test_sequential_different_axes_still_share_frame_time():
 def test_whole_half_turn_gets_double_rate():
     double = ((0, (2, 0, 0)),)
     assert double not in costs(FLAT, FLAT, 150.)
+    assert not any(r.groups == double for r in routes_between(FLAT, FLAT, 150., 187.5))
+    witnessed = frozenset({('direct', 0, 2)})
     assert any(r.groups == double and r.degrees == 180. and r.budget == 187.5
-               for r in routes_between(FLAT, FLAT, 150., 187.5))
+               for r in routes_between(FLAT, FLAT, 150., 187.5, witnessed))
 
 
 def test_double_span_support_includes_motion_before_second_commit():
