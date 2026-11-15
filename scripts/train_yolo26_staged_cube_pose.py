@@ -104,6 +104,11 @@ def build_parser():
     p.add_argument(
         "--max-batches", type=int, help="Bound both train and validation for smoke tests"
     )
+    p.add_argument(
+        "--progress-test",
+        action="store_true",
+        help="Test console replacement for two seconds without loading weights/data or training",
+    )
     return p
 
 
@@ -280,7 +285,15 @@ def selection_score(metrics, phase):
 
 
 def main():
-    args = validate_args(build_parser().parse_args())
+    args = build_parser().parse_args()
+    if args.progress_test:
+        with ConsoleProgress() as progress:
+            print(f"Batch progress: {progress.backend}", flush=True)
+            for batch in range(1, 21):
+                progress.update(f"batch {batch}/20 loss=1.234 R=12.3 turn=17.0 vis=6.2px")
+                time.sleep(0.1)
+        return
+    args = validate_args(args)
     resume = None
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
@@ -371,6 +384,7 @@ def main():
         flush=True,
     )
     model.use_amp = args.amp
+    print(f"Batch progress: {ConsoleProgress().backend}", flush=True)
     model.configure_phase("joint")
     args.batch = resolve_batch_size(
         args.batch,

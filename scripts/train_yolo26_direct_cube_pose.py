@@ -57,6 +57,7 @@ from live_recognition.direct_cube_pose_data import (  # noqa: E402
 from live_recognition.direct_pose_training_numerics import (  # noqa: E402
     attempt_diagnostics, nonfinite_fields,
 )
+from live_recognition.training_progress import ConsoleProgress  # noqa: E402
 
 
 def seed_worker(_worker_id):
@@ -151,7 +152,7 @@ def run_epoch(model, loader, independent_loss, direct_loss, device, optimizer=No
     training = optimizer is not None
     model.train(training)
     totals, denominators = {}, {}
-    progress_width = 0
+    progress = ConsoleProgress()
     entries = {entry["key"]: entry for entry in loader.dataset.entries} if not training else {}
     for batch_index, (batch, target, keys) in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
@@ -171,9 +172,7 @@ def run_epoch(model, loader, independent_loss, direct_loss, device, optimizer=No
             per_image = metrics.pop("per_image")
             total = losses["total"] + independent_weight * independent
             if not torch.isfinite(total):
-                if progress_width:
-                    print(flush=True)
-                    progress_width = 0
+                progress.close()
                 # Expensive inspection and batch serialization occur ONLY on
                 # failure. Normal training has no scans, snapshots or retries.
                 attempt = {"outputs": {"independent": independent_loss.raw_predictions(prediction["independent"]),
@@ -253,10 +252,8 @@ def run_epoch(model, loader, independent_loss, direct_loss, device, optimizer=No
                   f"moving_turns={float(metrics['moving_angle_mae_deg']):.2f}deg "
                   f"pose_quality={float(metrics['quality_predicted']):.3f} "
                   f"quality_target={float(metrics['quality_target']):.3f}")
-            print("\r" + message.ljust(progress_width), end="", flush=True)
-            progress_width = max(progress_width, len(message))
-    if progress_width:
-        print(flush=True)
+            progress.update(message)
+    progress.close()
     if not totals:
         raise ValueError("No batches were processed")
     result = {name: value / max(1, denominators[name]) for name, value in totals.items()}

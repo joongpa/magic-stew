@@ -1428,6 +1428,18 @@ batch estimation. `--resolution` aliases `--imgsz` (128 by default), and
 augmentation is introduced. Windows loaders use spawn, top-level functions and
 the multiprocessing main guard. `--workers 0` is available for loader diagnostics.
 
+To check CMD progress without loading weights/data or starting training:
+
+```powershell
+python scripts/train_yolo26_staged_cube_pose.py --progress-test
+```
+
+On an attached Windows console this reports `Batch progress: Windows console cursor`
+and counts twenty updates on one row. It uses native console cursor positioning
+and the visible window width; redirected output reports its capture mode and
+prints one final summary. Restart/resume the Python process after updating the
+trainer and `src/live_recognition/training_progress.py` to load the new writer.
+
 To continue an interrupted run, using its saved split, optimizer, RNG and schedule:
 
 ```powershell

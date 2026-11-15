@@ -1,11 +1,17 @@
 """Progress must occupy one physical row, including narrow Windows consoles."""
 
+import ctypes
 import io
 import os
 
 import pytest
 
-from live_recognition.training_progress import ConsoleProgress
+from live_recognition.training_progress import (
+    ConsoleProgress,
+    _Coord,
+    _ScreenBufferInfo,
+    _WindowsConsole,
+)
 
 
 class Terminal(io.StringIO):
@@ -96,3 +102,67 @@ def test_trainer_keeps_batch_updates_on_one_row_without_changing_metrics(monkeyp
     for update in stream.getvalue().rstrip("\n").split("\r")[1:]:
         assert len(update) < 80
     assert "val 21/21" in stream.getvalue().rsplit("\r", 1)[1]
+
+
+class WindowsScreen:
+    """CMD can have a300-column buffer behind a much narrower viewport."""
+
+    def __init__(self, columns):
+        self.columns = columns
+        self.left = 10
+        self.x, self.y = 23, 4
+        self.rows = [[" "] * 300 for _ in range(20)]
+        self.positions = []
+        self.newlines = 0
+
+    def GetConsoleScreenBufferInfo(self, _handle, result):
+        info = result._obj
+        info.dwSize = _Coord(300, 20)
+        info.dwCursorPosition = _Coord(self.x, self.y)
+        info.srWindow.Left, info.srWindow.Right = self.left, self.left + self.columns - 1
+        return True
+
+    def SetConsoleCursorPosition(self, _handle, position):
+        self.x, self.y = position.X, position.Y
+        self.positions.append((self.x, self.y))
+        return True
+
+    def WriteConsoleW(self, _handle, text, units, written, _reserved):
+        if text == "\r\n":
+            self.x = 0
+            self.y += 1
+            self.newlines += 1
+        else:
+            # Native writes must fit the WINDOW, not merely the screen buffer.
+            assert len(text) < self.columns
+            self.rows[self.y][self.x : self.x + len(text)] = list(text)
+            self.x += len(text)
+        written._obj.value = units
+        return True
+
+
+@pytest.mark.parametrize("columns", [40, 80, 120])
+def test_cmd_native_updates_bypass_stream_line_translation(monkeypatch, columns):
+    screen = WindowsScreen(columns)
+    monkeypatch.setattr(
+        "live_recognition.training_progress._open_windows_console",
+        lambda _stream: _WindowsConsole(screen, 42),
+    )
+    # Even a wrapper reporting non-TTY output must use the real native console
+    # if GetConsoleMode identified one. No stream writes occur per update.
+    stream = io.StringIO()
+    progress = ConsoleProgress(stream)
+    assert progress.backend == "Windows console cursor"
+    progress.update("batch 1/20 " + "x" * 300)
+    progress.update("batch 2/20")
+    assert screen.positions == [(10, 4), (10, 4)]
+    assert "".join(screen.rows[4][10:]).rstrip() == "batch 2/20"
+    assert stream.getvalue() == "" and screen.newlines == 0
+    progress.close()
+    assert screen.newlines == 1 and screen.y == 5
+
+
+def test_win32_screen_buffer_structure_layout():
+    assert ctypes.sizeof(_Coord) == 4
+    assert ctypes.sizeof(_ScreenBufferInfo) == 22
+    assert _ScreenBufferInfo.srWindow.offset == 10
