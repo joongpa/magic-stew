@@ -15,7 +15,7 @@ def test_flat_to_flat_only_admits_one_whole_quarter():
     assert ((0, (0, 0, 2)),) not in routes
     assert ((0, (0, 0, 1)), (1, (0, 0, 1))) not in routes
     assert all(cost in (0., 90.) for cost in routes.values())
-    assert len(routes) == 55  # Parallel face, wide, slice and simultaneous interpretations.
+    assert len(routes) == 25  # Face/wide turns; two relative slab turns exceed the shared cap.
 
 
 @pytest.mark.parametrize('angle', [30., 45.])
@@ -34,27 +34,28 @@ def test_aligned_middle_and_upper_are_a_negative_outer_offset(angle):
 def test_both_outer_offsets_are_measured_from_the_middle():
     before = RotationGeometry.make(2, (0., -30., 15.))
     after = RotationGeometry.make(1, (15., 0., 0.))
-    assert costs(before, after)[((2, (1, 0, 0)),)] == 75.
+    assert costs(before, after)[((2, (1, 0, 0)),)] == 120.
 
 
-def test_slice_turn_limits_both_relative_angles_independently():
+def test_slice_turn_spends_both_relative_angles_from_shared_budget():
     whole_slice = ((0, (0, 1, 0)),)
     assert whole_slice not in costs(FLAT, FLAT, 89.999)
-    assert costs(FLAT, FLAT, 90.)[whole_slice] == 90.
+    assert whole_slice not in costs(FLAT, FLAT, 179.999)
+    assert costs(FLAT, FLAT, 180.)[whole_slice] == 180.
     partial = RotationGeometry.make(0, (0., 30., 0.))
-    assert costs(FLAT, partial, 30.)[()] == 30.
-    assert () not in costs(FLAT, partial, 29.999)
-    # A hidden slice moves both relative angles concurrently.
+    assert costs(FLAT, partial, 60.)[()] == 60.
+    assert () not in costs(FLAT, partial, 59.999)
+    # A hidden slice spends travel for both relative angles even concurrently.
     before = RotationGeometry.make(2, (0., 0., 3.))
     after = RotationGeometry.make(2, (0., 0., 14.))
-    assert whole_slice not in costs(before, after, 106.999)
-    assert costs(before, after, 107.)[whole_slice] == 107.
+    assert whole_slice not in costs(before, after, 196.999)
+    assert costs(before, after, 197.)[whole_slice] == 197.
 
 
 def test_slice_residual_seam_counts_concurrent_relative_distance():
     before = RotationGeometry.make(0, (0., 40., 0.))
     after = RotationGeometry.make(0, (0., -40., 0.))
-    assert costs(before, after)[((0, (0, 1, 0)),)] == 10.
+    assert costs(before, after)[((0, (0, 1, 0)),)] == 20.
 
 
 def test_rigid_rotation_does_not_spend_turn_budget_or_add_orientation_rescue():
@@ -118,10 +119,13 @@ def test_invalid_budgets_are_rejected(budget):
         routes_between(FLAT, FLAT, budget)
 
 
-def test_simultaneous_turns_each_get_the_single_turn_limit():
+def test_simultaneous_turns_obey_individual_and_pooled_limits():
     before = RotationGeometry.make(0, (0., 0., 0.))
     after = RotationGeometry.make(0, (40., 0., -40.))
-    assert costs(before, after, 60.)[()] == 40.
+    assert () not in costs(before, after, 60.)
+    assert not any(r.groups == () for r in routes_between(before, after, 60., 75.))
+    assert any(r.groups == () and r.degrees == 80.
+               for r in routes_between(before, after, 60., 80.))
     too_fast = RotationGeometry.make(0, (61., 0., -20.))
     assert () not in costs(before, too_fast, 60.)
     # Merely moving two slabs never unlocks the 50 TPS rate.
@@ -140,6 +144,8 @@ def test_whole_half_turn_gets_double_rate():
     assert double not in costs(FLAT, FLAT, 150.)
     assert not any(r.groups == double for r in routes_between(FLAT, FLAT, 150., 187.5))
     witnessed = frozenset({('direct', 0, 2)})
+    assert not any(r.groups == double
+                   for r in routes_between(FLAT, FLAT, 150., 150., witnessed))
     assert any(r.groups == double and r.degrees == 180. and r.budget == 187.5
                for r in routes_between(FLAT, FLAT, 150., 187.5, witnessed))
 

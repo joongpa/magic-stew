@@ -97,6 +97,7 @@ def search_cached_records(renderer, records, args, colors, source_fps):
                 handoff_bonus=bidirectional.WIDENING_HANDOFF_BONUS, progress=progress,
                 branch_widths=args.branch_widths, branch_stage_expansions=args.branch_stage_expansions,
                 mismatch_window_weight=bidirectional.WIDENING_MISMATCH_WEIGHT,
+                unrestricted_sticker_count=getattr(args, 'unrestricted_sticker_count', None),
             )
         else:
             try:
@@ -107,6 +108,7 @@ def search_cached_records(renderer, records, args, colors, source_fps):
                     turn_handoff_bonus=bidirectional.WIDENING_HANDOFF_BONUS,
                     ignore_queue_geometry=True, mismatch_window_weight=bidirectional.WIDENING_MISMATCH_WEIGHT,
                     branch_widths=args.branch_widths, branch_stage_expansions=args.branch_stage_expansions,
+                    unrestricted_sticker_count=getattr(args, 'unrestricted_sticker_count', None),
                 )
             except frame_search.SearchTimeLimit:
                 result = dict(status="time_limit", steps=[], solved_frame_index=None)

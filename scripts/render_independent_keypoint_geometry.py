@@ -30,6 +30,10 @@ def main():
     parser.add_argument('--render-refined', action='store_true',
         help='Render an existing joint-fit log without fitting the poses again.')
     parser.add_argument('--joint-depth-fallback', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--geometry-sweep-device', choices=('cpu', 'mps', 'cuda'), default='cpu',
+        help='Device for exhaustive sweeps, independent of the refinement device.')
+    parser.add_argument('--geometry-refinement-device', choices=('cpu', 'mps'), default='cpu',
+        help='Experimental batched Metal refinement; final scoring remains on CPU.')
     args = parser.parse_args()
     metadata = json.loads(args.log.with_suffix('.meta.json').read_text())
     source = args.source or Path(metadata['source'])
@@ -63,6 +67,8 @@ def main():
     ])
     config.turning_start_frame = metadata.get('turning_start_frame')
     config.joint_depth_fallback = args.joint_depth_fallback
+    config.geometry_sweep_device = args.geometry_sweep_device
+    config.geometry_refinement_device = args.geometry_refinement_device
     fps = metadata.get('source_fps', metadata['fps'])
     last = 0.
 
@@ -128,6 +134,9 @@ def main():
         temporal_pose_seeds='previous_and_next_frame',
         geometry_shortlist_policy='exhaustive_sweep_and_refined_pose_families',
         reference_solution_used=False, video=str(video.resolve()))
+    if not args.render_refined:
+        metadata['geometry_sweep_device'] = args.geometry_sweep_device
+        metadata['geometry_refinement_device'] = args.geometry_refinement_device
     if args.render_refined:
         metadata['refinement_seconds'] = json.loads(
             args.log.with_suffix('.meta.json').read_text()).get('refinement_seconds')

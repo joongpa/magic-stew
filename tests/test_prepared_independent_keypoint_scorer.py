@@ -375,6 +375,24 @@ def test_prepared_scorer_requires_cpu(renderer):
         search.PreparedReplayScorer(renderer, {}, "mps")
 
 
+def test_multi_state_scoring_matches_scalar_candidates_and_diagnostics(renderer):
+    record = observation_record(renderer)
+    count = len(record['search_pose']['sticker_mask_centers'])
+    record['search_pose']['sticker_color_names'] = ['red', 'green', 'white'] * (count//3) + ['red'] * (count%3)
+    options = dict(balance_geometry_color=True, color_confusion_scoring=True,
+                   initial_colors=search.initial_sticker_colors(renderer, 'R U F2'))
+    scorer = search.PreparedReplayScorer(renderer, {7: record}, 'cpu', **options)
+    identity = renderer.CubeGeometryState.identity()
+    states = [scorer.key(identity.apply_moves(moves)) for moves in ((), ('R',), ('U', "F'"), ('Rw', 'D2'))]
+    expected = [scorer(7, state) for state in states]
+    scorer.cache.clear()
+    actual = scorer.evaluate_many(7, states)
+    for old, new in zip(expected, actual, strict=True):
+        assert [(t.state, t.rank, dict(t.payload)) for t in new] == [
+            (t.state, t.rank, dict(t.payload)) for t in old]
+    assert scorer.evaluate_many(7, []) == ()
+
+
 def test_compact_transitions_match_geometry_for_turns_wide_turns_and_rotations(renderer):
     scorer = search.PreparedReplayScorer(renderer, {}, "cpu")
     state = renderer.CubeGeometryState.identity()

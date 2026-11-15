@@ -106,8 +106,8 @@ def test_flat_update_can_win_a_tie_without_layer_inliers():
 
 @pytest.mark.parametrize('widths', [(3,), (2, 3)])
 def test_branch_cutoff_keeps_all_distinct_children_tied_on_full_rank(widths):
-    choices = [edge('a', .1), edge('b', .1), edge('a', .1)]
-    choices += [search.replay.Transition(state, .2, (.2, tiebreak), dict(state_moves=()))
+    choices = [edge('a', .1, ('R',)), edge('b', .1, ('U',)), edge('a', .1, ('R',))]
+    choices += [search.replay.Transition(state, .2, (.2, tiebreak), dict(state_moves=(state,)))
                 for state, tiebreak in (('c', 0), ('d', 0), ('goal', 0), ('worse', 1))]
 
     def solve(target):
@@ -120,6 +120,35 @@ def test_branch_cutoff_keeps_all_distinct_children_tied_on_full_rank(widths):
     assert result['branch_width'] == 3
     assert result['deferred_promoted'] == (3 if len(widths) > 1 else 0)
     assert solve('worse')['status'] == 'exhausted'
+
+
+def test_branch_slots_keep_best_geometry_per_move_sequence():
+    choices = [edge('bad-best', .1, ("F'", 'R')),
+               edge('bad-other-geometry', .11, ("F'", 'R')),
+               edge('goal', .2, ('R',))]
+    result = search.frame_full_solve('root', (0,), lambda *_: choices,
+        lambda state: state == 'goal', str, branch_widths=(2,))
+    assert result['status'] == 'solved'
+    assert result['steps'][0]['state_moves'] == ('R',)
+    assert result['steps'][0]['sibling_rank'] == 2
+
+
+@pytest.mark.parametrize('stickers', [0, 1, 3, 4])
+def test_sparse_observations_admit_low_ranked_moves_without_widening(stickers):
+    choices = [search.replay.Transition(str(i), i/100., (i/100.,),
+        dict(state_moves=(str(i),), color_match_count=stickers)) for i in range(1, 22)]
+    result = search.frame_full_solve('root', (0,), lambda *_: choices,
+        lambda state: state == '21', str, branch_widths=(3,), unrestricted_sticker_count=3)
+    assert result['status'] == ('solved' if stickers <= 3 else 'exhausted')
+    if stickers <= 3:
+        assert result['steps'][0]['sibling_rank'] == 21
+        assert result['steps'][0]['branch_cutoff_bypassed']
+
+
+def test_sparse_branch_requires_every_fit_to_have_few_assigned_stickers():
+    assert search.unrestricted_sticker_branch([dict(color_match_count=2), dict(color_match_count=3)], 3)
+    assert not search.unrestricted_sticker_branch([dict(color_match_count=2), dict(color_match_count=4)], 3)
+    assert not search.unrestricted_sticker_branch([{}], 3)
 
 
 def test_bottom_quartile_orders_queue_using_the_complete_observed_history():
@@ -182,7 +211,7 @@ def test_mismatch_window_pools_counts_reorders_queue_and_expires_oldest_frame():
 def test_branch_widening_releases_saved_siblings_without_scoring_parent_again(stage_budget):
     def fitted(state, score, color):
         return search.replay.Transition(state, score, (score,), dict(
-            state_moves=(), color_error=color), None)
+            state_moves=(str(state),), color_error=color), None)
 
     calls = []
     events = []
@@ -211,7 +240,7 @@ def test_branch_widening_releases_saved_siblings_without_scoring_parent_again(st
 def test_resume_restores_the_queue_order_and_path_history(tmp_path, widths):
     def transitions(frame, state):
         return tuple(search.replay.Transition(next_state, .1, (.1,), dict(
-            state_moves=(), color_match_count=10, color_error=.2,
+            state_moves=('R',) if next_state != state else (), color_match_count=10, color_error=.2,
             color_forbidden_count=misses))
             for next_state, misses in ((state+1, frame % 3), (state, 2)))
 

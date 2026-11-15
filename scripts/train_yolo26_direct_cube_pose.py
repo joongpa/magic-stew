@@ -11,6 +11,9 @@ branch predicts rotation, exact projection parameters, six face offsets,
 auxiliary ordered centers and a projection-error-derived pose quality score.
 It sees predicted landmark/sticker points and feature maps, never GT points.
 One allowed symmetry is selected jointly across all direct-pose losses.
+Geometry fits all retained visible landmark/center-sticker observations with
+a robust distance penalty; hidden ideal points remain diagnostic targets only for that
+term. Other parameter and center-anchor supervision remains in place.
 
 The first five epochs train the new branch with the detector frozen; later
 epochs fine-tune both with a smaller detector learning rate. Validation uses a
@@ -43,7 +46,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 from live_recognition.direct_cube_pose import (  # noqa: E402
-    CHECKPOINT_FORMAT, CLASS_NAMES, FACE_ORDER, DirectCubePoseModel, SymmetryPoseLoss,
+    CHECKPOINT_FORMAT, CLASS_NAMES, DIRECT_POSE_LOSS_VERSION, DIRECT_POSE_OBSERVATION_VERSION,
+    FACE_ORDER, TURN_ACTIVE_EPSILON_DEGREES,
+    DirectCubePoseModel, SymmetryPoseLoss,
     independent_pose_criterion, load_direct_pose_checkpoint, make_detector,
 )
 from live_recognition.direct_cube_pose_data import (  # noqa: E402
@@ -146,6 +151,7 @@ def run_epoch(model, loader, independent_loss, direct_loss, device, optimizer=No
     training = optimizer is not None
     model.train(training)
     totals, denominators = {}, {}
+    progress_width = 0
     entries = {entry["key"]: entry for entry in loader.dataset.entries} if not training else {}
     for batch_index, (batch, target, keys) in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
@@ -165,6 +171,9 @@ def run_epoch(model, loader, independent_loss, direct_loss, device, optimizer=No
             per_image = metrics.pop("per_image")
             total = losses["total"] + independent_weight * independent
             if not torch.isfinite(total):
+                if progress_width:
+                    print(flush=True)
+                    progress_width = 0
                 # Expensive inspection and batch serialization occur ONLY on
                 # failure. Normal training has no scans, snapshots or retries.
                 attempt = {"outputs": {"independent": independent_loss.raw_predictions(prediction["independent"]),
@@ -197,6 +206,12 @@ def run_epoch(model, loader, independent_loss, direct_loss, device, optimizer=No
         values = {"loss": total.detach(), "independent_loss": independent.detach(),
                   **{f"direct_{name}": value.detach() for name, value in losses.items()}, **metrics}
         valid_count = int(target["enabled"].sum())
+        visible_counts = target["observed_mask"].sum(-1) + target.get(
+            "observed_center_mask", torch.zeros_like(target["centers"][..., 0], dtype=torch.bool)).sum(-1)
+        visible_enabled = target["enabled"] & (visible_counts > 0)
+        moving_faces = target["angles"].abs() > TURN_ACTIVE_EPSILON_DEGREES
+        angle_counts = {"moving_angle_mae_deg": moving_faces.sum(-1),
+                        "stationary_angle_mae_deg": (~moving_faces).sum(-1)}
         for name, value in values.items():
             # Direct geometric losses/metrics average over supervised poses;
             # independent and quality losses also include empty-label images.
@@ -204,6 +219,10 @@ def run_epoch(model, loader, independent_loss, direct_loss, device, optimizer=No
                                      or name in ("rotation_deg", "center_rmse_px", "landmark_rmse_px", "angle_mae_deg")) else size
             if name == "observed_landmark_rmse_px":
                 weight = int((target["enabled"] & target["observed_mask"].any(-1)).sum())
+            elif name in ("direct_geometry", "visible_keypoint_rmse_px"):
+                weight = int(visible_enabled.sum())
+            elif name in angle_counts:
+                weight = int((angle_counts[name] * target["enabled"]).sum())
             totals[name] = totals.get(name, 0.) + float(value) * weight
             denominators[name] = denominators.get(name, 0) + weight
         if not training:
@@ -217,24 +236,40 @@ def run_epoch(model, loader, independent_loss, direct_loss, device, optimizer=No
                     for name, value in per_image.items():
                         if name == "observed_landmark_rmse_px" and not bool(target["observed_mask"][index].any()):
                             continue
+                        if name == "visible_keypoint_rmse_px" and not bool(visible_enabled[index]):
+                            continue
+                        weight = int(angle_counts[name][index]) if name in angle_counts else 1
+                        if not weight:
+                            continue
                         field = f"{group}/{name}"
-                        totals[field] = totals.get(field, 0.) + float(value[index])
-                        denominators[field] = denominators.get(field, 0) + 1
+                        totals[field] = totals.get(field, 0.) + float(value[index]) * weight
+                        denominators[field] = denominators.get(field, 0) + weight
         if training and (batch_index == 0 or (batch_index + 1) % 50 == 0):
-            print(f"  batch {batch_index + 1}/{len(loader)} total={float(total.detach()):.4f} "
+            message = (f"  batch {batch_index + 1}/{len(loader)} total={float(total.detach()):.4f} "
                   f"yolo={float(independent.detach()):.4f} pose={float(losses['total'].detach()):.4f} "
                   f"centers={float(metrics['center_rmse_px']):.2f}px "
-                  f"landmarks={float(metrics['landmark_rmse_px']):.2f}px "
+                  f"visible={float(metrics['visible_keypoint_rmse_px']):.2f}px "
                   f"rotation={float(metrics['rotation_deg']):.2f}deg turns={float(metrics['angle_mae_deg']):.2f}deg "
+                  f"moving_turns={float(metrics['moving_angle_mae_deg']):.2f}deg "
                   f"pose_quality={float(metrics['quality_predicted']):.3f} "
-                  f"quality_target={float(metrics['quality_target']):.3f}", flush=True)
+                  f"quality_target={float(metrics['quality_target']):.3f}")
+            print("\r" + message.ljust(progress_width), end="", flush=True)
+            progress_width = max(progress_width, len(message))
+    if progress_width:
+        print(flush=True)
     if not totals:
         raise ValueError("No batches were processed")
-    return {name: value / max(1, denominators[name]) for name, value in totals.items()}
+    result = {name: value / max(1, denominators[name]) for name, value in totals.items()}
+    result["moving_face_count"] = denominators.get("moving_angle_mae_deg", 0)
+    result["stationary_face_count"] = denominators.get("stationary_angle_mae_deg", 0)
+    return result
 
 
 def save_checkpoint(path, model, optimizer, scheduler, scaler, args, epoch, best, bad_epochs, manifest, generator):
-    checkpoint = {"format": CHECKPOINT_FORMAT, "epoch": epoch, "best_val_loss": best,
+    checkpoint = {"format": CHECKPOINT_FORMAT, "direct_loss_version": DIRECT_POSE_LOSS_VERSION,
+                  "observation_version": DIRECT_POSE_OBSERVATION_VERSION,
+                  "observation_token_branch": "one2one" if model.detector.end2end else "one2many",
+                  "epoch": epoch, "best_val_loss": best,
                   "bad_epochs": bad_epochs, "detector_yaml": copy.deepcopy(model.detector.yaml),
                   "detector_end2end": model.detector.end2end,
                   "head_config": model.head_config, "class_names": list(CLASS_NAMES), "face_order": list(FACE_ORDER),
@@ -244,7 +279,7 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, args, epoch, best
                   "torch_rng": torch.get_rng_state(), "numpy_rng": np.random.get_state(),
                   "python_rng": random.getstate(), "loader_rng": generator.get_state(),
                   "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-                  "quality_definition": "exp(-0.5*(max(joint-selected articulated target landmark RMSE, saved observed landmark RMSE) / quality_sigma)^2); zero where pose supervision is masked; not a calibrated probability"}
+                  "quality_definition": "exp(-0.5*(joint-selected all-visible-keypoint RMSE / quality_sigma)^2); no point trimming; zero without visible supervision; not a calibrated probability"}
     temporary = path.with_suffix(".tmp")
     torch.save(checkpoint, temporary)
     temporary.replace(path)
@@ -300,6 +335,8 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
     device = select_device(args.device)
+    args.direct_loss_version = DIRECT_POSE_LOSS_VERSION
+    args.observation_version = DIRECT_POSE_OBSERVATION_VERSION
     print(f"PyTorch {torch.__version__}; Ultralytics {version('ultralytics')}", flush=True)
     entries, manifest = read_manifest(args.dataset)
     args.dataset = str(args.dataset.resolve())
@@ -378,6 +415,17 @@ def main():
         for group, base_lr in zip(optimizer.param_groups, scheduler.base_lrs):
             group["lr"] = scheduler.eta_min + (base_lr - scheduler.eta_min) * (1 + math.cos(math.pi * start_epoch / args.epochs)) / 2
         bad_epochs = checkpoint["bad_epochs"]
+        if checkpoint.get("direct_loss_version") != DIRECT_POSE_LOSS_VERSION:
+            # The previous all-face reduction has a different numerical loss
+            # scale. Keep learned weights/optimizer progress, but do not compare
+            # new validation losses against the old best or patience counter.
+            print(f"Direct pose loss changed to {DIRECT_POSE_LOSS_VERSION}; "
+                  "resetting best validation loss and early-stopping patience", flush=True)
+            best, bad_epochs = float("inf"), 0
+        if checkpoint.get("observation_version") != DIRECT_POSE_OBSERVATION_VERSION:
+            print("Observation tokens now follow the detector's configured inference branch; "
+                  "resetting best validation loss and early-stopping patience", flush=True)
+            best, bad_epochs = float("inf"), 0
         torch.set_rng_state(checkpoint["torch_rng"])
         np.random.set_state(checkpoint["numpy_rng"])
         random.setstate(checkpoint["python_rng"])
@@ -406,7 +454,9 @@ def main():
         improved = val["loss"] < best
         best = min(best, val["loss"])
         bad_epochs = 0 if improved else bad_epochs + 1
-        record = {"epoch": epoch, "detector_frozen": frozen, "seconds": time.monotonic() - started,
+        record = {"epoch": epoch, "direct_loss_version": DIRECT_POSE_LOSS_VERSION,
+                  "observation_version": DIRECT_POSE_OBSERVATION_VERSION,
+                  "detector_frozen": frozen, "seconds": time.monotonic() - started,
                   "train": train, "val": val, "learning_rates": [group["lr"] for group in optimizer.param_groups]}
         with (output / "metrics.jsonl").open("a") as handle:
             handle.write(json.dumps(record, allow_nan=False) + "\n")
@@ -420,7 +470,9 @@ def main():
               f"pose_train={train['direct_total']:.4f} pose_val={val['direct_total']:.4f} "
               f"centers={val['center_rmse_px']:.2f}px landmarks={val['landmark_rmse_px']:.2f}px "
               f"observed={val['observed_landmark_rmse_px']:.2f}px "
+              f"visible={val['visible_keypoint_rmse_px']:.2f}px "
               f"rotation={val['rotation_deg']:.2f}deg turns={val['angle_mae_deg']:.2f}deg "
+              f"moving_turns={val['moving_angle_mae_deg']:.2f}deg "
               f"pose_quality={val['quality_predicted']:.3f} quality_target={val['quality_target']:.3f} "
               f"({record['seconds']:.1f}s)", flush=True)
         if hasattr(independent_loss, "update"):

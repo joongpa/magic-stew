@@ -28,8 +28,10 @@ import zlib
 
 try:
     from scripts.independent_keypoint_rotation_budget import RotationBudgetScorerMixin
+    from scripts import independent_keypoint_search_fast as fast
 except ModuleNotFoundError:
     from independent_keypoint_rotation_budget import RotationBudgetScorerMixin
+    import independent_keypoint_search_fast as fast
 
 ROOT = Path(__file__).resolve().parents[1]
 GEOMETRY_SHORTLIST_SIZE = 5
@@ -933,6 +935,7 @@ class PreparedReplayScorer(RotationBudgetScorerMixin, ReplayScorer):
                                  for axis in range(3) for side in (-1, 1))
         self.color_configurations_scored = 0
         self.child_states_built = 0
+        self.row_cache = OrderedDict()
 
     def key(self, state):
         # Search, queue storage and dominance keys share the same 54-byte value.
@@ -947,6 +950,10 @@ class PreparedReplayScorer(RotationBudgetScorerMixin, ReplayScorer):
         moves = tuple(moves)
         if not moves:
             return state
+        return fast.permute(state, self.move_sources(moves))
+
+    def move_sources(self, moves):
+        """Cache the exact position permutation separately from state creation."""
         np = self.np
         if moves not in self.move_permutations:
             indices = {position: index for index, position in enumerate(self.positions)}
@@ -955,7 +962,7 @@ class PreparedReplayScorer(RotationBudgetScorerMixin, ReplayScorer):
             source_by_label = {label: indices[position] for position, label in identity_sources.items()}
             self.move_permutations[moves] = np.asarray(
                 [source_by_label[sources[target]] for target in self.positions], dtype=np.intp)
-        return np.frombuffer(state, dtype=np.uint8)[self.move_permutations[moves]].tobytes()
+        return self.move_permutations[moves]
 
     def solved_predicate(self, sticker_colors):
         valid_colors = set(self.m.CubeState.solved().colors.values())
@@ -1188,6 +1195,9 @@ class PreparedReplayScorer(RotationBudgetScorerMixin, ReplayScorer):
 
     @staticmethod
     def _template(prepared, index):
+        cached = prepared.setdefault('row_templates', {})
+        if index in cached:
+            return cached[index]
         option = int(prepared['option_rows'][index])
         payload, robust = prepared['templates'][option]
         moves, offset, direction = prepared['action_specs'][prepared['group_ids'][index]]
@@ -1205,7 +1215,8 @@ class PreparedReplayScorer(RotationBudgetScorerMixin, ReplayScorer):
                           previous_geometry_index=previous if previous >= 0 else None,
                           angular_travel_degrees=float(prepared['rotation_degrees'][index]),
                           rotation_budget_degrees=float(prepared['rotation_budgets'][index]))
-        return result, direction, robust
+        cached[index] = result, direction, robust
+        return cached[index]
 
     def _parallel_geometry(self, frame, candidate, limit):
         """Deduplicate assignments, preserving distinct angles for shortlisting."""
@@ -1318,6 +1329,9 @@ class PreparedReplayScorer(RotationBudgetScorerMixin, ReplayScorer):
             active_holds = np.asarray([not template['state_moves'] and
                 self.m.turn_trial_activity_layer(template) is not None for template in templates])
             result['group_ids'] = 2*result['group_ids']+active_holds
+        result['rank_groups'] = np.unique(result['group_ids'], return_inverse=True)[1].astype(np.intp)
+        result['rank_inliers'] = np.asarray(result['inliers'], dtype=np.float64)
+        result['rank_layer_inliers'] = np.asarray(result['layer_inliers'], dtype=np.float64)
         prepared["selections"][restriction] = result
         return result
 
@@ -1335,7 +1349,26 @@ class PreparedReplayScorer(RotationBudgetScorerMixin, ReplayScorer):
             return self.m.color_confusion_trial_fields(metrics, 0, self.color_confusion_cost)
         return dict(color_forbidden_count=int(metrics['forbidden'][0]))
 
-    def _evaluate(self, frame, state, restriction):
+    def evaluate_many(self, frame, states, restriction=None):
+        """Score a fixed batch without changing expansion order or admission rules."""
+        np = self.np
+        states = tuple(states)
+        if not states or self.hold_reason(frame) is not None or not self.color_confusion_scoring:
+            return tuple(self._evaluate(frame, state, restriction) for state in states)
+        prepared = self.prepare(frame)
+        selection = self._selection(prepared, restriction)
+        if selection['nearest'] is None:
+            return tuple(self._evaluate(frame, state, restriction) for state in states)
+        rows = selection.get('color_rows', slice(None))
+        indices = self.canonical_from_encoded[np.asarray([
+            np.frombuffer(self.key(state), dtype=np.uint8)[self.geometry_positions] for state in states])]
+        metrics = fast.color_metrics(self.m, indices, selection['nearest'][rows], selection['weights'][rows],
+                                     prepared['confusion_costs'], self.color_confusion_cost)
+        return tuple(self._evaluate(frame, state, restriction,
+            _confusion={key: value[index] for key, value in metrics.items()})
+            for index, state in enumerate(states))
+
+    def _evaluate(self, frame, state, restriction, *, _confusion=None, _rows_only=False):
         if self.hold_reason(frame) is not None:
             return self.hold_transition(frame, state)
         np, m = self.np, self.m
@@ -1343,10 +1376,11 @@ class PreparedReplayScorer(RotationBudgetScorerMixin, ReplayScorer):
         # The same physical state can have different legal next moves depending
         # on its update history. A filtered result cannot serve another history.
         cache_key = (frame, encoded, restriction, isinstance(state, bytes))
-        if cache_key in self.cache:
+        cache = self.row_cache if _rows_only else self.cache
+        if cache_key in cache:
             self.cache_hits += 1
-            self.cache.move_to_end(cache_key)
-            return self.cache[cache_key]
+            cache.move_to_end(cache_key)
+            return cache[cache_key]
         prepared = self.prepare(frame)
         pruned_before = self.confusion_pruned_fits
         selection = self._selection(prepared, restriction)
@@ -1364,8 +1398,8 @@ class PreparedReplayScorer(RotationBudgetScorerMixin, ReplayScorer):
             nearest = selection['nearest'][color_rows]
             weights = selection['weights'][color_rows]
             if self.color_confusion_scoring:
-                confusion = m.sticker_color_confusion_metrics(indices, nearest, weights,
-                    prepared['confusion_costs'], self.color_confusion_cost)
+                confusion = (_confusion if _confusion is not None else fast.color_metrics(
+                    m, indices, nearest, weights, prepared['confusion_costs'], self.color_confusion_cost))
                 errors = confusion['error']
             else:
                 observation_matches = weights * prepared["match_matrix"][
@@ -1385,13 +1419,7 @@ class PreparedReplayScorer(RotationBudgetScorerMixin, ReplayScorer):
             forbidden = confusion['forbidden'][color_inverse] > 0
             self.confusion_pruned_fits += int(forbidden.sum())
             costs = np.where(forbidden, np.inf, costs)
-        eligible = (np.flatnonzero(np.isfinite(costs)) if self.minimum_color_accuracy is not None or confusion is not None
-                    else np.arange(len(costs)))
-        order = eligible[np.lexsort((-selection["layer_inliers"][eligible], selection["p90s"][eligible],
-                                     -selection["inliers"][eligible], costs[eligible], selection["group_ids"][eligible]))]
-        ordered_groups = selection["group_ids"][order]
-        best = (np.sort(order[np.r_[True, ordered_groups[1:] != ordered_groups[:-1]]])
-                if len(order) else np.empty(0, dtype=np.intp))
+        best = fast.best_rows(costs, selection)
         observation_masks = {}
         if self.track_sticker_observations:
             observed = correct = np.zeros(len(best), dtype=np.uint64)
@@ -1401,7 +1429,30 @@ class PreparedReplayScorer(RotationBudgetScorerMixin, ReplayScorer):
             observation_masks = {int(index):dict(sticker_observed_mask_hex=f'{int(o):014x}',
                                                 sticker_correct_mask_hex=f'{int(c):014x}')
                                  for index,o,c in zip(best,observed,correct,strict=True)}
-        unique, moved = {}, {(): (state, encoded)}
+        data = dict(frame=frame, state=state, encoded=encoded, prepared=prepared, selection=selection,
+                    costs=costs, errors=errors, best=best, confusion=confusion, indices=indices,
+                    color_inverse=color_inverse, observation_masks=observation_masks)
+        if _rows_only:
+            cache[cache_key] = data
+            if len(cache) > self.cache_size:
+                cache.popitem(last=False)
+            return data
+        result = self._transitions_from_rows(data)
+        if not result and self.confusion_pruned_fits > pruned_before:
+            self.confusion_dead_end_states += 1
+        cache[cache_key] = result
+        if len(cache) > self.cache_size:
+            cache.popitem(last=False)
+        return result
+
+    def _transitions_from_rows(self, data, selected=None):
+        m = self.m
+        state, encoded, prepared, selection = (data[key] for key in ('state', 'encoded', 'prepared', 'selection'))
+        costs, errors, confusion, indices, color_inverse, observation_masks = (
+            data[key] for key in ('costs', 'errors', 'confusion', 'indices', 'color_inverse', 'observation_masks'))
+        best = data['best'] if selected is None else selected
+        compact = self.rotation_budget_enabled and isinstance(state, bytes)
+        unique, moved = {}, {(): (state, self.move_sources(()).tobytes() if compact else encoded)}
         for index in best:
             score, color_error = float(costs[index]), float(errors[index])
             if not math.isfinite(score) or not math.isfinite(color_error):
@@ -1409,8 +1460,9 @@ class PreparedReplayScorer(RotationBudgetScorerMixin, ReplayScorer):
             template, direction, robust = self._template(prepared, selection['rows'][index])
             moves = template["state_moves"]
             if moves not in moved:
-                after = self.apply_moves(state, moves)
-                moved[moves] = (after, self.key(after))
+                sources = self.move_sources(moves)
+                after = fast.DeferredState(state, sources) if compact else self.apply_moves(state, moves)
+                moved[moves] = (after, sources.tobytes() if compact else self.key(after))
                 self.child_states_built += 1
             after, after_key = moved[moves]
             rank = (score, -float(selection["inliers"][index]), float(selection["p90s"][index]),
@@ -1425,22 +1477,15 @@ class PreparedReplayScorer(RotationBudgetScorerMixin, ReplayScorer):
                     confusion_fields = m.color_confusion_trial_fields(confusion, color_index, self.color_confusion_cost)
                 else:
                     confusion_fields = self._confusion_fields(prepared, int(selection['rows'][index]), indices)
-                payload = dict(template, state_score=score, global_mean_error=score,
-                    global_robust_error=(float(m.balanced_robust_cost(robust, color_error)) if self.balance_geometry_color else
-                                         robust + m.PNP_TURN_COLOR_WEIGHT * color_error),
-                    color_error=color_error, color_match_count=int(selection["matches"][index]),
-                    **observation_masks.get(int(index), {}),
-                    **confusion_fields)
-                if self.balance_geometry_color:
-                    payload["score_components"] = dict(geometry=float(selection["geometry_scores"][index]),
-                                                       color=color_error, geometry_weight=.5, color_weight=.5)
-                unique[key] = Transition(after, score, rank, payload, direction)
+                payload = fast.ScoredPayload(template, m, robust, self.balance_geometry_color,
+                    float(selection['geometry_scores'][index]), state_score=score, global_mean_error=score,
+                    color_error=color_error, color_match_count=int(selection['matches'][index]),
+                    **observation_masks.get(int(index), {}), **confusion_fields)
+                transition = fast.CompactTransition if compact else Transition
+                if not compact:
+                    payload = dict(payload)
+                unique[key] = transition(after, score, rank, payload, direction)
         result = tuple(sorted(unique.values(), key=lambda t: t.rank))
-        if not result and self.confusion_pruned_fits > pruned_before:
-            self.confusion_dead_end_states += 1
-        self.cache[cache_key] = result
-        if len(self.cache) > self.cache_size:
-            self.cache.popitem(last=False)
         return result
 
 

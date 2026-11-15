@@ -174,7 +174,7 @@ def test_reverse_search_and_join_compose_a_handoff_with_the_current_turn(widths)
 @pytest.mark.parametrize('widths', [(3,), (2, 3)])
 def test_widening_join_keeps_full_tie_at_branch_cutoff(direction, widths):
     def expand(node, depth):
-        return [Link(state, step=dict(state_moves=(), state_score=score, queue_priority=score),
+        return [Link(state, step=dict(state_moves=(state.decode(),), state_score=score, queue_priority=score),
                      rank=((tiebreak,),))
                 for state, score, tiebreak in (
                     (b'a', .1, 0), (b'b', .1, 0), (b'a', .1, 0), (b'c', .2, 0),
@@ -194,6 +194,48 @@ def test_widening_join_keeps_full_tie_at_branch_cutoff(direction, widths):
     assert match is not None
     assert match[direction + 1].step['sibling_rank'] == 5
     assert join(b'worse') is None
+
+
+@pytest.mark.parametrize('direction', [0, 1])
+def test_widening_deduplicates_move_sequences_across_residual_geometries(direction):
+    def expand(node, depth):
+        return [Link(state, cue, step=dict(state_moves=moves, state_score=score, queue_priority=score),
+                     rank=((score,),))
+                for state, cue, moves, score in (
+                    (b'bad', 1, ("F'", 'R'), .1),
+                    (b'bad', 2, ("F'", 'R'), .11),
+                    (b'goal', None, ('R',), .2))]
+    expansions = [expand, lambda *_: ()]
+    seeds = [b'root', b'goal']
+    if direction:
+        expansions.reverse()
+        seeds.reverse()
+    match = widening_join(*expansions, seeds[0], (seeds[1],), 1,
+        widths=(2,), stage_budget=10, mismatch_weight=0., expanded=[0, 0], reached=[0, 1],
+        time_limit_check=lambda: None, state_limit=10, report=lambda *_, **__: None)
+    assert match is not None
+    assert match[direction+1].step['sibling_rank'] == 2
+
+
+@pytest.mark.parametrize('direction', [0, 1])
+@pytest.mark.parametrize('stickers', [0, 3, 4])
+def test_sparse_observations_release_all_distinct_moves_in_either_direction(direction, stickers):
+    def expand(node, depth):
+        return [Link(str(i).encode(), step=dict(state_moves=(str(i),), state_score=i/100.,
+                    queue_priority=i/100., color_match_count=stickers, color_forbidden_count=0), rank=((i/100.,),))
+                for i in range(1, 22)]
+    expansions = [expand, lambda *_: ()]
+    seeds = [b'root', b'21']
+    if direction:
+        expansions.reverse(); seeds.reverse()
+    match = widening_join(*expansions, seeds[0], (seeds[1],), 1,
+        widths=(3,), stage_budget=10, mismatch_weight=0., expanded=[0, 0], reached=[0, 1],
+        time_limit_check=lambda: None, state_limit=30, report=lambda *_, **__: None,
+        unrestricted_sticker_count=3)
+    assert (match is not None) == (stickers <= 3)
+    if match:
+        assert match[direction+1].step['sibling_rank'] == 21
+        assert match[direction+1].step['branch_cutoff_bypassed']
 
 
 def test_lookahead_ranks_complete_windows_and_reuses_the_shifted_forecast():

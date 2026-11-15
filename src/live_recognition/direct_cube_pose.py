@@ -21,6 +21,41 @@ FACE_ORDER = ("U", "D", "F", "B", "R", "L")
 FACE_COLORS = ("white", "yellow", "green", "blue", "red", "orange")
 FACE_AXES = ((0, 0, 1), (0, 0, -1), (0, -1, 0), (0, 1, 0), (1, 0, 0), (-1, 0, 0))
 CHECKPOINT_FORMAT = "direct_cube_pose_checkpoint_v2"
+DIRECT_POSE_LOSS_VERSION = "visible_reprojection_v2"
+DIRECT_POSE_OBSERVATION_VERSION = "configured_inference_branch_v1"
+TURN_ACTIVE_EPSILON_DEGREES = 1e-4
+
+
+def balanced_face_angle_loss(errors: Tensor, target_angles: Tensor) -> Tensor:
+    """Weight moving and stationary face groups equally for each candidate.
+
+    Most faces have zero target offset. Averaging all six lets those faces
+    dominate the articulation objective. A group that is absent contributes
+    neither loss nor weight; aligned cubes still supervise all six zero angles.
+    """
+    moving = target_angles.abs() > TURN_ACTIVE_EPSILON_DEGREES
+    stationary = ~moving
+    moving_count, stationary_count = moving.sum(-1), stationary.sum(-1)
+    moving_loss = (errors * moving).sum(-1) / moving_count.clamp_min(1)
+    stationary_loss = (errors * stationary).sum(-1) / stationary_count.clamp_min(1)
+    present = (moving_count > 0).float() + (stationary_count > 0).float()
+    return (moving_loss + stationary_loss) / present.clamp_min(1)
+
+
+def visible_reprojection_loss(projected: Tensor, observed: Tensor, visible: Tensor):
+    """Per-candidate radial Huber loss and RMSE on all saved visible points.
+
+    No rank-based trimming or hard residual cutoff: every visible match keeps
+    a gradient, with bounded influence for large errors. Masked coordinates
+    never enter the residual; an image without observations contributes zero.
+    """
+    delta = torch.where(visible[..., None], projected - observed, 0.)
+    distances = torch.linalg.vector_norm(delta, dim=-1)
+    counts = visible.sum(-1)
+    losses = F.smooth_l1_loss(distances, torch.zeros_like(distances), beta=.02, reduction="none")
+    losses = losses.sum(-1) / counts.clamp_min(1)
+    rmse = (distances.detach().square().sum(-1) / counts.clamp_min(1)).sqrt()
+    return losses, rmse
 
 
 def rotation_from_6d(value: Tensor) -> Tensor:
@@ -162,18 +197,27 @@ class DirectCubePoseModel(nn.Module):
 
     def encode_observations(self, images):
         """Return model-predicted inputs; a frozen encoder can cache these."""
-        from ultralytics.nn.modules.head import Pose26
-        from ultralytics.utils.loss import PoseLoss26, v8PoseLoss
-        from ultralytics.utils.tal import make_anchors
-
         independent = self.detector(images)
         raw = independent[1] if isinstance(independent, tuple) else independent
         if not isinstance(raw, dict):
             raise TypeError("This branch requires Ultralytics' dictionary pose outputs (tested with 8.4.51)")
+        head = self.detector.model[-1]
         pyramid_branch = raw.get("one2many", raw)
-        token_branch = raw.get("one2one", pyramid_branch)
+        # Dual-head YOLO checkpoints can return both branches even when their
+        # configured inference path is one-to-many. Use the same point/class
+        # predictions as inference instead of selecting a branch by existence.
+        token_branch = raw.get("one2one", pyramid_branch) if getattr(head, "end2end", False) else pyramid_branch
         if "kpts" not in token_branch or "scores" not in token_branch:
             raise ValueError("YOLO output is missing independent keypoints or class logits")
+        points, scores = self._decode_observation_tokens(images, token_branch)
+        return independent, pyramid_branch["feats"], points, scores
+
+    def _decode_observation_tokens(self, images, token_branch):
+        """Decode one explicitly selected branch without changing detector mode."""
+        from ultralytics.nn.modules.head import Pose26
+        from ultralytics.utils.loss import PoseLoss26, v8PoseLoss
+        from ultralytics.utils.tal import make_anchors
+
         head = self.detector.model[-1]
         anchors, strides = make_anchors(token_branch["feats"], head.stride, .5)
         # Use the installed TRAINING decoder: YOLO26 and YOLO11 have different
@@ -183,7 +227,7 @@ class DirectCubePoseModel(nn.Module):
         keypoints = token_branch["kpts"].transpose(1, 2).reshape(len(images), -1, 1, 3)
         points = decoder(anchors, keypoints)[:, :, 0, :2] * strides[None]
         points = points / images.new_tensor((images.shape[-1], images.shape[-2]))
-        return independent, pyramid_branch["feats"], points, token_branch["scores"].sigmoid()
+        return points, token_branch["scores"].sigmoid()
 
     def forward(self, images):
         independent, features, points, scores = self.encode_observations(images)
@@ -301,18 +345,28 @@ class SymmetryPoseLoss(nn.Module):
         target_angles = target["angles"][:, self.center_inverse]
         target_centers = target["centers"][:, self.center_inverse]
         target_landmarks = target["landmarks"][:, self.landmark_inverse]
+        observed_landmarks = target["observed_landmarks"][:, self.landmark_inverse]
+        landmark_mask = target["observed_mask"][:, self.landmark_inverse]
+        observed_centers = target.get("observed_centers", torch.zeros_like(target["centers"]))[:, self.center_inverse]
+        center_mask = target.get("observed_center_mask", torch.zeros_like(target["centers"][..., 0], dtype=torch.bool))[:, self.center_inverse]
         articulated = articulated_landmarks(self.rest_points, self.owners, prediction["angles"])
         projected = project_points(articulated, prediction)
+        visible = torch.cat((landmark_mask, center_mask), -1)
+        observations = torch.cat((observed_landmarks, observed_centers), -2)
+        visible_projected = torch.cat((projected, prediction["projected_centers"]), -2)[:, None]
+        geometry, visible_rmse = visible_reprojection_loss(visible_projected, observations, visible)
+        geometry_enabled = enabled * visible.any(-1)[:, 0]
 
         def smooth(value, expected, beta=.02):
             return F.smooth_l1_loss(value.expand_as(expected), expected, reduction="none", beta=beta)
 
         components = {
             "rotation": (prediction["rotation_matrix"][:, None] - target_rotations).square().mean((-1, -2)),
-            "angles": smooth(prediction["angles"][:, None] / 45, target_angles / 45, beta=.1).mean(-1),
+            "angles": balanced_face_angle_loss(
+                smooth(prediction["angles"][:, None] / 45, target_angles / 45, beta=.1), target_angles),
             "centers": (smooth(prediction["center_keypoints"][:, None], target_centers).mean((-1, -2))
                         + smooth(prediction["projected_centers"][:, None], target_centers).mean((-1, -2))),
-            "geometry": smooth(projected[:, None], target_landmarks).mean((-1, -2)),
+            "geometry": geometry,
         }
         projection_loss = (
             F.smooth_l1_loss(prediction["center"], target["center"], reduction="none", beta=.02).mean(-1)
@@ -327,33 +381,48 @@ class SymmetryPoseLoss(nn.Module):
         chosen = {name: values[rows, selected] for name, values in components.items()}
         chosen["projection"] = projection_loss
         losses = {name: (values * enabled).sum() / count for name, values in chosen.items()}
+        losses["geometry"] = (chosen["geometry"] * geometry_enabled).sum() / geometry_enabled.sum().clamp_min(1)
         landmark_error = (projected - target_landmarks[rows, selected]).square().sum(-1).mean(-1).clamp_min(1e-12).sqrt()
-        observed = target["observed_landmarks"][:, self.landmark_inverse][rows, selected]
-        observed_mask = target["observed_mask"][:, self.landmark_inverse][rows, selected].float()
+        observed = observed_landmarks[rows, selected]
+        observed_mask = landmark_mask[rows, selected].float()
         observed_count = observed_mask.sum(-1)
         observed_error = (((projected - observed).square().sum(-1) * observed_mask).sum(-1)
                           / observed_count.clamp_min(1)).clamp_min(1e-12).sqrt()
         # A detached, projection-error-derived quality target prevents the
         # confidence output from reducing geometric supervision by itself.
-        quality_error = torch.maximum(landmark_error, observed_error)
-        quality_target = torch.exp(-.5 * (quality_error.detach() / self.quality_sigma).square()) * enabled
+        quality_error = visible_rmse[rows, selected]
+        quality_target = torch.exp(-.5 * (quality_error / self.quality_sigma).square()) * geometry_enabled
         losses["quality"] = F.binary_cross_entropy_with_logits(prediction["quality_logit"], quality_target)
         losses["total"] = sum(self.weights[name] * value for name, value in losses.items())
         with torch.no_grad():
             relative = prediction["rotation_matrix"].transpose(-1, -2) @ target_rotations[rows, selected]
             rotation_degrees = ((relative.diagonal(dim1=-2, dim2=-1).sum(-1) - 1) / 2).clamp(-1, 1).acos() * 180 / math.pi
             center_error = (prediction["projected_centers"] - target_centers[rows, selected]).square().sum(-1).mean(-1).sqrt()
-            angle_error = (prediction["angles"] - target_angles[rows, selected]).abs().mean(-1)
+            face_errors = (prediction["angles"] - target_angles[rows, selected]).abs()
+            moving = target_angles[rows, selected].abs() > TURN_ACTIVE_EPSILON_DEGREES
+            stationary = ~moving
+            angle_error = face_errors.mean(-1)
+            moving_error = (face_errors * moving).sum(-1) / moving.sum(-1).clamp_min(1)
+            stationary_error = (face_errors * stationary).sum(-1) / stationary.sum(-1).clamp_min(1)
+            moving_weight = moving * enabled[:, None]
+            stationary_weight = stationary * enabled[:, None]
             metrics = {"rotation_deg": (rotation_degrees * enabled).sum() / count,
                        "center_rmse_px": (center_error * enabled).sum() / count * image_size,
                        "landmark_rmse_px": (landmark_error * enabled).sum() / count * image_size,
                        "observed_landmark_rmse_px": (observed_error * enabled * (observed_count > 0)).sum()
                        / (enabled * (observed_count > 0)).sum().clamp_min(1) * image_size,
+                       "visible_keypoint_rmse_px": (quality_error * geometry_enabled).sum()
+                       / geometry_enabled.sum().clamp_min(1) * image_size,
                        "angle_mae_deg": (angle_error * enabled).sum() / count,
+                       "moving_angle_mae_deg": (face_errors * moving_weight).sum() / moving_weight.sum().clamp_min(1),
+                       "stationary_angle_mae_deg": (face_errors * stationary_weight).sum() / stationary_weight.sum().clamp_min(1),
                        "quality_target": quality_target.mean(), "quality_predicted": prediction["quality"].mean()}
             metrics["per_image"] = {"rotation_deg": rotation_degrees, "center_rmse_px": center_error * image_size,
                                     "landmark_rmse_px": landmark_error * image_size, "angle_mae_deg": angle_error,
-                                    "observed_landmark_rmse_px": observed_error * image_size}
+                                    "observed_landmark_rmse_px": observed_error * image_size,
+                                    "visible_keypoint_rmse_px": quality_error * image_size,
+                                    "moving_angle_mae_deg": moving_error,
+                                    "stationary_angle_mae_deg": stationary_error}
         return losses, metrics, selected
 
 

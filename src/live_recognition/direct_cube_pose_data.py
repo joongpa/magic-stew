@@ -102,13 +102,19 @@ def target_tensors(payload):
               "rotation": torch.eye(3), "center": torch.full((2,), .5),
               "scale": torch.tensor(.12), "perspective": torch.tensor(.2), "principal": torch.full((2,), .5),
               "angles": torch.zeros(6), "centers": torch.full((6, 2), .5), "landmarks": torch.full((56, 2), .5),
-              "observed_landmarks": torch.zeros(56, 2), "observed_mask": torch.zeros(56, dtype=torch.bool)}
+              "observed_landmarks": torch.zeros(56, 2), "observed_mask": torch.zeros(56, dtype=torch.bool),
+              "observed_centers": torch.zeros(6, 2), "observed_center_mask": torch.zeros(6, dtype=torch.bool)}
     if enabled:
         centers = payload["virtual_core_anchors"]
         if [anchor["name"] for anchor in centers] != list(FACE_ORDER):
             raise ValueError("Expected exactly six ordered center anchors")
         if len(payload["landmark_anchors"]) != 56:
             raise ValueError("Expected 56 ordered articulated landmark anchors")
+        for index, anchor in enumerate(centers):
+            point = anchor.get("source_observed_pixel")
+            if anchor.get("source_label_visibility") in (1, 2) and point is not None:
+                result["observed_centers"][index] = torch.tensor(point) / width
+                result["observed_center_mask"][index] = True
         names = {anchor["name"]: index for index, anchor in enumerate(payload["landmark_anchors"])}
         observed_counts = torch.zeros(56)
         for observation in payload["matched_observations"]:

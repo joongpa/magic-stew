@@ -26,7 +26,7 @@ class PoseFit:
 class ArticulatedProjection:
     """Class-aware projection residuals with an analytic pose/angle Jacobian."""
 
-    def __init__(self, renderer, candidate, axis):
+    def __init__(self, renderer, candidate, axis, *, cache_sticker_jacobians=False):
         self.m, self.base, self.axis = renderer, candidate, axis
         self.observed = np.asarray(candidate.assignment_image_points, float).reshape(-1, 2)
         self.classes = (np.full(len(self.observed), -1) if
@@ -44,30 +44,49 @@ class ArticulatedProjection:
                            | (self.classes[:, None] == pc[None]))
         self.scale = max(renderer.projected_cube_diameter(candidate) / 220., .3)
         self._last = None
+        self._articulation_key = None
+        self._articulation_geometry = None
+        self.cache_sticker_jacobians = cache_sticker_jacobians
 
     def evaluate(self, parameters):
         x = np.asarray(parameters)
         if self._last is not None and np.array_equal(x, self._last[0]):
             return self._last[1:]
         rvec, tvec = x[:3].reshape(3, 1), x[3:6].reshape(3, 1)
-        angles = (x[6], 0., x[7])
-        matrices = np.asarray([cv2.Rodrigues(np.eye(3)[self.axis] * np.deg2rad(a))[0]
-                               for a in angles])
-        objects = np.einsum('nij,nj->ni', matrices[self.layers], self.points)
-        polygons = np.einsum('nij,nkj->nki', matrices[self.face_layers], self.polygons)
+        # Rigid-only optimizer steps leave the articulated object geometry
+        # unchanged. This one-entry cache is local to this frame and axis.
+        articulation_key = (x.dtype.str, x[6:].tobytes())
+        if articulation_key != self._articulation_key:
+            angles = (x[6], 0., x[7])
+            matrices = np.asarray([cv2.Rodrigues(np.eye(3)[self.axis] * np.deg2rad(a))[0]
+                                   for a in angles])
+            objects = np.einsum('nij,nj->ni', matrices[self.layers], self.points)
+            polygons = np.einsum('nij,nkj->nki', matrices[self.face_layers], self.polygons)
+            normals = np.einsum('nij,nfj->nfi', matrices[self.layers], self.normals)
+            face_centers = polygons.mean(axis=1)
+            face_normals = np.einsum('nij,nj->ni', matrices[self.face_layers], self.face_normals)
+            unit_axis = np.eye(3)[self.axis]
+            point_derivative = np.cross(unit_axis, objects) * (np.pi / 180.)
+            face_derivative = np.cross(unit_axis, polygons) * (np.pi / 180.)
+            self._articulation_geometry = (matrices, objects, polygons, normals, face_centers,
+                                           face_normals, point_derivative, face_derivative)
+            self._articulation_key = articulation_key
+        (matrices, objects, polygons, normals, face_centers, face_normals,
+         point_derivative, face_derivative) = self._articulation_geometry
         rotation = cv2.Rodrigues(rvec)[0]
         camera = -rotation.T @ tvec.ravel()
-        normals = np.einsum('nij,nfj->nfi', matrices[self.layers], self.normals)
         visible = np.any(self.face_mask & (np.sum(
             normals * (camera - objects)[:, None], axis=-1) > 0), axis=1)
-        face_centers = polygons.mean(axis=1)
-        face_normals = np.einsum('nij,nj->ni', matrices[self.face_layers], self.face_normals)
         face_visible = np.sum(face_normals * (camera - face_centers), axis=1) > 0
+        # Both sets use the same camera and slab blockers. Batch their rays
+        # without changing any per-ray arithmetic or visibility thresholds.
+        rays = np.concatenate((objects-camera, face_centers-camera))[None]
+        point_count = len(objects)
         for layer in range(3):
-            visible &= self.m._parallel_slab_entry(camera, (objects-camera)[None],
+            clear = self.m._parallel_slab_entry(camera, rays,
                 matrices[layer:layer+1], self.axis, layer)[0] >= 1. - 1e-5
-            face_visible &= self.m._parallel_slab_entry(camera, (face_centers-camera)[None],
-                matrices[layer:layer+1], self.axis, layer)[0] >= 1. - 1e-5
+            visible &= clear[:point_count]
+            face_visible &= clear[point_count:]
 
         points, point_jac = cv2.projectPoints(objects, rvec, tvec,
             self.base.camera_matrix, self.base.dist_coeffs)
@@ -92,9 +111,6 @@ class ArticulatedProjection:
         jacobian = np.zeros((len(residual), 2, 8))
         jacobian[:len(columns), :, :6] = point_jac[columns]
         jacobian[len(columns):, :, :6] = face_jac[sticker_columns].mean(axis=1)
-        unit_axis = np.eye(3)[self.axis]
-        point_derivative = np.cross(unit_axis, objects) * (np.pi / 180.)
-        face_derivative = np.cross(unit_axis, polygons) * (np.pi / 180.)
         # d(pixel)/d(object) = d(pixel)/d(camera translation) @ camera rotation.
         point_angle = np.einsum('nij,jk,nk->ni', point_jac[:, :, 3:6],
                                 rotation, point_derivative)
@@ -105,7 +121,16 @@ class ArticulatedProjection:
                 self.layers[columns] == layer)[:, None]
             jacobian[len(columns):, :, parameter] = face_angle[sticker_columns] * (
                 self.face_layers[sticker_columns] == layer)[:, None]
+        if self.cache_sticker_jacobians:
+            derivatives = np.zeros((len(centers), 2, 8))
+            derivatives[:, :, :6] = face_jac.mean(axis=1)
+            for parameter, layer in ((6, 0), (7, 2)):
+                derivatives[:, :, parameter] = face_angle*(self.face_layers == layer)[:, None]
+            self.sticker_projection_cache = centers, derivatives
         usable = np.r_[matched, sticker_matched]
+        # Optional correspondence access for the experimental causal PnP seed.
+        # This uses only real current-frame landmarks, never inferred corners.
+        self.landmark_correspondences = objects[columns][matched], self.observed[matched]
         residual[~usable] = 40. * self.scale
         jacobian[~usable] = 0.
         residual, jacobian = residual.ravel()/self.scale, jacobian.reshape(-1, 8)/self.scale
@@ -113,12 +138,22 @@ class ArticulatedProjection:
         return residual, jacobian
 
 
-def _refine(model, seed, *, fixed_angles=None, free_angle=None, prior=None, iterations=18):
+def _refine(model, seed, *, fixed_angles=None, free_angle=None, prior=None, iterations=18,
+            pose_radius=None, angle_radius=None):
     """Refine a swept geometry while preserving its inactive outer slabs."""
     seed = np.asarray(seed, float)
     origin = seed[:6]
-    lower = np.r_[origin-np.array([.8, .8, .8, 40., 40., 100.]), -45., -45.]
-    upper = np.r_[origin+np.array([.8, .8, .8, 40., 40., 100.]), 45., 45.]
+    radius = np.asarray([.8, .8, .8, 40., 40., 100.] if pose_radius is None else pose_radius,
+                        dtype=float)
+    if radius.shape != (6,) or not np.isfinite(radius).all() or np.any(radius <= 0):
+        raise ValueError('pose_radius must contain six finite positive values')
+    lower = np.r_[origin-radius, -45., -45.]
+    upper = np.r_[origin+radius, 45., 45.]
+    if angle_radius is not None:
+        if not np.isfinite(angle_radius) or angle_radius <= 0:
+            raise ValueError('angle_radius must be finite and positive')
+        lower[6:] = np.maximum(lower[6:], seed[6:]-angle_radius)
+        upper[6:] = np.minimum(upper[6:], seed[6:]+angle_radius)
     lower[5] = max(lower[5], model.m.CUBE_SIZE_MM+1.)
     if prior is None:
         prior = origin
@@ -321,7 +356,7 @@ def _materialize(renderer, base, axis, parameters):
     return PoseFit(candidate, axis, angles, option, nearest[0], valid[0], score)
 
 
-def swept_geometries(renderer, base, camera):
+def swept_geometries(renderer, base, camera, *, sweep_device='cpu'):
     """Evaluate the complete cached slab-angle grid at one camera pose.
 
     Move the middle angle into the rigid rotation and wrap the outer offsets
@@ -334,21 +369,31 @@ def swept_geometries(renderer, base, camera):
                    layer_rotations=(), sticker_layer_rotations=None)
     limit = renderer.PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * renderer.projected_cube_diameter(pose)
     fits = []
+    if sweep_device != 'cpu':
+        from scripts.independent_keypoint_gpu_sweep import parallel_turn_sweeps
+        gpu_sweeps = parallel_turn_sweeps(renderer, pose, limit, device=sweep_device, middle_frame=True)
     for axis in range(3):
-        options, _, _ = renderer.parallel_turn_frame_geometry(pose, limit, axis, middle_frame=True)
+        if sweep_device == 'cpu':
+            options, _, _ = renderer.parallel_turn_frame_geometry(pose, limit, axis, middle_frame=True)
+        else:
+            options, _, _ = gpu_sweeps[axis]
         # The batched sweep omits the shared all-zero geometry.
         options += renderer.parallel_turn_frame_geometry(pose, limit, axis, angles=(0., 0., 0.))[0]
+        middle_cameras = {}
         for option in options:
             score = float(renderer.balanced_geometry_cost(option['keypoint_error'], option['sticker_error']))
             if not math.isfinite(score):
                 continue
             angles = np.asarray(renderer.parallel_layer_angles(option['layer_rotations']))
-            middle = cv2.Rodrigues(np.eye(3)[axis]*np.deg2rad(angles[1]))[0]
+            middle_key = np.asarray(angles[1], dtype=np.float64).tobytes()
+            if middle_key not in middle_cameras:
+                middle = cv2.Rodrigues(np.eye(3)[axis]*np.deg2rad(angles[1]))[0]
+                middle_cameras[middle_key] = cv2.Rodrigues(aligned @ middle)[0]
             relative = (angles-angles[1]+45.) % 90.-45.
             # Keep the two endpoint interpretations when their signed travel differs.
             relative[(relative == -45.) & (angles-angles[1] > 0)] = 45.
             rotations = renderer.parallel_layer_rotations(axis, relative)
-            candidate = replace(pose, rvec=cv2.Rodrigues(aligned @ middle)[0],
+            candidate = replace(pose, rvec=middle_cameras[middle_key].copy(),
                                 layer_rotations=rotations)
             # These lightweight proposals need full assignments only if retained.
             fits.append(PoseFit(candidate, axis, tuple(relative), option, None, None, score))
@@ -400,7 +445,8 @@ def diverse_shortlist(renderer, fits, size=5, tolerance=.01):
     return [fit for fit in ranked if fit.score < cutoff]
 
 
-def fit_frame(renderer, candidate, *, static=False, prior=None, neighbors=(), retained=()):
+def fit_frame(renderer, candidate, *, static=False, prior=None, neighbors=(), retained=(), sweep_device='cpu',
+              refinement_device='cpu'):
     """Sweep all angles, refine diverse slab hypotheses, then retain five fits.
 
     A temporal call supplies retained fits and sweeps only the new neighboring
@@ -424,7 +470,8 @@ def fit_frame(renderer, candidate, *, static=False, prior=None, neighbors=(), re
     models = {axis: ArticulatedProjection(renderer, base, axis) for axis in range(3)}
     proposals, seeds = [], []
     for camera in cameras:
-        swept = swept_geometries(renderer, base, camera)
+        swept = (swept_geometries(renderer, base, camera) if sweep_device == 'cpu' else
+                 swept_geometries(renderer, base, camera, sweep_device=sweep_device))
         proposals.extend(swept)
         # Rank before expensive fitting, preserving each axis and active-slab
         # hypothesis. Pure single-slab fits keep the other outer angle fixed.
@@ -441,13 +488,21 @@ def fit_frame(renderer, candidate, *, static=False, prior=None, neighbors=(), re
         measured = _materialize(renderer, base, fit.axis, seed)
         if measured is not None:
             fits.append(measured)
-    for fit in seeds:
+    batched_parameters = None
+    if refinement_device != 'cpu' and seeds:
+        from scripts.independent_keypoint_gpu_refine import refine_batch
+        starts = [np.r_[fit.candidate.rvec.ravel(), fit.candidate.tvec.ravel(),
+                        np.asarray(fit.angles)[[0, 2]]] for fit in seeds]
+        batched_parameters = refine_batch(renderer, base, [fit.axis for fit in seeds], starts,
+            device=refinement_device, prior=prior_parameters)
+    for seed_index, fit in enumerate(seeds):
         seed = np.r_[fit.candidate.rvec.ravel(), fit.candidate.tvec.ravel(),
                      np.asarray(fit.angles)[[0, 2]]]
         active = np.flatnonzero(seed[6:] != 0.)+6
         constraints = (dict(fixed_angles=(0., 0.)) if len(active) == 0 else
                        dict(free_angle=int(active[0])) if len(active) == 1 else {})
-        parameters = _refine(models[fit.axis], seed, prior=prior_parameters, **constraints)
+        parameters = (_refine(models[fit.axis], seed, prior=prior_parameters, **constraints)
+                      if batched_parameters is None else batched_parameters[seed_index])
         revised = _materialize(renderer, base, fit.axis, parameters)
         if revised is not None:
             fits.append(replace(revised, proposal_source='angle_sweep_refined'))
@@ -585,6 +640,8 @@ def process_pose_geometry(renderer, cache, args, colors, fps, progress=None):
     previous = None
     originals = [record.pose_candidate for record in cache]
     depth_targets = depth_trend_targets(renderer, cache, args, fps)
+    sweep_device = getattr(args, 'geometry_sweep_device', 'cpu')
+    refinement_device = getattr(args, 'geometry_refinement_device', 'cpu')
     for index, record in enumerate(cache):
         if progress:
             progress('joint pose/geometry refinement', index, len(cache))
@@ -602,7 +659,8 @@ def process_pose_geometry(renderer, cache, args, colors, fps, progress=None):
                     sticker_mask_centers=tuple(obs.stickers), sticker_color_names=obs.colors,
                     sticker_mask_center_uncertainties=tuple(np.ones(len(obs.stickers))))
         static = renderer._frame_forces_static_hold(record.frame_index, getattr(args, 'turning_start_frame', None))
-        fits = fit_frame(renderer, candidate, static=static, prior=previous)
+        fits = fit_frame(renderer, candidate, static=static, prior=previous, sweep_device=sweep_device,
+                         refinement_device=refinement_device)
         banks.append(fits)
         if fits:
             previous = fits[0].candidate
@@ -629,7 +687,8 @@ def process_pose_geometry(renderer, cache, args, colors, fps, progress=None):
                 getattr(args, 'turning_start_frame', None))
             prior_pose = replace(base, rvec=prior[:3].reshape(3, 1), tvec=prior[3:].reshape(3, 1))
             banks[index] = fit_frame(renderer, base, static=static, prior=prior_pose,
-                                     neighbors=neighbors, retained=fits)
+                                     neighbors=neighbors, retained=fits, sweep_device=sweep_device,
+                                     refinement_device=refinement_device)
         if progress:
             progress('joint trajectory refit', len(cache), len(cache))
     tracker = renderer.CubeSymmetryTracker()

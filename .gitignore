@@ -5,6 +5,8 @@
 .mlsd_pytorch/
 __pycache__/
 *.py[cod]
+src/live_recognition/_search_kernels*.so
+src/live_recognition/_search_kernels*.pyd
 .pytest_cache/
 .ruff_cache/
 dist/

@@ -40,6 +40,24 @@ def test_analytic_projection_jacobian_matches_finite_difference(observation):
     np.testing.assert_allclose(analytic, numeric, atol=1e-5, rtol=1e-5)
 
 
+def test_articulated_geometry_cache_does_not_cache_camera_or_stale_layer_angles(observation):
+    candidate, _ = observation
+    model = geometry.ArticulatedProjection(m, candidate, 1)
+    x = np.r_[candidate.rvec.ravel(), candidate.tvec.ravel(), -23., 4.]
+    model.evaluate(x)
+    for change in (np.array([.03, -.02, .01, 2., -1., 5., 0., 0.]),
+                   np.array([0., 0., 0., 0., 0., 0., 7., -9.]),
+                   np.array([-.02, .01, .02, -1., 2., -3., 0., 0.])):
+        x = x+change
+        residual, jacobian = model.evaluate(x)
+        fresh = geometry.ArticulatedProjection(m, candidate, 1)
+        expected_residual, expected_jacobian = fresh.evaluate(x)
+        np.testing.assert_array_equal(residual, expected_residual)
+        np.testing.assert_array_equal(jacobian, expected_jacobian)
+        for actual, expected in zip(model.landmark_correspondences, fresh.landmark_correspondences, strict=True):
+            np.testing.assert_array_equal(actual, expected)
+
+
 def test_capped_landmark_loss_has_no_background_pull_and_correct_jacobian():
     rng = np.random.default_rng(76)
     values = np.array([2., 1., 90., -60., 1., -2., -80., 70.])

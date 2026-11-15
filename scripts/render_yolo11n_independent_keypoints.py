@@ -5239,12 +5239,16 @@ def _torch_sticker_assignment_distances(torch, observed, centers, polygons, fron
     return torch.where(inside & front_faces[:, None], distances, torch.full_like(distances, float('inf')))
 
 
-def parallel_turn_frame_geometry(candidate, limit, axis, *, angles=None, middle_frame=False):
+def parallel_turn_frame_geometry(candidate, limit, axis, *, angles=None, middle_frame=False,
+                                 angle_grid=None):
     """Combine slab projections, pairwise occlusion, and cached observation fits.
 
     The exhaustive grid covers the three disjoint layers on a single axis.
     A surface lattice vertex on a seam belongs to both touching slabs, which
     may expose distinct landmarks once the slabs turn independently.
+
+    angle_grid optionally restricts the batched search to rows from the same
+    15-degree grid. Explicit angles still materialize one geometry as before.
     """
     import torch
 
@@ -5260,9 +5264,23 @@ def parallel_turn_frame_geometry(candidate, limit, axis, *, angles=None, middle_
         values = np.arange(-45., 46., 15.)
         projection_values = values[:-1]
         shape_rows = np.r_[np.arange(len(projection_values)), 0]
-        grid = np.asarray(tuple(product(range(len(values)), repeat=3)))
+        if angle_grid is None:
+            grid = np.asarray(tuple(product(range(len(values)), repeat=3)))
+        else:
+            requested = np.asarray(angle_grid, dtype=float)
+            if (requested.ndim != 2 or requested.shape[1] != 3 or not len(requested)
+                    or not np.isfinite(requested).all()
+                    or np.any(np.abs(requested) > 45.)
+                    or not np.allclose(requested / 15., np.round(requested / 15.), atol=1e-10, rtol=0)):
+                raise ValueError('angle_grid must contain nonempty Nx3 rows on the -45..45 degree grid')
+            grid = np.rint((requested+45.)/15.).astype(int)
+            grid = np.unique(grid, axis=0)
         grid = grid[np.any(values[grid] != 0., axis=1)]  # Flat geometry is shared with the legacy options.
+        if not len(grid):
+            return [], np.empty((0, len(centers)), dtype=np.uint8), np.empty((0, len(centers)), dtype=bool)
     else:
+        if angle_grid is not None:
+            raise ValueError('angles and angle_grid are mutually exclusive')
         values, grid = np.unique(angles, return_inverse=True)
         projection_values = values
         shape_rows = np.arange(len(values))
@@ -12610,6 +12628,10 @@ def build_parser() -> argparse.ArgumentParser:
         help='Draw only the fitted cube wireframe in the final video.')
     parser.add_argument('--joint-depth-fallback', action=argparse.BooleanOptionalAction, default=True,
         help='Recover sparse joint fits with implausible depth jumps after the baseline pass.')
+    parser.add_argument('--geometry-sweep-device', choices=('cpu', 'mps', 'cuda'), default='cpu',
+        help='Device for exhaustive joint-geometry sweeps, independent of the refinement device.')
+    parser.add_argument('--geometry-refinement-device', choices=('cpu', 'mps'), default='cpu',
+        help='Experimental batched Metal refinement; CPU final geometry scoring remains in use.')
     parser.add_argument(
         "--pose-smoothing", action=argparse.BooleanOptionalAction, default=True,
         help="Refit articulated measurements with nearby middle-frame pose priors.",
@@ -12646,11 +12668,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--max-tps', type=float, default=40.,
                         help='Per-turn TPS limit, with simultaneous slabs measured independently (default: 40).')
     parser.add_argument('--max-double-tps', type=float, default=50.,
-                        help='TPS limit for geometry-supported 180-degree spans (default: 50).')
+                        help='Shared total-travel TPS cap and witnessed double-turn rate (default: 50).')
     parser.add_argument("--branch-widths", type=int, nargs="+", default=(3,),
                         help="Per-parent child cutoffs including ties (default: 3).")
     parser.add_argument("--branch-stage-expansions", type=int,
                         help="Override the widening budget of 100 expansions per solving frame.")
+    parser.add_argument('--unrestricted-sticker-count', type=int,
+                        help='Admit every distinct legal move sequence when all fits score at most this many stickers.')
     parser.add_argument("--frame-parity", choices=("auto", "all", "even", "odd", "both"), default="auto",
                         help="Frames for full search (auto tries both parities at 50 FPS or higher).")
     parser.add_argument("--solved-anchor-frame", type=int,

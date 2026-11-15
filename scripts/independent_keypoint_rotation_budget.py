@@ -1,6 +1,10 @@
 """Precompute angularly feasible routes between two residual cube geometries."""
 from dataclasses import dataclass
 from functools import lru_cache
+try:
+    from scripts import independent_keypoint_search_fast as fast
+except ModuleNotFoundError:
+    import independent_keypoint_search_fast as fast
 from itertools import product
 import math
 
@@ -65,6 +69,7 @@ def _quarter_offsets(start, end, budget):
             yield negative + middle, middle, positive + middle
 
 
+@lru_cache(maxsize=4096)
 def _boundary_routes(geometry, budget, exiting):
     if geometry.axis is None:
         return (((), 0., (0, 0, 0)),)
@@ -102,7 +107,7 @@ def _hidden_routes(count):
 
 @lru_cache(maxsize=16384)
 def routes_between(previous, current, budget, double_budget=None, double_support=frozenset(), optimistic_doubles=False):
-    """Budget simultaneous slabs independently and sequential axes in time.
+    """Enforce individual rates plus one shared budget across all slabs.
 
     double_support identifies components in a geometry-supported 180-degree
     span, including frames before its second quarter commit. Each component
@@ -138,11 +143,26 @@ def routes_between(previous, current, budget, double_budget=None, double_support
                 double = tuple(a or b for a, b in zip(old_double, double, strict=True))
             merged.append((axis, delta, quarters, double))
         degrees, fraction = 0., 0.
-        for _axis, delta, _quarters, double in merged:
-            degrees += max(map(abs, delta))
-            fractions = [abs(d)/(double_budget if fast else budget) if (double_budget if fast else budget) > 0
-                         else (0. if d == 0 else float('inf')) for d, fast in zip(delta, double, strict=True)]
+        for _axis, delta, quarters, double in merged:
+            # Concurrent slabs still obey their individual speed limits, but
+            # their travel also spends one pooled double-rate allowance.
+            degrees += sum(map(abs, delta))
+            fractions = []
+            for distance, quarter, fast in zip(map(abs, delta), quarters, double, strict=True):
+                # A residual seam can legitimately represent a q=2 state
+                # update with less than 180 degrees of current-frame travel.
+                # It must nevertheless use the ordinary rate unless this
+                # interval can physically accommodate a complete half-turn;
+                # otherwise a one-frame q=2 update would borrow the double
+                # rate merely because a geometry witness exists elsewhere in
+                # the span.
+                fast = fast and (abs(quarter) < 2 or double_budget >= 180.)
+                limit = double_budget if fast else budget
+                fractions.append(distance/limit if limit > 0 else
+                                 (0. if distance == 0 else float('inf')))
             fraction += max(fractions)
+        fraction = max(fraction, degrees/double_budget if double_budget else
+                       (0. if degrees == 0 else float('inf')))
         if fraction <= 1.+1e-9:
             groups = _groups(groups)
             route = RotationRoute(groups, degrees, degrees/fraction if fraction else budget)
@@ -275,6 +295,7 @@ class RotationBudgetScorerMixin:
         self._rotation_route_limits = {}
         self._rotation_finalized = max_double_tps == max_tps
         self._rotation_permutations = {}
+        self._rotation_move_cache = {}
         earlier = [index for index in self.records if index < frames[0]]
         baseline = (self.records[max(earlier)].get('original_source_frame', max(earlier)) if earlier else
                     self.records[frames[0]].get('original_source_frame', frames[0])-1)
@@ -294,6 +315,8 @@ class RotationBudgetScorerMixin:
         self.compiled_frames.clear()
         self.prepared.clear()
         self.cache.clear()
+        if hasattr(self, 'row_cache'):
+            self.row_cache.clear()
 
     def finalize_rotation_budgets(self):
         """Classify multi-frame doubles and filter compiled routes once."""
@@ -323,7 +346,12 @@ class RotationBudgetScorerMixin:
                     prepared['rotation_budgets'][row] = self._rotation_route_limits[frame, before, after, moves]
             prepared['rotation_allowed'] = allowed
             prepared['selections'].clear()
+            prepared.pop('row_templates', None)
+            prepared.pop('rotation_expansion_specs', None)
+            prepared.pop('rotation_state_batches', None)
         self.cache.clear()
+        if hasattr(self, 'row_cache'):
+            self.row_cache.clear()
         self._rotation_finalized = True
 
     def _rotation_plans(self, frame, geometry, selected, projection_indices, nearest, valid):
@@ -361,9 +389,12 @@ class RotationBudgetScorerMixin:
                 optimistic = self._rotation_double_edges is None and not self._rotation_finalized
                 for route in routes_between(before, after, self.rotation_limits[frame],
                         self.rotation_double_limits[frame], frozenset(support), optimistic):
-                    moves = tuple(self.m.cube_rotation_to_notation(rotation)
-                                  for axis, offsets in route.groups
-                                  for rotation in self.m.parallel_layer_rotations(axis, tuple(90.*q for q in offsets)))
+                    moves = self._rotation_move_cache.get(route.groups)
+                    if moves is None:
+                        moves = tuple(self.m.cube_rotation_to_notation(rotation)
+                                      for axis, offsets in route.groups
+                                      for rotation in self.m.parallel_layer_rotations(axis, tuple(90.*q for q in offsets)))
+                        self._rotation_move_cache[route.groups] = moves
                     key = before_index, moves
                     plans[after_index][key] = min(plans[after_index].get(key, float('inf')), route.degrees)
                     self._rotation_route_limits[frame, before_index, after_index, moves] = route.budget
@@ -417,7 +448,7 @@ class RotationBudgetScorerMixin:
         weights = previous['weights'][rows]
         self.color_configurations_scored += len(rows)
         if self.color_confusion_scoring:
-            return self.m.sticker_color_confusion_metrics(indices, nearest, weights,
+            return fast.color_metrics(self.m, indices, nearest, weights,
                 previous['confusion_costs'], self.color_confusion_cost)['error']
         matches = weights * previous['match_matrix'][indices[nearest], previous['observation_indices']]
         faces = np.zeros((len(rows), 54))
@@ -426,7 +457,21 @@ class RotationBudgetScorerMixin:
         return np.where(previous['has_weight'][rows], 1.-correct/previous['denominator'][rows],
                         0. if nearest.shape[1] == 0 else float('inf'))
 
-    def rotation_predecessors(self, frame, after, geometry_index=None):
+    def _rotation_state_specs(self, prepared, current, routes):
+        specs = prepared.setdefault('rotation_state_batches', {})
+        if current not in specs:
+            unique, source_rows, route_rows = {}, [], []
+            for _, moves, _ in routes:
+                undo = tuple(move.rstrip("'") if move.endswith('2') else
+                             move[:-1] if move.endswith("'") else move+"'" for move in reversed(moves))
+                if undo not in unique:
+                    unique[undo] = len(source_rows)
+                    source_rows.append(self.move_sources(undo))
+                route_rows.append(unique[undo])
+            specs[current] = self.np.asarray(source_rows, dtype=self.np.intp), route_rows
+        return specs[current]
+
+    def rotation_predecessors(self, frame, after, geometry_index=None, *, defer_states=False):
         self.finalize_rotation_budgets()
         if self.hold_reason(frame) is not None:
             for choice in self.rotation_choices(frame, after, geometry_index):
@@ -442,19 +487,20 @@ class RotationBudgetScorerMixin:
             if not routes:
                 continue
             previous_errors = self._rotation_prior_errors(frame, after, current)
-            for (before_index, moves, degrees), prior_error in zip(routes, previous_errors, strict=True):
+            sources, route_rows = self._rotation_state_specs(prepared, current, routes)
+            batch = fast.StateBatch(after, sources)
+            for (before_index, moves, degrees), prior_error, row in zip(routes, previous_errors, route_rows, strict=True):
                 if not math.isfinite(float(prior_error)):
                     continue
-                undo = tuple(move.rstrip("'") if move.endswith('2') else
-                             move[:-1] if move.endswith("'") else move+"'" for move in reversed(moves))
-                before = self.apply_moves(after, undo)
-                if before_index == -1 and before != self.key(self.m.CubeGeometryState.identity()):
+                before = fast.BatchedState(batch, row)
+                if before_index == -1 and before.resolve() != self.key(self.m.CubeGeometryState.identity()):
                     continue
                 context = None if before_index == -1 else before_index
-                payload = dict(endpoint.payload, state_moves=moves, color_offset=0.,
+                payload = fast.PayloadOverlay(endpoint.payload, state_moves=moves, color_offset=0.,
                     previous_geometry_index=context, rotation_context=current,
                     angular_travel_degrees=degrees,
                     rotation_budget_degrees=self._rotation_route_limits[frame, before_index, current, moves],
                     label=f"{' '.join(moves) or 'hold'} · {endpoint.payload['label']}",
                     is_baseline=bool(endpoint.payload.get('is_baseline') and not moves))
-                yield before, context, type(endpoint)(after, endpoint.score, endpoint.rank, payload, None), float(prior_error)
+                yield (before if defer_states else before.resolve()), context, type(endpoint)(
+                    after, endpoint.score, endpoint.rank, payload, None), float(prior_error)

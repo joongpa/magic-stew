@@ -460,6 +460,49 @@ for extra slab parameters. Original candidates are saved in recovery diagnostics
 Recovery runs after the baseline trajectory and orientation passes and cannot
 change neighboring frames. Use `--no-joint-depth-fallback` for the baseline alone.
 
+The established joint fitter caches repeated angle-dependent slab geometry,
+batches landmark/sticker visibility rays, and reuses middle-angle camera
+rotations within sweeps. Its exhaustive grid, refinement budgets, scores,
+candidate order, diversity and cutoff ties are preserved. Two interleaved
+benchmarks across all five reference clips measured 9.3% and 11.4% aggregate
+reductions in joint-geometry/temporal-neighbor fitting time, with byte-identical
+complete candidate banks on all 15 sampled workloads. Individual timings vary;
+this is not an end-to-end throughput measurement or an accuracy improvement.
+See `runs/pose-fitting-mechanical-speed/README.md` for per-stage results, the
+saved pre-change baseline and the repeatable benchmark command.
+
+The opt-in `--geometry-sweep-device mps` batches the full exhaustive sweep on
+Apple GPUs; continuous refinement remains on CPU. The default is `cpu`.
+A five-repeat test of 60 sweep and 25 fitting workloads across all five
+references reduced sweep time by 26.4% and fitting time by 5.4% on an M2.
+24/25 complete candidate banks were byte-identical; the remaining Nahm case
+had a wireframe difference below 1% of cube diameter. These are sampled cached
+workloads, not complete-video throughput or whole-video accuracy validation.
+See `runs/gpu-exhaustive-sweep-mps-v3/README.md` for timings, quality limits,
+parallelism and reproduction. The cached geometry renderer accepts the same flag.
+
+Experimental batched Metal refinement is available with
+`--geometry-refinement-device mps`, together with `--geometry-sweep-device mps`.
+A clean five-repeat benchmark of the same 25 fitting workloads across all five
+references measured 6.71× faster refinement and 41.2% less fitting time relative
+to GPU sweeping with CPU refinement. All sampled Metal banks retained a geometry
+within 1% of cube diameter of the saved selected reference. Banks and cutoff ties
+can change because the GPU uses a projected LM solver in float32; CPU final
+scoring and the five-plus-ties policy remain in use. The shown Xuanyi Metal fit
+was visually confirmed correct by the user. CPU refinement remains the default.
+See `runs/gpu-refine-mps-metal-final/README.md` for quality limits, comparisons,
+timing scope and reproduction. Static holds and depth recovery remain on CPU.
+
+A separate buffered partial-first experiment is implemented in
+`scripts/independent_keypoint_deferred_pose.py`. It generates rigid candidates
+from subsets of current detections, uses a one-frame buffer to rank compatible
+poses, and runs one all-axis articulated GPU stage with a global refinement
+budget. The default fitter is unchanged. A 604-frame five-reference comparison
+reduced measured pose work by 56.4%, with mixed quality: best-scored reference
+wire agreement improved overall, but retained-bank reference coverage lost two
+frames. See `runs/deferred-pose-five-reference-v1/README.md` for the common-input
+control, timing limits and regression-only wireframe review. This is experimental.
+
 For a pose-only video, omit `--recognize-moves` and add `--wireframe-only`.
 To recompute joint poses from previously filtered observations without running
 inference or move search:
@@ -473,6 +516,244 @@ python scripts/render_independent_keypoint_geometry.py \
 The log's `.meta.json` supplies the source video, scramble, FPS, and static-frame
 boundary. Add `--render-refined` when the input is already a joint-fit log to
 render its saved geometries without fitting again.
+
+An experimental previous-pose benchmark reuses already filtered observations
+from the saved Matty, Nahm, Xuanyi, Tommy, and Yiheng runs:
+
+```bash
+.venv/bin/python scripts/benchmark_temporal_pose_reuse.py \
+  --adaptive --rollout --samples 40 \
+  --output-dir runs/temporal-pose-experiment
+```
+
+It narrows numerical pose/angle bounds after low-error fits, then expands through
+wider local fitting, a 49-row-per-axis outer-angle search, and the existing
+exhaustive fitter. Early acceptance uses the displayed `REPROJ fit` metric
+(`median + 0.5*p90` landmark error divided by projected cube diameter), with a
+default limit of `0.025`, plus a separate balanced landmark/sticker geometry-cost
+limit of `0.15`. Override these with `--reprojection-threshold` and
+`--geometry-threshold`. These are fit-error gates, not detector confidence gates.
+Numerical rotation-vector bounds are not physical angular-travel limits;
+quarter-turn angle wrapping and cube symmetry still need physical bookkeeping.
+
+One-step trials start from the saved previous-frame pose; rollouts bootstrap once
+and then feed back their own outputs. Current saved poses are evaluation references
+only. The JSON report includes timing, search stages, unresolved quality gates,
+and differences from the saved geometry costs, which are not ground-truth accuracy.
+Detection, initialization, move search, and future-frame smoothing are excluded.
+The production renderer's default fitting path is unchanged. Matty stops at frame
+560 to omit the solved tail. Use `--cases yiheng` to run a single clip.
+
+To examine the core-motion prior on conservative middle-of-solve windows:
+
+```bash
+MPLCONFIGDIR=/private/tmp/live-recognition-mpl .venv/bin/python scripts/analyze_core_motion.py \
+  --settle-seconds .75 --tail-seconds .5 \
+  --output-dir runs/core-motion-analysis
+```
+
+The analysis removes startup/ending transitions, compares stationary, velocity,
+and mean-reverting predictions, and chooses prediction parameters on the other
+four clips for each held-out clip. These trimmed windows are a sensitivity test,
+not annotated solve boundaries. Core translations come from fitted references,
+so their short-term noise must not be interpreted as measured physical velocity.
+
+The separate five-geometry physics prototype keeps an independent causal core
+history for every retained hypothesis and shares projection models across them:
+
+```bash
+.venv/bin/python scripts/benchmark_physics_pose_tracker.py \
+  --iterations 3 --reversion 8 --samples 20 --rollout \
+  --output-dir runs/physics-five-bank-experiment
+```
+
+It learns a recent working-position anchor, rather than pulling toward the
+pickup position. A weak exponential return prior, rotation/angle prediction,
+and current-observation PnP proposals initialize short analytic-Jacobian fits.
+The existing exact geometry score and diversity test admit five distinct
+geometries, with a hard beam cap of five (no extra score ties). The report checks
+the complete retained bank against saved reference projections as well as the
+best geometry cost. Use `--reversion 0` for the otherwise identical no-return
+control. No current-frame saved poses enter tracker updates, and only the
+initial five-hypothesis bootstrap reuses saved reference fits. This prototype
+does not enable a new renderer mode or perform move search.
+
+To test continuous next-frame motion prediction with an adaptive local search:
+
+```bash
+.venv/bin/python scripts/benchmark_physics_pose_tracker.py \
+  --motion-prediction --iterations 2 --max-update-fps 30 --samples 4 --rollout \
+  --output-dir runs/motion-prediction-repeat
+```
+
+`scripts/independent_keypoint_motion_prediction.py` maintains a separate damped
+angular velocity, near-stationary core prediction, layer-turn velocity and
+recent prediction-error scales for each of the five hypotheses. Rotation uses
+continuous SO(3) increments; it has no preferred quarter-turn orientations.
+The angular predictor caps speed at 2700 degrees/second (90 degrees at 30 fps).
+Its recent prediction errors determine translation, rotation and layer-angle
+search bounds. Current landmarks can propose a bounded PnP correction. Poor
+geometry scores or reprojection fits trigger ordinary wider recovery probes.
+New layer-turn axes remain possible, and all outputs pass the existing exact
+geometry score and diversity filter with a hard cap of five.
+
+`--prediction-damping 0` disables velocity extrapolation while keeping local
+search, recent-error bounds and the weak core-position anchor. This ablation
+separates the value of angular momentum from the value of restricting the
+search. `--max-update-fps 30` samples actual observations and preserves their
+original timestamps; zero keeps all available observations. The tracker uses
+neither current saved reference poses nor future frames. Like the other
+prototype, it bootstraps from a cached reference geometry bank and does not
+evaluate cold-start acquisition or full move reconstruction.
+
+Reports are in `runs/motion-prediction-v1`,
+`runs/motion-prediction-control-2iter`, `runs/motion-prediction-no-velocity`,
+`runs/motion-prediction-30fps-2iter`, and
+`runs/motion-prediction-30fps-control`. The first three use every available
+reference observation; the final pair use approximately 30 updates/second
+(Xuanyi remains at its native 24). These are opt-in experiments. Read
+`runs/motion-prediction-30fps-2iter/README.md` for results and limitations.
+
+To test a separate static best-slab search followed by fresh articulation:
+
+**Failed quality experiment:** visual inspection shows severe startup/recovery
+failures and wrong orientation/articulation even when core displacement is
+accurate. Partial point-projection scores overstated complete wireframe quality.
+This prototype should not replace the established pose fitter. Failure audits
+are in `runs/slab-failure-audit-full` and `runs/slab-failure-audit-mid`; they
+separate translation errors from complete wireframe errors and use explicitly
+reference-only interventions to diagnose premature axis/anchor selection.
+
+The opt-in `--slab-all-axes` correctness control removes the premature turn-axis
+restriction and refines every available zero-angle anchor of retained coarse
+geometries. It does not predict articulation. On the same mid-solve windows,
+whole-wireframe agreement improves from 179/417 to 252/417 frames under a 2%
+symmetric p90 edge-distance diagnostic. This remains inadequate and costs about
+235–446 ms/update. It is not a replacement or a real-time solution. Results are
+in `runs/slab-hierarchy-v5-all-axes`, with whole-wireframe audits in
+`runs/slab-failure-audit-v5` and exact replay videos in
+`runs/slab-hierarchy-v5-wireframes`. These changes have not established reliable
+full-start solve tracking. Future benchmark reports now include complete
+wireframe reference comparisons after update timing, separately from detected
+landmark reprojection and from best-of-five projection coverage.
+
+```bash
+.venv/bin/python scripts/benchmark_physics_pose_tracker.py \
+  --slab-hierarchy --static-beam 8 --iterations 3 --max-update-fps 30 \
+  --samples 4 --rollout --output-dir runs/slab-hierarchy-repeat
+```
+
+`scripts/independent_keypoint_slab_search.py` interprets a useful static pose as
+one supported rigid slab, on any of the three axes. It scores that slab against
+the current observations without requiring the other slabs to remain static.
+Mutual one-to-one matches, landmark classes, sticker support and noncollinear
+image support prevent a few duplicate detections from claiming a good slab.
+Coarse orientation probes surround the previous hypotheses' predicted cameras;
+12-degree and 4-degree local stencils plus static-only PnP refine a diverse
+shortlist. Nearly identical prior cameras share a static search.
+
+Only after static ranking does the tracker independently search the two other
+slab angles on a 15-degree grid. It never predicts articulation or reads the
+previous angle values to seed/restrict this search. Continuous angle refinement
+keeps the supported slab's rigid pose fixed; folding the middle-slab angle into
+the output camera is a coordinate conversion. Complete articulated scores rank
+the candidates, and the existing exact geometry/diversity policy retains five
+distinct outputs. The full coarse articulation pool supplies alternatives if
+continuous fits converge to the same solution.
+
+A good partial slab score alone never marks an update successful. The final
+full-observation robust reprojection fit must be at most 0.035 cube diameters,
+and the balanced geometry cost at most 0.2. Poor full fits may remain uncertain
+proposals for the next search, but cannot train angular/translation velocity
+or the trusted working-position anchor. This avoids freezing the search after
+a temporary failure while distinguishing proposals from accepted poses.
+
+The final experiment and earlier variants are recorded under
+`runs/slab-hierarchy-v4-uncertain-proposals` and `runs/slab-hierarchy-v1-complete`.
+The intermediate `v2-ranked` variant is rejected because pruning sometimes left
+fewer than five geometries; `v3-gated` retained five but holding only old accepted
+poses harmed recovery. The final experiment has a dedicated regression check
+for five distinct outputs with only one supported static camera. These modes
+remain opt-in and do not change the default renderer or perform move search.
+
+Render all five solve windows with the final reference on the left and a fresh
+slab-first rollout on the right:
+
+```bash
+.venv/bin/python scripts/render_slab_hierarchy_wireframes.py \
+  --output-dir runs/slab-hierarchy-wireframes-repeat
+```
+
+Use `--report runs/slab-hierarchy-v4-uncertain-proposals/report.json` to replay
+the exact saved benchmark windows instead of rerunning full solves. The outputs
+include five individual MP4s, a combined video, previews and per-frame banks.
+Green passes the full-fit gate; orange fails it. These are fit-status colors,
+not detector confidence. Full-start videos in
+`runs/slab-hierarchy-full-solve-wireframes` expose much weaker startup/recovery
+on Matty, Nahm and Xuanyi than the later-initialized benchmark. The benchmark
+results therefore do not establish reliable complete-solve tracking.
+
+To test color-supported orientation tracking on the same five-solve benchmark:
+
+```bash
+.venv/bin/python scripts/benchmark_physics_pose_tracker.py \
+  --color-tracking --iterations 3 --reversion 8 --samples 8 --rollout \
+  --output-dir runs/color-supported-pose-experiment
+```
+
+Detected sticker colors gate one-to-one matches between consecutive frames.
+Sparse image motion in a common ROI must pass a forward/backward consistency
+check; ambiguous same-color matches are dropped. Occlusion ends a track, and
+reacquisition creates a new ID. New face-center labels additionally require an
+observed four-inner-landmark profile around the sticker and a good geometry fit;
+these checks can still admit incorrect labels. Confirmed face-center tracks keep their physical
+association separately for each of the five pose hypotheses. Ordinary sticker
+tracks provide robust motion proposals, while center tracks can add soft
+orientation constraints without treating outer face turns as core motion.
+
+The tracker uses a smaller fitting budget only when enough nonplanar inliers
+support the core across slabs and agree with two tracked centers. Poor geometric
+fits restore ordinary proposals without tracked-color constraints. Use
+`--no-color-fast-lane` to retain the normal fitting budget throughout. The
+quarter-turn prior is independently opt-in and is off in this color experiment.
+
+The benchmark defaults to final selected solution paths. It evaluates sticker
+associations and the physical center-color orientation after the update; final
+reference identities and future poses never enter the tracker. Reported match
+precision includes only observations assigned an evaluable reference sticker.
+Color-oriented estimates require two nonparallel, distinct center colors and
+are marked unavailable otherwise. These are supporting cues, not guaranteed
+identities or calibrated detector confidence scores. Video decoding and initial
+bootstrap are excluded from timings; image tracking, motion proposals, fitting,
+and maintaining five distinct geometries are included.
+
+The five-reference color experiment is recorded in
+`runs/color-tracks-validated-centers-v6/report.json`. Its sequential rollouts
+retained five geometries on every frame, with about 3–7 color matches per frame
+and about 99% agreement on evaluable sticker pairs. This is association accuracy,
+not pose accuracy. Geometry agreement improved on Nahm and Tommy, regressed on
+Matty and Yiheng, and was unchanged on Xuanyi. Pose updates took about 60–67 ms,
+including about 3–5 ms for tracking and color proposals. Center-label errors on
+Yiheng could still produce almost 180-degree orientation errors. The prototype
+is opt-in; these results do not establish a reliable orientation anchor or a
+30-fps fitting path. See that run's `README.md` for the comparison and limits.
+
+Analyze orientation modes from completed, color-matched solution paths with:
+
+```bash
+MPLCONFIGDIR=/private/tmp/live-recognition-mpl .venv/bin/python scripts/analyze_orientation_motion.py \
+  --output-dir runs/orientation-analysis
+```
+
+The default reads the final selected geometry and saved orientation correction
+from each solved path, rather than assuming pose-bank option zero was selected.
+Recorded color-frame rotations remain intact. A separate quarter-turn mode
+analysis measures offsets from 24 preferred orientations without treating a
+change between those modes as a pose error. It also tests causal forecasts with
+parameters selected on the other four clips. The left plot shows rotation
+between consecutive selected poses, not departure from a presumed fixed target.
+Use `--source bank-rank0` only for comparison with the earlier candidate-bank
+analysis; its poses are not the final selected reference trajectory.
 
 Each sticker color keypoint finds its closest class-valid three- and four-landmark
 groups by expanding the nearest-landmark neighborhood. Cyclic classes must match
@@ -690,6 +971,30 @@ both sides reach the same cube state and compatible turn handoff at the
 same frame boundary. Supply a flat solved frame with `--end-frame` as the
 backward anchor.
 
+The prepared scorer keeps candidate scoring and ranking in compact numeric
+rows. Bidirectional widening applies its existing unique-move cutoff and tie
+rules to those rows before constructing states and diagnostic records.
+Optional native kernels accelerate grouped ranking, state permutations and
+color scoring, including batches of independent states. Build them locally with:
+
+```bash
+.venv/bin/python setup.py build_ext --inplace
+```
+
+Installation also attempts to build the optional extension. The Python/NumPy
+fallback preserves the same candidates and scores; set
+`CUBE_SEARCH_PYTHON_KERNELS=1` to exercise it explicitly. `evaluate_many` scores
+independent states sharing a frame and restriction in a single color batch.
+The priority queues still expand one node at a time; batching does not reorder
+the frontier or change pruning, TPS limits, scoring or branch widths.
+
+To compare mechanical throughput, first capture real expansion inputs with
+`scripts/benchmark_independent_keypoint_expansion.py --config CONFIG_JSON
+--output-dir CAPTURE_DIR`, then replay its `workload.json` using `--workload`
+and a fresh output directory. Replay verifies the complete candidate records
+outside the timed region. `--compare-admission BENCHMARK_JSON` additionally
+checks that the admitted continuations match a previous replay exactly.
+
 `--search-seconds 300` sets a search-only time limit per pass.
 `--max-explored-states 20000` sets an exact expansion limit per pass.
 A two-pass run writes a `summary.json` and separate `even/` and `odd/`
@@ -758,8 +1063,10 @@ with `--batch -1` restores the checkpoint's effective batch size. The resolved
 image and batch sizes are printed at startup.
 
 Progress prints on the first batch and every 50 batches: total loss, independent
-YOLO loss, custom pose loss, center/landmark error in pixels, rotation and mean
-face-angle error in degrees, and predicted pose quality versus its target.
+YOLO loss, custom pose loss, center/visible-keypoint error in pixels, rotation and mean
+face-angle error in degrees, moving-face angle error, and predicted pose quality
+versus its target. Batch updates refresh one console line; epoch summaries
+remain on separate lines.
 Epoch summaries report train/validation losses and validation pose metrics.
 
 Inputs to the branch are shared multiscale features and multiple predicted
@@ -768,17 +1075,49 @@ objects' detection/class logits, never their keypoint-presence channel.
 Ground-truth points are used only for supervision. Auxiliary center predictions
 and projected articulated landmarks guide the structured pose. The loss chooses
 one allowed symmetry jointly for rotation, ordered centers, turn channels, and
-the 56 projected landmark anchors. It cannot choose a different symmetry for
+visible keypoint reprojection. It cannot choose a different symmetry for
 each term. Historical sticker omissions make the allowed sets conservative.
 Slice targets use the verified frame rebase; corner cuts use the dominant angle.
 
+The geometric term (default weight 10) fits the saved visible landmark
+observations and labeled center-sticker observations, using their existing
+physical-anchor correspondences. Both retained visibility 1 and 2 contribute;
+absent labels and hidden ideal points do not. It averages radial Smooth L1
+reprojection error in normalized image coordinates (transition at 0.02 image
+width). Every visible match contributes: there is no fixed-fraction trimming
+or hard distance cutoff. Large residuals have bounded gradient magnitude
+instead of the increasing influence of squared error. With no visible matches the
+geometric term is zero, with no fallback to hidden targets. Geometry is averaged
+over images with visible supervision, so empty sets cannot dilute its scale.
+No dataset regeneration is needed. Other rotation, projection-parameter,
+center-anchor and balanced face-angle losses retain ground-truth supervision.
+
+`visible` is the untrimmed RMSE over all landmark and center-sticker observations
+used by this geometric loss. Epoch `landmarks` remains the full 56-point ideal
+target RMSE for diagnostics; `observed` remains untrimmed visible-landmark RMSE.
+Colored sticker points without a matched physical anchor retain their original
+independent YOLO supervision.
+
+The angle loss averages errors within moving and stationary face groups, then
+weights the two present groups equally for each image and symmetry candidate.
+Aligned cubes still supervise all six zero angles. A face is moving when its
+target offset exceeds `0.0001` degrees in magnitude. This avoids letting the
+roughly 85% zero-offset targets dominate articulation training. `turns` retains
+the mean over all six faces for comparison with earlier logs; `moving_turns`
+reports only target moving faces. JSON metrics additionally include
+`stationary_angle_mae_deg`. Epoch and group moving/stationary metrics are
+weighted by the number of corresponding supervised faces, excluding masked
+images. Epoch JSON metrics also record the moving/stationary face counts; a
+zero count means that metric has no contributing faces. These diagnostics use
+saved target motion, not predicted visibility.
+
 Empty-label images retain their independent detection supervision and have all
 direct geometric losses masked. Their pose-quality target is zero. The learned
-`quality` score estimates articulated projection accuracy relative to the best
-joint allowed target: `exp(-0.5 * (normalized_landmark_RMSE / 0.02)^2)` by default.
-Its error is the larger of full target-landmark RMSE and saved observed-landmark
-RMSE when observations exist, so a dominant-angle corner-cut approximation's
-residual also affects quality.
+`quality` score estimates visible reprojection accuracy relative to the best
+joint allowed target: `exp(-0.5 * (normalized_visible_RMSE / 0.02)^2)` by
+default. It uses all visible matches, is
+detached from the pose gradients, and has target zero without visible matches.
+Hidden ideal landmarks do not determine this quality target.
 This score is distinct from object detection and keypoint-presence scores and
 does not measure the probability that an orientation is unique or calibrated.
 
@@ -791,6 +1130,10 @@ error, including validation breakdowns by turn mode and allowed symmetry count.
 optimizer/scheduler/scaler state, random states, and configuration. Resume with
 `--resume runs/direct_cube_pose/weights/last.pt` and the same model/data/objective
 options; `--epochs` may be increased. Reuse the same output directory on resume.
+The objective version is recorded in checkpoints and metric records. Resuming
+an older objective's checkpoint keeps learned weights and optimizer progress,
+prints the objective change, and resets best-loss/early-stopping history because
+the old and new loss scales are not comparable.
 
 A short CPU wiring check, which does not establish pose accuracy:
 
@@ -809,6 +1152,13 @@ auxiliary `center_keypoints`, `projected_centers`, and `quality`;
 checkpoint is required to reload the saved model. This architecture still needs
 an accuracy comparison against the earlier six-point model on matching data and
 training budgets, especially for blur and occlusion.
+
+Observation tokens follow the checkpoint's configured inference branch:
+one-to-many when end-to-end inference is disabled, otherwise one-to-one.
+New custom-pose checkpoints record `observation_version` and
+`observation_token_branch`. Earlier observation caches that always selected
+one-to-one outputs for a non-end-to-end checkpoint must be regenerated;
+custom heads trained on those inputs need fresh validation or retraining.
 
 The current single-state objective does **not** yet handle hidden-layer
 articulation uncertainty. It still penalizes hidden face-angle and geometry
@@ -1010,3 +1360,88 @@ intersection of the predicted cube and sticker masks:
   --source path/to/cube.png \
   --segmentation-type combined
 ```
+
+## Staged cube pose with joint CUDA training
+
+`scripts/train_yolo26_staged_cube_pose.py` trains the architecture used by
+`robust_handoff_context60/epoch_045.pt`: one independent YOLO26m encoder,
+a static orientation/projection head, and the canonical geometry plus
+image-context transformer articulation head. The second head predicts layer
+turns; it does not revise the first head's static pose. There is no PnP or
+iterative pose fitter in inference. The geometric frame is defined modulo the
+24 proper cube symmetries; a separate color-frame assignment is not added here.
+
+Use the already exported `data/direct_cube_pose_dataset` (17,857 images),
+including `manifest.jsonl`, `symmetries.json`, `images/`, `pose/` and `targets/`.
+The original nine independent classes and visibility 1/2 annotations are
+preserved. No re-export or Blender generation is needed. For auxiliary
+reprojection and layer-support targets, retained landmark metadata provides
+physical slots, and sticker labels use known centers or unique nearby model
+projections. Uncertain sticker bindings are omitted only from this auxiliary
+loss; all original YOLO rows remain in the default detector loss. Dominant-angle
+corner-cut handling is retained.
+
+From the repository root in the Windows CUDA Python environment, copy
+`runs/staged_cube_pose_epoch45_init.pt` from this workspace to the same relative
+path, then run this single-line PowerShell-compatible command:
+
+```powershell
+python scripts/train_yolo26_staged_cube_pose.py --dataset data/direct_cube_pose_dataset --init-checkpoint runs/staged_cube_pose_epoch45_init.pt --device 0 --batch 16
+```
+
+The approximately 100 MiB initialization file contains the reviewed static/source
+epoch30 and complete articulation epoch45 weights; no investigation caches or
+other `runs/` folders are needed. It also records their original training keys,
+which are kept out of the new validation split. With seed17 and the current
+dataset, the split is 16,083 training / 1,774 validation images. This is validation
+for the new custom-head training; the existing detector's earlier keypoint
+pretraining may already have used these source images.
+
+The default128px schedule automatically runs:
+
+| Phase | Epochs | Updated components | Articulation conditioning |
+|---|---:|---|---|
+| Static | 30 | Detector and static head | Turn head frozen |
+| Articulation | 40 | Complete turn head | 50% correct, 50% perturbed static poses |
+| Handoff | 30 | Complete turn head | 25% actual estimates, 25% correct, 50% perturbed poses |
+| Joint | 30 | Detector, static head and complete turn head | Actual RGB estimates; correct-pose replay is an auxiliary loss |
+
+Each phase hands its best validation checkpoint to the next phase. Static is
+selected by static rotation error, articulation by explicitly teacher-conditioned
+observed-turn error, and handoff/joint by actual RGB-only moving-layer error.
+All stages also report actual static/moving/observed-moving errors and visible
+reprojection RMSE. Teacher-conditioned metrics are labeled separately. Metrics
+and stage losses are saved in `metrics.jsonl`; batch progress overwrites one
+console line. The static/source copy and both turn branches are unfrozen during
+joint training, with lower continuation learning rates. Detector batch-normalization
+statistics remain fixed, as in the reviewed model. The unused one-to-one branch
+and DFL integral are frozen; the configured one-to-many path uses the installed
+default YOLO pose loss. Structured geometry stays FP32; supported CUDA hardware
+can use AMP for the detector after its stock compatibility check.
+
+`--static-epochs`, `--articulation-epochs`, `--handoff-epochs` and `--joint-epochs`
+change stage lengths; zero skips a phase. `--batch -1` requests CUDA automatic
+batch estimation. `--resolution` aliases `--imgsz` (128 by default), and
+`--source-dir` aliases `--dataset` for the exported dataset. No spatial
+augmentation is introduced. Windows loaders use spawn, top-level functions and
+the multiprocessing main guard. `--workers 0` is available for loader diagnostics.
+
+To continue an interrupted run, using its saved split, optimizer, RNG and schedule:
+
+```powershell
+python scripts/train_yolo26_staged_cube_pose.py --resume runs/staged_cube_pose/weights/last.pt --device 0
+```
+
+Checkpoints are self-contained. Load for inference with
+`live_recognition.staged_pose.model.model_from_checkpoint(path, device)`;
+`model(images)["pose"]` uses only RGB. The joint stage writes
+`weights/best.pt`; `weights/last.pt` and per-stage best checkpoints are retained.
+
+To reproduce the portable initialization from individual experimental weights:
+
+```powershell
+python scripts/train_yolo26_staged_cube_pose.py --static-checkpoint runs/direct_cube_pose_1k_investigation/continued/static_first_rgb_adapt30/epoch_030.pt --articulation-checkpoint runs/direct_cube_pose_1k_investigation/continued/robust_handoff_context60/epoch_045.pt --initial-split runs/direct_cube_pose_1k_generalization_128_mps/split.json --export-init runs/staged_cube_pose_epoch45_init.pt
+```
+
+For a short pipeline check instead of full training, add
+`--limit 16 --max-batches 1 --static-epochs 1 --articulation-epochs 1 --handoff-epochs 1 --joint-epochs 1 --output-dir runs/staged_pose_smoke`.

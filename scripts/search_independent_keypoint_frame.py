@@ -178,14 +178,35 @@ def branch_stage_budget(solving_frame_count, override=None):
     return override
 
 
+def move_sequence_key(step):
+    """Geometry variants of the same ordered moves share one branch slot."""
+    return tuple(step.get('state_moves', ()))
+
+
+def unrestricted_sticker_branch(steps, threshold):
+    """Use assigned sticker counts, not raw detections or match accuracy.
+
+    Require every legal fit to be sparse so a fit cannot trigger unlimited
+    branching merely by projecting fewer of the available observations.
+    Missing counts leave the ordinary cutoff enabled.
+    """
+    if threshold is None or not steps:
+        return False
+    counts = [step.get('color_match_count') for step in steps]
+    return all(count is not None and count <= threshold for count in counts)
+
+
 def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
                      queue=None, serialize_state=pickle.dumps, deserialize_state=pickle.loads,
                      progress=None, progress_seconds=10., max_explored_states=None,
                      bottom_quartile_weight=0., turn_handoff_bonus=None, ignore_queue_geometry=False,
                      mismatch_window_weight=0., queue_geometry_weight=.5,
-                     branch_widths=(), branch_stage_expansions=None, resume_from=None):
+                     branch_widths=(), branch_stage_expansions=None, resume_from=None,
+                     unrestricted_sticker_count=None):
     """Expand the lowest queue score, keeping one entry per frame and state."""
     frames = tuple(frames)
+    if unrestricted_sticker_count is not None and unrestricted_sticker_count < 0:
+        raise ValueError('Unrestricted sticker count must be nonnegative')
     if not frames or any(b <= a for a, b in zip(frames, frames[1:])):
         raise ValueError("Search frames must be strictly increasing")
     if not math.isfinite(progress_seconds) or progress_seconds <= 0:
@@ -221,7 +242,8 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
                 progress=progress, progress_seconds=progress_seconds, max_explored_states=max_explored_states,
                 bottom_quartile_weight=bottom_quartile_weight, turn_handoff_bonus=turn_handoff_bonus,
                 queue_geometry_weight=queue_geometry_weight, mismatch_window_weight=mismatch_window_weight,
-                branch_widths=branch_widths, branch_stage_expansions=branch_stage_expansions)
+                branch_widths=branch_widths, branch_stage_expansions=branch_stage_expansions,
+                unrestricted_sticker_count=unrestricted_sticker_count)
         finally:
             queue.close()
     if resume_from is None and (queue.context_count or queue.deferred_count):
@@ -363,7 +385,10 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
                    frame_choices(transitions, frame, node.state, completion))
         if branch_widths:
             choices.sort(key=sibling_order)
+            unrestricted = unrestricted_sticker_branch(
+                [c.payload for c in choices if math.isfinite(c.score)], unrestricted_sticker_count)
             siblings = set()
+            move_sequences = set()
             previous_order = None
             admission_rank = 0
         else:
@@ -378,17 +403,22 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
                                supported_completion(transitions.m, step) if handoffs else None)
             key = context(depth, choice.state, next_completion)
             if branch_widths:
+                moves = move_sequence_key(step)
+                if moves in move_sequences:
+                    continue
                 if key in siblings:
                     continue
                 siblings.add(key)
+                move_sequences.add(moves)
                 rank = len(siblings)
                 order = sibling_order(choice)
                 if order != previous_order:
                     admission_rank = rank
                     previous_order = order
-                if admission_rank > branch_widths[-1]:
+                if not unrestricted and admission_rank > branch_widths[-1]:
                     break
                 step['sibling_rank'] = rank
+                step['branch_cutoff_bypassed'] = unrestricted
             recent = node.recent
             if mismatch_window_weight:
                 recent, window = recent
@@ -415,7 +445,7 @@ def frame_full_solve(initial_state, frames, transitions, solved, state_key, *,
             step['queue_priority'] = priority
             child = storage.MeanNode(depth, choice.state, priority, empty_update,
                                      node.path_id, recent=recent, priority=priority)
-            if branch_widths and admission_rank > width:
+            if branch_widths and not unrestricted and admission_rank > width:
                 # The same state can become eligible at different widths.
                 deferred_key = pickle.dumps((admission_rank, key), protocol=5)
                 queue.defer(deferred_key, admission_rank, child, serialize_state(child.state), step)
@@ -447,7 +477,7 @@ def build_parser():
     parser.add_argument('--max-tps', type=float, default=40.,
                         help='Per-turn TPS limit, with simultaneous slabs measured independently (default: 40).')
     parser.add_argument('--max-double-tps', type=float, default=50.,
-                        help='TPS limit for geometry-supported 180-degree spans (default: 50).')
+                        help='Shared total-travel TPS cap and witnessed double-turn rate (default: 50).')
     parser.add_argument("--frame-parity", choices=("both", "even", "odd", "all"), default="both",
                         help="Search both parities independently, one parity, or all input frames (default: both).")
     parser.add_argument("--start-frame", type=int, default=0)
@@ -469,6 +499,8 @@ def build_parser():
                         help="Per-parent child cutoffs including ties, e.g. 3 5 8.")
     parser.add_argument("--branch-stage-expansions", type=int,
                         help=f"Override the stage budget of {BRANCH_STAGE_EXPANSIONS_PER_FRAME} expansions per solving frame.")
+    parser.add_argument('--unrestricted-sticker-count', type=int,
+                        help='Admit every distinct legal move sequence when all fits score at most this many stickers.')
     queue_geometry = parser.add_mutually_exclusive_group()
     queue_geometry.add_argument("--queue-geometry-weight", type=float, default=.5,
                                 help="Geometry coefficient in queue priority (default: 0.5).")
@@ -537,6 +569,7 @@ def run_pass(args, directory, frames, scorer, initial, colors, config, *, resume
                 mismatch_window_weight=args.mismatch_window_weight,
                 branch_widths=config.get('branch_widths', ()),
                 branch_stage_expansions=config.get('branch_stage_expansions'),
+                unrestricted_sticker_count=args.unrestricted_sticker_count,
                 resume_from=resume_from)
         except (KeyboardInterrupt, SearchTimeLimit) as error:
             status = 'time_limit' if isinstance(error, SearchTimeLimit) else 'interrupted'
@@ -555,6 +588,8 @@ def run_pass(args, directory, frames, scorer, initial, colors, config, *, resume
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    if args.unrestricted_sticker_count is not None and args.unrestricted_sticker_count < 0:
+        parser.error('--unrestricted-sticker-count must be nonnegative')
     if (args.start_frame < 0 or args.end_frame is not None and args.end_frame < args.start_frame
             or args.turning_start_frame is not None and args.turning_start_frame < 0
             or args.frontier_cache_size < 1 or args.cost_cache_size < 0 or args.score_cache_size < 0
@@ -638,6 +673,7 @@ def main():
         parser.error(str(error))
 
     common_config = dict(algorithm='best_first_latest_frame', log=str(args.log.resolve()),
+        unrestricted_sticker_count=args.unrestricted_sticker_count,
         log_sha256=hashlib.sha256(args.log.read_bytes()).hexdigest(), observation_input=metadata,
         initial_scramble=args.initial_scramble, turning_start_frame=args.turning_start_frame,
         priority_statistic='latest_frame_geometric_plus_color_cost',
@@ -692,7 +728,8 @@ def main():
                 rotation_degrees_per_second=90.*args.max_tps,
                 rotation_budgets_degrees=scorer.rotation_limits,
                 double_rotation_budgets_degrees=scorer.rotation_double_limits,
-                simultaneous_budget_policy="independent_relative_to_middle",
+                simultaneous_budget_policy="individual_rates_plus_shared_double_cap_relative_to_middle",
+                branch_candidate_policy="best_geometry_per_unique_move_sequence",
                 merge_key='frame,physical_state,residual_geometry')
             config.pop('turn_handoff_bonus', None)
             config.pop('turn_handoff_min_degrees', None)

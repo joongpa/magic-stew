@@ -136,7 +136,8 @@ class WideningFrontier:
 
 
 def widening_join(forward, backward, initial, goals, length, *, widths, stage_budget,
-                  mismatch_weight, expanded, reached, time_limit_check, state_limit, report):
+                  mismatch_weight, expanded, reached, time_limit_check, state_limit, report,
+                  unrestricted_sticker_count=None):
     def sibling_order(edge):
         return edge.step['state_score'], frame_search.unsupported_state_update(edge.step), edge.rank[-1]
 
@@ -181,27 +182,39 @@ def widening_join(forward, backward, initial, goals, length, *, widths, stage_bu
         start = time.monotonic()
         expanded[direction] += 1
         child_depth = depth + (1 if direction == 0 else -1)
-        children = (forward if direction == 0 else backward)(node, depth)
+        candidates = (forward if direction == 0 else backward)(node, depth)
+        if isinstance(candidates, replay.fast.ExpansionBatch):
+            children, unrestricted = candidates.select(widths[-1], unrestricted_sticker_count)
+        else:
+            children = sorted(candidates, key=sibling_order)
+            unrestricted = frame_search.unrestricted_sticker_branch(
+                [edge.step for edge in children], unrestricted_sticker_count)
         seen = set()
+        move_sequences = set()
         previous_order = None
         admission_rank = 0
-        for edge in sorted(children, key=sibling_order):
+        for edge in children:
+            time_limit_check()
+            moves = frame_search.move_sequence_key(edge.step)
+            if moves in move_sequences:
+                continue
             key = edge.state, edge.cue
             if key in seen:
                 continue
             seen.add(key)
+            move_sequences.add(moves)
             rank = len(seen)
             order = sibling_order(edge)
             if order != previous_order:
                 admission_rank = rank
                 previous_order = order
-            if admission_rank > widths[-1]:
+            if not unrestricted and admission_rank > widths[-1]:
                 break
-            step = dict(edge.step, sibling_rank=rank)
+            step = dict(edge.step, sibling_rank=rank, branch_cutoff_bypassed=unrestricted)
             window = frame_search.update_mismatch_window(node.window, step, mismatch_weight)
             step['queue_priority'] += step['window_mismatch_penalty']
             child = Link(edge.state, edge.cue, node, step, window=window)
-            if admission_rank <= side.width:
+            if unrestricted or admission_rank <= side.width:
                 side.offer(child_depth, child)
             else:
                 side.deferred[admission_rank].append((child_depth, child))
@@ -211,10 +224,12 @@ def widening_join(forward, backward, initial, goals, length, *, widths, stage_bu
 def bidirectional_search(scorer, frames, initial, goals, *, width, retries, overlap,
                          time_limit, state_limit, handoff_bonus, progress, physical_key=None,
                          lookahead_frames=0, lookahead_budget=384, branch_widths=(),
-                         branch_stage_expansions=None, mismatch_window_weight=1.):
+                         branch_stage_expansions=None, mismatch_window_weight=1., unrestricted_sticker_count=None):
     """Retain a beam and a deferred batch at each frame, then retry from the stack."""
     if not frames or not goals or width < 1 or min(retries, overlap) < 0:
         raise ValueError("Search requires frames, solved seeds and a positive beam width")
+    if unrestricted_sticker_count is not None and unrestricted_sticker_count < 0:
+        raise ValueError('Unrestricted sticker count must be nonnegative')
     if (any(value < 1 for value in branch_widths)
             or any(b <= a for a, b in zip(branch_widths, branch_widths[1:]))
             or not math.isfinite(mismatch_window_weight)
@@ -248,6 +263,7 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
     bounds = (min(len(frames), midpoint + overlap), max(0, midpoint - overlap))
     attempted_retries = 0
     rotation_budget = getattr(scorer, 'rotation_budget_enabled', False)
+    compact_edges = rotation_budget and bool(branch_widths)
 
     def evaluations():
         return sum(expanded) + (forecaster.expanded if forecaster else 0)
@@ -275,7 +291,8 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
     def step_for(choice, frame, cue):
         committed = frame_search.handoff_moves(choice.payload) or tuple(choice.payload['state_moves'])
         bonus = handoff_bonus if not rotation_budget and cue and committed == frame_search.completion_moves(cue) else 0.
-        step = dict(choice.payload, frame_index=frame, state_score=choice.score,
+        factory = replay.fast.PayloadOverlay if compact_edges else dict
+        step = factory(choice.payload, frame_index=frame, state_score=choice.score,
                     queue_priority=priority(choice)-bonus)
         if bonus:
             step["turn_handoff_bonus"] = bonus
@@ -291,16 +308,24 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
                 cue = (scorer.rotation_context(step, previous_cue) if rotation_budget else
                        frame_search.supported_completion(scorer.m, step))
                 unsupported = frame_search.unsupported_state_update(step)
-                yield Link(choice.state, cue, step=step, rank=(step["queue_priority"], unsupported, choice.rank))
+                rank = step['queue_priority'], unsupported, choice.rank
+                if compact_edges:
+                    yield replay.fast.CompactEdge(choice, cue, step, rank)
+                else:
+                    yield Link(choice.state, cue, step=step, rank=rank)
 
     forecaster = (WindowForecaster(forward_options, scorer.m.move_lookahead_weights, len(frames),
                                    lookahead_frames, lookahead_budget, check_forecast_budget)
                   if lookahead_frames else None)
 
     def forward(node, depth):
+        if compact_edges and hasattr(scorer, '_transitions_from_rows'):
+            batch = replay.fast.forward_expansion(scorer, frames[depth], node.state, node.cue, step_for)
+            if batch is not None:
+                return batch
         expand = forecaster.edges if forecaster else forward_options
-        for edge in expand(depth, node.state, node.cue):
-            yield Link(edge.state, edge.cue, node, edge.step, edge.rank)
+        return (edge if compact_edges else Link(edge.state, edge.cue, node, edge.step, edge.rank)
+                for edge in expand(depth, node.state, node.cue))
 
     @lru_cache(maxsize=None)
     def previous_handoffs(depth):
@@ -315,13 +340,16 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
                 return tuple(sorted({frame_search.completion_moves(cue) for cue in cues if cue}))
         return tuple(action for action, _direction, _undo in reverse_actions)
 
-    def backward(node, depth):
+    def backward_options(node, depth):
         frame = frames[depth-1]
         if rotation_budget:
-            for before, context, choice, prior_color in scorer.rotation_predecessors(frame, node.state, node.cue):
+            options = {'defer_states': True} if compact_edges else {}
+            for before, context, choice, prior_color in scorer.rotation_predecessors(frame, node.state, node.cue, **options):
                 check_budget()
                 step = step_for(choice, frame, None)
-                yield Link(before, context, node, step, (priority(choice), False, (prior_color, choice.rank)))
+                rank = priority(choice), False, (prior_color, choice.rank)
+                yield (replay.fast.CompactEdge(before, context, step, rank) if compact_edges else
+                       Link(before, context, node, step, rank))
             return
         hold = scorer.score_hold(frame, node.state)
         possibilities = [((), None, node.state)]
@@ -393,6 +421,13 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
                         continue
                     step = step_for(composed, frame, need)
                     yield Link(parent, need, node, step, (priority(prior), step['queue_priority'], composed.rank))
+
+    def backward(node, depth):
+        if compact_edges and hasattr(scorer, '_transitions_from_rows'):
+            batch = replay.fast.backward_expansion(scorer, frames[depth-1], node.state, node.cue, step_for)
+            if batch is not None:
+                return batch
+        return backward_options(node, depth)
 
     def meeting(depth, direction, nodes):
         opposite = layers[1-direction].get(depth)
@@ -492,11 +527,12 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
                           and all(choice.payload.get(k) == step.get(k) for k in trial_key)), None)
             if match is None:
                 raise RuntimeError(f"Joined transition failed forward replay at frame {frame}")
-            verified_step = step_for(match, frame, cue)
+            verified_step = dict(step_for(match, frame, cue))
             if branch_widths:
                 window = frame_search.update_mismatch_window(window, verified_step, mismatch_window_weight)
                 verified_step['queue_priority'] += verified_step['window_mismatch_penalty']
                 verified_step['sibling_rank'] = step['sibling_rank']
+                verified_step['branch_cutoff_bypassed'] = step.get('branch_cutoff_bypassed', False)
             verified.append(verified_step)
             state, cue = after, (scorer.rotation_context(verified[-1], cue) if rotation_budget else
                                 frame_search.supported_completion(scorer.m, verified[-1]))
@@ -512,7 +548,7 @@ def bidirectional_search(scorer, frames, initial, goals, *, width, retries, over
             joined = widening_join(forward, backward, initial, goals, len(frames), widths=branch_widths,
                 stage_budget=branch_stage_expansions, mismatch_weight=mismatch_window_weight,
                 expanded=expanded, reached=reached, time_limit_check=check_budget, state_limit=state_limit,
-                report=report)
+                report=report, unrestricted_sticker_count=unrestricted_sticker_count)
         else:
             joined = sweep(0, 0, tuple(layers[0][0].values()), 0)
             if not joined:
@@ -555,18 +591,22 @@ def main():
     parser.add_argument('--max-tps', type=float, default=40.,
                         help='Per-turn TPS limit, with simultaneous slabs measured independently (default: 40).')
     parser.add_argument('--max-double-tps', type=float, default=50.,
-                        help='TPS limit for geometry-supported 180-degree spans (default: 50).')
+                        help='Shared total-travel TPS cap and witnessed double-turn rate (default: 50).')
     parser.add_argument("--max-explored-states", type=int)
     parser.add_argument("--branch-widths", type=int, nargs="+", default=(),
                         help="Per-parent child cutoffs including ties for the best-first queues, e.g. 3 5 8.")
     parser.add_argument("--branch-stage-expansions", type=int,
                         help=f"Override the per-direction stage budget of "
                              f"{frame_search.BRANCH_STAGE_EXPANSIONS_PER_FRAME} expansions per solving frame.")
+    parser.add_argument('--unrestricted-sticker-count', type=int,
+                        help='Admit every distinct legal move sequence when all fits score at most this many stickers.')
     parser.add_argument("--mismatch-window-weight", type=float, default=WIDENING_MISMATCH_WEIGHT,
                         help="Weight of the eight-frame mismatch history in the widening queues.")
     parser.add_argument("--lookahead-frames", type=int, default=0, help="Future sampled frames for forward ordering.")
     parser.add_argument("--lookahead-budget", type=int, default=384, help="New forecast expansions per forward layer.")
     args = parser.parse_args()
+    if args.unrestricted_sticker_count is not None and args.unrestricted_sticker_count < 0:
+        parser.error('--unrestricted-sticker-count must be nonnegative')
     if (args.beam_width < 1 or args.max_explored_states is not None and args.max_explored_states < 1
             or min(args.retries, args.overlap, args.lookahead_frames) < 0 or args.lookahead_budget < 1
             or not math.isfinite(args.search_seconds) or args.search_seconds <= 0
@@ -628,6 +668,7 @@ def main():
         return min(row.tobytes() for row in np.frombuffer(state, dtype=np.uint8)[scorer.orientation_sources])
 
     config = dict(algorithm="bidirectional_bounded_beam_stack", log=str(args.log.resolve()),
+        unrestricted_sticker_count=args.unrestricted_sticker_count,
         observation_input=metadata, initial_scramble=args.initial_scramble, turning_start_frame=static_end,
         geometry_shortlist_size=scorer.geometry_shortlist_size,
         geometry_tie_tolerance=replay.GEOMETRY_TIE_TOLERANCE,
@@ -641,7 +682,8 @@ def main():
         rotation_degrees_per_second=90.*args.max_tps,
         rotation_budgets_degrees=scorer.rotation_limits,
         double_rotation_budgets_degrees=scorer.rotation_double_limits,
-        simultaneous_budget_policy="independent_relative_to_middle",
+        simultaneous_budget_policy="individual_rates_plus_shared_double_cap_relative_to_middle",
+        branch_candidate_policy="best_geometry_per_unique_move_sequence",
         merge_key='frame,physical_state,residual_geometry',
         preferred_orientations_per_physical_state=2, reference_solution_used=False,
         anchor_colors=dict(observed=anchor.payload["color_match_count"], error=anchor.payload["color_error"]))
@@ -674,7 +716,8 @@ def main():
             physical_key=physical_key, lookahead_frames=args.lookahead_frames,
             lookahead_budget=args.lookahead_budget, branch_widths=args.branch_widths,
             branch_stage_expansions=stage_budget,
-            mismatch_window_weight=args.mismatch_window_weight)
+            mismatch_window_weight=args.mismatch_window_weight,
+            unrestricted_sticker_count=args.unrestricted_sticker_count)
     if result["steps"]:
         prefix = [dict(scorer(index, initial)[0].payload, frame_index=index, state_score=0., queue_priority=0.)
                   for index in sorted(records) if index <= static_end]

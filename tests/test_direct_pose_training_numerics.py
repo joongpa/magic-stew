@@ -58,7 +58,9 @@ class PrecisionCheckingLoss:
         assert raw["scores"].dtype == torch.float32
         assert raw["feats"][0].dtype == torch.float32
         # This reduction can overflow when evaluated on FP16 inputs.
-        loss = raw["scores"].square().mean().reshape(1)
+        # Normalize after the FP32 reduction, keeping this synthetic probe's
+        # unscaled FP16 backward in range as well as its loss computation.
+        loss = raw["scores"].square().mean().reshape(1) / 100
         return loss, loss.detach()
 
 
@@ -79,6 +81,12 @@ def loss_inputs():
 
 def test_mixed_precision_forward_keeps_loss_math_in_float32_with_gradients():
     model = NumericalProbeModel()
+    with torch.no_grad():
+        # Large enough to overflow a FP16 squared loss, without depending on
+        # random BatchNorm means or the RNG state left by preceding tests.
+        model.conv.weight.copy_(torch.tensor([[.5, 0, 0], [0, .5, 0], [0, 0, .5], [.3, .3, .3]])[:, :, None, None])
+        model.conv.bias.zero_()
+        model.bn.bias.fill_(1)
     batch, target, direct = loss_inputs()
     attempt = compute_loss_attempt(model, batch, target, PrecisionCheckingLoss(), direct,
                                    torch.device("cpu"), amp_enabled=True, amp_dtype=torch.float16)
@@ -179,3 +187,26 @@ def test_probe_replays_exact_saved_batch(tmp_path):
     assert keys == ("a", "b")
     assert torch.equal(restored["img"], batch["img"])
     assert all(torch.equal(restored_target[key], value) for key, value in target.items())
+
+
+def test_epoch_moving_angle_metric_weights_faces_and_excludes_masked_images():
+    model = NumericalProbeModel()
+    batch, target, direct = loss_inputs()
+    target = {k: torch.cat((v, v[:1])) for k, v in target.items()}
+    target["angles"][:] = torch.tensor([[20., 0, 0, 0, 0, 0], [5., -15., 0, 0, 0, 0], [45., 45., 45., 0, 0, 0]])
+    target["enabled"][2] = False
+    images = torch.rand(3, 3, 16, 16)
+
+    class Loader:
+        dataset = SimpleNamespace(entries=[{"key": k, "mode": "none", "symmetry_count": 1} for k in ("a", "b", "c")])
+
+        def __iter__(self):
+            for indexes in ([0, 1], [2]):
+                yield ({"img": images[indexes]}, {k: v[indexes] for k, v in target.items()},
+                       tuple(("a", "b", "c")[i] for i in indexes))
+
+    metrics = run_epoch(model, Loader(), StandardPrecisionLoss(), direct, torch.device("cpu"))
+    assert metrics["moving_angle_mae_deg"] == pytest.approx(40 / 3)
+    assert metrics["stationary_angle_mae_deg"] == 0
+    assert metrics["moving_face_count"] == 3 and metrics["stationary_face_count"] == 9
+    assert metrics["by_mode/none/moving_angle_mae_deg"] == pytest.approx(40 / 3)
