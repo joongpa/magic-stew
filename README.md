@@ -1412,7 +1412,9 @@ observed-turn error, and handoff/joint by actual RGB-only moving-layer error.
 All stages also report actual static/moving/observed-moving errors and visible
 reprojection RMSE. Teacher-conditioned metrics are labeled separately. Metrics
 and stage losses are saved in `metrics.jsonl`; batch progress overwrites one
-console line. The static/source copy and both turn branches are unfrozen during
+console line and fits within the current terminal width to prevent wrapping.
+Redirected/captured output receives one final batch summary per train/validation
+pass. The static/source copy and both turn branches are unfrozen during
 joint training, with lower continuation learning rates. Detector batch-normalization
 statistics remain fixed, as in the reviewed model. The unused one-to-one branch
 and DFL integral are frozen; the configured one-to-many path uses the installed

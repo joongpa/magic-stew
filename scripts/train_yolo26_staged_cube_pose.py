@@ -38,6 +38,7 @@ from live_recognition.staged_pose.model import (
     checkpoint_model,
     model_from_checkpoint,
 )
+from live_recognition.training_progress import ConsoleProgress
 from scripts.train_yolo26_direct_cube_pose import (
     resolve_batch_size,
     resolve_training_amp,
@@ -215,51 +216,52 @@ def run_epoch(model, loader, criterion, device, phase, optimizer, scaler, max_ba
     model.train(training)
     sums = {}
     counts = {}
-    width = 0
-    for index, (batch, target, keys) in enumerate(loader):
-        if max_batches is not None and index >= max_batches:
-            break
-        batch = {k: v.to(device, non_blocking=device.type == "cuda") for k, v in batch.items()}
-        target = {k: v.to(device, non_blocking=device.type == "cuda") for k, v in target.items()}
-        if training:
-            optimizer.zero_grad(set_to_none=True)
-        with torch.set_grad_enabled(training):
-            loss, parts, context = criterion(model, batch, target, phase)
-            if not torch.isfinite(loss):
-                raise FloatingPointError(
-                    f"Nonfinite {phase} loss for {keys}: "
-                    + str({k: float(v.detach()) for k, v in parts.items()})
-                )
-            with torch.no_grad():
-                batch_metrics = criterion.metrics(model, context, target, batch["img"].shape[-1])
+    with ConsoleProgress() as progress:
+        for index, (batch, target, keys) in enumerate(loader):
+            if max_batches is not None and index >= max_batches:
+                break
+            batch = {k: v.to(device, non_blocking=device.type == "cuda") for k, v in batch.items()}
+            target = {
+                k: v.to(device, non_blocking=device.type == "cuda") for k, v in target.items()
+            }
             if training:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                for group in optimizer.param_groups:
-                    torch.nn.utils.clip_grad_norm_(group["params"], 10, error_if_nonfinite=True)
-                scaler.step(optimizer)
-                scaler.update()
-        for name, value in dict(total=loss, **parts).items():
-            sums[name] = sums.get(name, 0.0) + float(value.detach()) * len(keys)
-            counts[name] = counts.get(name, 0) + len(keys)
-        # Metrics use the actual RGB pose/own predicted axis, even during
-        # teacher-conditioned training phases. GT-only diagnostic is named.
-        for name, (value, count) in batch_metrics.items():
-            sums[name] = sums.get(name, 0.0) + value
-            counts[name] = counts.get(name, 0) + count
-        if index % 10 == 0 or index + 1 == len(loader):
-            moving = sums.get("moving_turn_deg", 0) / max(counts.get("moving_turn_deg", 0), 1)
-            rotation = sums.get("static_rotation_deg", 0) / max(
-                counts.get("static_rotation_deg", 0), 1
-            )
-            visible = sums.get("visible_keypoint_rmse_px", 0) / max(
-                counts.get("visible_keypoint_rmse_px", 0), 1
-            )
-            message = f"  {phase} {'train' if training else 'val'} batch {index + 1}/{len(loader)} loss={float(loss.detach()):.4f} phase={float(parts['phase'].detach()):.3f} geom={float(parts['geometry'].detach()):.3f} R={rotation:.2f}deg moving={moving:.2f}deg visible={visible:.2f}px"
-            width = max(width, len(message))
-            print("\r" + message.ljust(width), end="", flush=True)
-    if width:
-        print(flush=True)
+                optimizer.zero_grad(set_to_none=True)
+            with torch.set_grad_enabled(training):
+                loss, parts, context = criterion(model, batch, target, phase)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(
+                        f"Nonfinite {phase} loss for {keys}: "
+                        + str({k: float(v.detach()) for k, v in parts.items()})
+                    )
+                with torch.no_grad():
+                    batch_metrics = criterion.metrics(
+                        model, context, target, batch["img"].shape[-1]
+                    )
+                if training:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    for group in optimizer.param_groups:
+                        torch.nn.utils.clip_grad_norm_(group["params"], 10, error_if_nonfinite=True)
+                    scaler.step(optimizer)
+                    scaler.update()
+            for name, value in dict(total=loss, **parts).items():
+                sums[name] = sums.get(name, 0.0) + float(value.detach()) * len(keys)
+                counts[name] = counts.get(name, 0) + len(keys)
+            # Metrics use the actual RGB pose/own predicted axis, even during
+            # teacher-conditioned training phases. GT-only diagnostic is named.
+            for name, (value, count) in batch_metrics.items():
+                sums[name] = sums.get(name, 0.0) + value
+                counts[name] = counts.get(name, 0) + count
+            if index % 10 == 0 or index + 1 == len(loader):
+                moving = sums.get("moving_turn_deg", 0) / max(counts.get("moving_turn_deg", 0), 1)
+                rotation = sums.get("static_rotation_deg", 0) / max(
+                    counts.get("static_rotation_deg", 0), 1
+                )
+                visible = sums.get("visible_keypoint_rmse_px", 0) / max(
+                    counts.get("visible_keypoint_rmse_px", 0), 1
+                )
+                message = f"{'train' if training else 'val'} {index + 1}/{len(loader)} loss={float(loss.detach()):.3f} R={rotation:.1f} turn={moving:.1f} vis={visible:.1f}px ce={float(parts['phase'].detach()):.3f} geo={float(parts['geometry'].detach()):.3f}"
+                progress.update(message)
     return {k: sums[k] / counts[k] if counts[k] else None for k in sums}
 
 
