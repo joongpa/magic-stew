@@ -35,6 +35,7 @@ from live_recognition.staged_pose.batching import resolve_phase_batch_size
 from live_recognition.staged_pose.data import StagedPoseDataset
 from live_recognition.staged_pose.loss import StagedPoseLoss
 from live_recognition.staged_pose.model import (
+    OBSERVATION_VERSION,
     StagedCubePoseModel,
     checkpoint_model,
     model_from_checkpoint,
@@ -118,6 +119,12 @@ def build_parser():
     p.add_argument("--imgsz", "--resolution", type=int, default=128)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--threads", type=int, default=4)
+    p.add_argument(
+        "--train-metrics-every",
+        type=int,
+        default=10,
+        help="Compute training pose diagnostics every N batches; all loss updates and validation batches remain complete",
+    )
     p.add_argument("--static-epochs", type=int, default=30)
     p.add_argument("--articulation-epochs", type=int, default=40)
     p.add_argument("--handoff-epochs", type=int, default=30)
@@ -147,6 +154,8 @@ def validate_args(args):
     validate_batch_args(args)
     if args.workers < 0 or args.threads < 1:
         raise ValueError("Invalid --workers/--threads")
+    if args.train_metrics_every < 1:
+        raise ValueError("--train-metrics-every must be positive")
     if any(getattr(args, f"{phase}_epochs") < 0 for phase in PHASES):
         raise ValueError("Stage epoch counts must be nonnegative")
     if not args.export_init and not any(getattr(args, f"{phase}_epochs") for phase in PHASES):
@@ -300,14 +309,19 @@ def stage_loaders(datasets, batch, args, device, sampler_rng, worker_rngs):
     ]
 
 
-def run_epoch(model, loader, criterion, device, phase, optimizer, scaler, max_batches):
+def run_epoch(
+    model, loader, criterion, device, phase, optimizer, scaler, max_batches, metrics_every=10
+):
     training = optimizer is not None
     model.train(training)
     sums = {}
     counts = {}
+    batches = min(len(loader), max_batches) if max_batches is not None else len(loader)
+    metric_batches = metric_images = processed_images = 0
+    started = time.monotonic()
     with ConsoleProgress() as progress:
         for index, (batch, target, keys) in enumerate(loader):
-            if max_batches is not None and index >= max_batches:
+            if index >= batches:
                 break
             batch = {k: v.to(device, non_blocking=device.type == "cuda") for k, v in batch.items()}
             target = {
@@ -322,10 +336,14 @@ def run_epoch(model, loader, criterion, device, phase, optimizer, scaler, max_ba
                         f"Nonfinite {phase} loss for {keys}: "
                         + str({k: float(v.detach()) for k, v in parts.items()})
                     )
-                with torch.no_grad():
-                    batch_metrics = criterion.metrics(
-                        model, context, target, batch["img"].shape[-1]
-                    )
+                batch_metrics = {}
+                if not training or index % metrics_every == 0 or index + 1 == batches:
+                    with torch.no_grad():
+                        batch_metrics = criterion.metrics(
+                            model, context, target, batch["img"].shape[-1]
+                        )
+                    metric_batches += 1
+                    metric_images += len(keys)
                 if training:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
@@ -336,12 +354,13 @@ def run_epoch(model, loader, criterion, device, phase, optimizer, scaler, max_ba
             for name, value in dict(total=loss, **parts).items():
                 sums[name] = sums.get(name, 0.0) + float(value.detach()) * len(keys)
                 counts[name] = counts.get(name, 0) + len(keys)
+            processed_images += len(keys)
             # Metrics use the actual RGB pose/own predicted axis, even during
             # teacher-conditioned training phases. GT-only diagnostic is named.
             for name, (value, count) in batch_metrics.items():
                 sums[name] = sums.get(name, 0.0) + value
                 counts[name] = counts.get(name, 0) + count
-            if index % 10 == 0 or index + 1 == len(loader):
+            if index % 10 == 0 or index + 1 == batches:
                 moving = sums.get("moving_turn_deg", 0) / max(counts.get("moving_turn_deg", 0), 1)
                 rotation = sums.get("static_rotation_deg", 0) / max(
                     counts.get("static_rotation_deg", 0), 1
@@ -349,9 +368,18 @@ def run_epoch(model, loader, criterion, device, phase, optimizer, scaler, max_ba
                 visible = sums.get("visible_keypoint_rmse_px", 0) / max(
                     counts.get("visible_keypoint_rmse_px", 0), 1
                 )
-                message = f"{'train' if training else 'val'} {index + 1}/{len(loader)} loss={float(loss.detach()):.3f} R={rotation:.1f} turn={moving:.1f} vis={visible:.1f}px ce={float(parts['phase'].detach()):.3f} geo={float(parts['geometry'].detach()):.3f}"
+                elapsed = time.monotonic() - started
+                rate = processed_images / max(elapsed, 1e-6)
+                remaining = int(elapsed / (index + 1) * (batches - index - 1))
+                message = f"{'train' if training else 'val'} {index + 1}/{batches} {rate:.1f}img/s ETA={remaining // 60}:{remaining % 60:02d} loss={float(loss.detach()):.3f} R={rotation:.1f} turn={moving:.1f} vis={visible:.1f}px"
                 progress.update(message)
-    return {k: sums[k] / counts[k] if counts[k] else None for k in sums}
+    result = {k: sums[k] / counts[k] if counts[k] else None for k in sums}
+    result.update(
+        pose_metric_batches=metric_batches,
+        pose_metric_images=metric_images,
+        images_per_second=processed_images / max(time.monotonic() - started, 1e-6),
+    )
+    return result
 
 
 def selection_score(metrics, phase):
@@ -384,6 +412,7 @@ def main():
         flush=True,
     )
     batch_overrides = batch_cli_overrides(args, argv)
+    explicit_metrics = any(token.split("=", 1)[0] == "--train-metrics-every" for token in argv)
     resume = None
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
@@ -398,6 +427,7 @@ def main():
             if (
                 key not in ("device", "workers", "threads", "dataset", "output_dir", "resume")
                 and key not in batch_overrides
+                and not (key == "train_metrics_every" and explicit_metrics)
             ):
                 setattr(
                     args,
@@ -482,6 +512,14 @@ def main():
     loader_rng = torch.Generator().manual_seed(args.seed)
     worker_rngs = [torch.Generator().manual_seed(args.seed + 100 + i) for i in range(2)]
     phase_batches = restore_phase_batches(resume, args, batch_overrides)
+    observations_changed = (
+        resume is not None and resume.get("observation_version") != OBSERVATION_VERSION
+    )
+    if observations_changed:
+        print(
+            "Point selector updated to complete CPU NMS; resetting the current-stage validation best. Model/optimizer/schedule progress is retained.",
+            flush=True,
+        )
     criterion = StagedPoseLoss(model, symmetries).to(device)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
     train_args = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
@@ -529,7 +567,7 @@ def main():
             if scaler.is_enabled():
                 scaler.load_state_dict(resume["scaler"])
             first = resume["phase_epoch"] + 1
-            best = resume["best_score"]
+            best = float("inf") if observations_changed else resume["best_score"]
         print(
             f"Phase {phase}: {epochs} epochs; batch={stage_batch}; trainable "
             + ", ".join(g["label"] for g in optimizer.param_groups),
@@ -538,7 +576,15 @@ def main():
         for epoch in range(first, epochs + 1):
             print(f"{phase} epoch {epoch}/{epochs}", flush=True)
             training = run_epoch(
-                model, loaders[0], criterion, device, phase, optimizer, scaler, args.max_batches
+                model,
+                loaders[0],
+                criterion,
+                device,
+                phase,
+                optimizer,
+                scaler,
+                args.max_batches,
+                metrics_every=args.train_metrics_every,
             )
             validation = run_epoch(
                 model, loaders[1], criterion, device, phase, None, scaler, args.max_batches
@@ -593,9 +639,15 @@ def main():
         # Hand off the best component from THIS phase, not its final epoch.
         best_path = output / f"weights/{phase}_best.pt"
         if best_path.exists():
-            model.load_state_dict(
-                torch.load(best_path, map_location="cpu", weights_only=False)["model_state"]
-            )
+            stage_best = torch.load(best_path, map_location="cpu", weights_only=False)
+            if stage_best.get("observation_version") == OBSERVATION_VERSION:
+                model.load_state_dict(stage_best["model_state"])
+            else:
+                print(
+                    f"{phase}: historical best used the previous point selector; keeping the loaded weights for handoff.",
+                    flush=True,
+                )
+            del stage_best
         del loaders, optimizer, scheduler
     final = output / "weights/best.pt"
     if not final.exists():

@@ -166,3 +166,58 @@ def test_win32_screen_buffer_structure_layout():
     assert ctypes.sizeof(_Coord) == 4
     assert ctypes.sizeof(_ScreenBufferInfo) == 22
     assert _ScreenBufferInfo.srWindow.offset == 10
+
+
+def test_sampling_training_diagnostics_preserves_every_optimizer_update():
+    import copy
+
+    import torch
+
+    from scripts.train_yolo26_staged_cube_pose import run_epoch
+
+    class Criterion:
+        calls = 0
+
+        def __call__(self, model, batch, *_args):
+            loss = model(batch["img"]).square().mean()
+            return loss, {"phase": loss * 0, "geometry": loss * 0}, None
+
+        def metrics(self, *_args):
+            self.calls += 1
+            return {"moving_turn_deg": (17.0, 1)}
+
+    original = torch.nn.Linear(1, 1, bias=False)
+    sampled, full = copy.deepcopy(original), copy.deepcopy(original)
+    samples = [({"img": torch.ones(1, 1, 1, 1)}, {}, ["sample"])] * 21
+    results = []
+    for model, every in [(sampled, 10), (full, 1)]:
+        criterion = Criterion()
+        result = run_epoch(
+            model,
+            samples,
+            criterion,
+            torch.device("cpu"),
+            "static",
+            torch.optim.SGD(model.parameters(), lr=0.01),
+            torch.amp.GradScaler("cuda", enabled=False),
+            None,
+            metrics_every=every,
+        )
+        results.append(result)
+        assert criterion.calls == (3 if every == 10 else 21)
+    assert torch.equal(sampled.weight, full.weight)
+    assert results[0]["total"] == results[1]["total"]
+    assert results[0]["pose_metric_images"] == 3 and results[1]["pose_metric_images"] == 21
+    criterion = Criterion()
+    run_epoch(
+        sampled,
+        samples,
+        criterion,
+        torch.device("cpu"),
+        "static",
+        None,
+        None,
+        None,
+        metrics_every=100,
+    )
+    assert criterion.calls == 21  # Validation always covers the full set.

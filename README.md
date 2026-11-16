@@ -1427,6 +1427,23 @@ and DFL integral are frozen; the configured one-to-many path uses the installed
 default YOLO pose loss. Structured geometry stays FP32; supported CUDA hardware
 can use AMP for the detector after its stock compatibility check.
 
+Internal point-selection NMS runs in FP32 on CPU, as in the reviewed experiment,
+and processes every image without a whole-batch wall-clock cutoff. This avoids
+slow Python-loop GPU NMS and prevents timeout-truncated batches from fabricating
+empty point inputs. Neural points/class scores retain gradients on their original
+device; the discrete CPU selection mask is transferred back once per batch.
+Checkpoints record the observation version. When resuming a pre-fix run, weights,
+optimizer and schedule are kept, but the current-stage validation best is reset
+so old timeout-affected scores do not control the new stage selection.
+
+Training pose diagnostics run every10batches by default; all batches still
+receive their original full losses/backward/optimizer updates. Validation metrics
+always use every validation batch. `--train-metrics-every 1` restores full training
+diagnostics, including on resume. Logged `pose_metric_batches`/`pose_metric_images`
+identify the diagnostic sample size. Articulation image descriptors are sampled
+only when the turn head or its diagnostics need them. Console progress includes
+images/second and an epoch ETA.
+
 `--static-epochs`, `--articulation-epochs`, `--handoff-epochs` and `--joint-epochs`
 change stage lengths; zero skips a phase. `--batch -1` calibrates a separate
 CUDA batch size at the start of each phase, using that phase's freeze mask and

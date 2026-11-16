@@ -114,11 +114,23 @@ class IndependentPointSource(nn.Module):
         branch = raw.get("one2many", raw)
         points, scores = DirectCubePoseModel._decode_observation_tokens(self, images, branch)
         with torch.no_grad():
-            decoded = head._inference(branch).detach().clone()
+            # Match the reviewed experiment: run discrete, small-box NMS on
+            # CPU once per batch. Python-loop NMS on CUDA/MPS launches many
+            # tiny synchronized GPU operations and can dominate training.
+            decoded = head._inference(branch).detach().float().cpu().clone()
             objects, indices = non_max_suppression(
-                decoded, conf_thres=0.001, iou_thres=0.7, nc=9, end2end=False, return_idxs=True
+                decoded,
+                conf_thres=0.001,
+                iou_thres=0.7,
+                nc=9,
+                end2end=False,
+                return_idxs=True,
+                # The default whole-batch wall-clock cutoff breaks out of
+                # the image loop and leaves later samples' results empty.
+                # Training requires complete inputs even for large batches.
+                max_time_img=float("inf"),
             )
-            selection = torch.zeros_like(scores)
+            selection = torch.zeros_like(scores, device="cpu")
             for i, (rows, index) in enumerate(zip(objects, indices)):
                 if not len(rows):
                     continue
@@ -128,7 +140,7 @@ class IndependentPointSource(nn.Module):
                     (rows[:, 6:8] >= 0) & (rows[:, 6:8] <= images.shape[-1])
                 ).all(-1)
                 selection[i, cls[keep], index.long().flatten()[keep]] = 1
-        object_scores = scores * selection
+        object_scores = scores * selection.to(scores.device)
         all_scores, classes = object_scores.max(1)
         count = min(64, all_scores.shape[-1])
         score, index = all_scores.topk(count, -1)
@@ -191,26 +203,30 @@ class StagedCubePoseModel(nn.Module):
         features = [v.float() for v in encoded["features"]]
         raw = self.static_head(features, encoded["points"], encoded["object_scores"])
         base = static_pose(raw, self.fields)
-        xy = encoded["native"]["xy"]
-        appearance = (
-            torch.cat(
-                [
-                    F.grid_sample(v, 2 * xy[:, None] - 1, align_corners=False)[:, :, 0].transpose(
-                        1, 2
-                    )
-                    for v in features
-                ],
-                -1,
-            )
-            .half()
-            .float()
-        )
-        return {"encoded": encoded, "raw_static": raw, "static": base, "appearance": appearance}
+        return {"encoded": encoded, "raw_static": raw, "static": base}
 
     def articulate(self, context, base=None):
         pose = context["static"] if base is None else base
         native = context["encoded"]["native"]
         x, valid = canonical_features_with_grad(pose, native, self.template)
+        if "appearance" not in context:
+            # Static-only optimization does not use the turn head. Sample its
+            # image descriptors only when articulation/loss/diagnostics need
+            # them; cache once for actual-pose and teacher-pose branches.
+            xy = native["xy"]
+            context["appearance"] = (
+                torch.cat(
+                    [
+                        F.grid_sample(v.float(), 2 * xy[:, None] - 1, align_corners=False)[
+                            :, :, 0
+                        ].transpose(1, 2)
+                        for v in context["encoded"]["features"]
+                    ],
+                    -1,
+                )
+                .half()
+                .float()
+            )
         logits, membership = self.articulation_head(
             x, valid, context["appearance"], native["class_scores"]
         )
@@ -227,6 +243,7 @@ class StagedCubePoseModel(nn.Module):
 
 
 CHECKPOINT_FORMAT = "staged_cube_pose_context_v1"
+OBSERVATION_VERSION = "complete_cpu_nms_v2"
 
 
 def model_from_checkpoint(path, device="cpu"):
@@ -248,6 +265,7 @@ def model_from_checkpoint(path, device="cpu"):
 def checkpoint_model(model):
     return {
         "format": CHECKPOINT_FORMAT,
+        "observation_version": OBSERVATION_VERSION,
         "detector_yaml": copy.deepcopy(model.detector.yaml),
         "initialization": copy.deepcopy(getattr(model, "initialization", {})),
         "model_state": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
