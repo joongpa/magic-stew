@@ -1,46 +1,31 @@
 #!/usr/bin/env python3
-"""Train a YOLO pose model on the nine-class sticker/keypoint dataset.
+"""Train the 18-class, four-corner sticker detector with cyclic center loss.
 
-Expected source layout:
-
-    dataset/
-      images/*.png
-      pose/*.txt
-      sticker_keypoint_manifest.json
-
-Each pose row is one object with one keypoint:
-
-    class cx cy width height keypoint_x keypoint_y visibility
-
-The training comparison intentionally disables mosaic, hue, and saturation
-augmentation while retaining value/brightness and ordinary geometric
-augmentation.
-
-Example:
-
-    .venv/bin/python scripts/train_yolo11n_keypoints_local.py \
-        --model-family yolo26 \
-        --model-size small \
-        --source-dir data/keypoints_only_dataset \
-        --device 0 \
-        --batch 12 \
-        --epochs 100
+First relabel existing direct-pose data using scripts/relabel_sticker_quads.py.
+Corner and edge order is fixed clockwise; centers accept four cyclic starts.
+An existing pose checkpoint can initialize compatible backbone/neck weights.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import shutil
+import sys
 from collections import Counter
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from live_recognition.sticker_quad_schema import CLASS_NAMES
+
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
-KEYPOINT_SHAPE = [1, 3]
+KEYPOINT_SHAPE = [4, 3]
 LABEL_FIELD_COUNT = 1 + 4 + KEYPOINT_SHAPE[0] * KEYPOINT_SHAPE[1]
 VISIBILITY_VALUES = {0, 1, 2}
-DEFAULT_CLASS_NAMES = ["corner", "corner-edge", "corner-edge-center"]
+DEFAULT_CLASS_NAMES = list(CLASS_NAMES)
 YOLO_POSE_MODEL_FAMILIES = {
     "yolo11": {
         "nano": "yolo11n-pose.pt",
@@ -94,13 +79,15 @@ def source_class_names(source_dir: Path) -> list[str]:
 
 
 def resolve_class_names(source_dirs: list[Path], override: list[str] | None) -> list[str]:
-    if override is not None:
-        return override
+    if override is not None and tuple(override) != CLASS_NAMES:
+        raise ValueError("This trainer requires the fixed 18 sticker color/type classes")
     names = source_class_names(source_dirs[0])
     for source_dir in source_dirs[1:]:
         other_names = source_class_names(source_dir)
         if other_names != names:
             raise ValueError(f"Class order differs between {source_dirs[0]} and {source_dir}")
+    if tuple(names) != CLASS_NAMES:
+        raise ValueError("Run scripts/relabel_sticker_quads.py first; this trainer requires the 18 four-corner classes")
     return names
 
 
@@ -119,16 +106,19 @@ def validate_label_file(path: Path, class_names: list[str]) -> Counter[int]:
         except ValueError as error:
             raise ValueError(f"{prefix}: all fields must be numeric") from error
 
+        if not all(math.isfinite(v) for v in values):
+            raise ValueError(f"{prefix}: fields must be finite")
         class_id = int(values[0])
         if values[0] != class_id or not 0 <= class_id < len(class_names):
             raise ValueError(f"{prefix}: invalid class ID {values[0]}")
         if not all(0.0 <= value <= 1.0 for value in values[1:5]):
             raise ValueError(f"{prefix}: bounding-box values must be in [0, 1]")
-        keypoint_x, keypoint_y, visibility = values[5:8]
-        if not 0.0 <= keypoint_x <= 1.0 or not 0.0 <= keypoint_y <= 1.0:
-            raise ValueError(f"{prefix}: keypoint coordinates must be in [0, 1]")
-        if visibility != int(visibility) or int(visibility) not in VISIBILITY_VALUES:
-            raise ValueError(f"{prefix}: visibility must be 0, 1, or 2")
+        for index in range(4):
+            keypoint_x, keypoint_y, visibility = values[5+index*3:8+index*3]
+            if not 0.0 <= keypoint_x <= 1.0 or not 0.0 <= keypoint_y <= 1.0:
+                raise ValueError(f"{prefix}: keypoint coordinates must be in [0, 1]")
+            if visibility != int(visibility) or int(visibility) not in VISIBILITY_VALUES:
+                raise ValueError(f"{prefix}: visibility must be 0, 1, or 2")
         counts[class_id] += 1
     return counts
 
@@ -237,14 +227,19 @@ def write_dataset(
 
 def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
     try:
-        from ultralytics import YOLO
+        from ultralytics import YOLO, __version__
+        from ultralytics.utils.checks import check_version
     except ImportError as error:
         raise RuntimeError("YOLO training requires: python -m pip install ultralytics") from error
 
+    if not check_version(__version__, ">=8.4.185"):
+        raise RuntimeError("Sticker quad training requires ultralytics>=8.4.185; run python -m pip install -U ultralytics")
     model_name = args.model or YOLO_POSE_MODEL_FAMILIES[args.model_family][args.model_size]
     print(f"YOLO pose model: {model_name}")
     model = YOLO(model_name)
+    from live_recognition.sticker_quad_training import StickerQuadTrainer
     model.train(
+        trainer=StickerQuadTrainer,
         data=str(data_yaml),
         epochs=args.epochs,
         imgsz=args.imgsz,
@@ -260,6 +255,8 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
         copy_paste=0.0,
         hsv_h=0.0,
         hsv_s=0.0,
+        fliplr=0.0,
+        flipud=0.0,  # Corner and edge reflections require different index permutations.
         plots=True,
     )
     trainer = getattr(model, "trainer", None)
@@ -308,7 +305,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit YOLO pose checkpoint override, such as a custom .pt file.",
     )
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--imgsz", "--resolution", type=int, default=288)
+    parser.add_argument("--imgsz", "--resolution", type=int, default=128)
     parser.add_argument("--batch", type=int, default=-1, help="Batch size; -1 lets Ultralytics auto-select.")
     parser.add_argument("--device", default=None, help="Training device, e.g. 0, cpu, or mps.")
     parser.add_argument("--workers", type=int, default=8)
@@ -331,7 +328,7 @@ def main() -> None:
 
     source_dirs = [
         path
-        for group in (args.source_dir_groups or [[Path("data/keypoints_only_dataset")]])
+        for group in (args.source_dir_groups or [[Path("data/sticker_quad_dataset")]])
         for path in group
     ]
     class_names = resolve_class_names(source_dirs, args.class_names)

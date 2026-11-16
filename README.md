@@ -252,7 +252,66 @@ lighting, hand visibility, layer state, and background family. The miner only
 selects from the generator's existing physically plausible variations; it does
 not create arbitrary adversarial images.
 
-## RF-DETR landmark and sticker keypoint training
+## Four-corner sticker pose training
+
+The Blender generator now writes `sticker_quads_v1`: 18 classes (six colors,
+each with corner, edge, and center types), with four cubie-face grid vertices
+per object. Corners start at C and run clockwise C → CE → CEC → CE. Edges
+start with the outside CE → CE edge, followed by CEC → CEC. Center stickers
+accept all four cyclic starts. The old three landmark roles remain geometric
+roles within the quad; separate landmark objects are absorbed into stickers.
+Use a new generator output directory to avoid mixing label schemas.
+
+Convert existing direct-pose datasets without changing their source files:
+
+```bash
+python scripts/relabel_sticker_quads.py --source-dir data/direct_cube_pose_dataset
+```
+
+This writes `data/sticker_quad_dataset` with images, pose labels, per-file
+metadata, previews, and a conversion report. Multiple `--source-dir` paths
+are supported. Images without per-file targets are omitted. It uses exact
+reference layer operations, including slices, simultaneous turns and both
+corner-cut rotations. Only stickers already retained by the source labels
+are converted; original angle/coverage decisions are preserved. All four
+in-frame corners are supervised, including the separate vertices along
+turned-layer seams. Saved landmark visibility flags are preserved; recovered
+corners use conservative visibility 1, which supplies coordinate supervision
+without claiming measured hand visibility. Out-of-frame corners use 0.
+Per-corner metadata records the visibility evidence. Unmatched sticker
+centers are omitted and recorded in `unmatched_stickers.jsonl` for inspection.
+The generator can ray-test each new corner, so new data also supplies
+visibility 1 for known occluded corners and 2 for visible corners.
+
+Train with Ultralytics **8.4.185 or newer** and the project installed with
+`python -m pip install -e .`:
+
+```bash
+python scripts/train_yolo11n_keypoints_local.py \
+  --source-dir data/sticker_quad_dataset \
+  --model-family yolo26 --model-size medium \
+  --imgsz 128 --device 0 --batch -1
+```
+
+Use `--model path/to/existing-pose.pt` to transfer compatible pretrained
+weights instead. The class and keypoint outputs are rebuilt for the new
+schema. `--prepare-only` validates and splits without training. The trainer
+keeps native detection, location, presence, and YOLO26 RLE losses; center
+target routing, pose-aware assignment and validation OKS accept cyclic
+orders. Coordinates and visibility are permuted together. Reflections are
+excluded; flip augmentation is disabled because corner and edge classes
+require different reflection permutations. The saved model class lives in
+`live_recognition.sticker_quad_training` and requires this project when loaded.
+
+Each four-point sticker has one overall detection/class score
+(`boxes.conf`). Its four `keypoints.conf` channels are presence scores,
+not per-corner localization confidence. Existing independent renderers and
+their older checkpoints still use the previous one-point schema.
+
+## Legacy RF-DETR landmark and sticker keypoint training
+
+This section describes older one-keypoint datasets. The RF-DETR trainer does
+not consume the new four-corner generator output.
 
 To train on a Colab GPU, open `notebooks/train_rfdetr_keypoints_colab.ipynb`
 in Google Colab and run the cells in order. The notebook accepts a generated
@@ -315,8 +374,8 @@ checkpoint. No mask labels or uncertainty ellipse annotations are required.
 
 ## Independent cube intersection-point pose labels
 
-The Blender generator writes independent one-keypoint pose objects by default
-when run with `--pose-label-mode independent`. The three pose classes are
+Older generator versions wrote independent one-keypoint pose objects
+with `--pose-label-mode independent`. The three pose classes were
 `corner`, `corner-edge`, and `corner-edge-center`, for 56 intersection points
 total. Corner-edge points are attached to the physical edge cubies, corner
 points to corner cubies, and corner-edge-center points to center cubies. Aligned
