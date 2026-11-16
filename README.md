@@ -1483,7 +1483,15 @@ and stage losses are saved in `metrics.jsonl`; batch progress overwrites one
 console line and fits within the current terminal width to prevent wrapping.
 Redirected/captured output receives one final batch summary per train/validation
 pass. The static/source copy and both turn branches are unfrozen during
-joint training, with lower continuation learning rates. Detector batch-normalization
+joint training. New runs start joint training at `1e-4` for the static head,
+`3e-4` for the articulation head, and `1e-5` for the shared backbone/detector.
+These are 10x, 6x, and 5x the previous joint defaults, allowing substantial
+head adaptation to the new objective. Override them with `--joint-static-lr`,
+`--joint-articulation-lr`, and `--joint-backbone-lr`. Each group follows the
+existing cosine schedule toward `1e-6` over the joint phase. Actual rates are
+printed at phase entry and each epoch, and the rates used for each epoch are
+recorded under `learning_rates` in `metrics.jsonl`. CUDA batch calibration uses
+the same configured optimizer as training. Detector batch-normalization
 statistics remain fixed, as in the reviewed model. The unused one-to-one branch
 and DFL integral are frozen; the configured one-to-many path uses the installed
 default YOLO pose loss. Structured geometry stays FP32; supported CUDA hardware
@@ -1528,6 +1536,17 @@ combined with `--limit` or `--resume`. Older checkpoints remain valid for
 initialization and rendering. Since the objective and selection metric changed,
 exact `--resume` requires a checkpoint with the new objective version; use
 `--init-checkpoint` and a new output directory to continue an older model.
+
+Resume preserves the saved learning-rate plan and optimizer/scheduler state.
+Checkpoints from before configurable joint rates preserve their old conservative
+rates. Explicit joint LR flags on resume override only those groups' base rates,
+preserving AdamW moments and the current cosine epoch. Thus overriding halfway
+through a phase applies the halfway-decayed value of the new base rate; it does
+not restart the schedule. To apply all three new base rates to such a run:
+
+```powershell
+python scripts/train_yolo26_staged_cube_pose.py --resume runs/staged_cube_pose_rgb_only/weights/last.pt --device 0 --joint-static-lr 1e-4 --joint-articulation-lr 3e-4 --joint-backbone-lr 1e-5
+```
 
 To automatically use larger head-only batches and fit joint training separately:
 

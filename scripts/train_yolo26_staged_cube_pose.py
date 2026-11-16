@@ -51,6 +51,12 @@ from scripts.train_yolo26_direct_cube_pose import (
 PHASES = ("static", "articulation", "handoff", "joint")
 BATCH_FIELDS = ("batch", *(f"{phase}_batch" for phase in PHASES))
 BATCH_POLICY_FIELDS = ("batch_memory_fraction", "max_auto_batch")
+JOINT_LR_FIELDS = {
+    "joint_static_lr": "static",
+    "joint_backbone_lr": "source",
+    "joint_articulation_lr": "turn",
+}
+LEGACY_JOINT_LRS = {"joint_static_lr": 1e-5, "joint_backbone_lr": 2e-6, "joint_articulation_lr": 5e-5}
 
 
 def build_parser():
@@ -132,6 +138,12 @@ def build_parser():
     p.add_argument("--articulation-epochs", type=int, default=40)
     p.add_argument("--handoff-epochs", type=int, default=30)
     p.add_argument("--joint-epochs", type=int, default=60)
+    p.add_argument("--joint-static-lr", type=float, default=1e-4,
+                   help="Initial joint learning rate for the static head (default: 1e-4)")
+    p.add_argument("--joint-articulation-lr", type=float, default=3e-4,
+                   help="Initial joint learning rate for the articulation head (default: 3e-4)")
+    p.add_argument("--joint-backbone-lr", type=float, default=1e-5,
+                   help="Initial joint learning rate for the shared backbone/detector (default: 1e-5)")
     p.add_argument("--geometry-weight", type=float, default=1.,
                    help="Full predicted-geometry loss weight during RGB-only handoff/joint")
     p.add_argument("--pose-aux-weight", type=float, default=.25,
@@ -152,6 +164,9 @@ def build_parser():
 
 
 def validate_args(args):
+    for field in JOINT_LR_FIELDS:
+        if not math.isfinite(getattr(args, field)) or getattr(args, field) <= 0:
+            raise ValueError(f"--{field.replace('_', '-')} must be positive and finite")
     if args.split and (args.resume or args.limit is not None):
         raise ValueError("--split is for a new run and cannot be combined with --resume or --limit")
     if not math.isfinite(args.geometry_weight) or args.geometry_weight <= 0:
@@ -267,12 +282,12 @@ def fixed_split(entries, path, initialization):
     return [lookup[k] for k in train], [lookup[k] for k in val]
 
 
-def optimizer_for(model, phase):
+def optimizer_for(model, phase, *, joint_static_lr=1e-4, joint_articulation_lr=3e-4, joint_backbone_lr=1e-5):
     model.configure_phase(phase)
     if phase == "static":
         rates = {"static": 1e-4, "source": 2e-5, "turn": 0.0}
     elif phase == "joint":
-        rates = {"static": 1e-5, "source": 2e-6, "turn": 5e-5}
+        rates = {"static": joint_static_lr, "source": joint_backbone_lr, "turn": joint_articulation_lr}
     else:
         rates = {"static": 0.0, "source": 0.0, "turn": 5e-4}
     groups = []
@@ -285,6 +300,32 @@ def optimizer_for(model, phase):
         if parameters:
             groups.append({"params": parameters, "lr": rates[name], "label": name})
     return torch.optim.AdamW(groups, weight_decay=0.001)
+
+
+def learning_rate_cli_overrides(args, argv):
+    flags = {token.split("=", 1)[0] for token in argv}
+    return {field: getattr(args, field) for field in JOINT_LR_FIELDS
+            if "--" + field.replace("_", "-") in flags}
+
+
+def restore_learning_rate_plan(args, saved_args, overrides):
+    # Existing runs keep their saved plan. Checkpoints predating configurable
+    # rates used the conservative constants; only NEW runs get higher defaults.
+    for field, legacy_rate in LEGACY_JOINT_LRS.items():
+        setattr(args, field, overrides.get(field, saved_args.get(field, legacy_rate)))
+
+
+def apply_resumed_joint_rates(optimizer, scheduler, overrides):
+    """Change explicit base rates without restarting cosine progress or AdamW."""
+    factor = .5 * (1 + math.cos(math.pi * scheduler.last_epoch / scheduler.T_max))
+    for field, rate in overrides.items():
+        label = JOINT_LR_FIELDS[field]
+        for index, group in enumerate(optimizer.param_groups):
+            if group["label"] == label:
+                scheduler.base_lrs[index] = rate
+                group["initial_lr"] = rate
+                group["lr"] = scheduler.eta_min + (rate - scheduler.eta_min) * factor
+    scheduler._last_lr = [g["lr"] for g in optimizer.param_groups]
 
 
 def stage_batch_request(args, phase):
@@ -443,6 +484,7 @@ def main():
         flush=True,
     )
     batch_overrides = batch_cli_overrides(args, argv)
+    lr_overrides = learning_rate_cli_overrides(args, argv)
     explicit_metrics = any(token.split("=", 1)[0] == "--train-metrics-every" for token in argv)
     resume = None
     torch.set_num_threads(args.threads)
@@ -459,12 +501,14 @@ def main():
                 "prior training images remain excluded from validation."
             )
         original = resume["train_args"]
+        restore_learning_rate_plan(args, original, lr_overrides)
         # Device/workers/root can change when moving the run from Windows to
         # another machine; its split, data fingerprint and training plan cannot.
         for key, value in original.items():
             if (
                 key not in ("device", "workers", "threads", "dataset", "output_dir", "resume")
                 and key not in batch_overrides
+                and key not in lr_overrides
                 and not (key == "train_metrics_every" and explicit_metrics)
             ):
                 setattr(
@@ -563,6 +607,7 @@ def main():
             flush=True,
         )
     criterion_factory = partial(StagedPoseLoss, geometry_weight=args.geometry_weight, pose_aux_weight=args.pose_aux_weight)
+    optimizer_factory = partial(optimizer_for, **{field: getattr(args, field) for field in JOINT_LR_FIELDS})
     criterion = criterion_factory(model, symmetries).to(device)
     print(f"Objective: {OBJECTIVE_VERSION}; handoff/joint conditioning: 100% predicted RGB pose; "
           f"geometry weight={args.geometry_weight:g}, pose/angle auxiliary weight={args.pose_aux_weight:g}; "
@@ -594,7 +639,7 @@ def main():
                 phase,
                 datasets[0],
                 symmetries,
-                optimizer_for,
+                optimizer_factory,
                 memory_fraction=args.batch_memory_fraction,
                 maximum=args.max_auto_batch,
                 criterion_factory=criterion_factory,
@@ -604,24 +649,28 @@ def main():
                     f.write(json.dumps(profile) + "\n")
         stage_batch = phase_batches[phase]
         loaders = stage_loaders(datasets, stage_batch, args, device, loader_rng, worker_rngs)
-        optimizer = optimizer_for(model, phase)
+        optimizer = optimizer_factory(model, phase)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs, eta_min=1e-6)
         first = 1
         best = float("inf")
         if resume and phase_index == resume["phase_index"]:
             optimizer.load_state_dict(resume["optimizer"])
             scheduler.load_state_dict(resume["scheduler"])
+            if phase == "joint" and lr_overrides:
+                apply_resumed_joint_rates(optimizer, scheduler, lr_overrides)
             if scaler.is_enabled():
                 scaler.load_state_dict(resume["scaler"])
             first = resume["phase_epoch"] + 1
             best = float("inf") if observations_changed else resume["best_score"]
         print(
             f"Phase {phase}: {epochs} epochs; batch={stage_batch}; trainable "
-            + ", ".join(g["label"] for g in optimizer.param_groups),
+            + ", ".join(f"{g['label']} lr={g['lr']:.3g}" for g in optimizer.param_groups),
             flush=True,
         )
         for epoch in range(first, epochs + 1):
-            print(f"{phase} epoch {epoch}/{epochs}", flush=True)
+            learning_rates = {g["label"]: g["lr"] for g in optimizer.param_groups}
+            print(f"{phase} epoch {epoch}/{epochs}; "
+                  + ", ".join(f"{label} lr={rate:.3g}" for label, rate in learning_rates.items()), flush=True)
             training = run_epoch(
                 model,
                 loaders[0],
@@ -644,6 +693,7 @@ def main():
                 "phase": phase,
                 "batch": stage_batch,
                 "epoch": epoch,
+                "learning_rates": learning_rates,
                 "train": training,
                 "val": validation,
                 "score": score,
