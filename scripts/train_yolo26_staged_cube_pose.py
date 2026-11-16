@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
 from live_recognition.direct_cube_pose import make_detector
 from live_recognition.direct_cube_pose_data import collate_direct_pose, read_manifest, split_entries
+from live_recognition.staged_pose.batching import resolve_phase_batch_size
 from live_recognition.staged_pose.data import StagedPoseDataset
 from live_recognition.staged_pose.loss import StagedPoseLoss
 from live_recognition.staged_pose.model import (
@@ -40,13 +41,14 @@ from live_recognition.staged_pose.model import (
 )
 from live_recognition.training_progress import ConsoleProgress
 from scripts.train_yolo26_direct_cube_pose import (
-    resolve_batch_size,
     resolve_training_amp,
     seed_worker,
     select_device,
 )
 
 PHASES = ("static", "articulation", "handoff", "joint")
+BATCH_FIELDS = ("batch", *(f"{phase}_batch" for phase in PHASES))
+BATCH_POLICY_FIELDS = ("batch_memory_fraction", "max_auto_batch")
 
 
 def build_parser():
@@ -89,7 +91,30 @@ def build_parser():
     )
     p.add_argument("--output-dir", type=Path, default=Path("runs/staged_cube_pose"))
     p.add_argument("--device", default="auto")
-    p.add_argument("--batch", type=int, default=16)
+    p.add_argument(
+        "--batch",
+        type=int,
+        default=16,
+        help="Default stage batch; -1 calibrates separately at each CUDA stage",
+    )
+    for phase in PHASES:
+        p.add_argument(
+            f"--{phase}-batch",
+            type=int,
+            help="Override this stage's batch; -1 auto-sizes this stage",
+        )
+    p.add_argument(
+        "--batch-memory-fraction",
+        type=float,
+        default=0.85,
+        help="Fraction of free CUDA memory used by automatic stage sizing",
+    )
+    p.add_argument(
+        "--max-auto-batch",
+        type=int,
+        default=1024,
+        help="Upper bound for automatic stage batch sizes",
+    )
     p.add_argument("--imgsz", "--resolution", type=int, default=128)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--threads", type=int, default=4)
@@ -119,8 +144,7 @@ def validate_args(args):
     if rounded != args.imgsz:
         print(f"Adjusting --imgsz {args.imgsz} to {rounded} (stride32)", flush=True)
     args.imgsz = rounded
-    if args.batch != -1 and args.batch < 1:
-        raise ValueError("--batch must be positive or -1")
+    validate_batch_args(args)
     if args.workers < 0 or args.threads < 1:
         raise ValueError("Invalid --workers/--threads")
     if any(getattr(args, f"{phase}_epochs") < 0 for phase in PHASES):
@@ -147,6 +171,17 @@ def validate_args(args):
             "Individual component checkpoints require --initial-split with their original training keys"
         )
     return args
+
+
+def validate_batch_args(args):
+    for name in BATCH_FIELDS:
+        value = getattr(args, name)
+        if value is not None and value != -1 and value < 1:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive or -1")
+    if not 0 < args.batch_memory_fraction < 1 or args.max_auto_batch < 1:
+        raise ValueError(
+            "--batch-memory-fraction must be between0 and1; --max-auto-batch must be positive"
+        )
 
 
 def initialize_model(args):
@@ -214,6 +249,55 @@ def optimizer_for(model, phase):
         if parameters:
             groups.append({"params": parameters, "lr": rates[name], "label": name})
     return torch.optim.AdamW(groups, weight_decay=0.001)
+
+
+def stage_batch_request(args, phase):
+    override = getattr(args, f"{phase}_batch", None)
+    return args.batch if override is None else override
+
+
+def batch_cli_overrides(args, argv):
+    flags = {token.split("=", 1)[0] for token in argv}
+    return {
+        name: getattr(args, name)
+        for name in (*BATCH_FIELDS, *BATCH_POLICY_FIELDS)
+        if "--" + name.replace("_", "-") in flags
+    }
+
+
+def restore_phase_batches(resume, args, overrides):
+    resolved = dict(resume.get("phase_batch_sizes", {})) if resume else {}
+    if resume and not resolved:
+        # Older checkpoints used one resolved batch for every stage.
+        resolved[resume["phase"]] = resume["train_args"]["batch"]
+    for phase in PHASES:
+        field = f"{phase}_batch"
+        if field in overrides or ("batch" in overrides and getattr(args, field, None) is None):
+            resolved.pop(phase, None)
+        if (
+            any(name in overrides for name in BATCH_POLICY_FIELDS)
+            and stage_batch_request(args, phase) == -1
+        ):
+            resolved.pop(phase, None)
+    return resolved
+
+
+def stage_loaders(datasets, batch, args, device, sampler_rng, worker_rngs):
+    return [
+        DataLoader(
+            d,
+            batch_size=batch,
+            sampler=RandomSampler(d, generator=sampler_rng) if i == 0 else None,
+            num_workers=args.workers,
+            collate_fn=collate_direct_pose,
+            worker_init_fn=seed_worker,
+            generator=worker_rngs[i],
+            pin_memory=device.type == "cuda",
+            persistent_workers=args.workers > 0,
+            **({"multiprocessing_context": "spawn"} if args.workers else {}),
+        )
+        for i, d in enumerate(datasets)
+    ]
 
 
 def run_epoch(model, loader, criterion, device, phase, optimizer, scaler, max_batches):
@@ -285,7 +369,8 @@ def selection_score(metrics, phase):
 
 
 def main():
-    args = build_parser().parse_args()
+    argv = sys.argv[1:]
+    args = build_parser().parse_args(argv)
     if args.progress_test:
         with ConsoleProgress() as progress:
             print(f"Batch progress: {progress.backend}", flush=True)
@@ -294,6 +379,7 @@ def main():
                 time.sleep(0.1)
         return
     args = validate_args(args)
+    batch_overrides = batch_cli_overrides(args, argv)
     resume = None
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
@@ -305,7 +391,10 @@ def main():
         # Device/workers/root can change when moving the run from Windows to
         # another machine; its split, data fingerprint and training plan cannot.
         for key, value in original.items():
-            if key not in ("device", "workers", "threads", "dataset", "output_dir", "resume"):
+            if (
+                key not in ("device", "workers", "threads", "dataset", "output_dir", "resume")
+                and key not in batch_overrides
+            ):
                 setattr(
                     args,
                     key,
@@ -322,6 +411,7 @@ def main():
                     else value,
                 )
         args.output_dir = args.resume.resolve().parent.parent
+        validate_batch_args(args)
     else:
         model = initialize_model(args)
     torch.set_num_threads(args.threads)
@@ -385,33 +475,9 @@ def main():
     )
     model.use_amp = args.amp
     print(f"Batch progress: {ConsoleProgress().backend}", flush=True)
-    model.configure_phase("joint")
-    args.batch = resolve_batch_size(
-        args.batch,
-        model,
-        device,
-        args.imgsz,
-        args.amp,
-        max(len(v) for d in datasets for v in d.labels),
-        len(train),
-    )
     loader_rng = torch.Generator().manual_seed(args.seed)
     worker_rngs = [torch.Generator().manual_seed(args.seed + 100 + i) for i in range(2)]
-    loaders = [
-        DataLoader(
-            d,
-            batch_size=args.batch,
-            sampler=RandomSampler(d, generator=loader_rng) if i == 0 else None,
-            num_workers=args.workers,
-            collate_fn=collate_direct_pose,
-            worker_init_fn=seed_worker,
-            generator=worker_rngs[i],
-            pin_memory=device.type == "cuda",
-            persistent_workers=args.workers > 0,
-            **({"multiprocessing_context": "spawn"} if args.workers else {}),
-        )
-        for i, d in enumerate(datasets)
-    ]
+    phase_batches = restore_phase_batches(resume, args, batch_overrides)
     criterion = StagedPoseLoss(model, symmetries).to(device)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
     train_args = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
@@ -430,6 +496,25 @@ def main():
         epochs = getattr(args, f"{phase}_epochs")
         if not epochs or resume and phase_index < resume["phase_index"]:
             continue
+        model.zero_grad(set_to_none=True)
+        model.configure_phase(phase)
+        if phase not in phase_batches:
+            phase_batches[phase], profile = resolve_phase_batch_size(
+                stage_batch_request(args, phase),
+                model,
+                device,
+                phase,
+                datasets[0],
+                symmetries,
+                optimizer_for,
+                memory_fraction=args.batch_memory_fraction,
+                maximum=args.max_auto_batch,
+            )
+            if profile is not None:
+                with (output / "batch_profiles.jsonl").open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(profile) + "\n")
+        stage_batch = phase_batches[phase]
+        loaders = stage_loaders(datasets, stage_batch, args, device, loader_rng, worker_rngs)
         optimizer = optimizer_for(model, phase)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs, eta_min=1e-6)
         first = 1
@@ -442,7 +527,7 @@ def main():
             first = resume["phase_epoch"] + 1
             best = resume["best_score"]
         print(
-            f"Phase {phase}: {epochs} epochs; trainable "
+            f"Phase {phase}: {epochs} epochs; batch={stage_batch}; trainable "
             + ", ".join(g["label"] for g in optimizer.param_groups),
             flush=True,
         )
@@ -460,6 +545,7 @@ def main():
             best = min(score, best)
             record = {
                 "phase": phase,
+                "batch": stage_batch,
                 "epoch": epoch,
                 "train": training,
                 "val": validation,
@@ -481,6 +567,7 @@ def main():
                 dataset_fingerprint=fingerprint,
                 symmetries=symmetries,
                 split=split,
+                phase_batch_sizes=dict(phase_batches),
                 metrics=record,
                 torch_rng=torch.get_rng_state(),
                 numpy_rng=np.random.get_state(),
@@ -494,6 +581,7 @@ def main():
                 atomic_save(saved, output / f"weights/{phase}_best.pt")
             if phase == "joint" and improved:
                 atomic_save(saved, output / "weights/best.pt")
+            del saved  # Do not retain GPU optimizer states across stage changes.
             print(
                 f"  validation: static={validation['static_rotation_deg']}deg moving={validation['moving_turn_deg']}deg observed={validation['observed_moving_turn_deg']}deg; best score={best:.4f}",
                 flush=True,
@@ -504,6 +592,7 @@ def main():
             model.load_state_dict(
                 torch.load(best_path, map_location="cpu", weights_only=False)["model_state"]
             )
+        del loaders, optimizer, scheduler
     final = output / "weights/best.pt"
     if not final.exists():
         final = output / "weights/last.pt"

@@ -1422,8 +1422,39 @@ default YOLO pose loss. Structured geometry stays FP32; supported CUDA hardware
 can use AMP for the detector after its stock compatibility check.
 
 `--static-epochs`, `--articulation-epochs`, `--handoff-epochs` and `--joint-epochs`
-change stage lengths; zero skips a phase. `--batch -1` requests CUDA automatic
-batch estimation. `--resolution` aliases `--imgsz` (128 by default), and
+change stage lengths; zero skips a phase. `--batch -1` calibrates a separate
+CUDA batch size at the start of each phase, using that phase's freeze mask and
+actual loss, metrics, backward pass and AdamW step. Calibration runs on a
+disposable model copy and preserves the training weights and random states.
+It includes optimizer-state memory and avoids requesting image gradients
+through a frozen encoder. It runs once per phase, with results recorded in
+`batch_profiles.jsonl`; it adds no per-batch profiling during training.
+
+To automatically use larger head-only batches and fit joint training separately:
+
+```powershell
+python scripts/train_yolo26_staged_cube_pose.py --dataset data/direct_cube_pose_dataset --init-checkpoint runs/staged_cube_pose_epoch45_init.pt --device 0 --batch -1
+```
+
+`--static-batch`, `--articulation-batch`, `--handoff-batch`, and `--joint-batch`
+override the global batch for individual phases; each accepts a positive size
+or `-1` for automatic sizing. For example, a manually selected plan could use
+`--static-batch 32 --articulation-batch 128 --handoff-batch 128 --joint-batch 16`.
+The CUDA calibration defaults to an85% free-memory budget and a1024-image cap,
+adjustable with `--batch-memory-fraction` and `--max-auto-batch`. Explicit sizes
+are used directly; CPU/MPS automatic sizing falls back to16 (or dataset size).
+Learning rates remain unchanged when batch sizes change; larger batches give
+fewer optimizer updates per epoch.
+
+Resolved stage batch sizes are saved in every training checkpoint and printed
+at phase entry. Resume normally restores them. Explicit batch arguments on
+resume override the saved sizes without resetting weights, optimizer or schedule.
+For example, `--resume runs/staged_cube_pose/weights/last.pt --device 0 --batch -1`
+recalibrates the current and remaining phases that inherit the global batch;
+`--joint-batch -1` recalibrates just joint training. Individual phase overrides
+take precedence over the global batch.
+
+`--resolution` aliases `--imgsz` (128 by default), and
 `--source-dir` aliases `--dataset` for the exported dataset. No spatial
 augmentation is introduced. Windows loaders use spawn, top-level functions and
 the multiprocessing main guard. `--workers 0` is available for loader diagnostics.
