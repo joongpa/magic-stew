@@ -67,3 +67,19 @@ def decode(logits):
     output = logits.new_zeros(len(logits), 6).scatter(1, face, continuous)
     output_hard = logits.new_zeros(len(logits), 6).scatter(1, face, hard)
     return output, output_hard, axis
+
+
+def decode_hypotheses(logits):
+    """Decode each axis with exactly the inference decoder, without GT routing.
+
+    Returns Bx3x6 angles and Bx3 marginal axis probabilities. The hard angle-bin
+    selection matches inference; local angle offsets and axis probabilities
+    retain gradients. No averages between incompatible 3-D shapes are formed.
+    """
+    b = len(logits)
+    conditional = torch.full_like(logits[:, None].expand(-1, 3, -1, -1, -1), -10000.)
+    axis = torch.arange(3, device=logits.device)
+    conditional[:, axis, axis] = logits
+    angles = decode(conditional.reshape(b * 3, 3, 9, 9))[0].reshape(b, 3, 6)
+    probability = logits.flatten(2).logsumexp(-1).softmax(-1)
+    return angles, probability

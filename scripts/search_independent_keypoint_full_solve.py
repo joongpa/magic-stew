@@ -521,15 +521,23 @@ def load_renderer():
 
 
 def add_nine_class_input_arguments(parser):
+    try:
+        from scripts.independent_keypoint_staged_pose import add_pose_method_arguments
+    except ModuleNotFoundError:
+        from independent_keypoint_staged_pose import add_pose_method_arguments
+
+    add_pose_method_arguments(parser)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--log", type=Path, help="A nine-class turn/observation JSONL log, or its directory.")
     source.add_argument("--source", type=Path, help="Video to process with the landmark/color pose model.")
     parser.add_argument("--model", type=Path,
                         default=ROOT / "runs/pose/runs/26m-pose/weights/best.pt")
     parser.add_argument("--bbox-model", type=Path, default=ROOT / "runs/500ExamplesWeights.pt")
+    parser.add_argument("--inference-device", default="cpu",
+                        help="Source-video network device: cpu, mps, or CUDA index; separate from search --device.")
     parser.add_argument("--pose-class-conf", help="Per-class detection thresholds, e.g. red=0.35.")
     parser.add_argument("--keypoint-conf", type=float, default=.05,
-                        help="Landmark visibility threshold; sticker color keypoints keep the 0.25 floor.")
+                        help="Landmark keypoint presence threshold; sticker color keypoints keep the 0.25 floor.")
     parser.add_argument("--roi-padding", type=float, default=.4,
                         help="Padding ratio around the pose-model ROI (default: 0.4).")
     parser.add_argument("--turning-start-frame", type=int,
@@ -552,15 +560,18 @@ def prepare_search_record(renderer, record, colors, turning_start_frame, device)
         else:
             limit = renderer.PNP_FINAL_ASSIGNMENT_ERROR_FRACTION * renderer.projected_cube_diameter(candidate)
             joint_options = getattr(candidate, 'joint_geometry_candidates', ())
-            geometry = (dict(options=joint_options) if joint_options else
-                        renderer._build_turn_geometry_frame(candidate, limit, device))
+            staged = (getattr(candidate, 'joint_pose_diagnostics', None) or {}).get('pose_method') == 'staged'
+            if joint_options:
+                geometry = dict(options=joint_options)
+            else:
+                geometry = None if staged else renderer._build_turn_geometry_frame(candidate, limit, device)
             diagnostics = dict(status="unavailable_geometry", evaluated_states=0,
                                turning_start_frame=turning_start_frame)
             if geometry is not None:
                 diagnostics.update(status="prepared_full_search", geometry=dict(
                     scoring_version=renderer.PNP_TURN_GEOMETRY_SCORE_VERSION,
                     scope='per_geometry_middle_pose' if joint_options else 'whole_cube',
-                    joint_refined=bool(joint_options),
+                    joint_refined=bool(joint_options) and not staged,
                     options=list(joint_options) if joint_options else
                         [renderer.turn_trial_log_payload(option) for option in geometry['options']]))
             candidate = replace(candidate,
@@ -573,11 +584,11 @@ def prepare_search_record(renderer, record, colors, turning_start_frame, device)
 def prepare_nine_class_video(args, renderer):
     """Cache nine-class observations and all geometric options, without local move rollout."""
     import torch
-    from ultralytics import YOLO
 
     if not args.source.is_file():
         raise ValueError(f"Source video not found: {args.source}")
-    if not args.model.is_file() or not args.bbox_model.is_file():
+    checkpoint = renderer.pose_checkpoint_path(args)
+    if not checkpoint.is_file() or not args.bbox_model.is_file():
         raise ValueError("Both the nine-class pose checkpoint and bbox checkpoint must exist")
     if not 0 <= args.keypoint_conf <= 1:
         raise ValueError("--keypoint-conf must be in [0, 1]")
@@ -592,16 +603,18 @@ def prepare_nine_class_video(args, renderer):
                "--model", str(args.model), "--bbox-model", str(args.bbox_model),
                "--keypoint-conf", str(args.keypoint_conf), "--roi-padding", str(args.roi_padding),
                "--no-display", "--no-show-fps"]
+    options += ["--pose-method", getattr(args, "pose_method", "manual"),
+                "--device", getattr(args, "inference_device", "cpu")]
+    if getattr(args, "pose_method", "manual") == "staged":
+        options += ["--staged-model", str(checkpoint)]
     if args.pose_class_conf:
         options += ["--pose-class-conf", args.pose_class_conf]
     render_args = renderer.build_parser().parse_args(options)
-    model = YOLO(str(args.model))
-    if not set(renderer.CLASS_NAMES).issubset(set(model.names.values())):
-        raise ValueError("Pose checkpoint must predict three landmarks and six sticker colors")
+    model = renderer.load_pose_model(render_args)
     detector = renderer.YOLOCubeDetector(
         model_name=str(args.bbox_model), confidence_threshold=render_args.bbox_conf,
-        image_size=render_args.bbox_imgsz, device="cpu")
-    print(f"Preparing nine-class observations with {args.model}", flush=True)
+        image_size=render_args.bbox_imgsz, device=render_args.device)
+    print(f"Preparing nine-class observations with {checkpoint} ({render_args.pose_method})", flush=True)
     cache, count, _completed, fps = renderer.run_neural_video_pass(
         str(args.source), detector, model, render_args)
     colors = initial_sticker_colors(renderer, args.initial_scramble)
@@ -615,8 +628,9 @@ def prepare_nine_class_video(args, renderer):
             stream.write(json.dumps(observation, separators=(",", ":")) + "\n")
     if cache:
         print()
-    metadata = dict(source=str(args.source.resolve()), pose_model=str(args.model.resolve()),
-        pose_model_sha256=hashlib.sha256(args.model.read_bytes()).hexdigest(),
+    metadata = dict(source=str(args.source.resolve()), pose_model=str(checkpoint.resolve()),
+        pose_model_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+        pose_method=render_args.pose_method, inference_device=render_args.device,
         class_names=list(renderer.CLASS_NAMES), class_confidences=render_args.pose_class_conf,
         landmark_keypoint_confidence=args.keypoint_conf,
         roi_padding=render_args.roi_padding,

@@ -10,12 +10,43 @@ from live_recognition.direct_cube_pose import independent_pose_criterion
 
 from .data import PhysicalReference
 from .kinematics import rotation_exp
-from .phase import decode, loss_function
+from .phase import decode, decode_hypotheses, loss_function
+
+
+OBJECTIVE_VERSION = "rgb_only_handoff_joint_geometry_v1"
+
+
+def visible_observations(batch, enabled):
+    """Pack original visible YOLO rows as loss targets, without physical IDs.
+
+    Visibility 1 and 2 both count. Observation coordinates are fixed labels,
+    never a trainable target derived from the detector being optimized.
+    """
+    ids = batch["batch_idx"].long()
+    order = ids.argsort(stable=True)
+    ids = ids[order]
+    counts = torch.bincount(ids, minlength=len(enabled))
+    maximum = max(int(counts.max()), 1)
+    slot = torch.arange(len(ids), device=ids.device) - (counts.cumsum(0)-counts)[ids]
+    points = batch["keypoints"][order, 0].detach()
+    classes = batch["cls"][order, 0].long().detach()
+    xy = points.new_zeros(len(enabled), maximum, 2)
+    types = classes.new_zeros(len(enabled), maximum)
+    mask = torch.zeros(len(enabled), maximum, device=ids.device, dtype=torch.bool)
+    xy[ids, slot] = points[:, :2]
+    types[ids, slot] = classes
+    mask[ids, slot] = ((points[:, 2] > 0) & torch.isfinite(points).all(-1)
+        & (points[:, :2] >= 0).all(-1) & (points[:, :2] <= 1).all(-1)
+        & (classes >= 0) & (classes < 9) & enabled[ids])
+    # Avoid NaNs even in a masked, malformed observation.
+    return torch.where(mask[..., None], xy.nan_to_num(nan=0., posinf=0., neginf=0.), 0.), types, mask
 
 
 class StagedPoseLoss(nn.Module):
-    def __init__(self, model, symmetries):
+    def __init__(self, model, symmetries, *, geometry_weight=1., pose_aux_weight=.25):
         super().__init__()
+        self.geometry_weight = geometry_weight
+        self.pose_aux_weight = pose_aux_weight
         self.reference = PhysicalReference()
         self.register_buffer(
             "rotations",
@@ -46,6 +77,27 @@ class StagedPoseLoss(nn.Module):
             permutations.append(permutation.argsort(-1))
         self.register_buffer("inverse_slots", torch.stack(permutations))
         self.independent = independent_pose_criterion(model.detector)
+
+    def predicted_geometry_loss(self, base, logits, batch, enabled, image_size):
+        """Score complete RGB predictions; target pose/axis never enters here."""
+        angles, probability = decode_hypotheses(logits)
+        xy, classes, mask = visible_observations(batch, enabled)
+        pose = {k:v.repeat_interleave(3, 0) for k,v in base.items()}
+        pose["angles"] = angles.flatten(0, 1)
+        family = torch.arange(3, device=logits.device).repeat(len(logits))
+        value, rmse, _ = self.reference.template.geometry(
+            pose, xy.repeat_interleave(3, 0), classes.repeat_interleave(3, 0),
+            mask.repeat_interleave(3, 0), family, beta=2./image_size)
+        value = value.reshape(-1, 3) * image_size / 4
+        selected = probability.argmax(-1)
+        row = torch.arange(len(logits), device=logits.device)
+        # Half directly scores the deployed hard choice. Half scores the
+        # probability-weighted alternatives, giving axis selection a geometric
+        # gradient. Each term scores a complete shape, never a blended shape.
+        per_image = .5 * (value[row, selected] + (value * probability).sum(-1))
+        active = mask.any(-1)
+        loss = per_image[active].mean() if active.any() else logits.sum()*0 + value.sum()*0
+        return loss, rmse.reshape(-1, 3)[row, selected] * image_size, active
 
     def gauge(self, base, target):
         truth = target["rotation"][:, None] @ self.rotations[None]
@@ -131,6 +183,12 @@ class StagedPoseLoss(nn.Module):
     def forward(self, model, batch, target, phase):
         context = model.encode(batch["img"], getattr(model, "use_amp", False))
         base = context["static"]
+        context["training_phase"] = phase
+        autonomous = phase in ("handoff", "joint")
+        # Complete the inference path before inspecting any target pose.
+        actual_logits = model.articulate(context)[0] if autonomous else None
+        if autonomous:
+            context["actual_logits"] = actual_logits
         enabled = target["enabled"]
         size = batch["img"].shape[-1]
         truth, eligible, qi = self.gauge(base, target)
@@ -143,13 +201,14 @@ class StagedPoseLoss(nn.Module):
                 model.fields.orientation_norm.square() / 9
             )
             static = field[enabled].mean() if enabled.any() else zero
-            camera_pose = dict(
-                truth, **{k: base[k] for k in ["center", "scale", "perspective", "principal"]}
-            )
-            family = truth["angles"].abs().reshape(-1, 3, 2).sum(-1).argmax(-1)
-            geometry = self.visible_loss(
-                self.reference.project(camera_pose, family), xy, mask, enabled, size
-            )
+            if phase == "static":
+                camera_pose = dict(
+                    truth, **{k: base[k] for k in ["center", "scale", "perspective", "principal"]}
+                )
+                family = truth["angles"].abs().reshape(-1, 3, 2).sum(-1).argmax(-1)
+                geometry = self.visible_loss(
+                    self.reference.project(camera_pose, family), xy, mask, enabled, size
+                )
             with torch.autocast(
                 device_type=batch["img"].device.type, enabled=getattr(model, "use_amp", False)
             ):
@@ -162,22 +221,12 @@ class StagedPoseLoss(nn.Module):
         logits = None
         if phase != "static":
             conditioning = base
-            if model.training and phase in ("articulation", "handoff"):
+            if model.training and phase == "articulation":
                 # Geometry augmentation affects only loss-time conditioning;
                 # actual validation ALWAYS uses the RGB-predicted static pose.
                 conditioning = {k: v.detach().clone() for k, v in truth.items()}
                 probability = torch.rand(len(enabled), device=enabled.device)
                 jitter = probability >= 0.5
-                if phase == "articulation":
-                    jitter = probability >= 0.5
-                else:
-                    actual = probability < 0.25
-                    for k in conditioning:
-                        conditioning[k] = torch.where(
-                            actual.reshape(-1, *([1] * (conditioning[k].ndim - 1))),
-                            base[k],
-                            conditioning[k],
-                        )
                 strength = 0.5 + torch.rand(len(enabled), device=enabled.device)
                 spin = rotation_exp(
                     torch.randn(len(enabled), 3, device=enabled.device) * (0.12 * strength[:, None])
@@ -202,20 +251,15 @@ class StagedPoseLoss(nn.Module):
                     + jitter * torch.randn_like(strength) * 0.30 * strength
                 ).sigmoid()
                 conditioning["perspective"] = p
-            logits, _ = model.articulate(context, conditioning)
+            logits = actual_logits if autonomous else model.articulate(context, conditioning)[0]
             phase_loss = loss_function(logits, truth["angles"], eligible, enabled)
-            if phase == "joint":
-                gt_logits, _ = model.articulate(context, truth)
-                replay = loss_function(gt_logits, truth["angles"], eligible, enabled)
-                family = truth["angles"].abs().reshape(-1, 3, 2).sum(-1).argmax(-1)
-                conditional = logits.masked_fill(
-                    ~F.one_hot(family, 3).bool()[:, :, None, None], -10000.0
-                )
-                predicted = dict(base, angles=decode(conditional)[0])
-                geometry = geometry + self.joint_visible_loss(
-                    predicted, truth, xy, mask, enabled, size
-                )
-        total = static + geometry + 0.1 * yolo + phase_loss + 0.1 * replay
+            if autonomous:
+                geometry, fit_rmse, fit_active = self.predicted_geometry_loss(
+                    base, logits, batch, enabled, size)
+                context["observed_fit_rmse_px"] = fit_rmse.detach()
+                context["observed_fit_active"] = fit_active
+        total = (self.pose_aux_weight * (static + phase_loss) + self.geometry_weight * geometry + .1*yolo
+                 if autonomous else static + geometry + .1*yolo + phase_loss)
         return (
             total,
             {
@@ -230,7 +274,9 @@ class StagedPoseLoss(nn.Module):
 
     @torch.no_grad()
     def metrics(self, model, context, target, image_size=128):
-        logits, _ = model.articulate(context)
+        logits = context.get("actual_logits")
+        if logits is None:
+            logits, _ = model.articulate(context)
         pose = dict(context["static"], angles=decode(logits)[0])
         truth, eligible, qi = self.gauge(pose, target)
         enabled = target["enabled"]
@@ -254,8 +300,14 @@ class StagedPoseLoss(nn.Module):
         distance = self.joint_visible_loss(pose, truth, xy, mask, enabled, image_size, metric=True)
         rmse = ((distance.square() * known).sum(-1) / known.sum(-1).clamp_min(1)).sqrt()
         add("visible_keypoint_rmse_px", rmse, known.any(-1))
-        # A separate, explicitly teacher-conditioned articulation diagnostic.
-        teacher, _ = model.articulate(context, truth)
-        teacher_error = (decode(teacher)[0] - angles + 45).remainder(90).sub(45).abs()
-        add("teacher_observed_moving_turn_deg", teacher_error, moving & eligible)
+        if "observed_fit_rmse_px" in context:
+            add("observed_fit_rmse_px", context["observed_fit_rmse_px"], context["observed_fit_active"])
+        # The early known-static phase retains its explicit teacher diagnostic.
+        # Handoff/joint NEVER run an additional GT-conditioned forward pass.
+        if context.get("training_phase", getattr(model, "phase", None)) not in ("handoff", "joint"):
+            teacher, _ = model.articulate(context, truth)
+            teacher_error = (decode(teacher)[0] - angles + 45).remainder(90).sub(45).abs()
+            add("teacher_observed_moving_turn_deg", teacher_error, moving & eligible)
+        else:
+            result["teacher_observed_moving_turn_deg"] = (0., 0)
         return result

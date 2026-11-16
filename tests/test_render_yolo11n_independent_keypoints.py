@@ -3513,8 +3513,10 @@ def test_initial_scramble_is_required_and_cpu_is_default():
     args = parser.parse_args(["--source", "video.mp4", "--initial-scramble", ""])
     assert args.initial_scramble == ()
     assert args.device == "cpu"
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--source", "video.mp4", "--initial-scramble", "", "--device", "mps"])
+    for device in ("mps", "0"):
+        assert parser.parse_args([
+            "--source", "video.mp4", "--initial-scramble", "", "--device", device,
+        ]).device == device
 
 
 def test_batched_keypoint_statistics_match_reference_scoring():

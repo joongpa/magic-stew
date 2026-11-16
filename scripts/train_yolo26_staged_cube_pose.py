@@ -4,8 +4,8 @@
 python scripts/train_yolo26_staged_cube_pose.py --dataset data/direct_cube_pose_dataset \
     --init-checkpoint runs/staged_cube_pose_epoch45_init.pt --device 0 --batch 16
 
-All four phases run automatically: static, known-static articulation, robust
-handoff, full joint fine-tuning. The shared detector and both heads use ONE
+All four phases run automatically: static, known-static articulation, RGB-only
+handoff, full RGB-only joint fine-tuning. The shared detector and both heads use ONE
 current RGB encoder pass; original default independent YOLO loss is retained.
 Checkpoints include detector architecture/weights and both custom heads.
 """
@@ -20,6 +20,7 @@ import multiprocessing
 import random
 import sys
 import time
+from functools import partial
 from importlib.metadata import version
 from pathlib import Path
 
@@ -33,7 +34,7 @@ from live_recognition.direct_cube_pose import make_detector
 from live_recognition.direct_cube_pose_data import collate_direct_pose, read_manifest, split_entries
 from live_recognition.staged_pose.batching import resolve_phase_batch_size
 from live_recognition.staged_pose.data import StagedPoseDataset
-from live_recognition.staged_pose.loss import StagedPoseLoss
+from live_recognition.staged_pose.loss import OBJECTIVE_VERSION, StagedPoseLoss
 from live_recognition.staged_pose.model import (
     OBSERVATION_VERSION,
     StagedCubePoseModel,
@@ -91,6 +92,8 @@ def build_parser():
         help="Continue interrupted training, including optimizer, schedule, split and RNG",
     )
     p.add_argument("--output-dir", type=Path, default=Path("runs/staged_cube_pose"))
+    p.add_argument("--split", type=Path,
+                   help="Reuse an exact saved train/validation split for a new continuation run")
     p.add_argument("--device", default="auto")
     p.add_argument(
         "--batch",
@@ -128,7 +131,11 @@ def build_parser():
     p.add_argument("--static-epochs", type=int, default=30)
     p.add_argument("--articulation-epochs", type=int, default=40)
     p.add_argument("--handoff-epochs", type=int, default=30)
-    p.add_argument("--joint-epochs", type=int, default=30)
+    p.add_argument("--joint-epochs", type=int, default=60)
+    p.add_argument("--geometry-weight", type=float, default=1.,
+                   help="Full predicted-geometry loss weight during RGB-only handoff/joint")
+    p.add_argument("--pose-aux-weight", type=float, default=.25,
+                   help="Auxiliary static/angle label loss weight during RGB-only handoff/joint")
     p.add_argument("--seed", type=int, default=17)
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
@@ -145,6 +152,12 @@ def build_parser():
 
 
 def validate_args(args):
+    if args.split and (args.resume or args.limit is not None):
+        raise ValueError("--split is for a new run and cannot be combined with --resume or --limit")
+    if not math.isfinite(args.geometry_weight) or args.geometry_weight <= 0:
+        raise ValueError("--geometry-weight must be positive and finite")
+    if not math.isfinite(args.pose_aux_weight) or args.pose_aux_weight < 0:
+        raise ValueError("--pose-aux-weight must be nonnegative and finite")
     if args.imgsz < 64:
         raise ValueError("--imgsz must be at least64")
     rounded = math.ceil(args.imgsz / 32) * 32
@@ -238,6 +251,20 @@ def split_for_initialization(entries, initialization, val_fraction, seed, limit=
             )
         val.append(train.pop(candidate))
     return train, val
+
+
+def fixed_split(entries, path, initialization):
+    split = json.loads(path.read_text(encoding="utf-8"))
+    lookup = {e["key"]: e for e in entries}
+    train, val = split["train"], split["val"]
+    if (not train or not val or len(set(train)) != len(train) or len(set(val)) != len(val)
+            or set(train) & set(val)):
+        raise ValueError("--split must contain nonempty, disjoint train/val keys without duplicates")
+    if not (set(train) | set(val)) <= lookup.keys():
+        raise ValueError("--split contains images missing from this dataset")
+    if set(val) & set(initialization.get("training_keys", [])):
+        raise ValueError("--split validation includes images previously used to train the checkpoint")
+    return [lookup[k] for k in train], [lookup[k] for k in val]
 
 
 def optimizer_for(model, phase):
@@ -368,10 +395,12 @@ def run_epoch(
                 visible = sums.get("visible_keypoint_rmse_px", 0) / max(
                     counts.get("visible_keypoint_rmse_px", 0), 1
                 )
+                fit = sums.get("observed_fit_rmse_px", 0) / max(counts.get("observed_fit_rmse_px", 0), 1)
                 elapsed = time.monotonic() - started
                 rate = processed_images / max(elapsed, 1e-6)
                 remaining = int(elapsed / (index + 1) * (batches - index - 1))
-                message = f"{'train' if training else 'val'} {index + 1}/{batches} {rate:.1f}img/s ETA={remaining // 60}:{remaining % 60:02d} loss={float(loss.detach()):.3f} R={rotation:.1f} turn={moving:.1f} vis={visible:.1f}px"
+                geometry_text = f"fit={fit:.1f}px" if "observed_fit_rmse_px" in sums else f"vis={visible:.1f}px"
+                message = f"{'train' if training else 'val'} {index + 1}/{batches} {rate:.1f}img/s ETA={remaining // 60}:{remaining % 60:02d} loss={float(loss.detach()):.3f} R={rotation:.1f} turn={moving:.1f} {geometry_text}"
                 progress.update(message)
     result = {k: sums[k] / counts[k] if counts[k] else None for k in sums}
     result.update(
@@ -391,6 +420,8 @@ def selection_score(metrics, phase):
             if metrics["teacher_observed_moving_turn_deg"] is not None
             else metrics["phase"]
         )
+    if metrics.get("observed_fit_rmse_px") is not None:
+        return metrics["observed_fit_rmse_px"]
     return (
         metrics["moving_turn_deg"] if metrics["moving_turn_deg"] is not None else metrics["total"]
     )
@@ -420,6 +451,13 @@ def main():
     random.seed(args.seed)
     if args.resume:
         model, resume = model_from_checkpoint(args.resume)
+        if resume.get("objective_version") != OBJECTIVE_VERSION:
+            raise ValueError(
+                "This checkpoint used the previous training objective. Start a new continuation run with "
+                "--init-checkpoint PATH --static-epochs 0 --articulation-epochs 0 --handoff-epochs 0 "
+                "--joint-epochs 60 --split ORIGINAL_SPLIT_JSON --output-dir NEW_DIR; "
+                "prior training images remain excluded from validation."
+            )
         original = resume["train_args"]
         # Device/workers/root can change when moving the run from Windows to
         # another machine; its split, data fingerprint and training plan cannot.
@@ -440,6 +478,7 @@ def main():
                         "articulation_checkpoint",
                         "initial_split",
                         "export_init",
+                        "split",
                     )
                     and value
                     else value,
@@ -485,9 +524,12 @@ def main():
         train = [lookup[k] for k in split["train"]]
         val = [lookup[k] for k in split["val"]]
     else:
-        train, val = split_for_initialization(
-            entries, getattr(model, "initialization", {}), args.val_fraction, args.seed, args.limit
-        )
+        if args.split:
+            train, val = fixed_split(entries, args.split, getattr(model, "initialization", {}))
+        else:
+            train, val = split_for_initialization(
+                entries, getattr(model, "initialization", {}), args.val_fraction, args.seed, args.limit
+            )
         split = {"train": [e["key"] for e in train], "val": [e["key"] for e in val]}
     if set(split["train"]) & set(split["val"]):
         raise ValueError("Train/validation overlap")
@@ -520,7 +562,11 @@ def main():
             "Point selector updated to complete CPU NMS; resetting the current-stage validation best. Model/optimizer/schedule progress is retained.",
             flush=True,
         )
-    criterion = StagedPoseLoss(model, symmetries).to(device)
+    criterion_factory = partial(StagedPoseLoss, geometry_weight=args.geometry_weight, pose_aux_weight=args.pose_aux_weight)
+    criterion = criterion_factory(model, symmetries).to(device)
+    print(f"Objective: {OBJECTIVE_VERSION}; handoff/joint conditioning: 100% predicted RGB pose; "
+          f"geometry weight={args.geometry_weight:g}, pose/angle auxiliary weight={args.pose_aux_weight:g}; "
+          "no GT-pose replay", flush=True)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
     train_args = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     (output / "args.json").write_text(json.dumps(train_args, indent=2) + "\n", encoding="utf-8")
@@ -551,6 +597,7 @@ def main():
                 optimizer_for,
                 memory_fraction=args.batch_memory_fraction,
                 maximum=args.max_auto_batch,
+                criterion_factory=criterion_factory,
             )
             if profile is not None:
                 with (output / "batch_profiles.jsonl").open("a", encoding="utf-8") as f:
@@ -608,6 +655,7 @@ def main():
                 checkpoint_model(model),
                 train_args=train_args,
                 phase_index=phase_index,
+                objective_version=OBJECTIVE_VERSION,
                 phase=phase,
                 phase_epoch=epoch,
                 optimizer=optimizer.state_dict(),
@@ -640,7 +688,8 @@ def main():
         best_path = output / f"weights/{phase}_best.pt"
         if best_path.exists():
             stage_best = torch.load(best_path, map_location="cpu", weights_only=False)
-            if stage_best.get("observation_version") == OBSERVATION_VERSION:
+            if (stage_best.get("observation_version") == OBSERVATION_VERSION
+                    and stage_best.get("objective_version") == OBJECTIVE_VERSION):
                 model.load_state_dict(stage_best["model_state"])
             else:
                 print(

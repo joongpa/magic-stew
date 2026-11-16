@@ -141,7 +141,7 @@ class ClassNearestGeometry(nn.Module):
             },
         )
 
-    def forward(self, p, observed, classes, mask, family):
+    def forward(self, p, observed, classes, mask, family, *, beta=None):
         projected, visible, types, _ = self.project(p, family)
         obs_type = classes.clamp_max(3)
         compatible = (obs_type[:, :, None] == types[:, None]) & visible[:, None]
@@ -151,7 +151,7 @@ class ClassNearestGeometry(nn.Module):
         nearest = torch.where(valid, nearest, torch.full_like(nearest, 0.25))
         nearest = torch.where(mask, nearest, 0.0)
         penalty = F.smooth_l1_loss(
-            nearest, torch.zeros_like(nearest), reduction="none", beta=self.beta
+            nearest, torch.zeros_like(nearest), reduction="none", beta=self.beta if beta is None else beta
         )
         groups = []
         rms = []

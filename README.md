@@ -428,14 +428,44 @@ rotations (`x/y/z`), in the white-top/U, green-front/F frame. `--known-scramble`
 is an alias. Use `--model PATH` to override the checkpoint; it must predict the
 three landmark classes and six colors.
 
+The completed staged pose network is available alongside the manual fitter:
+
+```bash
+python scripts/render_yolo11n_independent_keypoints.py \
+  --source /path/to/solve.mp4 --initial-scramble "" \
+  --pose-method staged --staged-model runs/staged_cube_pose/weights/best.pt \
+  --device 0 --save-final-video runs/staged_pose.mp4 --no-display
+```
+
+`--pose-method manual` remains the default. The staged checkpoint supplies its
+own independent detector, static head, and articulation head in one RGB pass;
+`--model` selects the independent detector only for manual fitting. Staged
+inference uses the checkpoint's training resolution (128px for this run),
+regardless of the display `--view-size` or manual detector `--imgsz`. The same
+bbox detector, ROI tracking, keypoint thresholds, overlays, and cached video
+outputs are used by both paths. Set `--device cpu`, `--device mps`, or a CUDA
+index such as `--device 0` for network inference.
+
+The staged path converts its predicted camera and slab angles analytically;
+it skips PnP, exhaustive geometry sweeps, numerical refinement, and pose
+smoothing. Center-color and temporal symmetry matching still choose an
+equivalent cube frame. The existing `--recognize-moves` state search remains
+optional and uses the predicted shape; the network does not itself output a
+move sequence or a calibrated overall pose confidence.
+
+The standalone `search_independent_keypoint_*.py` tools that accept `--source`
+also accept `--pose-method staged --staged-model PATH`. Their
+`--inference-device` selects the network device separately from the search
+scorer's `--device`. Existing `--log` inputs reuse their saved geometry.
+
 Detections are filtered by pose-model object scores (`boxes.conf`) and keypoint
 presence scores (`keypoints.conf`). Object-score defaults are
 `corner=0.25`, `corner-edge=0.40`, `corner-edge-center=0.25`, and `0.90` for each
 color. Override any class with `--pose-class-conf red=0.35,corner-edge=0.45`.
 `--min-keypoint-conf` filters keypoint presence (default `0.05` for landmarks);
 sticker color keypoints have a minimum of `0.25` for scoring, drawing, and ROI
-tracking. `--track-conf` controls ROI tracking. Neural inference and the prepared
-full-search scorer run on CPU.
+tracking. `--track-conf` controls ROI tracking. Neural inference defaults to CPU;
+the prepared full-search scorer runs on CPU.
 
 The cached pose pass exhaustively scores every 15-degree slab-angle combination
 on all three axes using shared slab projections and visibility tables. It then
@@ -1381,10 +1411,12 @@ Use the already exported `data/direct_cube_pose_dataset` (17,857 images),
 including `manifest.jsonl`, `symmetries.json`, `images/`, `pose/` and `targets/`.
 The original nine independent classes and visibility 1/2 annotations are
 preserved. No re-export or Blender generation is needed. For auxiliary
-reprojection and layer-support targets, retained landmark metadata provides
+early reprojection and layer-support targets, retained landmark metadata provides
 physical slots, and sticker labels use known centers or unique nearby model
 projections. Uncertain sticker bindings are omitted only from this auxiliary
-loss; all original YOLO rows remain in the default detector loss. Dominant-angle
+loss; all original YOLO rows remain in the default detector loss. RGB-only
+handoff/joint geometry uses the original visible label rows directly, without
+requiring those physical-slot bindings. Dominant-angle
 corner-cut handling is retained.
 
 From the repository root in the Windows CUDA Python environment, copy
@@ -1409,14 +1441,44 @@ The default128px schedule automatically runs:
 |---|---:|---|---|
 | Static | 30 | Detector and static head | Turn head frozen |
 | Articulation | 40 | Complete turn head | 50% correct, 50% perturbed static poses |
-| Handoff | 30 | Complete turn head | 25% actual estimates, 25% correct, 50% perturbed poses |
-| Joint | 30 | Detector, static head and complete turn head | Actual RGB estimates; correct-pose replay is an auxiliary loss |
+| Handoff | 30 | Complete turn head | 100% actual RGB estimates |
+| Joint | 60 | Detector, static head and complete turn head | 100% actual RGB estimates; no ground-truth pose replay |
+
+Thus 90 of the default 160 epochs run the full prediction path without
+ground-truth pose, camera, or articulation inputs. Ground truth is used only
+after prediction to calculate losses and metrics. The earlier static and
+known-static phases still train the components individually.
+
+During handoff/joint, the geometry objective projects all three network-predicted
+axis hypotheses, each with its predicted rotation, camera, and continuous layer
+angles. Visible label rows (both visibility 1 and 2) are matched to the nearest
+visible, class-compatible projected landmark or sticker. All observations are
+retained with radial Huber influence; no fixed fraction is discarded. Geometry
+ignores sticker identities/colors when matching centers, as in the manual fitter.
+It is invariant to equivalent cube frames and layer quarter-turn permutations.
+Half the objective scores the deployed hard axis choice; half scores the
+axis-probability-weighted losses of the three complete shapes. This supplies
+gradients to axis selection without averaging incompatible shapes. No
+ground-truth axis is forced into these projections. The shared encoder runs
+once and articulation runs once per batch in these phases, including diagnostics.
+
+The RGB-only objective is `geometry + 0.25 * (static + angle) + 0.1 * YOLO`.
+Geometry uses a 2px Huber transition and is expressed in pixel-loss units divided
+by 4, balancing landmark/sticker groups. `--geometry-weight` (default 1) and
+`--pose-aux-weight` (default 0.25) adjust the first two weights. Pose/angle labels
+remain auxiliary loss targets; they never condition the handoff/joint forward
+pass. The detector retains its installed default YOLO pose loss.
 
 Each phase hands its best validation checkpoint to the next phase. Static is
 selected by static rotation error, articulation by explicitly teacher-conditioned
-observed-turn error, and handoff/joint by actual RGB-only moving-layer error.
+observed-turn error, and handoff/joint by actual RGB-only class-nearest visible
+fit RMSE (`observed_fit_rmse_px`, displayed as `fit=...px`).
 All stages also report actual static/moving/observed-moving errors and visible
-reprojection RMSE. Teacher-conditioned metrics are labeled separately. Metrics
+reprojection RMSE. The older bound-point metric remains
+`visible_keypoint_rmse_px`; its correspondence policy differs from the new
+class-nearest fit metric. Teacher-conditioned metrics are labeled separately
+and are omitted (`null`) during handoff/joint, which perform no GT-conditioned
+diagnostic forward pass. Metrics
 and stage losses are saved in `metrics.jsonl`; batch progress overwrites one
 console line and fits within the current terminal width to prevent wrapping.
 Redirected/captured output receives one final batch summary per train/validation
@@ -1452,6 +1514,20 @@ disposable model copy and preserves the training weights and random states.
 It includes optimizer-state memory and avoids requesting image gradients
 through a frozen encoder. It runs once per phase, with results recorded in
 `batch_profiles.jsonl`; it adds no per-batch profiling during training.
+
+To continue the completed model using only the new RGB-only joint objective,
+keep the original held-out split and start a separate run:
+
+```powershell
+python scripts/train_yolo26_staged_cube_pose.py --dataset data/direct_cube_pose_dataset --init-checkpoint runs/staged_cube_pose/weights/best.pt --split runs/staged_cube_pose/split.json --static-epochs 0 --articulation-epochs 0 --handoff-epochs 0 --joint-epochs 60 --device 0 --batch -1 --output-dir runs/staged_cube_pose_rgb_only
+```
+
+`--split` preserves the exact listed train/validation memberships and rejects
+validation images previously used to train the checkpoint. It cannot be
+combined with `--limit` or `--resume`. Older checkpoints remain valid for
+initialization and rendering. Since the objective and selection metric changed,
+exact `--resume` requires a checkpoint with the new objective version; use
+`--init-checkpoint` and a new output directory to continue an older model.
 
 To automatically use larger head-only batches and fit joint training separately:
 

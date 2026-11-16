@@ -63,6 +63,9 @@ from live_recognition.independent_pose_thresholds import (  # noqa: E402
 from live_recognition.roi_tracking import RoiTracker  # noqa: E402
 from live_recognition.roi_tracking import \
     roi_for_frame as shared_roi_for_frame  # noqa: E402
+from scripts.independent_keypoint_staged_pose import (  # noqa: E402
+    add_pose_method_arguments, pose_checkpoint_path,
+)
 
 CLASS_NAMES = INDEPENDENT_POSE_CLASS_NAMES
 STICKER_KEYPOINT_MIN_CONFIDENCE = 0.25
@@ -8855,6 +8858,23 @@ def predict_pose_result(
     return results[0] if results else None
 
 
+def load_pose_model(args):
+    """Load only the detector required by the selected pose path."""
+    checkpoint = pose_checkpoint_path(args)
+    if not checkpoint.is_file():
+        raise ValueError(f"Could not find {getattr(args, 'pose_method', 'manual')} pose model: {checkpoint}")
+    if getattr(args, "pose_method", "manual") == "staged":
+        from scripts.independent_keypoint_staged_pose import StagedPosePredictor
+
+        return StagedPosePredictor(checkpoint, args.device)
+    from ultralytics import YOLO
+
+    model = YOLO(str(checkpoint))
+    if not set(CLASS_NAMES).issubset(set(model.names.values())):
+        raise ValueError("Pose checkpoint must predict the three landmark classes and six sticker colors")
+    return model
+
+
 def local_to_frame_points(
     local_points: np.ndarray,
     roi_xyxy: tuple[int, int, int, int],
@@ -10017,7 +10037,8 @@ def draw_sticker_pnp_candidate(
     output = image.copy()
     if candidate is None:
         return output
-    draw_reprojection_error_overlay(output, candidate)
+    if getattr(candidate, "sticker_type", None) != "staged" or candidate.assignment_projected_points is not None:
+        draw_reprojection_error_overlay(output, candidate)
     # Draw only the finalized measurement, without a pre-refinement wireframe.
     display_rvec = candidate.rvec
     display_tvec = candidate.tvec
@@ -10455,6 +10476,11 @@ def render_frame(
     move_accumulator: MoveAccumulator | None = None,
 ) -> tuple[np.ndarray, str, int]:
     height, width = frame.shape[:2]
+    staged = getattr(args, 'pose_method', 'manual') == 'staged'
+    fresh_inference = neural_data is None
+    if staged and candidate_only and neural_data is not None:
+        # The foreground already produced the complete learned pose.
+        return frame, neural_data.roi_source, len(neural_data.local_points)
     if cached_final_only and neural_data is not None and neural_data.pose_ready and getattr(args, 'wireframe_only', False):
         output = frame.copy()
         pose = neural_data.pose_candidate
@@ -10557,29 +10583,44 @@ def render_frame(
         return output, roi_source, 0
 
     if neural_data is None:
-        model_roi = resize_to_square(roi, args.view_size)
-        result = predict_pose_result(pose_model, model_roi, args)
-        if result is None:
-            local_points = np.empty((0, 2), dtype=np.float32)
-            point_confidences = np.empty((0,), dtype=np.float32)
-            class_ids = np.empty((0,), dtype=np.int32)
-            box_confidences = np.empty((0,), dtype=np.float32)
+        if staged:
+            prediction = pose_model.predict_crop(roi, args)
+            local_points = prediction.local_points
+            point_confidences = prediction.presence_scores
+            class_ids = prediction.class_ids
+            box_confidences = prediction.object_scores
         else:
-            local_points, point_confidences, class_ids, box_confidences = pose_predictions(result)
-        if neural_cache is not None:
-            neural_cache.append(
-                NeuralFrameData(
-                    frame_index=0 if frame_index is None else frame_index,
-                    frame=frame.copy(),
-                    roi_xyxy=roi_xyxy,
-                    roi_source=roi_source,
-                    sticker_masks=None,
-                    local_points=np.asarray(local_points, dtype=np.float32).copy(),
-                    point_confidences=np.asarray(point_confidences, dtype=np.float32).copy(),
-                    class_ids=np.asarray(class_ids, dtype=np.int32).copy(),
-                    box_confidences=np.asarray(box_confidences, dtype=np.float32).copy(),
-                )
+            model_roi = resize_to_square(roi, args.view_size)
+            result = predict_pose_result(pose_model, model_roi, args)
+            if result is None:
+                local_points = np.empty((0, 2), dtype=np.float32)
+                point_confidences = np.empty((0,), dtype=np.float32)
+                class_ids = np.empty((0,), dtype=np.int32)
+                box_confidences = np.empty((0,), dtype=np.float32)
+            else:
+                local_points, point_confidences, class_ids, box_confidences = pose_predictions(result)
+        if neural_cache is not None or staged:
+            record = NeuralFrameData(
+                frame_index=0 if frame_index is None else frame_index,
+                frame=frame.copy(),
+                roi_xyxy=roi_xyxy,
+                roi_source=roi_source,
+                sticker_masks=None,
+                local_points=np.asarray(local_points, dtype=np.float32).copy(),
+                point_confidences=np.asarray(point_confidences, dtype=np.float32).copy(),
+                class_ids=np.asarray(class_ids, dtype=np.int32).copy(),
+                box_confidences=np.asarray(box_confidences, dtype=np.float32).copy(),
             )
+            if staged:
+                from scripts.independent_keypoint_staged_pose import candidate_from_prediction
+
+                record.pose_candidate = candidate_from_prediction(
+                    sys.modules[__name__], prediction, roi_xyxy, (width, height), args)
+                record.pose_candidates = (record.pose_candidate,) if record.pose_candidate is not None else ()
+                record.pose_ready = True
+                neural_data = record
+            if neural_cache is not None:
+                neural_cache.append(record)
     else:
         local_points = np.asarray(neural_data.local_points)
         point_confidences = np.asarray(neural_data.point_confidences)
@@ -10587,7 +10628,14 @@ def render_frame(
         box_confidences = np.asarray(neural_data.box_confidences)
     if candidate_only and len(local_points) == 0:
         return frame, roi_source, 0
-    if cached_final_only and neural_data is not None and neural_data.pose_ready:
+    if (cached_final_only or staged) and neural_data is not None and neural_data.pose_ready:
+        if staged and fresh_inference:
+            _, local_roi_points = local_to_frame_points(local_points, roi_xyxy, args.view_size)
+            roi_tracker.observe_tracking_bounds(
+                tracking_bounds(local_roi_points, point_confidences, class_ids, box_confidences,
+                    args.pose_class_conf, args.track_conf, roi.shape[:2]),
+                width, height, tracking_gain=args.roi_tracking_gain,
+                tracking_padding=args.roi_tracking_padding)
         pnp_candidate = neural_data.pose_candidate
         diagnostic_candidate = getattr(
             neural_data,
@@ -11169,12 +11217,13 @@ def run_neural_video_pass(
     total_frames = capture_frame_count if capture_frame_count > 0 else None
     cache: list[NeuralFrameData] = []
     records: SimpleQueue[NeuralFrameData | None] = SimpleQueue()
+    staged = getattr(args, 'pose_method', 'manual') == 'staged'
     progress = (
-        CombinedHeadlessProgress(("neural inference", "pose seeds"))
+        CombinedHeadlessProgress(("neural inference",) if staged else ("neural inference", "pose seeds"))
         if not args.display
         else None
     )
-    worker = Thread(
+    worker = None if staged else Thread(
         target=consume_neural_cache_for_pose,
         args=(
             records,
@@ -11189,7 +11238,8 @@ def run_neural_video_pass(
         name="initial-pose-consumer",
         daemon=True,
     )
-    worker.start()
+    if worker is not None:
+        worker.start()
     writer = None
     roi_tracker = RoiTracker()
     previous_loop_end = None
@@ -11245,7 +11295,8 @@ def run_neural_video_pass(
                 smoothed_processing_fps,
                 smoothed_loop_fps,
             )
-            records.put(cache[-1])
+            if worker is not None:
+                records.put(cache[-1])
             frame_index += 1
             if progress is not None:
                 progress.update("neural inference", frame_index, total_frames)
@@ -11269,8 +11320,9 @@ def run_neural_video_pass(
         if writer is not None:
             writer.release()
         capture.release()
-        records.put(None)
-        worker.join()
+        if worker is not None:
+            records.put(None)
+            worker.join()
         if progress is not None:
             progress.finish()
     if output_path is not None and writer is not None:
@@ -12563,8 +12615,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-height", type=int, default=480, help="Requested camera height (0 leaves it unchanged).")
     parser.add_argument("--camera-fps", type=float, default=30.0, help="Requested camera FPS (0 leaves it unchanged).")
     parser.add_argument("--model", type=Path, default=DEFAULT_POSE_MODEL)
+    add_pose_method_arguments(parser)
     parser.add_argument("--bbox-model", type=Path, default=DEFAULT_BBOX_MODEL)
-    parser.add_argument("--device", choices=("cpu",), default="cpu", help="Neural inference runs on CPU.")
+    parser.add_argument("--device", default="cpu", help="Neural inference device: cpu, mps, or CUDA index (e.g. 0).")
     parser.add_argument("--bbox-conf", type=float, default=0.25)
     parser.add_argument("--bbox-imgsz", type=int, default=640)
     parser.add_argument(
@@ -12590,7 +12643,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="keypoint_conf",
         type=float,
         default=0.05,
-        help="Minimum landmark keypoint confidence (default: 0.05); sticker color keypoints have a 0.25 floor.",
+        help="Minimum landmark keypoint presence score (default: 0.05); sticker color keypoints have a 0.25 floor.",
     )
     parser.add_argument("--track-conf", type=float, default=0.05)
     parser.add_argument("--imgsz", type=int, default=256)
@@ -12751,7 +12804,18 @@ def process_cached_poses(
 ) -> None:
     """Recover poses and optional moves directly from the cached model predictions."""
     needs_pose = args.show_pnp or args.recognize_moves or args.show_colored_masks
-    if needs_pose and getattr(args, 'joint_pose_geometry', True):
+    if getattr(args, 'pose_method', 'manual') == 'staged':
+        from scripts.independent_keypoint_staged_pose import cache_predicted_geometry
+
+        # Center-color / temporal symmetry selection relabels the learned
+        # geometry without optimizing its camera or articulation.
+        if needs_pose:
+            orient_cached_poses(cache, known_initial_colors, source_fps)
+            for record in cache:
+                record.pose_candidate = cache_predicted_geometry(sys.modules[__name__], record.pose_candidate)
+                record.pose_candidates = (record.pose_candidate,) if record.pose_candidate is not None else ()
+                record.pose_ready = True
+    elif needs_pose and getattr(args, 'joint_pose_geometry', True):
         from scripts.independent_keypoint_pose_geometry import process_pose_geometry
 
         stages = ['joint pose/geometry refinement']
@@ -12875,12 +12939,10 @@ def main() -> int:
         raise SystemExit("--pnp-focal-scale must be positive")
     if args.orientation_axis_length <= 0.0:
         raise SystemExit("--orientation-axis-length must be positive")
-    if not args.model.is_file():
-        raise SystemExit(f"Could not find independent pose model: {args.model}")
+    if not pose_checkpoint_path(args).is_file():
+        raise SystemExit(f"Could not find pose model: {pose_checkpoint_path(args)}")
     if not args.bbox_model.is_file():
         raise SystemExit(f"Could not find bbox model: {args.bbox_model}")
-
-    from ultralytics import YOLO
 
     bbox_detector = YOLOCubeDetector(
         model_name=str(args.bbox_model),
@@ -12888,9 +12950,11 @@ def main() -> int:
         image_size=args.bbox_imgsz,
         device=args.device,
     )
-    pose_model = YOLO(str(args.model))
-    if not set(CLASS_NAMES).issubset(set(pose_model.names.values())):
-        raise SystemExit("Pose checkpoint must predict the three landmark classes and six sticker colors")
+    try:
+        pose_model = load_pose_model(args)
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
+    print(f"Pose method: {args.pose_method}; checkpoint: {pose_checkpoint_path(args)}", flush=True)
     source = parse_source(args.source)
     if is_image_source(source):
         frame = cv2.imread(str(source), cv2.IMREAD_COLOR)

@@ -30,7 +30,7 @@ def find_solved_anchor(renderer, records, frames, goals, scorer_options, source_
 def search_cached_records(renderer, records, args, colors, source_fps):
     """Use the same expansion, scoring, and widening code as the standalone tools."""
     scorer_options = bidirectional.widening_scorer_options(
-        renderer, colors, args.turning_start_frame, args.model,
+        renderer, colors, args.turning_start_frame, renderer.pose_checkpoint_path(args),
     )
     scorer = replay.PreparedReplayScorer(renderer, records, "cpu", parallel_layers=True, **scorer_options)
     initial = scorer.key(renderer.CubeGeometryState.identity())
