@@ -124,8 +124,20 @@ def resolve_batch_size(batch, model, device, image_size, amp, max_objects, datas
         return 16
     from ultralytics.utils.autobatch import check_train_batch_size
 
-    result = check_train_batch_size(BatchSizeProbe(model), imgsz=image_size, amp=amp,
-                                    batch=-1, max_num_obj=max_objects, dataset_size=dataset_size)
+    try:
+        result = check_train_batch_size(BatchSizeProbe(model), imgsz=image_size, amp=amp,
+                                        batch=-1, max_num_obj=max_objects, dataset_size=dataset_size)
+    except RuntimeError as error:
+        if "no usable batch size" not in str(error).lower():
+            raise
+        raise RuntimeError(
+            "Ultralytics AutoBatch could not profile this older SINGLE-STAGE direct-pose trainer. "
+            "This error alone does not establish that GPU memory is exhausted. "
+            "For the epoch45 static/articulation architecture and per-stage auto-sizing, run "
+            "scripts/train_yolo26_staged_cube_pose.py instead. "
+            "If intentionally training this single-stage model, use an explicit --batch. "
+            f"Original profiler error: {error}"
+        ) from error
     if result < 1:
         raise ValueError(f"Automatic batch sizing returned an invalid value: {result}")
     return int(result)
@@ -316,6 +328,11 @@ def build_parser():
 
 def main():
     args = normalize_training_arguments(build_parser().parse_args())
+    print(
+        "Trainer: single-stage direct cube pose (train_yolo26_direct_cube_pose.py). "
+        "For the staged epoch45 architecture use scripts/train_yolo26_staged_cube_pose.py.",
+        flush=True,
+    )
     if args.workers < 0 or args.freeze_epochs < 0 or args.width < 8 or args.width % 8:
         raise ValueError("Workers/freeze epochs must be nonnegative; head width must be a positive multiple of 8")
     if args.lr <= 0 or args.detector_lr_factor <= 0 or args.quality_sigma <= 0:

@@ -73,6 +73,33 @@ def test_cuda_auto_batch_profiles_the_custom_wrapper(monkeypatch):
     assert captured == {"imgsz": 160, "amp": True, "batch": -1, "max_num_obj": 57, "dataset_size": 120}
 
 
+def test_failed_old_profiler_identifies_the_staged_trainer_without_claiming_oom(monkeypatch):
+    from ultralytics.utils import autobatch
+
+    def failed(*_args, **_kwargs):
+        raise RuntimeError("AutoBatch: no usable batch size found while profiling batch=[1, 2, 4]")
+
+    monkeypatch.setattr(autobatch, "check_train_batch_size", failed)
+    with pytest.raises(RuntimeError, match="train_yolo26_staged_cube_pose.py") as result:
+        resolve_batch_size(-1, TinyNestedModel(), torch.device("cuda:0"), 128, False, 57, 120)
+    assert "does not establish" in str(result.value)
+    assert isinstance(result.value.__cause__, RuntimeError)
+
+
+def test_other_cuda_profiler_errors_preserve_original_cause(monkeypatch):
+    from ultralytics.utils import autobatch
+
+    original = RuntimeError("CUDA device unavailable")
+
+    def failed(*_args, **_kwargs):
+        raise original
+
+    monkeypatch.setattr(autobatch, "check_train_batch_size", failed)
+    with pytest.raises(RuntimeError) as result:
+        resolve_batch_size(-1, TinyNestedModel(), torch.device("cuda:0"), 128, False, 57, 120)
+    assert result.value is original
+
+
 def test_stock_amp_check_rejects_reported_gtx_1660_super_without_forward(monkeypatch):
     # Exercise the actual installed Ultralytics blacklist without CUDA hardware.
     detector = SimpleNamespace(parameters=lambda: iter([SimpleNamespace(device=torch.device('cuda:0'))]))

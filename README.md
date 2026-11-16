@@ -1032,6 +1032,12 @@ For ground-truth overlays on the prepared dataset, use
 
 ## Direct pose and articulation head
 
+This section describes the earlier **single-stage** experiment. For the reviewed
+epoch45 model with separate static and image-context articulation heads, use
+[`train_yolo26_staged_cube_pose.py`](scripts/train_yolo26_staged_cube_pose.py) and
+the [staged CUDA training instructions](#staged-cube-pose-with-joint-cuda-training).
+The two trainers have different architectures and incompatible custom checkpoints.
+
 The additional targets in `data/direct_cube_pose_dataset/` support a structured
 head on the existing nine-class independent YOLO pose detector. Six centers in
 `U,D,F,B,R,L` order (white, yellow, green, blue, red, orange) supervise the rigid

@@ -379,6 +379,10 @@ def main():
                 time.sleep(0.1)
         return
     args = validate_args(args)
+    print(
+        "Trainer: staged static pose + image-context articulation (train_yolo26_staged_cube_pose.py)",
+        flush=True,
+    )
     batch_overrides = batch_cli_overrides(args, argv)
     resume = None
     torch.set_num_threads(args.threads)
