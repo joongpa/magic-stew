@@ -15,6 +15,11 @@
   import type { SourceFrame, VideoFileSource } from "./lib/frame-stream";
   import { startCameraCapture } from "./lib/camera-source";
   import type { CameraCapture } from "./lib/camera-source";
+  import { PoseFitter } from "./lib/pose-fitter";
+  import type { FittedPose } from "./lib/pose-types";
+  import { OrderedStage } from "./lib/ordered-stage";
+  import { VideoResultCache, videoResultKey } from "./lib/video-result-cache";
+  import type { SavedVideoResult } from "./lib/video-result-cache";
 
   let manifest = $state<ModelManifest>();
   let size = $state(256);
@@ -37,6 +42,14 @@
   let bboxThreshold = $state(0.25),
     roiPadding = $state(0.4);
   let showRoi = $state(false);
+  let showPose = $state(false);
+  let poseFitting = $state(false);
+  let poseError = $state("");
+  let poseFitter: PoseFitter | undefined;
+  let resetPose = true;
+  let fitBufferedFrames = $state(0);
+  const videoResults = new VideoResultCache();
+  let cachedVideoFrames = $state(0), viewingSavedResult = $state(false);
   const recording = new DetectionRecording();
   let savedFrames = $state(0);
   let thresholds = $state([0.25, 0.4, 0.25, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]);
@@ -77,9 +90,14 @@
     lastResultTime = 0,
     lastStarted = -Infinity;
   let disposed = false;
+  let presentationTimes: number[] = [];
   let modelGeneration = 0;
   let currentFrame:
     | {
+        snapshot: OffscreenCanvas;
+        generation: number;
+        fitPose: boolean;
+        resetPose: boolean;
         timestamp: number;
         counted: boolean;
         camera: boolean;
@@ -89,8 +107,22 @@
         pacingMs: number;
         intervalMs: number;
         recording: RecordingContext;
+        cacheKey: string;
       }
     | undefined;
+  type FrameContext = NonNullable<typeof currentFrame>;
+  type DetectedFrame = { context: FrameContext; result: FrameResult; detectorCompletedAt: number;
+    fitting?: Promise<FittedPose>; fitStartedAtMs?: number; fitCompletedAtMs?: number };
+  type CachedFrame = { saved: SavedVideoResult; context: Pick<FrameContext, "snapshot" | "generation" | "timestamp"> };
+  // Recovery needs 180ms of future source context, plus the adjacent initial fit.
+  const completionQueue = new OrderedStage<DetectedFrame | CachedFrame>(12, completeFrame,
+    (packet) => presenter.releaseFrame(packet.context.snapshot),
+    (size) => { fitBufferedFrames = size; continuePipeline(); },
+    (cause) => {
+      mediaError = cause instanceof Error ? cause.message : String(cause);
+      running = false;
+      capture?.pause();
+    });
   const idleWaiters: (() => void)[] = [];
   const baseUrl = new URL(import.meta.env.BASE_URL, location.origin).href;
   const counts = $derived(
@@ -114,12 +146,99 @@
       ? Math.max(0, Math.min(2, roiPadding))
       : 0.4,
   });
+  const currentCacheKey = (fitPose = showPose) => videoResultKey(size, backend, settings(), fitPose);
+  const savedFrameCount = () => Math.max(videoResults.count(currentCacheKey()),
+    showPose ? 0 : videoResults.count(currentCacheKey(true)));
+  function findSavedResult(timestamp: number, tolerance = 0.00001) {
+    return videoResults.get(currentCacheKey(), timestamp, tolerance) ??
+      (!showPose ? videoResults.get(currentCacheKey(true), timestamp, tolerance) : undefined);
+  }
   function send(message: WorkerRequest, transfer: Transferable[] = []) {
     worker?.postMessage(message, transfer);
   }
   function markIdle() {
     busy = false;
     for (const resolve of idleWaiters.splice(0)) resolve();
+  }
+  async function waitForPipelineIdle() {
+    if (busy) await new Promise<void>((resolve) => idleWaiters.push(resolve));
+    await flushPose();
+    await completionQueue.whenIdle();
+  }
+  async function flushPose() {
+    try { await poseFitter?.flush(); }
+    catch { /* The ordered frame promise reports the fitting error. */ }
+  }
+  function continuePipeline() {
+    if (disposed) return;
+    if (!busy && (refreshPending || !running || status !== "ready")) void flushPose();
+    if (refreshPending && !busy && !completionQueue.size && !seeking && status === "ready") {
+      refreshPending = false;
+      void inferFrame();
+    } else scheduleNext();
+  }
+  async function completeFrame(packet: DetectedFrame | CachedFrame) {
+    if ("saved" in packet) {
+      if (packet.context.generation === generation && !disposed)
+        presentSavedSnapshot(packet.context.snapshot, packet.saved);
+      return;
+    }
+    const completed = packet.context;
+    const token = completed.generation;
+    if (token !== generation || disposed) return;
+    if (packet.fitting) {
+      poseFitting = true;
+      try {
+        packet.result.fittedPose = await packet.fitting;
+        if (token === generation) poseError = "";
+      } catch (cause) {
+        if (token === generation) {
+          poseError = cause instanceof Error ? cause.message : String(cause);
+          poseFitter?.dispose();
+          poseFitter = undefined;
+          resetPose = true;
+        }
+      } finally {
+        if (token === generation) poseFitting = false;
+      }
+    }
+    if (token !== generation || disposed) return;
+    const overlayStart = performance.now();
+    presenter.presentFrame(stage, completed.snapshot, showRoi || showPose
+      ? (context, width, height) => drawOverlay(context, width, height, packet.result) : undefined);
+    const presentedAtMs = performance.now();
+    packet.result.pipeline = {
+      detectorStartedAtMs: completed.sentAt,
+      detectorCompletedAtMs: packet.detectorCompletedAt,
+      fitStartedAtMs: packet.fitStartedAtMs, fitCompletedAtMs: packet.fitCompletedAtMs, presentedAtMs,
+      presentationMs: presentedAtMs - overlayStart,
+    };
+    result = packet.result;
+    viewingSavedResult = false;
+    if (completed.recording.sourceKind === "video" && (!completed.fitPose || packet.result.fittedPose))
+      cachedVideoFrames = videoResults.put(completed.cacheKey, completed.timestamp, packet.result);
+    if (completed.counted || completed.recording.sourceKind === "image" || completed.recording.sourceKind === "video") {
+      recording.append(packet.result, completed.recording);
+      savedFrames = recording.length;
+    }
+    if (completed.counted) {
+      if (!processedFrames || !lastResultTime) presentationTimes = [];
+      processedFrames++;
+      position = completed.timestamp;
+      // Buffered fits may finish together. Measure a window instead of the
+      // instantaneous dispatch rate of two adjacent ready frames.
+      presentationTimes.push(presentedAtMs);
+      while (presentationTimes.length > 2 && presentationTimes[1] < presentedAtMs - 1000) presentationTimes.shift();
+      if (presentationTimes.length > 1) fps = (presentationTimes.length - 1) * 1000 / (presentedAtMs - presentationTimes[0]);
+      lastResultTime = presentedAtMs;
+      if (completed.camera) capture?.acknowledge();
+      frameTiming = {
+        acquireMs: completed.acquireMs, drawMs: completed.drawMs,
+        roundTripMs: packet.detectorCompletedAt - completed.sentAt,
+        overlayMs: presentedAtMs - overlayStart, intervalMs: completed.intervalMs,
+        pacingMs: completed.pacingMs,
+      };
+    }
   }
   function cancelScheduled() {
     clearTimeout(timer);
@@ -133,13 +252,14 @@
     cancelScheduled();
     // Finish an admitted frame before restarting the model; keep the file cursor
     // and camera FIFO intact while the new sessions initialize.
-    if (busy) await new Promise<void>((resolve) => idleWaiters.push(resolve));
+    await waitForPipelineIdle();
     if (disposed || request !== modelGeneration) return;
     error = "";
     result = undefined;
     refreshPending = false;
     fps = 0;
     resetTracking = true;
+    resetPose = true;
     worker?.terminate();
     worker = undefined;
     if (backend === "webgpu" && !window.isSecureContext) {
@@ -191,7 +311,7 @@
         { type: "module" },
       );
       worker = currentWorker;
-      currentWorker.onmessage = ({ data }: MessageEvent<WorkerResponse>) => {
+      currentWorker.onmessage = async ({ data }: MessageEvent<WorkerResponse>) => {
         if (currentWorker !== worker) return;
         if (data.type === "progress")
           loadingText =
@@ -211,55 +331,46 @@
           status = "error";
           error = data.message;
           capture?.pause();
+          if (currentFrame) presenter.releaseFrame(currentFrame.snapshot);
           currentFrame = undefined;
           markIdle();
+          void flushPose();
         }
         if (data.type === "result") {
-          result = data.result;
-          if (
-            currentFrame &&
-            (currentFrame.counted ||
-              currentFrame.recording.sourceKind === "image")
-          ) {
-            recording.append(data.result, currentFrame.recording);
-            savedFrames = recording.length;
-          }
-          if (currentFrame?.counted) {
-            processedFrames++;
-            position = currentFrame.timestamp;
-            const now = performance.now();
-            if (lastResultTime && running)
-              fps = 0.8 * fps + 0.2 * (1000 / (now - lastResultTime));
-            lastResultTime = now;
-            if (currentFrame.camera) capture?.acknowledge();
-          }
           const completed = currentFrame;
-          const receivedAt = performance.now();
           currentFrame = undefined;
+          if (completed) {
+            const packet: DetectedFrame = { context: completed, result: data.result,
+              detectorCompletedAt: performance.now() };
+            if (completed.fitPose) {
+              poseFitter ??= new PoseFitter(baseUrl);
+              packet.fitStartedAtMs = performance.now();
+              try {
+                packet.fitting = poseFitter.fit(data.result, completed.resetPose,
+                  completed.timestamp, completed.recording.sourceFps).finally(() => {
+                    packet.fitCompletedAtMs = performance.now();
+                  });
+              } catch (cause) { packet.fitting = Promise.reject(cause); }
+              // Admission continues while the ordered presenter awaits an earlier fit.
+              void packet.fitting.catch(() => {});
+            }
+            completionQueue.enqueue(packet);
+          }
+          // GPU admission is released at detector completion, independently of
+          // the ordered fitting/presentation stage.
           markIdle();
-          const overlayStart = performance.now();
-          presenter.present(stage, showRoi ? drawOverlay : undefined);
-          if (completed?.counted)
-            frameTiming = {
-              acquireMs: completed.acquireMs,
-              drawMs: completed.drawMs,
-              roundTripMs: receivedAt - completed.sentAt,
-              overlayMs: performance.now() - overlayStart,
-              intervalMs: completed.intervalMs,
-              pacingMs: completed.pacingMs,
-            };
-          if (refreshPending) {
-            refreshPending = false;
-            void inferFrame();
-          } else scheduleNext();
+          continuePipeline();
         }
+
       };
       currentWorker.onerror = () => {
         status = "error";
         error = "The detector worker could not start. Reload the detector.";
         capture?.pause();
+        if (currentFrame) presenter.releaseFrame(currentFrame.snapshot);
         currentFrame = undefined;
         markIdle();
+        void flushPose();
       };
       send({
         type: "init",
@@ -279,14 +390,22 @@
     seekVersion++;
     seeking = false;
     running = false;
+    refreshPending = false;
     cancelScheduled();
     resetTracking = true;
+    resetPose = true;
+    poseFitter?.dispose();
+    poseFitter = undefined;
+    completionQueue.clear();
+    poseFitting = false;
+    poseError = "";
     capture?.stop();
     capture = undefined;
     stream?.getTracks().forEach((track) => track.stop());
     stream = undefined;
     fileSource?.close();
     fileSource = undefined;
+    videoResults.clear(); cachedVideoFrames = 0; viewingSavedResult = false;
     cameraQueue.clear();
     queuedFrames = 0;
     captureStopped = false;
@@ -435,10 +554,14 @@
 
   function dispatch(bitmap: ImageBitmap, timestamp: number, counted: boolean) {
     const drawStart = performance.now();
-    presenter.capture(bitmap);
+    const snapshot = presenter.captureFrame(bitmap);
     const sentAt = performance.now();
     const appliedSettings = settings();
     currentFrame = {
+      snapshot,
+      generation,
+      fitPose: showPose,
+      resetPose,
       timestamp,
       counted,
       camera: sourceKind === "camera" && counted,
@@ -452,6 +575,7 @@
         backend,
         settings: appliedSettings,
       },
+      cacheKey: videoResultKey(size, backend, appliedSettings, showPose),
       sentAt,
       drawMs: sentAt - drawStart,
       acquireMs: counted ? acquireMs : 0,
@@ -470,11 +594,15 @@
       [bitmap],
     );
     resetTracking = false;
+    if (showPose) resetPose = false;
     if (counted) previousFrameStart = lastStarted;
   }
 
   async function inferFrame() {
-    if (busy || disposed || sourceKind === "none") return;
+    if (busy || completionQueue.size || disposed || sourceKind === "none") {
+      if (!disposed && sourceKind !== "none") refreshPending = true;
+      return;
+    }
     const source = sourceKind === "image" ? still : presenter.snapshot;
     if (!source) {
       scheduleNext();
@@ -500,7 +628,7 @@
 
   async function processNext() {
     timer = 0;
-    if (busy || !running || status !== "ready" || disposed) return;
+    if (busy || !completionQueue.canAdmit || !running || status !== "ready" || disposed) return;
     busy = true;
     // Pace from the start of the whole frame, including source acquisition and
     // drawing. Pacing from post-draw dispatch adds those costs to every interval.
@@ -525,9 +653,20 @@
           fileEnded = true;
           running = false;
         } else if (captureStopped) running = false;
+        if (!running) void flushPose();
         return;
       }
-      dispatch(frame.bitmap, frame.timestamp, true);
+      const saved = sourceKind === "video" ? findSavedResult(frame.timestamp) : undefined;
+      if (saved) {
+        // A cached island closes the preceding numerical segment. Present it
+        // through the same queue so it cannot overtake an earlier pending fit.
+        void flushPose(); resetTracking = true; resetPose = true;
+        const snapshot = presenter.captureFrame(frame.bitmap);
+        frame.bitmap.close();
+        completionQueue.enqueue({ saved, context: { snapshot, generation, timestamp: frame.timestamp } });
+        markIdle();
+        continuePipeline();
+      } else dispatch(frame.bitmap, frame.timestamp, true);
     } catch (cause) {
       if (token !== generation) return;
       markIdle();
@@ -537,10 +676,25 @@
     }
   }
 
+  function presentSavedFrame(bitmap: ImageBitmap, saved: SavedVideoResult) {
+    try {
+      const snapshot = presenter.captureFrame(bitmap);
+      presentSavedSnapshot(snapshot, saved);
+    } finally { bitmap.close(); }
+  }
+  function presentSavedSnapshot(snapshot: OffscreenCanvas, saved: SavedVideoResult) {
+    presenter.presentFrame(stage, snapshot, showRoi || showPose
+      ? (ctx, width, height) => drawOverlay(ctx, width, height, saved.result) : undefined);
+    result = saved.result; position = saved.timestamp; viewingSavedResult = true;
+    cachedVideoFrames = savedFrameCount(); frameTiming = undefined;
+  }
+
   function scheduleNext() {
     if (
       timer ||
       busy ||
+      !completionQueue.canAdmit ||
+      refreshPending ||
       !running ||
       status !== "ready" ||
       disposed ||
@@ -549,7 +703,7 @@
     )
       return;
     if (sourceKind === "camera" && !cameraQueue.length) {
-      if (captureStopped) running = false;
+      if (captureStopped) { running = false; void flushPose(); }
       return;
     }
     const interval = 1000 / Math.min(30, sourceFps || 30);
@@ -568,13 +722,14 @@
     ctx: OffscreenCanvasRenderingContext2D,
     width: number,
     height: number,
+    frame = result,
   ) {
-    if (!result) return;
-    const sx = width / result.transform.sourceWidth,
-      sy = height / result.transform.sourceHeight;
+    if (!frame) return;
+    const sx = width / frame.transform.sourceWidth,
+      sy = height / frame.transform.sourceHeight;
     const radius = Math.max(3.5, width / 230);
-    if (showRoi && result.roi) {
-      const t = result.transform;
+    if (showRoi && frame.roi) {
+      const t = frame.transform;
       ctx.strokeStyle = "#c6f69bcc";
       ctx.lineWidth = (1.5 * radius) / 3.5;
       ctx.setLineDash([radius * 2, radius * 2]);
@@ -586,10 +741,37 @@
       );
       ctx.setLineDash([]);
     }
+    if (showPose && frame.fittedPose?.pose) {
+      ctx.strokeStyle = "#64f6dd";
+      ctx.lineWidth = Math.max(1.5, width / 650);
+      ctx.lineJoin = "round";
+      for (const polygon of frame.fittedPose.wireframe) {
+        if (!polygon.length) continue;
+        ctx.beginPath();
+        ctx.moveTo(polygon[0][0] * sx, polygon[0][1] * sy);
+        for (const point of polygon.slice(1)) ctx.lineTo(point[0] * sx, point[1] * sy);
+        ctx.closePath();
+        ctx.stroke();
+      }
+    }
   }
 
   function redrawOverlay() {
-    if (result) presenter.redraw(stage, showRoi ? drawOverlay : undefined);
+    if (result) presenter.redraw(stage, showRoi || showPose ? drawOverlay : undefined);
+  }
+  function changePoseDisplay() {
+    poseError = "";
+    cachedVideoFrames = savedFrameCount();
+    if (!showPose) void flushPose();
+    const saved = sourceKind === "video" ? findSavedResult(position) : undefined;
+    if (saved) { result = saved.result; viewingSavedResult = true; }
+    redrawOverlay();
+    if (showPose && !result?.fittedPose) {
+      resetPose = true;
+      if (busy || completionQueue.size) refreshPending = true;
+      else void inferFrame();
+      continuePipeline();
+    }
   }
   function downloadDetections() {
     if (!recording.length) return;
@@ -613,8 +795,11 @@
   }
   function refresh() {
     resetTracking = true;
-    if (busy) refreshPending = true;
+    resetPose = true;
+    cachedVideoFrames = savedFrameCount();
+    if (busy || completionQueue.size) refreshPending = true;
     else void inferFrame();
+    continuePipeline();
   }
   function reacquire() {
     refresh();
@@ -639,10 +824,12 @@
     running = false;
     cancelScheduled();
     const token = generation;
-    if (busy) await new Promise<void>((resolve) => idleWaiters.push(resolve));
+    await waitForPipelineIdle();
     if (token !== generation || request !== seekVersion || !fileSource) return;
-    fileSource.seek(timestamp);
-    position = timestamp;
+    refreshPending = false;
+    const saved = findSavedResult(timestamp, 0.5 / Math.min(30, sourceFps || 30) + 0.001);
+    fileSource.seek(saved?.timestamp ?? timestamp);
+    position = saved?.timestamp ?? timestamp;
     processedFrames = 0;
     lastResultTime = 0;
     lastStarted = -Infinity;
@@ -651,6 +838,25 @@
     fps = 0;
     fileEnded = false;
     resetTracking = true;
+    resetPose = true;
+    if (saved) {
+      busy = true;
+      try {
+        const frame = await fileSource.next();
+        if (token !== generation || request !== seekVersion || !fileSource) { frame?.bitmap.close(); return; }
+        if (frame && Math.abs(frame.timestamp - saved.timestamp) < 0.00001) presentSavedFrame(frame.bitmap, saved);
+        else {
+          frame?.bitmap.close();
+          fileSource.seek(timestamp);
+          throw new Error("The saved frame could not be decoded at its original timestamp.");
+        }
+      } catch (cause) {
+        if (token === generation && request === seekVersion) mediaError = cause instanceof Error ? cause.message : String(cause);
+      } finally { if (token === generation) markIdle(); }
+      if (token !== generation || request !== seekVersion) return;
+      running = seekResume; seeking = false; scheduleNext();
+      return;
+    }
     // Display/process the first selected frame at the seek point even when paused.
     running = true;
     await processNext();
@@ -663,6 +869,7 @@
       running = false;
       cancelScheduled();
       capture?.pause();
+      if (!busy) void flushPose();
       return;
     }
     if (sourceKind === "camera" && captureStopped) {
@@ -690,6 +897,8 @@
     cameraQueue.clear();
     fileSource?.close();
     worker?.terminate();
+    poseFitter?.dispose();
+    completionQueue.clear();
     stream?.getTracks().forEach((track) => track.stop());
     markIdle();
   }
@@ -828,8 +1037,9 @@
             ><span
               >{processedFrames} frames processed{sourceKind === "camera"
                 ? ` · ${queuedFrames} queued`
-                : ""}</span
+                : ""}{fitBufferedFrames ? ` · ${fitBufferedFrames} fitting/presentation buffered` : ""}</span
             >
+            {#if sourceKind === "video"}<span>{cachedVideoFrames} saved frames{viewingSavedResult ? " · Showing saved result" : ""}</span>{/if}
           </div>
         {/if}
         <div class="pipeline-status" role="status">
@@ -977,6 +1187,24 @@
             onclick={reacquire}
             disabled={sourceKind === "none"}>Reacquire cube</button
           >
+        </section>
+        <section class="control-section">
+          <h2>Fitted pose</h2>
+          <label class="toggle">
+            <input type="checkbox" bind:checked={showPose} onchange={changePoseDisplay} />
+            <span>Show fitted pose</span>
+          </label>
+          <p class="hint">Fit and display a cube wireframe. Points remain hidden.</p>
+          {#if showPose}
+            <p class="hint" role="status" aria-label="Pose fitting status">
+              {poseError || result?.fittedPose?.message || (poseFitting ? "Fitting pose…" : "Waiting for a cube")}
+              {#if result?.fittedPose}
+                · Fit {result.fittedPose.elapsedMs.toFixed(1)}ms
+                · Draw {(result.pipeline?.presentationMs ?? 0).toFixed(1)}ms
+                · {result.fittedPose.bank.length} options
+              {/if}
+            </p>
+          {/if}
         </section>
         <section class="control-section">
           <div class="section-heading">

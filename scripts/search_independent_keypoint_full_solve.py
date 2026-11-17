@@ -1006,6 +1006,15 @@ class PreparedReplayScorer(RotationBudgetScorerMixin, ReplayScorer):
         """Rank distinct misalignments, counting flat labels once and admitting cutoff ties."""
         if self.geometry_shortlist_size is None:
             return tuple(range(len(geometry)))
+        if geometry and all(option.get('geometry_bank_policy') == 'sticker_assignments_plus_flat'
+                            for option in geometry):
+            # The joint fitter has already selected assignment-distinct rows.
+            # Its flat fallback is reserved independently of geometry score.
+            ordinary = tuple(i for i, option in enumerate(geometry)
+                             if not option.get('flat_fallback') and math.isfinite(self._geometry_score(option)))
+            flat = tuple(i for i, option in enumerate(geometry)
+                         if option.get('flat_fallback') and math.isfinite(self._geometry_score(option)))
+            return ordinary[:self.geometry_shortlist_size] + flat[:1]
         scores, best = [], {}
         for option in geometry:
             score = self._geometry_score(option)

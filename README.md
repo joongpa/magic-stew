@@ -872,6 +872,40 @@ between consecutive selected poses, not departure from a presumed fixed target.
 Use `--source bank-rank0` only for comparison with the earlier candidate-bank
 analysis; its poses are not the final selected reference trajectory.
 
+Measure maximum rolling TPS in the saved Matty and corrected Yiheng paths with:
+
+```bash
+MPLCONFIGDIR=/private/tmp/live-recognition-mpl .venv/bin/python scripts/analyze_peak_window_tps.py \
+  --output-dir runs/tps-window-study
+```
+
+This studies 1–60 source-frame intervals for Matty and 1–30 for Yiheng. Each
+N-frame window spans N intervals and N+1 endpoint poses. TPS is pooled route
+angular travel divided by 90° and elapsed seconds, matching the shared search
+cap, including partial turns. It is distinct from HTM move-event TPS. Every
+saved interval cost is checked against its selected geometry and move route;
+the four missing costs in Yiheng's manually corrected steps are recomputed.
+The CSV and JSON outputs include peak-window endpoints and exact durations,
+and the plot compares both frame counts and elapsed time. At their different
+source rates, Matty's 60-frame and Yiheng's 30-frame windows both span about
+1.001 seconds. These fitted trajectories were already constrained by the 54 TPS cap;
+their observed maxima do not establish safe pruning limits for other solves.
+
+Cross-check those peaks with committed quarter-turn counts using:
+
+```bash
+MPLCONFIGDIR=/private/tmp/live-recognition-mpl .venv/bin/python scripts/analyze_committed_window_tps.py \
+  --output-dir runs/committed-tps-window-study
+```
+
+This counts each saved quarter/inverse face or wide turn as one and each half
+turn as two, at its recorded commit frame, through the same one-second window
+range. Split quarter commits are counted individually; no smoothing, merging,
+or cancellation is applied. The CSV includes each metric's peak and the angular
+rate in the committed peak's own window. Commit timing can produce short-window
+rates above the physical travel cap, while fitted residual motion and reversals
+can increase angular totals without increasing committed counts.
+
 Each sticker color keypoint finds its closest class-valid three- and four-landmark
 groups by expanding the nearest-landmark neighborhood. Cyclic classes must match
 a corner, edge, or center sticker profile. For four points, the seed score is the

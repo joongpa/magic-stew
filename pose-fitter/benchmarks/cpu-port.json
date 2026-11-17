@@ -1,0 +1,360 @@
+{
+  "passed": true,
+  "scope": "Interleave CPU, native Rust and Node WASM fits on the same saved inputs.\n\nNumerical work only: loading, fixture reconstruction and JSON transfer are outside\ntimers. The cached cameras are inputs to every runtime, including Python. This\ndoes not measure detection, PnP initialization, orientation or sequence recovery.\n",
+  "timestamp_utc": "2026-11-17T20:24:36.167965+00:00",
+  "fixture_sha256": "79703aa02e3adeb21fed3960afbcb1a843237afd215fe87c10fa6b9b49573064",
+  "source_sha256": {
+    "scripts/independent_keypoint_pose_geometry.py": "0f0d30afbf2dd1351146f89a3b9bcc00808fc07891a45ab8aa7a1f93ab7ff392",
+    "scripts/render_yolo11n_independent_keypoints.py": "fa627645d3f3a457d83004a416a46d16743b401eeb4a9cd0c596bfacb904d074"
+  },
+  "port_source_sha256": {
+    "pose-fitter/src/lib.rs": "e800689e44dbe85bf8e6c01e6cb129671b15094f9ce06505d2ca7b47e4ccdc09",
+    "pose-fitter/src/main.rs": "3b96793c61275b7448c887d2cf9cbe05b76b4387f7ec351850fa70509e0f4262",
+    "pose-fitter/src/math.rs": "33a2032787157d6464f7429a76a63e1320e7e706eee458e914d0dceacb19f78d",
+    "pose-fitter/src/projection.rs": "f5fa0a2f2f762626b54f7354b9ec198641bb176d6e6cbc1daf8842f5ed97d95d",
+    "pose-fitter/src/search.rs": "8009e077e53d0b2ff1a62610ac1e7abf084fc4360584771534ab44e5e181daf2",
+    "pose-fitter/src/solver.rs": "5371ceb774213cfc5ba5f960ca15f772e0ebb1c3bf290db6143823715d03412e",
+    "pose-fitter/src/wasm.rs": "c0e28089349db65f5c0a427a3e299166a52e6015fc315acefa7746f3a5bf8247"
+  },
+  "wasm_sha256": "6aaaa09709036412abb7f4eceb12f0cd082137e2ca138c54547c66eadc2e1505",
+  "platform": "macOS-15.7.3-arm64-arm-64bit-Mach-O",
+  "python": "3.13.3",
+  "numpy": "2.4.6",
+  "scipy": "1.17.1",
+  "torch": "2.12.0",
+  "torch_threads": 2,
+  "node_runtime": {
+    "ready": true,
+    "runtime": "v18.18.0",
+    "engine": "10.2.154.26-node.26",
+    "wasmBytes": 480434
+  },
+  "browser": {
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
+    "hardwareConcurrency": 8,
+    "wasmBytes": 480434,
+    "init_ms": 10.899999856948853
+  },
+  "workloads": 20,
+  "repeats": 5,
+  "browser_repeats": 5,
+  "timings": {
+    "initial_geometry": {
+      "cpu": {
+        "median_ms": 241.49822944309562,
+        "min_ms": 219.52800010330975,
+        "max_ms": 318.17250000312924
+      },
+      "native": {
+        "median_ms": 17.173687,
+        "min_ms": 14.246,
+        "max_ms": 21.184749999999998
+      },
+      "wasm_node": {
+        "median_ms": 23.960583448410034,
+        "min_ms": 19.799416065216064,
+        "max_ms": 30.008790969848633
+      },
+      "wasm_browser": {
+        "median_ms": 22.25,
+        "min_ms": 18,
+        "max_ms": 28.09999990463257
+      }
+    },
+    "temporal_neighbors": {
+      "cpu": {
+        "median_ms": 537.2925000265241,
+        "min_ms": 498.5507500823587,
+        "max_ms": 589.4395839422941
+      },
+      "native": {
+        "median_ms": 36.704415999999995,
+        "min_ms": 34.417625,
+        "max_ms": 43.803000000000004
+      },
+      "wasm_node": {
+        "median_ms": 51.35933303833008,
+        "min_ms": 47.53016686439514,
+        "max_ms": 61.95608305931091
+      },
+      "wasm_browser": {
+        "median_ms": 46.60000014305115,
+        "min_ms": 43.60000014305115,
+        "max_ms": 55.89999985694885
+      }
+    },
+    "static_geometry": {
+      "cpu": {
+        "median_ms": 4.256999818608165,
+        "min_ms": 3.2508329022675753,
+        "max_ms": 8.701625047251582
+      },
+      "native": {
+        "median_ms": 0.261375,
+        "min_ms": 0.190083,
+        "max_ms": 0.6389170000000001
+      },
+      "wasm_node": {
+        "median_ms": 0.3435831069946289,
+        "min_ms": 0.2453749179840088,
+        "max_ms": 0.8389999866485596
+      },
+      "wasm_browser": {
+        "median_ms": 0.2999999523162842,
+        "min_ms": 0.20000004768371582,
+        "max_ms": 0.7000000476837158
+      }
+    }
+  },
+  "browser_bank_max_abs": {
+    "params": 1.1969555213875438e-05,
+    "angles": 1.1969555213875438e-05,
+    "score": 1.2828733292336025e-07,
+    "metrics": 2.6185834139935693e-08,
+    "assignment_objects": 5.890792714069448e-06,
+    "assignment_projected": 3.359328789542815e-05
+  },
+  "tolerances": {
+    "params": 0.0001,
+    "angles": 0.0001,
+    "score": 1e-06,
+    "metrics": 1e-06,
+    "assignment_objects": 0.0001,
+    "assignment_projected": 0.0001
+  },
+  "browser_probes": {
+    "projection": {
+      "circle_reference_max_abs": 6.103515625e-05,
+      "diameter_max_abs": 6.103515625e-05,
+      "jacobian_max_abs": 1.5102539748568233e-05,
+      "probes": 45,
+      "residual_max_abs": 6.378653949923319e-06
+    },
+    "solver": {
+      "cost_max_abs": 4.888534022029489e-12,
+      "parameter_max_abs": 9.052314453583676e-12,
+      "solves": 485,
+      "stopping_differences": 0
+    },
+    "sweep": {
+      "cameras": 20,
+      "length_differences": 0,
+      "rows": 20580,
+      "score_max_abs": 6.020477908430522e-07
+    }
+  },
+  "native_probes": {
+    "projection": {
+      "circle_reference_max_abs": 6.103515625e-05,
+      "diameter_max_abs": 6.103515625e-05,
+      "jacobian_max_abs": 1.5102539748568233e-05,
+      "probes": 45,
+      "residual_max_abs": 6.378653949923319e-06
+    },
+    "solver": {
+      "cost_max_abs": 5.229594535194337e-12,
+      "parameter_max_abs": 4.600764214046649e-12,
+      "solves": 485,
+      "stopping_differences": 0
+    },
+    "sweep": {
+      "cameras": 20,
+      "length_differences": 0,
+      "rows": 20580,
+      "score_max_abs": 6.020477908430522e-07
+    }
+  },
+  "node_probes": {
+    "projection": {
+      "circle_reference_max_abs": 6.103515625e-05,
+      "diameter_max_abs": 6.103515625e-05,
+      "jacobian_max_abs": 1.5102539748568233e-05,
+      "probes": 45,
+      "residual_max_abs": 6.378653949923319e-06
+    },
+    "solver": {
+      "cost_max_abs": 4.888534022029489e-12,
+      "parameter_max_abs": 9.052314453583676e-12,
+      "solves": 485,
+      "stopping_differences": 0
+    },
+    "sweep": {
+      "cameras": 20,
+      "length_differences": 0,
+      "rows": 20580,
+      "score_max_abs": 6.020477908430522e-07
+    }
+  },
+  "browser_seed_differences": [
+    {
+      "workload": 1,
+      "index": 4,
+      "axis": 0,
+      "cpu_seed": [
+        1.2543690867459794,
+        -1.0416806380787271,
+        -0.1458967696032318,
+        -69.39040853401615,
+        -41.028812222124394,
+        975.2485334566477,
+        0.0,
+        45.0
+      ],
+      "port_seed": [
+        1.2543690867459796,
+        -1.041680638078727,
+        -0.14589676960323172,
+        -69.39040853401615,
+        -41.028812222124394,
+        975.2485334566477,
+        0,
+        -45
+      ],
+      "parameter_max_abs": 90.0,
+      "score_gap": 4.440892098500626e-16
+    },
+    {
+      "workload": 4,
+      "index": 19,
+      "axis": 2,
+      "cpu_seed": [
+        -0.6815821221805601,
+        -1.1494993846516148,
+        -2.2846922796673788,
+        -0.4712501620641346,
+        -27.5365009990702,
+        271.35234467245533,
+        45.0,
+        0.0
+      ],
+      "port_seed": [
+        -1.0306748091988451,
+        -0.2633801572561026,
+        -0.9097377834309002,
+        -0.4712501620641346,
+        -27.5365009990702,
+        271.35234467245533,
+        -45,
+        0
+      ],
+      "parameter_max_abs": 90.0,
+      "score_gap": 1.6653345369377348e-16
+    },
+    {
+      "workload": 4,
+      "index": 20,
+      "axis": 2,
+      "cpu_seed": [
+        -0.9287851752229783,
+        -0.6956972230874311,
+        -1.6107683097396992,
+        -0.4712501620641346,
+        -27.5365009990702,
+        271.35234467245533,
+        0.0,
+        45.0
+      ],
+      "port_seed": [
+        -0.9287851752229784,
+        -0.6956972230874303,
+        -1.6107683097396996,
+        -0.4712501620641346,
+        -27.5365009990702,
+        271.35234467245533,
+        0,
+        -45
+      ],
+      "parameter_max_abs": 90.0,
+      "score_gap": 2.7755575615628914e-16
+    },
+    {
+      "workload": 13,
+      "index": 12,
+      "axis": 1,
+      "cpu_seed": [
+        0.0018522801790217993,
+        -2.450871988223008,
+        -0.004831554471660742,
+        -109.01912735869222,
+        55.77878662051409,
+        1009.0570579718966,
+        0.0,
+        -45.0
+      ],
+      "port_seed": [
+        0.0018522801790209465,
+        -2.450871988223008,
+        -0.004831554471660742,
+        -109.01912735869222,
+        55.77878662051409,
+        1009.0570579718966,
+        0,
+        45
+      ],
+      "parameter_max_abs": 90.0,
+      "score_gap": 9.71445146547012e-16
+    },
+    {
+      "workload": 17,
+      "index": 13,
+      "axis": 1,
+      "cpu_seed": [
+        -0.7590995514359379,
+        -0.01377683266164061,
+        -2.2485447247700554,
+        49.57649198676241,
+        -35.6360113852028,
+        597.0236467004288,
+        0.0,
+        45.0
+      ],
+      "port_seed": [
+        -0.7590995514359379,
+        -0.01377683266164061,
+        -2.248544724770056,
+        49.57649198676241,
+        -35.6360113852028,
+        597.0236467004288,
+        0,
+        -45
+      ],
+      "parameter_max_abs": 90.0,
+      "score_gap": 8.881784197001252e-16
+    },
+    {
+      "workload": 18,
+      "index": 30,
+      "axis": 0,
+      "cpu_seed": [
+        -0.39428280567428997,
+        -1.212205323838616,
+        -1.8826709831456092,
+        35.57727015721961,
+        -57.6088000434567,
+        582.640079592548,
+        30.0,
+        30.0
+      ],
+      "port_seed": [
+        -1.1507667476073462,
+        0.5328373589727489,
+        -2.459582671937767,
+        35.57727015721961,
+        -57.6088000434567,
+        582.640079592548,
+        30,
+        30
+      ],
+      "parameter_max_abs": 1.7450426828113648,
+      "score_gap": 2.1756360935043517e-08
+    }
+  ],
+  "output_serialization_mean_ms": 0.1570000171661377,
+  "notes": [
+    "Five independent saved runs; cached cameras are provided to every runtime.",
+    "CPU/native/Node measurements are interleaved; browser measurements are a separate pass.",
+    "Bank order, axes, sources, integer metrics and assignments match within declared float tolerances.",
+    "Coarse tie choices can differ; exact seed solver probes are separate from normal search.",
+    "No app integration, whole-video rollout or ground-truth accuracy claim."
+  ]
+}

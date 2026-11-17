@@ -1,6 +1,7 @@
 node_modules/
 dist/
 public/runtime/
+public/pose/
 public/models/*.onnx
 public/models/*.onnx.data
 public/models/verification.json

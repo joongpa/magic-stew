@@ -74,6 +74,17 @@ def test_geometry_shortlist_counts_hold_once_and_includes_strict_cutoff_ties(ren
     assert scorer._geometry_shortlist(geometry) == expected
 
 
+def test_assignment_unique_bank_keeps_reserved_flat_even_outside_score_cutoff(renderer):
+    scorer = search.PreparedReplayScorer(renderer, {}, 'cpu', geometry_shortlist_size=5)
+    policy = dict(geometry_bank_policy='sticker_assignments_plus_flat', layer_axis=0,
+                  layer_rotations=(), flat_fallback=False)
+    geometry = [dict(policy, combined_mean_error=i*.001) for i in range(5)]
+    geometry.append(dict(policy, flat_fallback=True, combined_mean_error=10.))
+    assert scorer._geometry_shortlist(geometry) == tuple(range(6))
+    scorer.geometry_shortlist_size = 2
+    assert scorer._geometry_shortlist(geometry) == (0, 1, 5)
+
+
 def test_shortlisted_hold_r_and_f_only_score_those_layer_updates(renderer):
     record = observation_record(renderer)
     flat = dict(record['search']['geometry']['options'][0], keypoint_mean_error=.025, heatmap_mean_error=0.)

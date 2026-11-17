@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CPU pose fitter · WASM benchmark</title>
+<style>
+body{font:15px system-ui,sans-serif;background:#111820;color:#e7edf4;max-width:1100px;margin:48px auto;padding:0 24px}h1{font-size:28px;font-weight:650}p{color:#b8c5d3;line-height:1.6}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}td,th{text-align:right;padding:9px 14px;border-bottom:1px solid #2c3845}td:first-child,th:first-child{text-align:left}button{font:inherit;background:#a9e1ce;color:#102920;border:0;border-radius:6px;padding:10px 16px;cursor:pointer}#status{padding:16px 0;color:#a9e1ce}small{color:#9cabbc}.error{color:#ffac9c}
+</style>
+<h1>CPU pose fitter · Rust/WASM</h1>
+<p>Standalone worker, saved detections and cached cameras. Full CPU search and bounded TRF solver.
+One worker processes a buffered FIFO of jobs. Loading, warm-up and JSON output are outside fit timings.</p>
+<button id="start">Run benchmark</button> <small>5 measured passes after warm-up</small>
+<div id="status">Ready</div>
+<table><thead><tr><th>Saved workload</th><th>Python CPU ms</th><th>Native Rust ms</th><th>Browser WASM ms</th><th>Bank size</th></tr></thead><tbody id="rows"></tbody></table>
+<p id="summary"></p>
+<p><small>These are isolated geometry fits. They do not include detection, initial PnP, orientation matching, depth recovery or move search.</small></p>
+<script type="module">
+const button=document.querySelector('#start'),status=document.querySelector('#status');
+button.onclick=async()=>{
+  button.disabled=true;status.textContent='Loading worker and fixtures…';
+  const [fixture,baseline]=await Promise.all([fetch('../fixtures/cpu-reference.json').then(r=>r.json()),fetch('../results/interleaved.json').then(r=>r.json())]);
+  const rows=fixture.workloads.map((w,index)=>{
+    const tr=document.createElement('tr'),b=baseline.cases[index].medians_ms;
+    for(const text of [`${w.name} · ${w.stage} · ${w.frame}`,b.cpu.toFixed(2),b.native.toFixed(2),'…','…']){
+      const td=document.createElement('td');td.textContent=text;tr.append(td);
+    }
+    document.querySelector('#rows').append(tr);return tr;
+  });
+  const worker=new Worker('./worker.mjs',{type:'module'});
+  worker.onerror=e=>{status.textContent=e.message;status.className='error';worker.terminate();};
+  worker.onmessage=async({data})=>{
+    if(data.type==='progress')status.textContent=data.message;
+    if(data.type==='case'){
+      rows[data.index].cells[3].textContent=data.median.toFixed(2);
+      rows[data.index].cells[4].textContent=data.count;
+    }
+    if(data.type==='done'){
+      const result={...data.report,userAgent:navigator.userAgent,hardwareConcurrency:navigator.hardwareConcurrency};
+      const response=await fetch('/api/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(result)});
+      status.textContent=response.ok?'Completed · report saved':'Completed · report could not be saved';
+      document.querySelector('#summary').textContent=`${fixture.workloads.length} workloads completed. ${result.wasmBytes.toLocaleString()} byte module. Projection and identical-seed solver checks are included in the saved report.`;
+      document.body.dataset.complete='true';worker.terminate();
+    }
+  };
+  worker.postMessage({repeats:5});
+};
+</script>
+</html>

@@ -1,4 +1,5 @@
 import { roundEven } from "./preprocess";
+import type { FittedPose } from "./pose-types";
 /** The raw pose object score and keypoint-presence channel remain separate. */
 export interface ModelVariant {
   size: number;
@@ -93,6 +94,15 @@ export interface FrameProfile {
   otherMs: number;
 }
 export interface FrameResult {
+  fittedPose?: FittedPose;
+  pipeline?: {
+    detectorStartedAtMs: number;
+    detectorCompletedAtMs: number;
+    fitStartedAtMs?: number;
+    fitCompletedAtMs?: number;
+    presentedAtMs: number;
+    presentationMs: number;
+  };
   detections: Detection[];
   transform: Transform;
   inferenceMs: number;

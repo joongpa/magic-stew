@@ -147,20 +147,68 @@ def test_targeted_recovery_preserves_baseline_banks_and_neighbors(solved_window,
         assert abs(after.tvec[2, 0]-after.joint_pose_diagnostics['depth_prior_mm']) < 20.
         options = after.joint_geometry_candidates
         scorer = search.PreparedReplayScorer(m, {}, 'cpu', balance_geometry_color=True)
-        assert [scorer._geometry_score(o) for o in options] == sorted(o['recovery_score'] for o in options)
+        ordinary = [o for o in options if not o['flat_fallback']]
+        assert [scorer._geometry_score(o) for o in ordinary] == sorted(o['recovery_score'] for o in ordinary)
+        assert options[-1]['flat_fallback'] and not options[-1]['layer_rotations']
     assert changed == [573, 574, 575]
 
 
-def test_recovers_matty_d_without_axis_hint_and_keeps_own_cameras(fits):
-    assert len(fits) >= 5
+def test_recovers_matty_d_assignments_without_axis_hint(observation, monkeypatch):
+    pool = []
+    select = geometry.assignment_shortlist
+
+    def capture(renderer, candidates, **kwargs):
+        pool.extend(candidates)
+        return select(renderer, candidates, **kwargs)
+
+    monkeypatch.setattr(geometry, 'assignment_shortlist', capture)
+    fits = geometry.fit_frame(m, observation[0])
+    assert len(fits) <= 6
     assert all(fit.angles[1] == 0 for fit in fits)
     # The saved successful diagnostic was .1532; the old omitted D was .8056.
-    correct = [fit for fit in fits if fit.axis == 2 and -29 < fit.angles[0] < -18
+    correct = [fit for fit in pool if fit.axis == 2 and -29 < fit.angles[0] < -18
                and abs(fit.angles[2]) < .5]
     assert correct and min(f.score for f in correct) < .18
     assert fits[0].score < .18
-    assert len({tuple(f.candidate.rvec.ravel()) for f in fits}) >= 5
-    assert max(f.score for f in fits) < fits[4].score+.01
+    reference = cv2.Rodrigues(fits[0].candidate.rvec)[0]
+    expected = geometry.sticker_assignment_signature(m, min(correct, key=lambda f: f.score), reference)
+    assert expected in {geometry.sticker_assignment_signature(m, f, reference) for f in fits[:-1]}
+    assert fits[-1].flat_fallback and fits[-1].angles == (0., 0., 0.)
+
+
+def test_assignment_bank_has_five_unique_rows_plus_unconditional_flat(observation):
+    base = geometry._materialize(m, observation[0], 0, np.r_[
+        observation[0].rvec.ravel(), observation[0].tvec.ravel(), -15., 0.])
+    candidates = []
+    for index in range(7):
+        candidates.append(replace(base, nearest=np.array([index, 0]), valid=np.array([True, False]),
+                                  score=index*.01))
+    # A different invalid placeholder and different slab angles are not new assignments.
+    candidates.append(replace(candidates[0], nearest=np.array([0, 53]), angles=(30., 0., 0.), score=.001))
+    flat = replace(base, angles=(0., 0., 0.), score=10.,
+                   nearest=np.array([0, 0]), valid=np.array([True, False]))
+    bank = geometry.assignment_shortlist(m, [*candidates, flat])
+    assert len(bank) == 6
+    assert [f.score for f in bank[:5]] == [i*.01 for i in range(5)]
+    assert len({geometry.sticker_assignment_signature(m, f, cv2.Rodrigues(base.candidate.rvec)[0])
+                for f in bank[:5]}) == 5
+    assert bank[-1].flat_fallback and bank[-1].angles == (0., 0., 0.)
+    assert bank[-1].score == 10.  # The fallback ignores the score cutoff.
+
+
+def test_assignment_bank_collapses_symmetry_relabeling_but_keeps_validity_changes(observation):
+    base = geometry._materialize(m, observation[0], 0, np.r_[
+        observation[0].rvec.ravel(), observation[0].tvec.ravel(), -15., 0.])
+    base = replace(base, nearest=np.array([0, 8]), valid=np.array([True, False]), score=0.)
+    reference = cv2.Rodrigues(base.candidate.rvec)[0]
+    variants = [base]
+    for symmetry, permutation in zip(m.CUBE_SYMMETRY_MATRICES, geometry._sticker_symmetry_permutations(m)):
+        renamed = replace(base.candidate, rvec=cv2.Rodrigues(reference @ symmetry)[0])
+        variants.append(replace(base, candidate=renamed, nearest=np.argsort(permutation)[base.nearest], score=.001))
+    changed = replace(base, valid=np.array([True, True]), score=.002)
+    bank = geometry.assignment_shortlist(m, [*variants, changed])
+    assert len(bank) == 2  # No padding, and no flat candidate was supplied to this selector.
+    assert bank[0].score == 0. and bank[1].score == .002
 
 
 def test_every_axis_evaluates_the_complete_angle_grid(observation, monkeypatch):
@@ -207,12 +255,21 @@ def test_good_sweep_measurements_survive_bad_refinement(observation, monkeypatch
     assert fits[0].proposal_source == 'angle_sweep'
 
 
-def test_matty425_d_only_fit_is_generated_from_exhaustive_sweep(observation):
+def test_matty425_d_only_fit_is_generated_from_exhaustive_sweep(observation, monkeypatch):
     record = json.loads((Path(__file__).parent/'fixtures/matty425-observations.json').read_text())
     candidate = playback.candidate_for_step(m, record, None, m.CubeGeometryState.identity(), observation[1])
+    pool = []
+    select = geometry.assignment_shortlist
+    def capture(renderer, candidates, **kwargs):
+        pool.extend(candidates)
+        return select(renderer, candidates, **kwargs)
+    monkeypatch.setattr(geometry, 'assignment_shortlist', capture)
     fits = geometry.fit_frame(m, candidate)
-    correct = [f for f in fits if f.axis == 2 and -32 < f.angles[0] < -27 and f.angles[2] == 0.]
+    correct = [f for f in pool if f.axis == 2 and -32 < f.angles[0] < -27 and f.angles[2] == 0.]
     assert correct and min(f.score for f in correct) < .08
+    reference = cv2.Rodrigues(fits[0].candidate.rvec)[0]
+    key = geometry.sticker_assignment_signature(m, min(correct, key=lambda f: f.score), reference)
+    assert key in {geometry.sticker_assignment_signature(m, f, reference) for f in fits[:-1]}
 
 
 def test_nearby_angle_solutions_share_a_pose_slot(observation):
@@ -300,6 +357,8 @@ def test_cached_options_skip_all_projection_during_state_exploration(observation
     state = scorer.key(m.CubeGeometryState.identity())
     compiled = scorer.prepare(469)
     assert compiled['projection_count'] == len(fits)
+    assert len(fits)-1 in compiled['selected_geometry_indices']
+    assert options[-1]['flat_fallback']
     choices = scorer(469, state)
     assert choices
     for choice in choices:

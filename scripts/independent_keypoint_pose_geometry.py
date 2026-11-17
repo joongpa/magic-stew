@@ -4,6 +4,7 @@ No cube moves or sticker states are inferred here. Each axis gets independent
 pose/angle refinement before the geometry-only shortlist is selected.
 """
 from dataclasses import dataclass, replace
+from functools import lru_cache
 import math
 
 import cv2
@@ -21,6 +22,7 @@ class PoseFit:
     valid: np.ndarray | None
     score: float
     proposal_source: str = 'angle_sweep'
+    flat_fallback: bool = False
 
 
 class ArticulatedProjection:
@@ -445,9 +447,59 @@ def diverse_shortlist(renderer, fits, size=5, tolerance=.01):
     return [fit for fit in ranked if fit.score < cutoff]
 
 
+@lru_cache(maxsize=4)
+def _sticker_symmetry_permutations(renderer):
+    """Map source face IDs into each relabeled cube frame."""
+    centers = np.asarray(renderer._turn_gpu_static_geometry()[2]).mean(axis=1)
+    symmetries = np.asarray(renderer.CUBE_SYMMETRY_MATRICES)
+    transformed = np.einsum('sij,nj->sni', symmetries, centers)
+    distances = np.linalg.norm(transformed[:, :, None]-centers[None, None], axis=-1)
+    return distances.argmin(axis=-1)
+
+
+def sticker_assignment_signature(renderer, fit, reference):
+    """One face ID (or -1 for unassigned) per observed sticker keypoint."""
+    rotation = cv2.Rodrigues(fit.candidate.rvec)[0]
+    symmetries = np.asarray(renderer.CUBE_SYMMETRY_MATRICES)
+    alternatives = rotation @ symmetries.transpose(0, 2, 1)
+    index = int(np.argmax(np.einsum('nij,ij->n', alternatives, reference)))
+    nearest = np.asarray(fit.nearest, dtype=np.intp)
+    valid = np.asarray(fit.valid, dtype=bool)
+    if nearest.shape != valid.shape or nearest.ndim != 1:
+        raise ValueError('Assignment selection requires materialized sticker assignments')
+    return tuple(np.where(valid, _sticker_symmetry_permutations(renderer)[index, nearest], -1))
+
+
+def assignment_shortlist(renderer, fits, size=5):
+    """Best five assignment patterns, followed by a reserved zero-angle fit.
+
+    The flat fallback is outside the uniqueness quota, even if its assignment
+    pattern or pose is already represented. Never pad missing patterns with
+    duplicates. Seed/sweep diversity still uses diverse_shortlist above.
+    """
+    ranked = sorted((replace(fit, flat_fallback=False) for fit in fits
+                     if fit is not None and math.isfinite(fit.score)),
+                    key=lambda fit: (fit.score, fit.axis, fit.angles))
+    if not ranked:
+        return []
+    reference = cv2.Rodrigues(ranked[0].candidate.rvec)[0]
+    selected, signatures = [], set()
+    for fit in ranked:
+        signature = sticker_assignment_signature(renderer, fit, reference)
+        if signature not in signatures:
+            signatures.add(signature)
+            selected.append(fit)
+            if len(selected) == size:
+                break
+    flat = next((fit for fit in ranked if not any(fit.angles)), None)
+    if flat is not None:
+        selected.append(replace(flat, flat_fallback=True))
+    return selected
+
+
 def fit_frame(renderer, candidate, *, static=False, prior=None, neighbors=(), retained=(), sweep_device='cpu',
               refinement_device='cpu'):
-    """Sweep all angles, refine diverse slab hypotheses, then retain five fits.
+    """Sweep/refine, retain five unique sticker assignments and a flat fallback.
 
     A temporal call supplies retained fits and sweeps only the new neighboring
     cameras. The original camera sweep and its refinement are not repeated.
@@ -465,7 +517,7 @@ def fit_frame(renderer, candidate, *, static=False, prior=None, neighbors=(), re
         seed = np.r_[base.rvec.ravel(), base.tvec.ravel(), 0., 0.]
         fit = _materialize(renderer, base, 0, _refine(ArticulatedProjection(renderer, base, 0),
             seed, fixed_angles=(0., 0.), prior=prior_parameters))
-        return [fit] if fit is not None else []
+        return [replace(fit, flat_fallback=True)] if fit is not None else []
     cameras = tuple(neighbors) if retained else (base, *neighbors)
     models = {axis: ArticulatedProjection(renderer, base, axis) for axis in range(3)}
     proposals, seeds = [], []
@@ -506,13 +558,14 @@ def fit_frame(renderer, candidate, *, static=False, prior=None, neighbors=(), re
         revised = _materialize(renderer, base, fit.axis, parameters)
         if revised is not None:
             fits.append(replace(revised, proposal_source='angle_sweep_refined'))
-    return diverse_shortlist(renderer, fits)
+    return assignment_shortlist(renderer, fits)
 
 
 def projection_option(renderer, fit):
     """Serializable, candidate-specific pose and projection cache for search."""
     result = renderer.turn_trial_log_payload(fit.option)
     result.update(joint_pose_fit=True, pose_rvec=fit.candidate.rvec.tolist(),
+        geometry_bank_policy='sticker_assignments_plus_flat', flat_fallback=fit.flat_fallback,
         pose_proposal_source=fit.proposal_source,
         pose_tvec=fit.candidate.tvec.tolist(),
         cached_sticker_indices=fit.nearest.tolist(), cached_sticker_valid=fit.valid.tolist(),
@@ -534,10 +587,11 @@ def orient_fits(renderer, fits, colors, tracker, frame, fps):
         result.append(_materialize(renderer, oriented, axis, parameters))
         if result[-1] is not None:
             result[-1].proposal_source = fit.proposal_source
+            result[-1].flat_fallback = fit.flat_fallback
             result[-1].candidate = replace(result[-1].candidate,
                 pose_continuity_diagnostics=oriented.pose_continuity_diagnostics,
                 orientation_axis_center_labels=oriented.orientation_axis_center_labels)
-    return diverse_shortlist(renderer, result)
+    return assignment_shortlist(renderer, result)
 
 
 def depth_fallback_reason(candidate, target, spatial_outliers=0):
@@ -617,7 +671,7 @@ def apply_depth_fallback(renderer, cache, originals, args, depth_targets):
                 fit.option.update(depth_fallback=True, recovery_source=name,
                     recovery_score=fit.score)
                 fits.append(fit)
-        retained = diverse_shortlist(renderer, fits)
+        retained = assignment_shortlist(renderer, fits)
         if not retained:
             continue
         options = tuple(projection_option(renderer, fit) for fit in retained)

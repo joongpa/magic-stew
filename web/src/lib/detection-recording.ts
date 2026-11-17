@@ -61,6 +61,15 @@ export class DetectionRecording {
         "result.cube.score":
           "Separate cube bbox detector score from the last acquisition",
       },
+      fittingFields: {
+        "result.fittedPose.stage": "cpu_pipeline means startup, initial, neighbors, orientation and recovery are complete",
+        "result.fittedPose.pipelineVersion": "Content-addressed Rust/WASM asset loaded by the fitter",
+        "result.fittedPose.fittingConfig": "Frame sequence configuration and buffered fitting segment for standalone replay",
+        "result.fittedPose.bank[].score": "Balanced geometry cost; lower is better, not a detector confidence",
+        "result.fittedPose.bank[].nearest": "Projected sticker-face ID for each observed sticker keypoint",
+        "result.fittedPose.bank[].valid": "Whether that sticker keypoint has an eligible projected-face assignment",
+        "result.fittedPose.bank[].flat_fallback": "Reserved zero-angle option outside the five assignment-distinct slots",
+      },
       sources: [...this.sources.values()],
       frames: this.frames,
     };

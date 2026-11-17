@@ -28,14 +28,82 @@ count. Threading requires cross-origin isolation; without it, CPU mode runs
 single-threaded and the viewer reports that limitation. Changing backend finishes the current
 frame, retains queued source frames, and restarts both model sessions.
 
-WebGPU now preprocesses camera/video frames on the GPU as well as running the
-models. Still images retain CPU pixel preprocessing to preserve canvas alpha
-conversion exactly; their selected inference backend is unchanged. WASM retains
-the CPU preprocessing kernels for all sources.
+## Fitted-pose preview
 
-Generated models are already present in this workspace. A fresh checkout needs
-the export below. The dev/build scripts copy the matching ONNX Runtime bootstrap
-from the installed package; no runtime CDN or external font service is used.
+Enable **Show fitted pose** in the sidebar to run the Rust/WASM geometry fitter
+and display its best-fit wireframe. It is off by default. Landmark/sticker
+points remain hidden, and each frame is presented only after its matching fit
+and overlay are complete. Saved detection data also includes `fittedPose`, its
+candidate bank, sticker assignments, mesh, and fitting time when enabled.
+
+Detection and fitting overlap through a CPU worker pool (up to three workers).
+The app uses the complete validated CPU pipeline: OpenCV sticker/PnP startup,
+initial geometry, immutable-neighbor refinement, color/continuity orientation,
+and sparse depth/outlier recovery. Initial priors and orientation advance in
+source order. Recovery buffers 180 ms of future source time. A twelve-frame
+presentation queue applies backpressure without replacing admitted frames.
+Each queued frame owns its raw canvas; rendering and saving happen in source
+order after that frame's complete fit. Pause/model changes/seek flush the
+available tail context; resuming starts a new fitting segment. Source replacement
+invalidates old work. ROI reacquisition alone does not reset pose history.
+
+Completed video results are retained for the loaded file. Scrubbing snaps to the
+nearest completed selected frame, decodes its pixels, and presents the saved
+detections and full fitted pose without rerunning either worker. Playback through
+cached frames also reuses results and does not append duplicate recording rows.
+The viewer labels these as **Showing saved result**. Fitted results remain reusable
+when their overlay is hidden. Cache entries are separated
+by model size, inference backend, thresholds, ROI padding and fitting mode;
+unprocessed frames still run normally. Only results are retained, not full video
+canvases. Clear, replacing the source or reloading the page releases this cache;
+the JSON download remains available for saving results to disk.
+
+The sidebar reports CPU computation and draw/presentation time separately. CPU
+computation sums all numerical jobs for that frame; it excludes queueing and
+lookahead waiting, and can exceed the frame interval because workers overlap.
+Downloaded results include main-thread `pipeline` timestamps, `fittedPose.stage`
+(`cpu_pipeline`), the content-addressed WASM version, source frame index and
+fitting segment/configuration for standalone replay. FPS measures presentation
+throughput over a window so simultaneous completions do not inflate it.
+
+Build the complete fitter from the repository root before starting/building the
+app. See [the fitter build instructions](../pose-fitter/README.md#build-and-run-without-the-app)
+for building the OpenCV helper first, using official OpenCV/Emscripten sources.
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo build --release --locked --target wasm32-unknown-unknown --lib \
+  --features cpu-pipeline --target-dir pose-fitter/target/parity-wasm \
+  --manifest-path pose-fitter/Cargo.toml
+```
+
+`npm run dev` / `npm run build` copy both WASM modules and cube geometry into
+`public/pose/` with content hashes and a `pipeline.json` manifest. There is no
+runtime CDN or pose-fitting server. Missing complete-pipeline assets produce a
+visible error. The worker does not fall back to the older quad preview.
+
+The pipeline uses the scripts' 55 mm cube and centered pinhole camera
+(`focal = 1.2 * max(width, height)`). The app supplies the actual ROI pixel scale,
+filtered detections, separate landmark-presence values and sticker color names.
+The app has no configured static-hold boundary; all frames use articulated
+search. Diagnostics can specify a boundary. Move search is outside the overlay.
+
+Numerical stages live in Rust; scheduling lives in the framework-independent
+`pose-fitter/runtime/buffered-pipeline.mjs`. Both run without Svelte. To verify
+streaming against batch fitting or replay a downloaded browser recording:
+
+```sh
+node pose-fitter/tools/check-buffered-pipeline.mjs \
+  pose-fitter/fixtures/full-pipeline/matty.json pose-fitter/results/matty-stream-check.json
+web/node_modules/.bin/tsx pose-fitter/tools/check-browser-recording.mts \
+  /absolute/path/cube-detections.json pose-fitter/results/browser-recording-check.json
+```
+
+The buffered scheduler matches the complete batch banks and recovery flags on
+all 1,247 saved frames across five solves. The batch pipeline's six accepted
+Python winner differences remain documented in the fitter report; this is not a
+claim that fresh WebGPU detections equal cached Python detections. The earlier
+initial-only preview's ~29 fps timing does not describe this complete pipeline.
 
 ## Export both models
 
@@ -130,7 +198,8 @@ while inference processes the current frame.
 A slow frame delays playback; it does not cause selected frames to be skipped.
 Playback is paced to the source frame rate, capped at 30fps, and the viewer shows
 an actual processed-frame count. Mediabunny loads only when opening a video file.
-Seeking starts a new processing segment and resets the count.
+Seeking resets the processing count. Completed frames use their saved results;
+unprocessed regions start a new fitting segment.
 
 Camera capture runs independently in a worker through MediaStreamTrackProcessor.
 The camera is requested at no more than 30fps. Selected frames are copied out of

@@ -1,0 +1,63 @@
+{
+  "scope": "Buffered CPU scheduler versus complete batch banks and recovery flags; actual browser recording replay uses identical saved inputs",
+  "saved_solve_replays": [
+    {
+      "name": "matty",
+      "frames": 289,
+      "differing_frames": []
+    },
+    {
+      "name": "nahm",
+      "frames": 384,
+      "differing_frames": []
+    },
+    {
+      "name": "xuanyi",
+      "frames": 235,
+      "differing_frames": []
+    },
+    {
+      "name": "tommy",
+      "frames": 221,
+      "differing_frames": []
+    },
+    {
+      "name": "yiheng",
+      "frames": 118,
+      "differing_frames": []
+    }
+  ],
+  "total_saved_frames": 1247,
+  "browser_recording": {
+    "recording": "pose-fitter/results/matty-browser-complete.json",
+    "checked": 317,
+    "segments": [
+      {
+        "segment": "1/1/1",
+        "frames": 317,
+        "first": 0,
+        "last": 632
+      }
+    ],
+    "expectedVersion": "cpu-pipeline.6384ead138dcf232.wasm",
+    "differingFrames": []
+  },
+  "browser_cache_check": {
+    "source": "mattySolve.mov",
+    "completed_frames": 317,
+    "scrubbed_source_frames": [
+      392,
+      394
+    ],
+    "new_processed_frames_after_scrub": 0,
+    "recorded_rows_after_cached_replay": 317,
+    "cache_lifetime": "loaded source in current tab",
+    "retains_video_canvases": false,
+    "download_after_cached_replay": "pose-fitter/results/matty-browser-cached.json"
+  },
+  "validation": {
+    "web_tests": 62,
+    "rust_tests": 12,
+    "production_build": "passed"
+  }
+}

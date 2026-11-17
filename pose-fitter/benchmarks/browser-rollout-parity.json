@@ -1,0 +1,1731 @@
+{
+  "scope": "Audit autonomous browser tracking against the saved Python geometry render.\n\nReplay already-filtered detections, with no saved cameras fed to the browser\nrollout. Warm up from the available clip prefix, sample by source time exactly\nas FrameSelector does, and measure the solve window. The fixed-camera control\nand isolated neighbor-pass experiment are explicitly separate from the app.\nThis compares with logged geometry option zero, not ground truth or move-search\nselection. Missing saved observations are reported, not reconstructed.\n",
+  "selection": "FrameSelector source-time buckets, 30 fps cap, clip origin frame 0",
+  "assignment_comparison": "Sticker-face IDs aligned by the closest global cube symmetry, including assigned/unassigned status; not raw IDs or a pixel-distance gate",
+  "limitations": [
+    "Reference is logged geometry option zero, not final move-search selection or ground truth",
+    "Replay uses saved filtered detections, not fresh detector inference or ROI-reset events",
+    "Unavailable saved observations are skipped and reported",
+    "Neighbor experiment is isolated and not connected to the app",
+    "Fixed-camera control changes the seed only; it is not a Python/Rust solver parity test"
+  ],
+  "source_sha256": {
+    "pose-fitter/src/browser.rs": "726068ef162735bdb6386d332abcbbe4df384544238b37d049cbeca5b8d49282",
+    "pose-fitter/src/search.rs": "a0d73a4095648c7b0d4a82b977ea39c5c476ac236f5e91bfb89596fddaf226c5",
+    "web/src/lib/pose.worker.ts": "a883cd95cc198401bcb3ee209de28057c0bcec5c3fbdfe683b8c4c9958a7ec72",
+    "web/src/lib/frame-stream.ts": "3bad8523e02476e5a293ec5aa5ca5a5912b51488e5c2ea3de77f2a5ebe81187d"
+  },
+  "cases": [
+    {
+      "name": "matty",
+      "log": "/Users/jeffpark/Documents/LiveRecognition/runs/matty-exhaustive-center08/observations.jsonl",
+      "log_sha256": "d9a0b59bf716e1db7a3ba03240eb4eae8f407d6fb3eac733dedaf169382e932c",
+      "source_fps": 59.9525243578388,
+      "start": 380,
+      "end": 576,
+      "available_prefix_frames": 190,
+      "unavailable_saved_observation_frames": [],
+      "wasm_sha256": "240b54a0b2a350c7b2b04f7509f19c0490b61dc768b48a69145be0aef8be5fd2",
+      "fixture_sha256": "815dd7d459b59ac33bf245d1ef9878e6f640daf4a09b9b679385003eb4e960cc",
+      "stages": {
+        "browser": {
+          "frames": 99,
+          "missing_fits": 0,
+          "differing_frames": 21,
+          "differing_keypoints": 182,
+          "assignment_absent_from_bank": 20,
+          "worst": [
+            {
+              "frame": 520,
+              "sticker_count": 27,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 23,
+              "sticker_assignment_raw_changes": 27,
+              "sticker_validity_changes": 2,
+              "sticker_symmetry_index": 2
+            },
+            {
+              "frame": 508,
+              "sticker_count": 23,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 20,
+              "sticker_assignment_raw_changes": 23,
+              "sticker_validity_changes": 4,
+              "sticker_symmetry_index": 1
+            },
+            {
+              "frame": 518,
+              "sticker_count": 24,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 19,
+              "sticker_assignment_raw_changes": 24,
+              "sticker_validity_changes": 3,
+              "sticker_symmetry_index": 1
+            },
+            {
+              "frame": 506,
+              "sticker_count": 19,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 16,
+              "sticker_assignment_raw_changes": 19,
+              "sticker_validity_changes": 3,
+              "sticker_symmetry_index": 10
+            },
+            {
+              "frame": 576,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 13,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 23
+            },
+            {
+              "frame": 486,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 12,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 13
+            },
+            {
+              "frame": 498,
+              "sticker_count": 11,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 11,
+              "sticker_assignment_raw_changes": 11,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 14
+            },
+            {
+              "frame": 472,
+              "sticker_count": 9,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 9,
+              "sticker_assignment_raw_changes": 9,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 3
+            },
+            {
+              "frame": 570,
+              "sticker_count": 19,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 9,
+              "sticker_assignment_raw_changes": 19,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 13
+            },
+            {
+              "frame": 556,
+              "sticker_count": 21,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 7,
+              "sticker_assignment_raw_changes": 21,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 13
+            }
+          ]
+        },
+        "revised": {
+          "frames": 99,
+          "missing_fits": 0,
+          "differing_frames": 6,
+          "differing_keypoints": 22,
+          "assignment_absent_from_bank": 5,
+          "worst": [
+            {
+              "frame": 576,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 13,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 23
+            },
+            {
+              "frame": 498,
+              "sticker_count": 11,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 11,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 14
+            },
+            {
+              "frame": 574,
+              "sticker_count": 8,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 7,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 13
+            },
+            {
+              "frame": 380,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 11
+            },
+            {
+              "frame": 542,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 17,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 13
+            },
+            {
+              "frame": 572,
+              "sticker_count": 6,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 6,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 5
+            },
+            {
+              "frame": 382,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 10,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 11
+            },
+            {
+              "frame": 384,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 10,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 11
+            },
+            {
+              "frame": 386,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 10,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 11
+            },
+            {
+              "frame": 388,
+              "sticker_count": 14,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 14,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 11
+            }
+          ]
+        },
+        "fixed": {
+          "frames": 99,
+          "missing_fits": 0,
+          "differing_frames": 4,
+          "differing_keypoints": 6,
+          "assignment_absent_from_bank": 2,
+          "worst": [
+            {
+              "frame": 574,
+              "sticker_count": 8,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 3,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 380,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 390,
+              "sticker_count": 15,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 504,
+              "sticker_count": 12,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 382,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 384,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 386,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 388,
+              "sticker_count": 14,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 392,
+              "sticker_count": 18,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 394,
+              "sticker_count": 24,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "nahm",
+      "log": "/Users/jeffpark/Documents/LiveRecognition/runs/split-tps-40-50-validation/nahm/observations.jsonl",
+      "log_sha256": "b9cd441a69a4bdfc19d7a9febb93b821ee29156eefd997ee42d6244c1421ad65",
+      "source_fps": 60.0,
+      "start": 493,
+      "end": 767,
+      "available_prefix_frames": 247,
+      "unavailable_saved_observation_frames": [],
+      "wasm_sha256": "240b54a0b2a350c7b2b04f7509f19c0490b61dc768b48a69145be0aef8be5fd2",
+      "fixture_sha256": "aa806fc79336df869385984dab69e31d1ca6a10f4357e2fb7c63f4bb50d58ad7",
+      "stages": {
+        "browser": {
+          "frames": 137,
+          "missing_fits": 0,
+          "differing_frames": 32,
+          "differing_keypoints": 162,
+          "assignment_absent_from_bank": 26,
+          "worst": [
+            {
+              "frame": 752,
+              "sticker_count": 21,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 17,
+              "sticker_assignment_raw_changes": 6,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 11
+            },
+            {
+              "frame": 504,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 14,
+              "sticker_assignment_raw_changes": 15,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 13
+            },
+            {
+              "frame": 500,
+              "sticker_count": 16,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 12,
+              "sticker_assignment_raw_changes": 16,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 17
+            },
+            {
+              "frame": 706,
+              "sticker_count": 19,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 12,
+              "sticker_assignment_raw_changes": 18,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 2
+            },
+            {
+              "frame": 728,
+              "sticker_count": 15,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 12,
+              "sticker_assignment_raw_changes": 15,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 11
+            },
+            {
+              "frame": 660,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 10,
+              "sticker_assignment_raw_changes": 10,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 4
+            },
+            {
+              "frame": 726,
+              "sticker_count": 14,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 10,
+              "sticker_assignment_raw_changes": 14,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 11
+            },
+            {
+              "frame": 662,
+              "sticker_count": 16,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 8,
+              "sticker_assignment_raw_changes": 16,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 2
+            },
+            {
+              "frame": 524,
+              "sticker_count": 12,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 6,
+              "sticker_assignment_raw_changes": 12,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 23
+            },
+            {
+              "frame": 708,
+              "sticker_count": 22,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 6,
+              "sticker_assignment_raw_changes": 22,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 2
+            }
+          ]
+        },
+        "revised": {
+          "frames": 137,
+          "missing_fits": 0,
+          "differing_frames": 17,
+          "differing_keypoints": 79,
+          "assignment_absent_from_bank": 12,
+          "worst": [
+            {
+              "frame": 752,
+              "sticker_count": 21,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 17,
+              "sticker_assignment_raw_changes": 6,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 11
+            },
+            {
+              "frame": 500,
+              "sticker_count": 16,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 12,
+              "sticker_assignment_raw_changes": 16,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 17
+            },
+            {
+              "frame": 706,
+              "sticker_count": 19,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 12,
+              "sticker_assignment_raw_changes": 18,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 2
+            },
+            {
+              "frame": 630,
+              "sticker_count": 11,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 8,
+              "sticker_assignment_raw_changes": 11,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 2
+            },
+            {
+              "frame": 662,
+              "sticker_count": 16,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 7,
+              "sticker_assignment_raw_changes": 16,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 2
+            },
+            {
+              "frame": 504,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 17,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 13
+            },
+            {
+              "frame": 586,
+              "sticker_count": 15,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 15,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 2
+            },
+            {
+              "frame": 700,
+              "sticker_count": 12,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 12,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 2
+            },
+            {
+              "frame": 714,
+              "sticker_count": 15,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 15,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 6
+            },
+            {
+              "frame": 750,
+              "sticker_count": 15,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 14,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 11
+            }
+          ]
+        },
+        "fixed": {
+          "frames": 137,
+          "missing_fits": 0,
+          "differing_frames": 6,
+          "differing_keypoints": 24,
+          "assignment_absent_from_bank": 3,
+          "worst": [
+            {
+              "frame": 706,
+              "sticker_count": 19,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 12,
+              "sticker_assignment_raw_changes": 12,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 666,
+              "sticker_count": 14,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 6,
+              "sticker_assignment_raw_changes": 6,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 560,
+              "sticker_count": 12,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 2,
+              "sticker_assignment_raw_changes": 2,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 632,
+              "sticker_count": 14,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 2,
+              "sticker_assignment_raw_changes": 2,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 618,
+              "sticker_count": 15,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 648,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 494,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 496,
+              "sticker_count": 12,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 498,
+              "sticker_count": 11,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 500,
+              "sticker_count": 16,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "xuanyi",
+      "log": "/Users/jeffpark/Documents/LiveRecognition/runs/split-tps-40-50-validation/xuanyi/observations.jsonl",
+      "log_sha256": "cfa62ca09dd7ab8c648de2e33d73242a8402dd5ea3c713253ea72c9d30f9b95b",
+      "source_fps": 23.976023976023978,
+      "start": 176,
+      "end": 234,
+      "available_prefix_frames": 176,
+      "unavailable_saved_observation_frames": [],
+      "wasm_sha256": "240b54a0b2a350c7b2b04f7509f19c0490b61dc768b48a69145be0aef8be5fd2",
+      "fixture_sha256": "7eb5d142f863cdce807d67611af76779e0f2e7137a49fc4f333e7f0a3630e72f",
+      "stages": {
+        "browser": {
+          "frames": 59,
+          "missing_fits": 0,
+          "differing_frames": 25,
+          "differing_keypoints": 124,
+          "assignment_absent_from_bank": 22,
+          "worst": [
+            {
+              "frame": 179,
+              "sticker_count": 21,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 20,
+              "sticker_assignment_raw_changes": 21,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 11
+            },
+            {
+              "frame": 217,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 16,
+              "sticker_assignment_raw_changes": 17,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 15
+            },
+            {
+              "frame": 234,
+              "sticker_count": 15,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 14,
+              "sticker_assignment_raw_changes": 15,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 4
+            },
+            {
+              "frame": 230,
+              "sticker_count": 14,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 11,
+              "sticker_assignment_raw_changes": 14,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 5
+            },
+            {
+              "frame": 232,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 9,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 5
+            },
+            {
+              "frame": 231,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 7,
+              "sticker_assignment_raw_changes": 10,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 5
+            },
+            {
+              "frame": 192,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 5,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 4
+            },
+            {
+              "frame": 229,
+              "sticker_count": 20,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 5,
+              "sticker_assignment_raw_changes": 20,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 5
+            },
+            {
+              "frame": 196,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 4,
+              "sticker_assignment_raw_changes": 17,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 4
+            },
+            {
+              "frame": 202,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 4,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 4
+            }
+          ]
+        },
+        "revised": {
+          "frames": 59,
+          "missing_fits": 0,
+          "differing_frames": 18,
+          "differing_keypoints": 65,
+          "assignment_absent_from_bank": 14,
+          "worst": [
+            {
+              "frame": 179,
+              "sticker_count": 21,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 17,
+              "sticker_assignment_raw_changes": 21,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 11
+            },
+            {
+              "frame": 183,
+              "sticker_count": 14,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 5,
+              "sticker_assignment_raw_changes": 5,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 192,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 5,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 4
+            },
+            {
+              "frame": 186,
+              "sticker_count": 15,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 4,
+              "sticker_assignment_raw_changes": 15,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 15
+            },
+            {
+              "frame": 202,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 4,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 4
+            },
+            {
+              "frame": 231,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 4,
+              "sticker_assignment_raw_changes": 10,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 4
+            },
+            {
+              "frame": 178,
+              "sticker_count": 18,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 18,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 9
+            },
+            {
+              "frame": 204,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 10,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 15
+            },
+            {
+              "frame": 225,
+              "sticker_count": 8,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 8,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 4
+            },
+            {
+              "frame": 230,
+              "sticker_count": 14,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 14,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 4
+            }
+          ]
+        },
+        "fixed": {
+          "frames": 59,
+          "missing_fits": 0,
+          "differing_frames": 4,
+          "differing_keypoints": 24,
+          "assignment_absent_from_bank": 1,
+          "worst": [
+            {
+              "frame": 179,
+              "sticker_count": 21,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 14,
+              "sticker_assignment_raw_changes": 14,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 231,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 4,
+              "sticker_assignment_raw_changes": 4,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 178,
+              "sticker_count": 18,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 3,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 200,
+              "sticker_count": 18,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 3,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 176,
+              "sticker_count": 18,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 177,
+              "sticker_count": 18,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 180,
+              "sticker_count": 18,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 181,
+              "sticker_count": 9,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 182,
+              "sticker_count": 9,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 183,
+              "sticker_count": 14,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "tommy",
+      "log": "/Users/jeffpark/Documents/LiveRecognition/runs/split-tps-40-50-validation/tommy-short-fresh/observations.jsonl",
+      "log_sha256": "282854bd4a267eaa6a0be78a817d736093073adbfadc988655455823ec8a71af",
+      "source_fps": 59.966846900356515,
+      "start": 49,
+      "end": 441,
+      "available_prefix_frames": 25,
+      "unavailable_saved_observation_frames": [],
+      "wasm_sha256": "240b54a0b2a350c7b2b04f7509f19c0490b61dc768b48a69145be0aef8be5fd2",
+      "fixture_sha256": "b9fdb4d0d75c3ea4081e16a8fd605cbe6d66f1dba3f6ee72c0827e522049cf17",
+      "stages": {
+        "browser": {
+          "frames": 196,
+          "missing_fits": 0,
+          "differing_frames": 37,
+          "differing_keypoints": 235,
+          "assignment_absent_from_bank": 27,
+          "worst": [
+            {
+              "frame": 58,
+              "sticker_count": 21,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 21,
+              "sticker_assignment_raw_changes": 21,
+              "sticker_validity_changes": 2,
+              "sticker_symmetry_index": 22
+            },
+            {
+              "frame": 56,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 16,
+              "sticker_assignment_raw_changes": 17,
+              "sticker_validity_changes": 2,
+              "sticker_symmetry_index": 9
+            },
+            {
+              "frame": 64,
+              "sticker_count": 16,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 16,
+              "sticker_assignment_raw_changes": 16,
+              "sticker_validity_changes": 3,
+              "sticker_symmetry_index": 17
+            },
+            {
+              "frame": 134,
+              "sticker_count": 15,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 15,
+              "sticker_assignment_raw_changes": 15,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 16
+            },
+            {
+              "frame": 60,
+              "sticker_count": 20,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 14,
+              "sticker_assignment_raw_changes": 20,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 9
+            },
+            {
+              "frame": 434,
+              "sticker_count": 16,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 14,
+              "sticker_assignment_raw_changes": 14,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 420,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 13,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 344,
+              "sticker_count": 14,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 12,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 15
+            },
+            {
+              "frame": 62,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 11,
+              "sticker_assignment_raw_changes": 17,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 9
+            },
+            {
+              "frame": 280,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 11,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 16
+            }
+          ]
+        },
+        "revised": {
+          "frames": 196,
+          "missing_fits": 0,
+          "differing_frames": 19,
+          "differing_keypoints": 105,
+          "assignment_absent_from_bank": 13,
+          "worst": [
+            {
+              "frame": 58,
+              "sticker_count": 21,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 19,
+              "sticker_assignment_raw_changes": 21,
+              "sticker_validity_changes": 2,
+              "sticker_symmetry_index": 22
+            },
+            {
+              "frame": 56,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 17,
+              "sticker_assignment_raw_changes": 17,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 5
+            },
+            {
+              "frame": 434,
+              "sticker_count": 16,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 14,
+              "sticker_assignment_raw_changes": 14,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 346,
+              "sticker_count": 12,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 11,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 15
+            },
+            {
+              "frame": 76,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 7,
+              "sticker_assignment_raw_changes": 17,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 3
+            },
+            {
+              "frame": 80,
+              "sticker_count": 15,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 7,
+              "sticker_assignment_raw_changes": 15,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 3
+            },
+            {
+              "frame": 242,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 5,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 14
+            },
+            {
+              "frame": 350,
+              "sticker_count": 9,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 4,
+              "sticker_assignment_raw_changes": 9,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 16
+            },
+            {
+              "frame": 60,
+              "sticker_count": 20,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 20,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 9
+            },
+            {
+              "frame": 96,
+              "sticker_count": 11,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 11,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 3
+            }
+          ]
+        },
+        "fixed": {
+          "frames": 196,
+          "missing_fits": 0,
+          "differing_frames": 10,
+          "differing_keypoints": 41,
+          "assignment_absent_from_bank": 6,
+          "worst": [
+            {
+              "frame": 202,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 11,
+              "sticker_assignment_raw_changes": 11,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 346,
+              "sticker_count": 12,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 11,
+              "sticker_assignment_raw_changes": 11,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 80,
+              "sticker_count": 15,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 7,
+              "sticker_assignment_raw_changes": 7,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 242,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 5,
+              "sticker_assignment_raw_changes": 5,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 290,
+              "sticker_count": 8,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 2,
+              "sticker_assignment_raw_changes": 2,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 94,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 200,
+              "sticker_count": 15,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 258,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 310,
+              "sticker_count": 11,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 336,
+              "sticker_count": 19,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "yiheng",
+      "log": "/Users/jeffpark/Documents/LiveRecognition/runs/yihengCropped-independent-keypoint-observations/turn_candidate_scores.jsonl",
+      "log_sha256": "cfabd90b9c38d4e7be224b8179aaf14c53f8994211f346c740f37ee0a2ec14b0",
+      "source_fps": 29.97002997002997,
+      "start": 0,
+      "end": 118,
+      "available_prefix_frames": 0,
+      "unavailable_saved_observation_frames": [
+        0
+      ],
+      "wasm_sha256": "240b54a0b2a350c7b2b04f7509f19c0490b61dc768b48a69145be0aef8be5fd2",
+      "fixture_sha256": "68e0551f72e5448261f317b7c99e864d93e0f39a4984efae82db35802b18165f",
+      "stages": {
+        "browser": {
+          "frames": 118,
+          "missing_fits": 0,
+          "differing_frames": 26,
+          "differing_keypoints": 120,
+          "assignment_absent_from_bank": 22,
+          "worst": [
+            {
+              "frame": 113,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 15,
+              "sticker_assignment_raw_changes": 17,
+              "sticker_validity_changes": 2,
+              "sticker_symmetry_index": 4
+            },
+            {
+              "frame": 111,
+              "sticker_count": 14,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 13,
+              "sticker_assignment_raw_changes": 14,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 3
+            },
+            {
+              "frame": 84,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 9,
+              "sticker_assignment_raw_changes": 10,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 9
+            },
+            {
+              "frame": 114,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 9,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 3
+            },
+            {
+              "frame": 41,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 8,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 21
+            },
+            {
+              "frame": 68,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 7,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 2,
+              "sticker_symmetry_index": 9
+            },
+            {
+              "frame": 78,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 7,
+              "sticker_assignment_raw_changes": 10,
+              "sticker_validity_changes": 2,
+              "sticker_symmetry_index": 9
+            },
+            {
+              "frame": 19,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 6,
+              "sticker_assignment_raw_changes": 17,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 21
+            },
+            {
+              "frame": 66,
+              "sticker_count": 12,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 6,
+              "sticker_assignment_raw_changes": 12,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 9
+            },
+            {
+              "frame": 73,
+              "sticker_count": 8,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 6,
+              "sticker_assignment_raw_changes": 8,
+              "sticker_validity_changes": 2,
+              "sticker_symmetry_index": 9
+            }
+          ]
+        },
+        "revised": {
+          "frames": 118,
+          "missing_fits": 0,
+          "differing_frames": 17,
+          "differing_keypoints": 69,
+          "assignment_absent_from_bank": 14,
+          "worst": [
+            {
+              "frame": 114,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 11,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 3
+            },
+            {
+              "frame": 41,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 8,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 21
+            },
+            {
+              "frame": 68,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 7,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 2,
+              "sticker_symmetry_index": 9
+            },
+            {
+              "frame": 19,
+              "sticker_count": 17,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 6,
+              "sticker_assignment_raw_changes": 17,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 21
+            },
+            {
+              "frame": 73,
+              "sticker_count": 8,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 6,
+              "sticker_assignment_raw_changes": 8,
+              "sticker_validity_changes": 2,
+              "sticker_symmetry_index": 9
+            },
+            {
+              "frame": 78,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 5,
+              "sticker_assignment_raw_changes": 9,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 9
+            },
+            {
+              "frame": 17,
+              "sticker_count": 11,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 4,
+              "sticker_assignment_raw_changes": 11,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 21
+            },
+            {
+              "frame": 63,
+              "sticker_count": 8,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 4,
+              "sticker_assignment_raw_changes": 8,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 9
+            },
+            {
+              "frame": 85,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 4,
+              "sticker_assignment_raw_changes": 13,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 10
+            },
+            {
+              "frame": 67,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 10,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 9
+            }
+          ]
+        },
+        "fixed": {
+          "frames": 118,
+          "missing_fits": 0,
+          "differing_frames": 7,
+          "differing_keypoints": 16,
+          "assignment_absent_from_bank": 4,
+          "worst": [
+            {
+              "frame": 41,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 8,
+              "sticker_assignment_raw_changes": 8,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 67,
+              "sticker_count": 10,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 3,
+              "sticker_assignment_raw_changes": 3,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 25,
+              "sticker_count": 15,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 26,
+              "sticker_count": 13,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 72,
+              "sticker_count": 11,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 81,
+              "sticker_count": 7,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 82,
+              "sticker_count": 5,
+              "missing_fit": false,
+              "matching_assignment_in_bank": false,
+              "sticker_assignment_changes": 1,
+              "sticker_assignment_raw_changes": 1,
+              "sticker_validity_changes": 1,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 1,
+              "sticker_count": 26,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 2,
+              "sticker_count": 26,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            },
+            {
+              "frame": 3,
+              "sticker_count": 26,
+              "missing_fit": false,
+              "matching_assignment_in_bank": true,
+              "sticker_assignment_changes": 0,
+              "sticker_assignment_raw_changes": 0,
+              "sticker_validity_changes": 0,
+              "sticker_symmetry_index": 0
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "matches_cpu_render": false,
+  "total_evaluated_frames": 609,
+  "total_browser_differing_frames": 141,
+  "total_neighbor_experiment_differing_frames": 77
+}

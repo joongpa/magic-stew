@@ -9,33 +9,48 @@ export class FramePresenter {
   private pending?: OffscreenCanvas;
   private displayed?: OffscreenCanvas;
   private composite?: OffscreenCanvas;
+  private reusable: OffscreenCanvas[] = [];
 
   get snapshot() {
     return this.displayed;
   }
 
   capture(source: HTMLImageElement | ImageBitmap | OffscreenCanvas) {
+    if (this.pending) this.releaseFrame(this.pending);
+    this.pending = this.captureFrame(source);
+  }
+
+  /** Detached raw frame: its pixels cannot be overwritten by later admissions. */
+  captureFrame(source: HTMLImageElement | ImageBitmap | OffscreenCanvas) {
     const width =
       source instanceof HTMLImageElement ? source.naturalWidth : source.width;
     const height =
       source instanceof HTMLImageElement ? source.naturalHeight : source.height;
-    if (
-      !this.pending ||
-      this.pending.width !== width ||
-      this.pending.height !== height
-    )
-      this.pending = new OffscreenCanvas(width, height);
-    const context = this.pending.getContext("2d")!;
+    const frame = this.reusable.pop() ?? new OffscreenCanvas(width, height);
+    if (frame.width !== width) frame.width = width;
+    if (frame.height !== height) frame.height = height;
+    const context = frame.getContext("2d")!;
     context.clearRect(0, 0, width, height);
     context.drawImage(source, 0, 0);
+    return frame;
+  }
+
+  releaseFrame(frame: OffscreenCanvas) {
+    if (frame !== this.displayed && this.reusable.length < 4) this.reusable.push(frame);
+  }
+
+  presentFrame(target: HTMLCanvasElement, frame: OffscreenCanvas, overlay?: OverlayPainter) {
+    const old = this.displayed;
+    this.displayed = frame;
+    if (old && old !== frame) this.releaseFrame(old);
+    this.redraw(target, overlay);
   }
 
   present(target: HTMLCanvasElement, overlay?: OverlayPainter) {
     if (!this.pending) return;
-    // The old raw frame becomes the next capture buffer. Overlay toggles always
-    // redraw the displayed raw frame, even while another frame is in flight.
-    [this.displayed, this.pending] = [this.pending, this.displayed];
-    this.redraw(target, overlay);
+    const frame = this.pending;
+    this.pending = undefined;
+    this.presentFrame(target, frame, overlay);
   }
 
   redraw(target: HTMLCanvasElement, overlay?: OverlayPainter) {
@@ -72,6 +87,7 @@ export class FramePresenter {
     this.pending = undefined;
     this.displayed = undefined;
     this.composite = undefined;
+    this.reusable = [];
     target?.getContext("2d")?.clearRect(0, 0, target.width, target.height);
   }
 }

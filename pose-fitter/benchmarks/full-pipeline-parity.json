@@ -1,0 +1,218 @@
+{
+  "scope": "Run standalone WASM pipeline diagnostics and check documented CPU parity.\n\nThe web app, detector models, and video decode are outside this tool. Accepted\nexceptions are explicit saved outputs; they cannot silently authorize new\nassignment patterns or new differing frames.\n",
+  "passed": true,
+  "acceptance_gate_scope": "Rank-0 sticker assignments, recovery decisions, and five-unique-plus-flat policy. Complete ordered-bank equality is reported separately and is not claimed.",
+  "acceptance_manifest_sha256": "1ee648c87e9ec2d57bb89cad805e84981f1666d633235284e719266254380c18",
+  "cases": [
+    {
+      "name": "matty",
+      "frames": 289,
+      "solve_frames": 99,
+      "strict_winner_differing_frames": 2,
+      "accepted_differing_frames": 2,
+      "new_differing_frames": 0,
+      "recovery_decision_differences": [],
+      "bank_policy_failures": [],
+      "ordered_bank_differing_frames": 20,
+      "unordered_bank_differing_frames": 19,
+      "differing_frames": [
+        {
+          "frame": 500,
+          "accepted": true,
+          "sticker_assignment_changes": 1,
+          "sticker_assignment_raw_changes": 1,
+          "sticker_validity_changes": 0,
+          "sticker_symmetry_index": 0
+        },
+        {
+          "frame": 504,
+          "accepted": true,
+          "sticker_assignment_changes": 2,
+          "sticker_assignment_raw_changes": 2,
+          "sticker_validity_changes": 0,
+          "sticker_symmetry_index": 0
+        }
+      ],
+      "timing": {
+        "elapsedMs": 9691.09654211998,
+        "stageTimesMs": {
+          "startup": 892.6507079601288,
+          "depth_targets": 39.06266689300537,
+          "initial": 2822.4452500343323,
+          "neighbors": 5785.416958093643,
+          "orientation": 83.98883390426636,
+          "recovery": 53.68525004386902
+        },
+        "runtime": "v18.18.0",
+        "stage": "all",
+        "fixture_sha256": "3a56be93f1fd966d1ff9c0770edf7e5629f3ca09f4d98e304ea3f5769a0d876b",
+        "wasm_sha256": "67ec530e4efeb5137d69ecb1ad37d2a79bd6ff9e782cd7ef58d6cb0124679999",
+        "opencv_sha256": "83e9da3fbae4564ded4fb316d4853892e407979ac18881bb09f1c4edc9f8d96b"
+      },
+      "reference_pixel_scale": "Saved camera diameter / 220 fallback; source ROI absent from historical logs",
+      "passed": true
+    },
+    {
+      "name": "nahm",
+      "frames": 384,
+      "solve_frames": 137,
+      "strict_winner_differing_frames": 0,
+      "accepted_differing_frames": 0,
+      "new_differing_frames": 0,
+      "recovery_decision_differences": [],
+      "bank_policy_failures": [],
+      "ordered_bank_differing_frames": 20,
+      "unordered_bank_differing_frames": 19,
+      "differing_frames": [],
+      "timing": {
+        "elapsedMs": 10903.247333049774,
+        "stageTimesMs": {
+          "startup": 562.9633328914642,
+          "depth_targets": 29.10700011253357,
+          "initial": 3282.117707967758,
+          "neighbors": 6890.800333976746,
+          "orientation": 96.12908291816711,
+          "recovery": 32.17862510681152
+        },
+        "runtime": "v18.18.0",
+        "stage": "all",
+        "fixture_sha256": "572231a52d33b33c012114e7441fe826a6fc534a61cf5723c45efcc708642b72",
+        "wasm_sha256": "67ec530e4efeb5137d69ecb1ad37d2a79bd6ff9e782cd7ef58d6cb0124679999",
+        "opencv_sha256": "83e9da3fbae4564ded4fb316d4853892e407979ac18881bb09f1c4edc9f8d96b"
+      },
+      "reference_pixel_scale": "Saved camera diameter / 220 fallback; source ROI absent from historical logs",
+      "passed": true
+    },
+    {
+      "name": "xuanyi",
+      "frames": 235,
+      "solve_frames": 59,
+      "strict_winner_differing_frames": 2,
+      "accepted_differing_frames": 2,
+      "new_differing_frames": 0,
+      "recovery_decision_differences": [],
+      "bank_policy_failures": [],
+      "ordered_bank_differing_frames": 12,
+      "unordered_bank_differing_frames": 11,
+      "differing_frames": [
+        {
+          "frame": 193,
+          "accepted": true,
+          "sticker_assignment_changes": 2,
+          "sticker_assignment_raw_changes": 2,
+          "sticker_validity_changes": 0,
+          "sticker_symmetry_index": 0
+        },
+        {
+          "frame": 204,
+          "accepted": true,
+          "sticker_assignment_changes": 3,
+          "sticker_assignment_raw_changes": 3,
+          "sticker_validity_changes": 0,
+          "sticker_symmetry_index": 0
+        }
+      ],
+      "timing": {
+        "elapsedMs": 5370.706542015076,
+        "stageTimesMs": {
+          "startup": 414.7154998779297,
+          "depth_targets": 17.651124954223633,
+          "initial": 1515.3355422019958,
+          "neighbors": 3349.963040828705,
+          "orientation": 49.76087498664856,
+          "recovery": 15.724167108535767
+        },
+        "runtime": "v18.18.0",
+        "stage": "all",
+        "fixture_sha256": "cdfd01314e488197b74369a809a2fed8862ad3430ab2cf277ab531bd23166a1a",
+        "wasm_sha256": "67ec530e4efeb5137d69ecb1ad37d2a79bd6ff9e782cd7ef58d6cb0124679999",
+        "opencv_sha256": "83e9da3fbae4564ded4fb316d4853892e407979ac18881bb09f1c4edc9f8d96b"
+      },
+      "reference_pixel_scale": "Saved camera diameter / 220 fallback; source ROI absent from historical logs",
+      "passed": true
+    },
+    {
+      "name": "tommy",
+      "frames": 221,
+      "solve_frames": 196,
+      "strict_winner_differing_frames": 1,
+      "accepted_differing_frames": 1,
+      "new_differing_frames": 0,
+      "recovery_decision_differences": [],
+      "bank_policy_failures": [],
+      "ordered_bank_differing_frames": 23,
+      "unordered_bank_differing_frames": 22,
+      "differing_frames": [
+        {
+          "frame": 434,
+          "accepted": true,
+          "sticker_assignment_changes": 12,
+          "sticker_assignment_raw_changes": 12,
+          "sticker_validity_changes": 0,
+          "sticker_symmetry_index": 0
+        }
+      ],
+      "timing": {
+        "elapsedMs": 15058.365334033966,
+        "stageTimesMs": {
+          "startup": 293.8610842227936,
+          "depth_targets": 13.98924994468689,
+          "initial": 4642.13729095459,
+          "neighbors": 9953.32966709137,
+          "orientation": 111.69654178619385,
+          "recovery": 35.974125146865845
+        },
+        "runtime": "v18.18.0",
+        "stage": "all",
+        "fixture_sha256": "237774afa950b37c34ec4863d67af92d86a3a9eb515d18174f2644db4d998d73",
+        "wasm_sha256": "67ec530e4efeb5137d69ecb1ad37d2a79bd6ff9e782cd7ef58d6cb0124679999",
+        "opencv_sha256": "83e9da3fbae4564ded4fb316d4853892e407979ac18881bb09f1c4edc9f8d96b"
+      },
+      "reference_pixel_scale": "Saved camera diameter / 220 fallback; source ROI absent from historical logs",
+      "passed": true
+    },
+    {
+      "name": "yiheng",
+      "frames": 118,
+      "solve_frames": 118,
+      "strict_winner_differing_frames": 1,
+      "accepted_differing_frames": 1,
+      "new_differing_frames": 0,
+      "recovery_decision_differences": [],
+      "bank_policy_failures": [],
+      "ordered_bank_differing_frames": 17,
+      "unordered_bank_differing_frames": 16,
+      "differing_frames": [
+        {
+          "frame": 116,
+          "accepted": true,
+          "sticker_assignment_changes": 1,
+          "sticker_assignment_raw_changes": 1,
+          "sticker_validity_changes": 0,
+          "sticker_symmetry_index": 0
+        }
+      ],
+      "timing": {
+        "elapsedMs": 9402.667375087738,
+        "stageTimesMs": {
+          "startup": 192.05099987983704,
+          "depth_targets": 8.244917154312134,
+          "initial": 2956.2634999752045,
+          "neighbors": 6159.526332855225,
+          "orientation": 66.90266704559326,
+          "recovery": 16.711666107177734
+        },
+        "runtime": "v18.18.0",
+        "stage": "all",
+        "fixture_sha256": "94365bf0e0332b1e97e5e1f43a457eefcfbb193f741b833925b900caa2e91803",
+        "wasm_sha256": "67ec530e4efeb5137d69ecb1ad37d2a79bd6ff9e782cd7ef58d6cb0124679999",
+        "opencv_sha256": "83e9da3fbae4564ded4fb316d4853892e407979ac18881bb09f1c4edc9f8d96b"
+      },
+      "reference_pixel_scale": "Saved camera diameter / 220 fallback; source ROI absent from historical logs",
+      "passed": true
+    }
+  ],
+  "total_frames": 1247,
+  "total_strict_differences": 6,
+  "total_new_differences": 0
+}
