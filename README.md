@@ -295,7 +295,11 @@ python scripts/train_yolo11n_keypoints_local.py \
 
 Use `--model path/to/existing-pose.pt` to transfer compatible pretrained
 weights instead. The class and keypoint outputs are rebuilt for the new
-schema. `--prepare-only` validates and splits without training. The trainer
+schema. `--batch -1` (also the default when omitted) targets 85% of estimated
+available GPU memory. Use a fraction such as `--batch 0.75` for another target,
+or a positive integer such as `--batch 32` for a fixed size. The profiler
+estimates utilization; actual peak memory can differ.
+`--prepare-only` validates and splits without training. The trainer
 keeps native detection, location, presence, and YOLO26 RLE losses; center
 target routing, pose-aware assignment and validation OKS accept cyclic
 orders. Coordinates and visibility are permuted together. Reflections are

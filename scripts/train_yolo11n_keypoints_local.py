@@ -26,6 +26,7 @@ KEYPOINT_SHAPE = [4, 3]
 LABEL_FIELD_COUNT = 1 + 4 + KEYPOINT_SHAPE[0] * KEYPOINT_SHAPE[1]
 VISIBILITY_VALUES = {0, 1, 2}
 DEFAULT_CLASS_NAMES = list(CLASS_NAMES)
+DEFAULT_AUTO_BATCH_FRACTION = 0.85
 YOLO_POSE_MODEL_FAMILIES = {
     "yolo11": {
         "nano": "yolo11n-pose.pt",
@@ -42,6 +43,24 @@ YOLO_POSE_MODEL_FAMILIES = {
         "xlarge": "yolo26x-pose.pt",
     },
 }
+
+
+def parse_batch(value: str) -> int | float:
+    """Accept fixed sizes or a memory fraction; -1 selects our 85% default."""
+    error = "Batch must be -1, a fraction between 0 and 1, or a positive integer."
+    try:
+        batch = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(error) from exc
+    if not math.isfinite(batch):
+        raise argparse.ArgumentTypeError(error)
+    if batch == -1:
+        return DEFAULT_AUTO_BATCH_FRACTION
+    if 0 < batch < 1:
+        return batch
+    if batch >= 1 and batch.is_integer():
+        return int(batch)
+    raise argparse.ArgumentTypeError(error)
 
 
 def parse_class_names(value: str) -> list[str]:
@@ -236,6 +255,8 @@ def train(data_yaml: Path, runs_dir: Path, args: argparse.Namespace) -> Path:
         raise RuntimeError("Sticker quad training requires ultralytics>=8.4.185; run python -m pip install -U ultralytics")
     model_name = args.model or YOLO_POSE_MODEL_FAMILIES[args.model_family][args.model_size]
     print(f"YOLO pose model: {model_name}")
+    if 0 < args.batch < 1:
+        print(f"Auto batch: target {args.batch:.0%} of estimated available GPU memory")
     model = YOLO(model_name)
     from live_recognition.sticker_quad_training import StickerQuadTrainer
     model.train(
@@ -306,7 +327,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", "--resolution", type=int, default=128)
-    parser.add_argument("--batch", type=int, default=-1, help="Batch size; -1 lets Ultralytics auto-select.")
+    parser.add_argument(
+        "--batch", type=parse_batch, default=DEFAULT_AUTO_BATCH_FRACTION,
+        help="Fixed positive batch size, or GPU memory fraction (e.g. 0.85); -1/default targets 85%%.",
+    )
     parser.add_argument("--device", default=None, help="Training device, e.g. 0, cpu, or mps.")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--patience", type=int, default=25)
@@ -323,8 +347,6 @@ def main() -> None:
         parser.error("--imgsz must be positive")
     if args.epochs <= 0 or args.workers < 0 or args.patience < 0:
         parser.error("--epochs must be positive; --workers and --patience must be nonnegative")
-    if args.batch == 0 or args.batch < -1:
-        parser.error("--batch must be -1 or a positive integer")
 
     source_dirs = [
         path
