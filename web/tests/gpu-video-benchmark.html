@@ -1,0 +1,259 @@
+<!doctype html><meta charset="utf-8" /><title>
+  GPU preprocessing video benchmark
+</title>
+<style>
+  body {
+    font: 14px system-ui;
+    margin: 30px;
+    max-width: 1400px;
+  }
+  button {
+    padding: 10px;
+  }
+  td,
+  th {
+    padding: 8px;
+    border-bottom: 1px solid #ccc;
+    text-align: left;
+  }
+  pre {
+    white-space: pre-wrap;
+  }
+  canvas {
+    max-width: 600px;
+    width: 100%;
+  }
+</style>
+<h1>GPU preprocessing video benchmark</h1>
+<p>
+  Same video, selected source frames, models and tracking settings. CPU
+  preprocessing versus GPU preprocessing with WebGPU inference. Includes
+  sequential video decode, two source draws, worker round trip and overlay
+  drawing. Four initial frames excluded from throughput and timing medians. No
+  30fps pacing, so this measures available processing capacity. Production
+  playback remains capped at 30fps.
+</p>
+<input
+  id="file"
+  type="file"
+  accept="video/*"
+  aria-label="Benchmark video"
+/><button id="run">Compare video preprocessing</button>
+<p id="status">Choose a video</p>
+<table>
+  <thead>
+    <tr>
+      <th>Input</th>
+      <th>Preprocessing</th>
+      <th>Processed</th>
+      <th>Uncapped fps</th>
+      <th>Worker ms</th>
+      <th>Pose session ms</th>
+      <th>Source wait ms</th>
+      <th>Draw ms</th>
+      <th>Changed results</th>
+    </tr>
+  </thead>
+  <tbody id="rows"></tbody>
+</table>
+<canvas id="scene"></canvas>
+<pre id="json"></pre>
+<script type="module">
+  import { openVideoFile } from "../src/lib/frame-stream.ts";
+  const button = document.querySelector("#run"),
+    fileInput = document.querySelector("#file"),
+    status = document.querySelector("#status"),
+    rows = document.querySelector("#rows"),
+    json = document.querySelector("#json"),
+    scene = document.querySelector("#scene");
+  const median = (values) =>
+    [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
+  button.onclick = async () => {
+    const file = fileInput.files[0];
+    if (!file) {
+      status.textContent = "Choose a video first";
+      return;
+    }
+    button.disabled = true;
+    rows.textContent = "";
+    json.textContent = "";
+    const results = [],
+      reference = new Map();
+    try {
+      const manifest = await (await fetch("/models/detector.json")).json();
+      for (const size of [160, 256])
+        for (const preprocessing of ["cpu", "gpu"]) {
+          const worker = new Worker(
+            new URL("../src/lib/inference.worker.ts", import.meta.url),
+            { type: "module" },
+          );
+          let source;
+          const request = (message, transfer = []) =>
+            new Promise((resolve, reject) => {
+              worker.onmessage = ({ data }) => {
+                if (data.type === "error") reject(new Error(data.message));
+                else if (data.type === "ready" || data.type === "result")
+                  resolve(data);
+                else
+                  status.textContent = `${size}px ${preprocessing}: ${data.stage} loading`;
+              };
+              worker.onerror = () =>
+                reject(new Error("Inference worker failed"));
+              worker.postMessage(message, transfer);
+            });
+          try {
+            await request({
+              type: "init",
+              manifest,
+              size,
+              backend: "webgpu",
+              preprocessing,
+              baseUrl: location.origin + "/",
+            });
+            source = await openVideoFile(file);
+            const settings = {
+              thresholds: manifest.classThresholds,
+              presenceThreshold: manifest.presenceThreshold,
+              bboxThreshold: manifest.bbox.threshold,
+              roiPadding: manifest.tracking.roiPadding,
+            };
+            const frames = [];
+            let snapshot,
+              index = 0,
+              changedResults = 0,
+              firstChangedFrame = null;
+            while (true) {
+              const started = performance.now();
+              const frame = await source.next();
+              const acquired = performance.now();
+              if (!frame) break;
+              const bitmap = frame.bitmap;
+              if (
+                !snapshot ||
+                snapshot.width !== bitmap.width ||
+                snapshot.height !== bitmap.height
+              )
+                snapshot = new OffscreenCanvas(bitmap.width, bitmap.height);
+              snapshot.getContext("2d").drawImage(bitmap, 0, 0);
+              const scale = Math.min(
+                  1,
+                  1920 / Math.max(bitmap.width, bitmap.height),
+                ),
+                w = Math.round(bitmap.width * scale),
+                h = Math.round(bitmap.height * scale);
+              if (scene.width !== w) scene.width = w;
+              if (scene.height !== h) scene.height = h;
+              const ctx = scene.getContext("2d");
+              ctx.drawImage(bitmap, 0, 0, w, h);
+              const sent = performance.now();
+              const { result } = await request(
+                { type: "frame", bitmap, settings, resetTracking: index === 0 },
+                [bitmap],
+              );
+              const received = performance.now();
+              const sx = w / result.transform.sourceWidth,
+                sy = h / result.transform.sourceHeight;
+              ctx.fillStyle = "#ffffff";
+              ctx.strokeStyle = "#101411";
+              for (const d of result.detections) {
+                ctx.beginPath();
+                ctx.arc(
+                  d.x * sx,
+                  d.y * sy,
+                  Math.max(3.5, w / 230),
+                  0,
+                  Math.PI * 2,
+                );
+                ctx.fill();
+                ctx.stroke();
+              }
+              const finished = performance.now();
+              const signature = JSON.stringify({
+                timestamp: frame.timestamp,
+                roi: result.roi,
+                roiSource: result.roiSource,
+                trackingLost: result.trackingLost,
+                detections: result.detections,
+              });
+              if (
+                preprocessing === "gpu" &&
+                reference.get(size)?.[index] !== signature
+              ) {
+                changedResults++;
+                firstChangedFrame ??= index;
+              }
+              frames.push({
+                timestamp: frame.timestamp,
+                workerMs: result.totalMs,
+                poseMs: result.poseMs ?? 0,
+                bboxMs: result.bboxMs ?? 0,
+                acquireMs: acquired - started,
+                drawMs: sent - acquired,
+                roundTripMs: received - sent,
+                overlayMs: finished - received,
+                finished,
+                signature,
+              });
+              index++;
+              if (index % 20 === 0)
+                status.textContent = `${size}px ${preprocessing}: ${index} frames processed`;
+            }
+            if (preprocessing === "cpu")
+              reference.set(
+                size,
+                frames.map((f) => f.signature),
+              );
+            else if (reference.get(size).length !== frames.length)
+              throw new Error("Frame count mismatch");
+            const measured = frames.slice(4),
+              elapsed = frames.at(-1).finished - frames[3].finished;
+            const summary = {
+              size,
+              preprocessing,
+              source: file.name,
+              sourceFps: source.sourceFps,
+              frames: frames.length,
+              measured: measured.length,
+              fps: (measured.length * 1000) / elapsed,
+              workerMs: median(measured.map((f) => f.workerMs)),
+              poseMs: median(measured.map((f) => f.poseMs)),
+              acquireMs: median(measured.map((f) => f.acquireMs)),
+              drawMs: median(measured.map((f) => f.drawMs)),
+              changedResults,
+              firstChangedFrame,
+            };
+            const tr = document.createElement("tr");
+            for (const value of [
+              size,
+              preprocessing,
+              frames.length,
+              summary.fps.toFixed(2),
+              summary.workerMs.toFixed(2),
+              summary.poseMs.toFixed(2),
+              summary.acquireMs.toFixed(2),
+              summary.drawMs.toFixed(2),
+              changedResults,
+            ]) {
+              const td = document.createElement("td");
+              td.textContent = String(value);
+              tr.append(td);
+            }
+            rows.append(tr);
+            results.push({
+              summary,
+              frames: frames.map(({ signature, finished, ...rest }) => rest),
+            });
+            json.textContent = JSON.stringify(results, null, 2);
+          } finally {
+            source?.close();
+            worker.terminate();
+          }
+        }
+      status.textContent = "Completed";
+    } catch (error) {
+      status.textContent = "Failed: " + error.message;
+    } finally {
+      button.disabled = false;
+    }
+  };
+</script>

@@ -1,0 +1,94 @@
+<!doctype html><meta charset="utf-8" /><title>GPU preprocessing parity</title>
+<style>
+  body {
+    font: 14px system-ui;
+    margin: 30px;
+    max-width: 1400px;
+  }
+  button {
+    padding: 10px;
+  }
+  td,
+  th {
+    padding: 8px;
+    border-bottom: 1px solid #ccc;
+    text-align: left;
+  }
+  pre {
+    white-space: pre-wrap;
+  }
+</style>
+<h1>GPU preprocessing parity</h1>
+<p>
+  Actual bitmap crop → area-to-256 → 8-bit rounding → fixed-point linear → 8-bit
+  rounding → NCHW normalization. CPU reference uses the app's canvas and
+  OpenCV-style kernels. GPU timing includes upload and synchronization, excludes
+  benchmark readback. Three warmups and nine timed runs.
+</p>
+<button id="run">Check GPU preprocessing</button>
+<p id="status">Not started</p>
+<table>
+  <thead>
+    <tr>
+      <th>Path</th>
+      <th>Source / crop</th>
+      <th>Input</th>
+      <th>Alpha</th>
+      <th>Different values</th>
+      <th>Max pixel difference</th>
+      <th>CPU ms</th>
+      <th>GPU ms</th>
+    </tr>
+  </thead>
+  <tbody id="rows"></tbody>
+</table>
+<pre id="json"></pre>
+<script type="module">
+  const button = document.querySelector("#run"),
+    status = document.querySelector("#status"),
+    rows = document.querySelector("#rows"),
+    json = document.querySelector("#json");
+  button.onclick = () => {
+    button.disabled = true;
+    rows.textContent = "";
+    status.textContent = "Running";
+    const results = [],
+      worker = new Worker(
+        new URL("./gpu-preprocess.worker.ts", import.meta.url),
+        { type: "module" },
+      );
+    worker.onmessage = ({ data }) => {
+      if (data.type === "result") {
+        const r = data.result;
+        results.push(r);
+        const tr = document.createElement("tr");
+        for (const v of [
+          r.kind,
+          `${r.width}×${r.height} / ${r.crop || "full"}`,
+          r.model,
+          r.alpha,
+          r.different,
+          r.maxPixelDifference,
+          r.cpuMs.toFixed(3),
+          r.gpuMs.toFixed(3),
+        ]) {
+          const td = document.createElement("td");
+          td.textContent = String(v);
+          tr.append(td);
+        }
+        rows.append(tr);
+        json.textContent = JSON.stringify(results, null, 2);
+      } else {
+        status.textContent = data.type === "done" ? "Completed" : data.message;
+        worker.terminate();
+        button.disabled = false;
+      }
+    };
+    worker.onerror = () => {
+      status.textContent = "Worker failed";
+      worker.terminate();
+      button.disabled = false;
+    };
+    worker.postMessage({});
+  };
+</script>

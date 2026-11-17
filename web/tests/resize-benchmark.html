@@ -1,0 +1,92 @@
+<!doctype html><meta charset="utf-8" /><title>
+  Resize optimization benchmark
+</title>
+<style>
+  body {
+    font: 14px system-ui;
+    margin: 30px;
+    max-width: 1200px;
+  }
+  button {
+    padding: 10px;
+  }
+  td,
+  th {
+    padding: 9px;
+    border-bottom: 1px solid #ccc;
+    text-align: left;
+  }
+  pre {
+    white-space: pre-wrap;
+  }
+</style>
+<h1>Resize optimization benchmark</h1>
+<p>
+  Same source pixels and crop dimensions. Original versus optimized CPU kernels.
+  Eight warmups and 21 alternating measured runs per case; medians include
+  output allocation. Pose uses area-to-256 then linear-to-model resizing.
+</p>
+<button id="run">Compare resize kernels</button>
+<p id="status">Not started</p>
+<table>
+  <thead>
+    <tr>
+      <th>Path</th>
+      <th>Source</th>
+      <th>Model/target</th>
+      <th>Before ms</th>
+      <th>After ms</th>
+      <th>Speedup</th>
+      <th>Max pixel difference</th>
+    </tr>
+  </thead>
+  <tbody id="rows"></tbody>
+</table>
+<pre id="json"></pre>
+<script type="module">
+  const button = document.querySelector("#run"),
+    status = document.querySelector("#status"),
+    rows = document.querySelector("#rows"),
+    json = document.querySelector("#json");
+  button.onclick = () => {
+    button.disabled = true;
+    rows.textContent = "";
+    json.textContent = "";
+    status.textContent = "Running";
+    const worker = new Worker(
+      new URL("./resize-benchmark.worker.ts", import.meta.url),
+      { type: "module" },
+    );
+    worker.onmessage = ({ data }) => {
+      if (data.type === "result") {
+        const r = data.result,
+          tr = document.createElement("tr");
+        for (const value of [
+          r.kind,
+          `${r.width}×${r.height}`,
+          r.size,
+          r.beforeMs.toFixed(3),
+          r.afterMs.toFixed(3),
+          r.speedup.toFixed(2) + "×",
+          r.maxDifference,
+        ]) {
+          const td = document.createElement("td");
+          td.textContent = String(value);
+          tr.append(td);
+        }
+        rows.append(tr);
+      } else {
+        status.textContent = data.type === "done" ? "Completed" : data.message;
+        json.textContent = JSON.stringify(data.results ?? data, null, 2);
+        worker.terminate();
+        button.disabled = false;
+      }
+    };
+    worker.onerror = () => {
+      status.textContent = "Worker failed";
+      worker.terminate();
+      button.disabled = false;
+    };
+    worker.postMessage({});
+  };
+</script>

@@ -1,0 +1,100 @@
+<!doctype html><meta charset="utf-8" /><title>
+  Synthetic frame-stream check
+</title>
+<button id="run">Run synthetic capture test</button>
+<pre id="status">Not started</pre>
+<script type="module">
+  import { startCameraCapture } from "/src/lib/camera-source.ts";
+  const status = document.querySelector("#status");
+  document.querySelector("#run").onclick = async () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 64;
+    canvas.height = 8;
+    const ctx = canvas.getContext("2d");
+    ctx.fillRect(0, 0, 64, 8);
+    const stream = canvas.captureStream(0);
+    const track = stream.getVideoTracks()[0];
+    let capture,
+      processing = false,
+      queue = [],
+      seen = [],
+      sent = 0,
+      failure = "";
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const decode = (bitmap) => {
+      const c = document.createElement("canvas");
+      c.width = 64;
+      c.height = 8;
+      const x = c.getContext("2d");
+      x.drawImage(bitmap, 0, 0);
+      const pixels = x.getImageData(0, 0, 64, 8).data;
+      let value = 0;
+      for (let bit = 0; bit < 8; bit++)
+        if (pixels[(4 * 64 + bit * 8 + 4) * 4] > 127) value |= 1 << bit;
+      return value;
+    };
+    async function drain() {
+      if (processing) return;
+      processing = true;
+      while (queue.length) {
+        const frame = queue.shift();
+        await wait(80);
+        const id = decode(frame.bitmap);
+        frame.bitmap.close();
+        capture?.acknowledge();
+        if (id) seen.push(id);
+        status.textContent = JSON.stringify({
+          sent,
+          processed: seen.length,
+          queued: queue.length,
+          failure,
+        });
+      }
+      processing = false;
+    }
+    try {
+      status.textContent = "Starting frame-stream capture…";
+      capture = await startCameraCapture(
+        track,
+        (frame) => {
+          queue.push(frame);
+          void drain();
+        },
+        (message) => {
+          if (message) failure = message;
+        },
+      );
+      for (let i = 1; i <= 60; i++) {
+        for (let bit = 0; bit < 8; bit++) {
+          ctx.fillStyle = i & (1 << bit) ? "white" : "black";
+          ctx.fillRect(bit * 8, 0, 8, 8);
+        }
+        track.requestFrame();
+        sent++;
+        await wait(40);
+      }
+      await wait(500);
+      while (processing || queue.length) await wait(100);
+      const pass =
+        !failure &&
+        seen.length === 60 &&
+        seen.every((id, index) => id === index + 1);
+      status.textContent = JSON.stringify(
+        {
+          result: pass ? "PASS" : "FAIL",
+          sent,
+          processed: seen.length,
+          seen,
+          failure,
+        },
+        null,
+        2,
+      );
+    } catch (error) {
+      status.textContent = "FAIL: " + error.message;
+    } finally {
+      capture?.stop();
+      track.stop();
+    }
+  };
+</script>

@@ -1,0 +1,109 @@
+<!doctype html><meta charset="utf-8" /><title>CPU inference benchmark</title>
+<style>
+  body {
+    font: 14px system-ui;
+    margin: 32px;
+    max-width: 1100px;
+  }
+  button {
+    padding: 10px;
+  }
+  pre {
+    white-space: pre-wrap;
+  }
+  td,
+  th {
+    padding: 10px;
+    text-align: left;
+    border-bottom: 1px solid #bbb;
+  }
+  table {
+    border-collapse: collapse;
+  }
+</style>
+<h1>CPU inference benchmark</h1>
+<p>
+  Same exported pose models and input tensors; three warmups, nine measured runs
+  per browser configuration. Run the native script first.
+</p>
+<button id="run">Run CPU comparison</button>
+<p id="status">Not started</p>
+<table>
+  <thead>
+    <tr>
+      <th>Runtime</th>
+      <th>Input</th>
+      <th>Threads</th>
+      <th>Median ms</th>
+    </tr>
+  </thead>
+  <tbody id="results"></tbody>
+</table>
+<pre id="json"></pre>
+<script type="module">
+  const button = document.querySelector("#run"),
+    status = document.querySelector("#status"),
+    body = document.querySelector("#results"),
+    json = document.querySelector("#json");
+  button.onclick = async () => {
+    button.disabled = true;
+    body.textContent = "";
+    const results = [];
+    const add = (row) => {
+      const tr = document.createElement("tr");
+      for (const value of [
+        row.runtime,
+        row.size,
+        row.threads,
+        row.medianMs.toFixed(2),
+      ]) {
+        const td = document.createElement("td");
+        td.textContent = value;
+        tr.append(td);
+      }
+      body.append(tr);
+    };
+    try {
+      const native = await (
+        await fetch("/models/native-cpu-benchmark.json")
+      ).json();
+      native.forEach(add);
+      for (const size of [160, 256])
+        for (const [runtime, threads] of [
+          ["legacy", 1],
+          ["wasm", 1],
+          ["wasm", 4],
+        ]) {
+          status.textContent = `Running ${runtime}, ${size}px, ${threads} thread(s)…`;
+          const worker = new Worker(
+            new URL("./cpu-benchmark.worker.ts", import.meta.url),
+            { type: "module" },
+          );
+          try {
+            const result = await new Promise((resolve, reject) => {
+              worker.onmessage = ({ data }) =>
+                data.error ? reject(new Error(data.error)) : resolve(data);
+              worker.onerror = () =>
+                reject(new Error("Benchmark worker failed"));
+              worker.postMessage({
+                runtime,
+                threads,
+                size,
+                baseUrl: location.href,
+              });
+            });
+            results.push(result);
+            add(result);
+            json.textContent = JSON.stringify(results, null, 2);
+          } finally {
+            worker.terminate();
+          }
+        }
+      status.textContent = "Completed";
+    } catch (error) {
+      status.textContent = "Failed: " + error.message;
+    } finally {
+      button.disabled = false;
+    }
+  };
+</script>

@@ -1,0 +1,127 @@
+<!doctype html><meta charset="utf-8" /><title>
+  GPU preprocessing state checks</title
+><style>
+  body {
+    font: 14px system-ui;
+    margin: 30px;
+  }
+  button {
+    padding: 10px;
+  }
+  pre {
+    white-space: pre-wrap;
+  }
+</style>
+<h1>GPU preprocessing state checks</h1>
+<p>
+  Same worker alternates landscape/portrait inputs with equal tensor element
+  counts, switches to still-image CPU preprocessing for alpha preservation, then
+  resumes GPU preprocessing and tracking. Compares exact outputs with the
+  CPU-preprocessed reference.
+</p>
+<button id="run">Check preprocessing transitions</button>
+<p id="status">Not started</p>
+<pre id="json"></pre>
+<script type="module">
+  const button = document.querySelector("#run"),
+    status = document.querySelector("#status"),
+    json = document.querySelector("#json");
+  button.onclick = async () => {
+    button.disabled = true;
+    const results = [];
+    try {
+      const manifest = await (await fetch("/models/detector.json")).json(),
+        image = await createImageBitmap(
+          await (await fetch("/sample.jpg")).blob(),
+        );
+      const settings = {
+        thresholds: manifest.classThresholds,
+        presenceThreshold: manifest.presenceThreshold,
+        bboxThreshold: manifest.bbox.threshold,
+        roiPadding: manifest.tracking.roiPadding,
+      };
+      let reference;
+      for (const preprocessing of ["cpu", "gpu"]) {
+        const worker = new Worker(
+          new URL("../src/lib/inference.worker.ts", import.meta.url),
+          { type: "module" },
+        );
+        const request = (message, transfer = []) =>
+          new Promise((resolve, reject) => {
+            worker.onmessage = ({ data }) => {
+              if (data.type === "error") reject(new Error(data.message));
+              if (data.type === "ready" || data.type === "result")
+                resolve(data);
+            };
+            worker.onerror = () => reject(new Error("Worker failed"));
+            worker.postMessage(message, transfer);
+          });
+        try {
+          status.textContent = `Loading ${preprocessing} reference`;
+          await request({
+            type: "init",
+            backend: "webgpu",
+            preprocessing,
+            size: 160,
+            manifest,
+            baseUrl: location.origin + "/",
+          });
+          const frames = [];
+          for (const [i, [width, height, alpha, preserveAlpha]] of [
+            [1280, 720, 1, false],
+            [720, 1280, 1, false],
+            [1280, 720, 1, false],
+            [1280, 720, 0.5, true],
+            [1280, 720, 1, false],
+            [1280, 720, 1, false],
+          ].entries()) {
+            const canvas = new OffscreenCanvas(width, height),
+              ctx = canvas.getContext("2d");
+            ctx.globalAlpha = alpha;
+            ctx.drawImage(image, 160, 180, 360, 360);
+            const bitmap = await createImageBitmap(canvas);
+            const { result } = await request(
+              {
+                type: "frame",
+                bitmap,
+                settings,
+                preserveAlpha,
+                resetTracking: i < 5,
+              },
+              [bitmap],
+            );
+            const signature = JSON.stringify({
+              detections: result.detections,
+              roi: result.roi,
+              roiSource: result.roiSource,
+              trackingLost: result.trackingLost,
+            });
+            frames.push(signature);
+            results.push({
+              preprocessing,
+              index: i,
+              width,
+              height,
+              preserveAlpha,
+              actualPreprocessing:
+                result.profile.pose?.preprocessing ??
+                result.profile.bbox?.preprocessing,
+              points: result.detections.length,
+              exactMatch: preprocessing === "cpu" || reference[i] === signature,
+            });
+            json.textContent = JSON.stringify(results, null, 2);
+          }
+          if (preprocessing === "cpu") reference = frames;
+        } finally {
+          worker.terminate();
+        }
+      }
+      image.close();
+      status.textContent = results.every((r) => r.exactMatch) ? "PASS" : "FAIL";
+    } catch (error) {
+      status.textContent = "Failed: " + error.message;
+    } finally {
+      button.disabled = false;
+    }
+  };
+</script>

@@ -313,10 +313,11 @@ python scripts/render_yolo_typed_sticker_keypoints.py \
   --source video.mp4 --model path/to/best.pt --device 0
 ```
 
-The original landmarks use white/yellow/purple markers. Sticker centers show
-a color initial with a white corner, yellow edge or purple center ring.
-Explicit W/C, B/E, G/CTR color/type labels are enabled by default;
-`--no-show-labels` hides that text.
+The default full-frame view shows small filled dots only: white corners,
+yellow edges, and purple centers. Original landmarks retain the same palette.
+Color initials, text, confidence values, ROI borders and FPS are hidden by
+default. Enable `--show-color-initials`, `--show-labels`, `--show-confidences`,
+`--show-roi` or `--show-fps` explicitly when needed.
 Default object/class thresholds are .25/.40/.25 for the three landmarks and
 .90 for every typed sticker class. `--pose-conf` overrides all classes;
 `--pose-class-conf "corner-edge=0.4,stickers=0.9,blue_corner=0.8"` supplies

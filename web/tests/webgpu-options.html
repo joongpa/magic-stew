@@ -1,0 +1,100 @@
+<!doctype html><meta charset="utf-8" /><title>WebGPU execution options</title>
+<style>
+  body {
+    font: 14px system-ui;
+    margin: 30px;
+    max-width: 1200px;
+  }
+  button {
+    padding: 10px;
+  }
+  td,
+  th {
+    padding: 9px;
+    border-bottom: 1px solid #ccc;
+    text-align: left;
+  }
+  pre {
+    white-space: pre-wrap;
+  }
+</style>
+<h1>WebGPU execution options</h1>
+<p>
+  Fixed FP32 pose model, identical input values, four warmups and eleven
+  measured runs. GPU-buffer cases include upload and output readback. Production
+  configuration stays unchanged.
+</p>
+<button id="run">Compare WebGPU options</button>
+<p id="status">Not started</p>
+<table>
+  <thead>
+    <tr>
+      <th>Input</th>
+      <th>Mode</th>
+      <th>Median ms</th>
+      <th>Max output difference</th>
+      <th>Result</th>
+    </tr>
+  </thead>
+  <tbody id="rows"></tbody>
+</table>
+<pre id="json"></pre>
+<script type="module">
+  const button = document.querySelector("#run"),
+    status = document.querySelector("#status"),
+    rows = document.querySelector("#rows"),
+    json = document.querySelector("#json");
+  button.onclick = async () => {
+    button.disabled = true;
+    rows.textContent = "";
+    const results = [];
+    try {
+      for (const size of [160, 256]) {
+        let reference;
+        for (const mode of ["cpu-io", "gpu-io", "capture"]) {
+          status.textContent = `${size}px · ${mode}`;
+          const worker = new Worker(
+            new URL("./webgpu-options.worker.ts", import.meta.url),
+            { type: "module" },
+          );
+          try {
+            const result = await new Promise((resolve, reject) => {
+              worker.onmessage = ({ data }) => resolve(data);
+              worker.onerror = () => reject(new Error("Worker failed"));
+              worker.postMessage({ size, mode, baseUrl: location.href });
+            });
+            if (result.output) {
+              if (!reference) reference = result.output;
+              result.maxAbsDifference = Math.max(
+                ...result.output.map((v, i) => Math.abs(v - reference[i])),
+              );
+              delete result.output;
+            }
+            results.push(result);
+            const tr = document.createElement("tr");
+            for (const value of [
+              size,
+              mode,
+              result.medianMs?.toFixed(2) ?? "—",
+              result.maxAbsDifference ?? "—",
+              result.error ?? "passed",
+            ]) {
+              const td = document.createElement("td");
+              td.textContent = String(value);
+              tr.append(td);
+            }
+            rows.append(tr);
+            json.textContent = JSON.stringify(results, null, 2);
+          } finally {
+            worker.terminate();
+          }
+        }
+      }
+      status.textContent = "Completed";
+    } catch (error) {
+      status.textContent = "Failed: " + error.message;
+    } finally {
+      button.disabled = false;
+    }
+  };
+</script>

@@ -1,0 +1,167 @@
+<!doctype html><meta charset="utf-8" /><title>
+  Complete-frame presentation check
+</title>
+<style>
+  body {
+    font: 15px system-ui;
+    margin: 30px;
+  }
+  button {
+    padding: 10px;
+  }
+  canvas {
+    width: 480px;
+    image-rendering: pixelated;
+    border: 1px solid #888;
+  }
+  pre {
+    white-space: pre-wrap;
+  }
+</style>
+<h1>Complete-frame presentation check</h1>
+<p>
+  Uses the app's FramePresenter. Delays each detection result across six browser
+  paints, checks that the prior annotated frame stays unchanged, redraws
+  overlays while a new frame is pending, and checks resolution changes and
+  transparency.
+</p>
+<button id="run">Check frame presentation</button>
+<p id="status">Not started</p>
+<canvas id="view" width="64" height="32"></canvas>
+<pre id="json"></pre>
+<script type="module">
+  import { FramePresenter } from "../src/lib/frame-presenter.ts";
+  const button = document.querySelector("#run"),
+    status = document.querySelector("#status"),
+    target = document.querySelector("#view"),
+    json = document.querySelector("#json");
+  button.onclick = async () => {
+    button.disabled = true;
+    status.textContent = "Checking pending frames";
+    const presenter = new FramePresenter();
+    let checks = 0,
+      heldPaints = 0,
+      commits = 0;
+    const assert = (condition, message) => {
+      checks++;
+      if (!condition) throw new Error(message);
+    };
+    const pixel = (x, y) =>
+      Array.from(target.getContext("2d").getImageData(x, y, 1, 1).data);
+    const same = (actual, expected) => actual.join(",") === expected.join(",");
+    const marker = (color) => (ctx) => {
+      ctx.fillStyle = color;
+      ctx.fillRect(0, 0, 8, 8);
+    };
+    const source = (color, w, h) => {
+      const c = new OffscreenCanvas(w, h),
+        ctx = c.getContext("2d");
+      if (color) {
+        ctx.fillStyle = color;
+        ctx.fillRect(0, 0, w, h);
+      }
+      return c;
+    };
+    try {
+      presenter.capture(source("red", 64, 32));
+      assert(
+        same(pixel(20, 20), [0, 0, 0, 0]),
+        "First raw frame became visible",
+      );
+      presenter.present(target, marker("white"));
+      commits++;
+      let previous = [255, 0, 0, 255],
+        oldWidth = 64,
+        oldHeight = 32;
+      for (let i = 0; i < 8; i++) {
+        const blue = i % 2 === 0,
+          w = blue ? 80 : 64,
+          h = blue ? 40 : 32,
+          next = blue ? [0, 0, 255, 255] : [255, 0, 0, 255];
+        presenter.capture(source(blue ? "blue" : "red", w, h));
+        for (let paint = 0; paint < 6; paint++) {
+          await new Promise(requestAnimationFrame);
+          heldPaints++;
+          assert(
+            target.width === oldWidth && target.height === oldHeight,
+            "Pending frame resized the visible canvas",
+          );
+          assert(
+            same(pixel(20, 20), previous),
+            "Pending raw source replaced the completed frame",
+          );
+          assert(
+            same(pixel(2, 2), [255, 255, 255, 255]),
+            "Detection overlay disappeared while waiting",
+          );
+        }
+        presenter.redraw(target, marker("lime"));
+        assert(
+          same(pixel(20, 20), previous),
+          "Overlay toggle used the pending source",
+        );
+        assert(
+          same(pixel(2, 2), [0, 255, 0, 255]),
+          "Overlay toggle did not redraw the completed frame",
+        );
+        presenter.present(target, marker("white"));
+        commits++;
+        assert(same(pixel(20, 20), next), "Completed source was not committed");
+        assert(
+          same(pixel(2, 2), [255, 255, 255, 255]),
+          "Completed source was shown without its detections",
+        );
+        previous = next;
+        oldWidth = w;
+        oldHeight = h;
+      }
+      presenter.capture(source(null, 64, 32));
+      presenter.present(target, marker("lime"));
+      commits++;
+      assert(
+        same(pixel(20, 20), [0, 0, 0, 0]),
+        "Transparent pixels retained the previous frame",
+      );
+      presenter.clear(target);
+      assert(!presenter.snapshot, "Clear retained a raw frame");
+      assert(same(pixel(2, 2), [0, 0, 0, 0]), "Clear retained visible pixels");
+      presenter.capture(source("blue", 64, 32));
+      presenter.present(target, marker("lime"));
+      commits++;
+      presenter.capture(source("red", 80, 40));
+      for (let paint = 0; paint < 6; paint++) {
+        await new Promise(requestAnimationFrame);
+        heldPaints++;
+        assert(
+          same(pixel(20, 20), [0, 0, 255, 255]),
+          "Pending frame appeared on the overlay-free path",
+        );
+        assert(
+          target.width === 64,
+          "Overlay-free path resized before completion",
+        );
+      }
+      presenter.present(target);
+      commits++;
+      assert(
+        same(pixel(2, 2), [255, 0, 0, 255]),
+        "Overlay-free presentation retained a marker",
+      );
+      assert(
+        target.width === 80 && target.height === 40,
+        "Overlay-free presentation did not resize on completion",
+      );
+      status.textContent = "PASS";
+      json.textContent = JSON.stringify(
+        { result: "PASS", checks, heldPaints, commits },
+        null,
+        2,
+      );
+    } catch (error) {
+      status.textContent = "FAIL";
+      json.textContent = String(error);
+    } finally {
+      button.disabled = false;
+    }
+  };
+</script>

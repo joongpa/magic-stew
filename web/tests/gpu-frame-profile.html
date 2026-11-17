@@ -1,0 +1,188 @@
+<!doctype html><meta charset="utf-8" /><title>
+  GPU frame processing profile
+</title>
+<style>
+  body {
+    font: 14px system-ui;
+    margin: 32px;
+    max-width: 1200px;
+  }
+  button {
+    padding: 10px;
+  }
+  pre {
+    white-space: pre-wrap;
+  }
+  td,
+  th {
+    padding: 8px;
+    text-align: left;
+    border-bottom: 1px solid #ccc;
+  }
+  table {
+    border-collapse: collapse;
+  }
+</style>
+<h1>GPU frame processing profile</h1>
+<p>
+  Actual app worker. 1280×720 frame with a 360px cube image. Acquisition
+  followed by 3 warmup tracked frames and 10 measured tracked frames. Medians in
+  milliseconds. GPU session times include remaining queued preprocessing; GPU
+  submission is CPU overhead only.
+</p>
+<button id="run">Profile GPU frames</button>
+<p id="status">Not started</p>
+<table>
+  <thead>
+    <tr>
+      <th>Pose input</th>
+      <th>Pass</th>
+      <th>Cube session</th>
+      <th>Pose session</th>
+      <th>Canvas + pixels</th>
+      <th>CPU resize</th>
+      <th>GPU submit</th>
+      <th>Tensor prep</th>
+      <th>Copy + cleanup</th>
+      <th>Postprocess + ROI</th>
+      <th>Overhead</th>
+      <th>Total</th>
+    </tr>
+  </thead>
+  <tbody id="rows"></tbody>
+</table>
+<pre id="json"></pre>
+<script type="module">
+  const button = document.querySelector("#run"),
+    status = document.querySelector("#status"),
+    rows = document.querySelector("#rows"),
+    json = document.querySelector("#json");
+  const median = (values) =>
+    [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
+  button.onclick = async () => {
+    button.disabled = true;
+    rows.textContent = "";
+    const results = [];
+    try {
+      const manifest = await (await fetch("/models/detector.json")).json();
+      const image = await createImageBitmap(
+        await (await fetch("/sample.jpg")).blob(),
+      );
+      const scene = new OffscreenCanvas(1280, 720);
+      const ctx = scene.getContext("2d");
+      ctx.fillStyle = "rgb(40,40,40)";
+      ctx.fillRect(0, 0, 1280, 720);
+      ctx.drawImage(image, 160, 180, 360, 360);
+      image.close();
+      for (const size of [160, 256]) {
+        const worker = new Worker(
+          new URL("../src/lib/inference.worker.ts", import.meta.url),
+          { type: "module" },
+        );
+        const request = (message, transfer = []) =>
+          new Promise((resolve, reject) => {
+            worker.onmessage = ({ data }) => {
+              if (data.type === "error") reject(new Error(data.message));
+              else if (data.type === "ready" || data.type === "result")
+                resolve(data);
+              else if (data.type === "progress")
+                status.textContent = `${size}px · ${data.stage} loading`;
+            };
+            worker.onerror = () => reject(new Error("Worker failed"));
+            worker.postMessage(message, transfer);
+          });
+        const settings = {
+          thresholds: manifest.classThresholds,
+          presenceThreshold: manifest.presenceThreshold,
+          bboxThreshold: manifest.bbox.threshold,
+          roiPadding: manifest.tracking.roiPadding,
+        };
+        try {
+          await request({
+            type: "init",
+            manifest,
+            size,
+            backend: "webgpu",
+            baseUrl: location.origin + "/",
+          });
+          const samples = [];
+          for (let i = 0; i < 14; i++) {
+            status.textContent = `${size}px · frame ${i + 1}/14`;
+            const bitmap = await createImageBitmap(scene);
+            const data = await request(
+              { type: "frame", bitmap, settings, resetTracking: i === 0 },
+              [bitmap],
+            );
+            samples.push(data.result);
+          }
+          for (const [pass, batch] of [
+            ["acquisition", [samples[0]]],
+            ["tracked", samples.slice(4)],
+          ]) {
+            const stage = (frame, key) =>
+              [frame.profile.bbox, frame.profile.pose].reduce(
+                (sum, p) => sum + (p?.[key] ?? 0),
+                0,
+              );
+            const summary = {
+              size,
+              pass,
+              samples: batch.length,
+              cubeMs: median(batch.map((f) => f.bboxMs ?? 0)),
+              poseMs: median(batch.map((f) => f.poseMs ?? 0)),
+              pixelsMs: median(batch.map((f) => stage(f, "pixelReadMs"))),
+              resizeMs: median(batch.map((f) => stage(f, "resizeMs"))),
+              gpuSubmitMs: median(batch.map((f) => stage(f, "gpuSubmitMs"))),
+              tensorMs: median(batch.map((f) => stage(f, "tensorMs"))),
+              copyCleanupMs: median(
+                batch.map((f) => stage(f, "copyCleanupMs")),
+              ),
+              postprocessMs: median(
+                batch.map(
+                  (f) =>
+                    f.profile.bboxDecodeMs +
+                    f.profile.poseDecodeMs +
+                    f.profile.trackingDecodeMs +
+                    f.profile.roiUpdateMs,
+                ),
+              ),
+              overheadMs: median(batch.map((f) => f.profile.nonInferenceMs)),
+              totalMs: median(batch.map((f) => f.totalMs)),
+              roi: batch[0].roi,
+            };
+            results.push({ summary, frames: batch });
+            const tr = document.createElement("tr");
+            for (const key of [
+              "size",
+              "pass",
+              "cubeMs",
+              "poseMs",
+              "pixelsMs",
+              "resizeMs",
+              "gpuSubmitMs",
+              "tensorMs",
+              "copyCleanupMs",
+              "postprocessMs",
+              "overheadMs",
+              "totalMs",
+            ]) {
+              const td = document.createElement("td");
+              const v = summary[key];
+              td.textContent = typeof v === "number" ? v.toFixed(2) : v;
+              tr.append(td);
+            }
+            rows.append(tr);
+            json.textContent = JSON.stringify(results, null, 2);
+          }
+        } finally {
+          worker.terminate();
+        }
+      }
+      status.textContent = "Completed";
+    } catch (error) {
+      status.textContent = "Failed: " + error.message;
+    } finally {
+      button.disabled = false;
+    }
+  };
+</script>

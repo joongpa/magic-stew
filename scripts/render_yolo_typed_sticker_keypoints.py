@@ -96,7 +96,7 @@ def draw_point(output, detection, points, valid, args):
     if cls < 3:
         color = flow.TYPE_OUTLINES_BGR[cls]
         if args.show_keypoints:
-            cv2.circle(output, (x, y), 4, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(output, (x, y), 3, (0, 0, 0), -1, cv2.LINE_AA)
             cv2.circle(output, (x, y), 2, color, -1, cv2.LINE_AA)
         tag = ("C", "CE", "CEC")[cls]
         label_y = y
@@ -104,8 +104,8 @@ def draw_point(output, detection, points, valid, args):
         color_id, kind = divmod(cls - 3, 3)
         color = flow.TYPE_OUTLINES_BGR[kind]
         if args.show_keypoints:
-            cv2.circle(output, (x, y), 10, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.circle(output, (x, y), 10, color, 1, cv2.LINE_AA)
+            cv2.circle(output, (x, y), 7, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(output, (x, y), 5, color, -1, cv2.LINE_AA)
         if args.show_color_initials:
             letter = COLORS[color_id][0].upper()
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -147,10 +147,16 @@ def build_parser():
     parser.set_defaults(
         model=ROOT / "runs/pose/runs/typed_sticker_keypoints/weights/best.pt",
         pose_conf=None,
-        show_labels=True,
+        show_labels=False,
+        show_confidences=False,
+        show_color_initials=False,
+        show_roi=False,
+        show_fps=False,
         pose_class_conf={},
     )
     for action in parser._actions:
+        if action.dest == "show_keypoints":
+            action.help = "Small filled dots: corner=white, edge=yellow, center=purple"
         if action.dest == "pose_class_conf":
             action.type = parse_class_conf
             action.help = "Per-object thresholds: corner-edge=0.4,stickers=0.9,blue_corner=0.8"
