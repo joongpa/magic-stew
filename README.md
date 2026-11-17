@@ -252,65 +252,88 @@ lighting, hand visibility, layer state, and background family. The miner only
 selects from the generator's existing physically plausible variations; it does
 not create arbitrary adversarial images.
 
-## Four-corner sticker pose training
+## Independent landmarks and typed sticker centers (21 classes)
 
-The Blender generator now writes `sticker_quads_v1`: 18 classes (six colors,
-each with corner, edge, and center types), with four cubie-face grid vertices
-per object. Corners start at C and run clockwise C → CE → CEC → CE. Edges
-start with the outside CE → CE edge, followed by CEC → CEC. Center stickers
-accept all four cyclic starts. The old three landmark roles remain geometric
-roles within the quad; separate landmark objects are absorbed into stickers.
-Use a new generator output directory to avoid mixing label schemas.
+The current generator and `train_yolo11n_keypoints_local.py` use one point per
+object: the original `corner`, `corner-edge`, and `corner-edge-center` classes
+at IDs 0–2, then eighteen sticker classes (six colors × corner/edge/center).
+The sticker point is the original sticker center. The model uses native YOLO
+pose losses; independent points need no corner-order or symmetry loss.
 
-Convert existing direct-pose datasets without changing their source files:
+Create the new direct-pose dataset version:
 
 ```bash
-python scripts/relabel_sticker_quads.py --source-dir data/direct_cube_pose_dataset
+python scripts/relabel_typed_sticker_keypoints.py \
+  --source-dir data/direct_cube_pose_dataset \
+  --output-dir data/direct_cube_pose_dataset_v2
 ```
 
-This writes `data/sticker_quad_dataset` with images, pose labels, per-file
-metadata, previews, and a conversion report. Multiple `--source-dir` paths
-are supported. Images without per-file targets are omitted. It uses exact
-reference layer operations, including slices, simultaneous turns and both
-corner-cut rotations. Only stickers already retained by the source labels
-are converted; original angle/coverage decisions are preserved. All four
-in-frame corners are supervised, including the separate vertices along
-turned-layer seams. Saved landmark visibility flags are preserved; recovered
-corners use conservative visibility 1, which supplies coordinate supervision
-without claiming measured hand visibility. Out-of-frame corners use 0.
-Per-corner metadata records the visibility evidence. Unmatched sticker
-centers are omitted and recorded in `unmatched_stickers.jsonl` for inspection.
-The generator can ray-test each new corner, so new data also supplies
-visibility 1 for known occluded corners and 2 for visible corners.
+This is a class-ID conversion: row counts, landmark rows, sticker coordinates,
+bounding boxes, visibility flags and angle/coverage inclusion are preserved.
+Cubie identities in metadata determine piece types. Images without per-image
+metadata are omitted; row/metadata inconsistencies fail rather than silently
+remove labels. The new `targets/` preserves pose, articulation and symmetry
+information and adds the typed sticker class metadata. The original dataset
+and the earlier four-point dataset remain available.
+
+The local v2 conversion contains 17,857 images and 733,125 objects: 382,246
+unchanged landmark rows and 350,879 reclassified sticker rows. Its `report.json`
+records the preservation checks and per-class counts.
 
 Train with Ultralytics **8.4.185 or newer** and the project installed with
 `python -m pip install -e .`:
 
 ```bash
 python scripts/train_yolo11n_keypoints_local.py \
-  --source-dir data/sticker_quad_dataset \
-  --model-family yolo26 --model-size medium \
+  --source-dir data/direct_cube_pose_dataset_v2 \
+  --model runs/pose/runs/26m-pose/weights/best.pt \
   --imgsz 128 --device 0 --batch -1
 ```
 
-Use `--model path/to/existing-pose.pt` to transfer compatible pretrained
-weights instead. The class and keypoint outputs are rebuilt for the new
-schema. `--batch -1` (also the default when omitted) targets 85% of estimated
-available GPU memory. Use a fraction such as `--batch 0.75` for another target,
-or a positive integer such as `--batch 32` for a fixed size. The profiler
-estimates utilization; actual peak memory can differ.
-`--prepare-only` validates and splits without training. The trainer
-keeps native detection, location, presence, and YOLO26 RLE losses; center
-target routing, pose-aware assignment and validation OKS accept cyclic
-orders. Coordinates and visibility are permuted together. Reflections are
-excluded; flip augmentation is disabled because corner and edge classes
-require different reflection permutations. The saved model class lives in
-`live_recognition.sticker_quad_training` and requires this project when loaded.
+An existing nine-class cube checkpoint can transfer its backbone, neck and
+single-keypoint head. The trainer sets class names before loading weights so
+the original three landmark classifier rows also transfer by name. The native
+YOLO26 loss is retained; the backbone and heads train jointly. New typed
+sticker classifier rows are initialized for training. `--prepare-only`
+validates and splits without training. The trainer defaults to the v2 dataset.
 
-Each four-point sticker has one overall detection/class score
-(`boxes.conf`). Its four `keypoints.conf` channels are presence scores,
-not per-corner localization confidence. Existing independent renderers and
-their older checkpoints still use the previous one-point schema.
+`--batch -1` (or omission) targets 85% of estimated available GPU memory;
+fractions such as `--batch 0.75` select another target, and positive integers
+set a fixed batch size. Windows defaults to `--workers 0`, retaining the RAM
+image cache without duplicating it across spawned workers. Explicit worker
+counts override that default. `--no-cache` disables the RAM image cache.
+Mosaic, MixUp, copy-paste, hue, saturation and flips are disabled. Value /
+brightness jitter retains the native default.
+
+Render a trained 21-class model with the same full-frame bbox → square ROI
+inference → tracking flow:
+
+```bash
+python scripts/render_yolo_typed_sticker_keypoints.py \
+  --source video.mp4 --model path/to/best.pt --device 0
+```
+
+The original landmarks use white/yellow/purple markers. Sticker centers show
+a color initial with a white corner, yellow edge or purple center ring.
+Explicit W/C, B/E, G/CTR color/type labels are enabled by default;
+`--no-show-labels` hides that text.
+Default object/class thresholds are .25/.40/.25 for the three landmarks and
+.90 for every typed sticker class. `--pose-conf` overrides all classes;
+`--pose-class-conf "corner-edge=0.4,stickers=0.9,blue_corner=0.8"` supplies
+individual or grouped overrides. `corner` names the original landmark class;
+`corner_stickers` selects the six typed corner-sticker classes.
+
+`--bbox-conf` controls the separate cube detector, `--keypoint-conf` filters
+keypoint **presence**, and `--track-conf` controls tracking object scores.
+Displayed decimal confidences are the pose model's per-object `boxes.conf`;
+optional `p=` values are `keypoints.conf` presence, not localization confidence.
+Both `--save output.mp4 --no-display` and `--save-json output.jsonl` work, along
+with the ROI padding/tracking, camera, frame selection, status and display
+options listed by `--help`.
+
+The older `render_yolo_sticker_quads.py` is retained for the 18-class four-point
+checkpoint. It supports its own color initials, white/yellow/purple outlines
+and confidence controls; it does not load the new one-point model.
 
 ## Legacy RF-DETR landmark and sticker keypoint training
 

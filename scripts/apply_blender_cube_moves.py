@@ -11,8 +11,8 @@ Assumptions:
 - Cubies are 1 meter wide, so cubie origins sit on the -1/0/1 grid.
 - Cubie objects use quaternion rotation mode.
 - Cubie object pass_index values identify physical cubies.
-- Pose labels contain one four-corner YOLO instance per qualifying sticker,
-  with 18 color/type classes and clockwise semantic ordering.
+- Pose labels contain the three original independent landmark classes and
+  18 color/type sticker-center classes, with one keypoint per object.
 - Blender axes are X=right, Z=up, and Y=front/back. Change FRONT_AXIS if needed.
 """
 
@@ -60,10 +60,9 @@ if site_packages is None:
     )
 site.addsitedir(str(site_packages))
 sys.path.insert(0, str(PROJECT / "src"))
-from live_recognition.sticker_keypoint_order import clockwise_sticker_order
-from live_recognition.sticker_quad_schema import (
-    CLASS_NAMES as STICKER_QUAD_CLASS_NAMES, class_id as sticker_quad_class_id,
-    manifest as sticker_quad_manifest, transformed_cubie_face, yolo_row as sticker_quad_yolo_row,
+from live_recognition.typed_sticker_keypoints import (
+    CLASS_NAMES as TYPED_KEYPOINT_CLASS_NAMES, STICKER_NAMES as TYPED_STICKER_CLASS_NAMES,
+    sticker_class_id as typed_sticker_class_id, manifest as typed_sticker_manifest,
 )
 
 
@@ -585,7 +584,7 @@ INDEPENDENT_CLASS_MASK_POINT_COLORS = {
     CORNER_EDGE_CLASS_ID: (0, 255, 255),
     CORNER_EDGE_CENTER_CLASS_ID: (255, 120, 255),
 }
-COMBINED_KEYPOINT_CLASS_NAMES = STICKER_QUAD_CLASS_NAMES
+COMBINED_KEYPOINT_CLASS_NAMES = TYPED_KEYPOINT_CLASS_NAMES
 CUBE_KEYPOINT_NAMES = (
     "UBL", "UBR", "UFR", "UFL",
     "DBL", "DBR", "DFR", "DFL",
@@ -6697,7 +6696,7 @@ def render_sticker_keypoints(
     landmark_lines: list[str] | None = None,
     landmark_pose_objects: list[dict[str, object]] | None = None,
 ) -> tuple[list[str], dict[str, object]]:
-    """Write clockwise four-corner color/type sticker objects."""
+    """Write three original landmark classes plus eighteen typed sticker centers."""
     try:
         import numpy as np
     except ImportError:
@@ -6759,45 +6758,24 @@ def render_sticker_keypoints(
             counts["excluded"] += 1
             continue
         cubie = bpy.data.objects[base_spec["source_cubie"]]
-        world_corners, roles, kind = transformed_cubie_face(
-            cubie.matrix_world, cubie.get(SOLVED_LOCATION_PROP, cubie.location),
-            Quaternion(cubie.get(SOLVED_ROTATION_PROP, (1, 0, 0, 0))).to_matrix(),
-            spec["normal"],
-        )
-        pixels = [project_world_point_unclipped(Vector(p), camera, scene) for p in world_corners]
-        if any(p is None for p in pixels):
-            counts["excluded"] += 1
-            continue
-        try:
-            order = clockwise_sticker_order(pixels, roles, kind)
-        except ValueError:
-            counts["excluded"] += 1
-            continue
-        corners = []
-        for index in order:
-            world = Vector(world_corners[index])
-            pixel = pixels[index]
-            in_frame = 0 <= pixel[0] < width and 0 <= pixel[1] < height
-            blocker = object_occluding_point(world, depsgraph) if in_frame else None
-            v = (1 if blocker else 2) if in_frame else 0
-            corners.append({"pixel_point": list(pixel), "world_point": list(world),
-                            "visibility": v, "landmark_class_id": int(roles[index]),
-                            "occluded_by": blocker})
-        label_class = sticker_quad_class_id(str(spec["class"]), kind)
-        lines.append(sticker_quad_yolo_row(
-            label_class, [c["pixel_point"] for c in corners],
-            [c["visibility"] for c in corners], (width, height),
+        solved_location = cubie.get(SOLVED_LOCATION_PROP, cubie.location)
+        outer_count = sum(abs(round(float(value))) == 1 for value in solved_location)
+        kind = {1: "center", 2: "edge", 3: "corner"}[outer_count]
+        label_class = typed_sticker_class_id(str(spec["class"]), kind)
+        bbox = sticker_keypoint_bbox(visible_mask, projected, width, height)
+        lines.append(yolo_pose_line(
+            label_class, bbox[0], bbox[1], bbox[2], bbox[3],
+            [(projected[0], projected[1], visibility)], width, height,
         ))
         keypoints.append({
             "name": spec["name"],
             "source_object": spec["source_object"],
             "source_cubie": base_spec["source_cubie"],
             "material": spec["material_name"],
-            "class": STICKER_QUAD_CLASS_NAMES[label_class],
+            "class": TYPED_KEYPOINT_CLASS_NAMES[label_class],
             "class_id": label_class,
             "color": spec["class"],
             "sticker_type": kind,
-            "corners": corners,
             "sticker_class_id": int(spec["class_id"]),
             "pixel_point": [projected[0], projected[1]],
             "normalized_point": list(normalize_point(projected[0], projected[1], width, height)),
@@ -6809,7 +6787,7 @@ def render_sticker_keypoints(
             "visible_area_ratio": area_ratio,
         })
 
-    combined_lines = lines
+    combined_lines = [*(landmark_lines or []), *lines]
     label_path.parent.mkdir(parents=True, exist_ok=True)
     label_path.write_text(
         "\n".join(combined_lines) + ("\n" if combined_lines else ""),
@@ -6821,13 +6799,13 @@ def render_sticker_keypoints(
         keypoints,
         width,
         height,
-        landmark_pose_objects=None,
+        landmark_pose_objects=landmark_pose_objects,
     )
     return combined_lines, {
-        **sticker_quad_manifest(),
+        **typed_sticker_manifest(),
         "class_names": list(COMBINED_KEYPOINT_CLASS_NAMES),
-        "sticker_class_names": list(STICKER_QUAD_CLASS_NAMES),
-        "keypoint_shape": [4, 3],
+        "sticker_class_names": list(TYPED_STICKER_CLASS_NAMES),
+        "keypoint_shape": [1, 3],
         "min_face_plane_angle_degrees": STICKER_KEYPOINT_MIN_PLANE_ANGLE_DEGREES,
         "min_visible_area_ratio_for_occluded": STICKER_KEYPOINT_MIN_VISIBLE_AREA_RATIO,
         "keypoints": keypoints,
@@ -6866,18 +6844,12 @@ def write_sticker_keypoint_mask(
     for keypoint in keypoints:
         class_id = int(keypoint["sticker_class_id"])
         color = STICKER_KEYPOINT_MASK_COLORS[class_id]
-        corners = keypoint["corners"]
-        polygon = np.asarray([c["pixel_point"] for c in corners]).round().astype(np.int32)
-        cv2.polylines(output, [polygon], True, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.polylines(output, [polygon], True, color, 1, cv2.LINE_AA)
-        for index, corner in enumerate(corners):
-            if not corner["visibility"]:
-                continue
-            center = tuple(polygon[index])
-            cv2.circle(output, center, outline_radius, (0, 0, 0), -1, cv2.LINE_AA)
-            cv2.circle(output, center, point_radius, color, -1, cv2.LINE_AA)
-            cv2.putText(output, str(index), (center[0]+2, center[1]-2),
-                        cv2.FONT_HERSHEY_SIMPLEX, .3, (0, 0, 0), 1, cv2.LINE_AA)
+        x, y = keypoint["pixel_point"]
+        center = (round(float(x)), round(float(y)))
+        cv2.circle(output, center, outline_radius, (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.circle(output, center, point_radius, color, -1, cv2.LINE_AA)
+        cv2.putText(output, str(keypoint["class_id"]), (center[0]+2, center[1]-2),
+                    cv2.FONT_HERSHEY_SIMPLEX, .3, (0, 0, 0), 1, cv2.LINE_AA)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not write_image_file(path, output, cv2):
         raise RuntimeError(f"Could not write sticker keypoint mask: {path}")
@@ -10068,14 +10040,14 @@ def generate_dataset(
 ) -> None:
     if (width, height) not in STICKER_DATASET_RESOLUTIONS:
         raise ValueError(
-            "Sticker quad dataset generation requires one of "
+            "Typed sticker dataset generation requires one of "
             f"{STICKER_DATASET_RESOLUTIONS}; "
             f"received {width}x{height}."
         )
     if nvidia_gpu:
         configure_nvidia_gpu()
     existing_manifest = output_dir / "sticker_keypoint_manifest.json"
-    if existing_manifest.exists() and json.loads(existing_manifest.read_text()).get("format") != "sticker_quads_v1":
+    if existing_manifest.exists() and json.loads(existing_manifest.read_text()).get("format") != "typed_sticker_keypoints_v1":
         raise ValueError("Output contains the older keypoint schema; use a new output directory.")
     if not existing_manifest.exists() and any((output_dir / "pose").glob("*.txt")):
         raise ValueError("Output contains unversioned pose labels; use a new output directory.")
@@ -10091,7 +10063,7 @@ def generate_dataset(
         output_dir / "sticker_keypoint_manifest.json",
         json.dumps(
             {
-                **sticker_quad_manifest(),
+                **typed_sticker_manifest(),
                 "model": "YOLO pose",
                 "generation_mode": "standard",
                 "blur_policy": {
@@ -10109,14 +10081,14 @@ def generate_dataset(
                     list(resolution) for resolution in STICKER_DATASET_RESOLUTIONS
                 ],
                 "class_names": list(COMBINED_KEYPOINT_CLASS_NAMES),
-                "landmark_class_names": [],
-                "sticker_class_names": list(STICKER_QUAD_CLASS_NAMES),
+                "landmark_class_names": list(INDEPENDENT_CLASS_NAMES),
+                "sticker_class_names": list(TYPED_STICKER_CLASS_NAMES),
                 "material_class_ids": {material: {
-                    kind: sticker_quad_class_id(material, kind)
+                    kind: typed_sticker_class_id(material, kind)
                     for kind in ("corner", "edge", "center")
                 } for material in STICKER_KEYPOINT_CLASS_ID_BY_MATERIAL},
-                "keypoint_shape": [4, 3],
-                "keypoints_per_sticker": 4,
+                "keypoint_shape": [1, 3],
+                "keypoints_per_sticker": 1,
                 "corner_landmark_roles": {
                     "corner": CORNER_CLASS_ID,
                     "corner-edge": CORNER_EDGE_CLASS_ID,
@@ -10131,7 +10103,7 @@ def generate_dataset(
                 },
                 "occluded_min_visible_sticker_area_ratio": STICKER_KEYPOINT_MIN_VISIBLE_AREA_RATIO,
                 "mask_output": (
-                    "Rendered image with color-coded sticker outlines and ordered corners."
+                    "Rendered image with the original landmarks and typed sticker center points."
                 ),
             },
             indent=2,
@@ -10558,11 +10530,11 @@ def generate_dataset(
         "train: images\n"
         "val: images\n"
         + "pose: pose\n"
-        + "kpt_shape: [4, 3]\n"
+        + "kpt_shape: [1, 3]\n"
         + f"image_size: {DEFAULT_IMAGE_SIZE}\n"
         + f"available_image_sizes: [{DEFAULT_IMAGE_SIZE}]\n"
         + "model: YOLO pose\n"
-        + "pose_label_mode: sticker_quads_v1\n"
+        + "pose_label_mode: typed_sticker_keypoints_v1\n"
         + "names:\n"
         + "".join(
             f"  {index}: {name}\n"
