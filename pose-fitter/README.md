@@ -1,5 +1,65 @@
 # CPU pose fitter: Rust and WASM
 
+## Incremental move search
+
+`move_search::Engine` is a forward-only CPU port of the scorer/transition and
+best-first widening logic used by `search_independent_keypoint_bidirectional.py`.
+Both rate limits are fixed at 54 TPS; the separate double-turn classification is
+removed. Input banks retain the five assignment-distinct fits plus reserved flat
+sixth option. Identical shape-and-assignment contexts are collapsed by the same
+rule as the CPU scorer, preserving their original bank indices.
+
+- `move_search/cube.rs`: immutable cube conventions and permutation composition.
+- `move_search/routes.rs`: relative-slab motion, shared angular budgets, seam
+  crossings, hidden moves, face/wide/slice notation; no future double witnesses.
+- `move_search/prepared.rs`: state-independent bank validation, context selection,
+  per-sticker color-cost aggregation and adjacent-frame transition compilation.
+- `move_search/frontier.rs`: state scoring, stable rank/tie rules, dominance,
+  shared paths, mismatch history, parked frontier and deferred widening.
+- `move_search/mod.rs`: typed session input and independent `push`, `advance`,
+  `end`, `snapshot` and `probe` operations. Out-of-order input prepares immediately
+  and waits for its missing earlier sequence before linking transitions.
+
+The WASM ABI `move_search_json` accepts `init`, `frame`, `advance`, `end`, `status`
+and `probe`. Waiting for input consumes no expansion budget. `advance` is bounded
+for cooperative workers. Configuration, full input banks and transitions are
+serializable; diagnostics run with neither the app nor OpenCV.
+
+```sh
+# Immutable conventions only; never includes fitted poses or scored rows:
+.venv/bin/python scripts/export_move_search_tables.py
+
+# Generate Python forward-search oracles using identical saved CPU fit banks:
+.venv/bin/python scripts/export_move_search_fixtures.py --states 25000
+cargo build --release --locked --features cpu-pipeline \
+  --bin move-search-benchmark --manifest-path pose-fitter/Cargo.toml
+.venv/bin/python scripts/check_move_search_parity.py
+.venv/bin/python scripts/check_move_search_parity.py --wasm
+
+# Same engine, incremental arrivals and independently checked Python edges:
+node pose-fitter/tools/run-move-search.mjs \
+  pose-fitter/fixtures/move-search/matty.json pose-fitter/results/matty-move-search-stream.json stream
+.venv/bin/python scripts/validate_streaming_move_search.py
+.venv/bin/python scripts/validate_streaming_move_search.py --browser-recording /absolute/path/cube-detections.json
+```
+
+The fixed-input tests check the same chosen geometries, moves, candidate scores,
+queue priorities, solved boundary and expansion/pruning counts on five solves.
+Matty, Nahm and Tommy solve within the 25,000-state benchmark budget; Xuanyi and
+Yiheng hit that same budget in both runtimes. They are not claimed solved. See
+[WASM timings/parity](benchmarks/move-search-wasm.json),
+[native timings/parity](benchmarks/move-search-native.json) and
+[the streamed Matty check](benchmarks/matty-move-search-stream.json).
+The small checked-in CPU oracle also exercises deferred widening with widths
+1/2/3 and a short expansion budget. Native tests cover explicit EOF, parked
+frontiers, out-of-order preparation and six separate projection meshes.
+
+Streaming deliberately retains alternatives and continues eligible work while
+waiting for new frames, so its expansion order can differ from a batch run.
+Its candidate scores and legality remain the reference rules. Reported CPU/WASM
+times exclude detection, fitting, module loading and file I/O; they are local
+single-pass diagnostic measurements, not whole-app FPS promises.
+
 ## Complete standalone CPU pipeline
 
 The `cpu-pipeline` feature adds the complete standard joint-pose pipeline outside

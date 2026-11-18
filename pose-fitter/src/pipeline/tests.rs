@@ -6,6 +6,63 @@ fn golden_geometry() -> Geometry {
     serde_json::from_value(golden["geometry"].clone()).unwrap()
 }
 #[test]
+fn each_search_geometry_keeps_its_own_projected_mesh() {
+    let g = golden_geometry();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/move-search-golden.json")).unwrap();
+    let bank: Vec<Fit> = serde_json::from_value(fixture["frames"][1]["bank"].clone()).unwrap();
+    assert_eq!(bank.len(), 6);
+    let frame = Frame {
+        frame: 382,
+        width: 720.,
+        height: 1280.,
+        observations: Observations {
+            points: vec![],
+            classes: vec![],
+            stickers: vec![],
+            uncertainties: vec![],
+        },
+        landmark_presence: vec![],
+        colors: vec![],
+        pixel_scale: 1.,
+    };
+    let output = jobs::run(
+        &g,
+        jobs::Job::Finalize {
+            frame: frame.clone(),
+            source: None,
+            bank: bank.clone(),
+            target: None,
+            static_mode: false,
+        },
+    );
+    assert_eq!(output["wireframes"].as_array().unwrap().len(), 6);
+    assert_eq!(output["wireframe"], output["wireframes"][0]);
+    for (i, fit) in bank.iter().enumerate() {
+        let alone = jobs::run(
+            &g,
+            jobs::Job::Finalize {
+                frame: frame.clone(),
+                source: None,
+                bank: vec![fit.clone()],
+                target: None,
+                static_mode: false,
+            },
+        );
+        assert_eq!(output["wireframes"][i], alone["wireframe"]);
+        assert_eq!(output["wireframeFaces"][i], alone["wireframeFaces"][0]);
+        assert_eq!(output["wireframeDepths"][i], alone["wireframeDepths"][0]);
+        let ids = output["wireframeFaces"][i].as_array().unwrap();
+        assert_eq!(ids.len(), output["wireframes"][i].as_array().unwrap().len());
+        assert!(ids.iter().all(|id| id.as_u64().unwrap() < 54));
+        assert!(output["wireframeDepths"][i]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|z| z.as_f64().unwrap().is_finite()));
+    }
+}
+#[test]
 fn cpu_sticker_groups_and_correspondence_sequences() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("../../tests/fixtures/startup-golden.json")).unwrap();

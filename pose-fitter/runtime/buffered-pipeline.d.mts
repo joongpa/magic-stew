@@ -10,6 +10,8 @@ export interface PipelineGeometry {
 export interface PipelinePose {
   bank:PipelineGeometry[];wireframe:[number,number][][];pose:{rvec:number[];tvec:number[]}|null;
   elapsedMs:number;bootstrap:boolean;message:string;stage:string;depth_recovery:boolean;
+  wireframes?:[number,number][][][];
+  wireframeFaces?:number[][];wireframeDepths?:number[][];
 }
 export interface PipelineConfig {fps:number;turningStartFrame:number|null;centers:{axis:number;side:number;color:string}[]}
 export class BufferedPosePipeline {

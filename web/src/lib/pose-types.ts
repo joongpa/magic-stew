@@ -12,6 +12,9 @@ export interface FittedGeometry {
 export interface FittedPose {
   bank: FittedGeometry[];
   wireframe: [number, number][][];
+  wireframes?: [number, number][][][];
+  wireframeFaces?: number[][];
+  wireframeDepths?: number[][];
   pose: { rvec: number[]; tvec: number[] } | null;
   bootstrap: boolean;
   message: string;

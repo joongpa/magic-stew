@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { FrameQueue, FrameSelector, FramePrefetcher } from "./frame-stream";
 
+test("a trim boundary excludes earlier frames before establishing the 30fps sampling phase", () => {
+  const selector = new FrameSelector(60, 30, 5.8);
+  assert.deepEqual([5.784049,5.800716,5.817383,5.834049].map(t=>selector.accept(t)),[false,true,false,true]);
+});
+
 function selectedIndices(fps: number, count: number) {
   const selector = new FrameSelector(fps);
   return Array.from({ length: count }, (_, i) => i).filter((i) =>

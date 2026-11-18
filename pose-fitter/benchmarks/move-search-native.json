@@ -1,0 +1,67 @@
+[
+  {
+    "name": "matty",
+    "runtime": "native",
+    "frames": 289,
+    "status": "solved",
+    "evaluated_states": 1366,
+    "candidate_probes": 5271,
+    "python_prepare_seconds": 3.810381666989997,
+    "python_search_seconds": 1.8854116660077125,
+    "rust_prepare_seconds": 0.439629875,
+    "rust_search_seconds": 0.184994709,
+    "issues": []
+  },
+  {
+    "name": "nahm",
+    "runtime": "native",
+    "frames": 384,
+    "status": "solved",
+    "evaluated_states": 917,
+    "candidate_probes": 5834,
+    "python_prepare_seconds": 5.587496208027005,
+    "python_search_seconds": 1.5693674159701914,
+    "rust_prepare_seconds": 0.609630667,
+    "rust_search_seconds": 0.1379385,
+    "issues": []
+  },
+  {
+    "name": "xuanyi",
+    "runtime": "native",
+    "frames": 235,
+    "status": "state_limit",
+    "evaluated_states": 25000,
+    "candidate_probes": 47376,
+    "python_prepare_seconds": 12.254846332827583,
+    "python_search_seconds": 216.0905177500099,
+    "rust_prepare_seconds": 1.8625032080000001,
+    "rust_search_seconds": 23.420025709,
+    "issues": []
+  },
+  {
+    "name": "tommy",
+    "runtime": "native",
+    "frames": 221,
+    "status": "solved",
+    "evaluated_states": 14507,
+    "candidate_probes": 8212,
+    "python_prepare_seconds": 12.411121417069808,
+    "python_search_seconds": 23.38658304209821,
+    "rust_prepare_seconds": 0.826514459,
+    "rust_search_seconds": 2.253357042,
+    "issues": []
+  },
+  {
+    "name": "yiheng",
+    "runtime": "native",
+    "frames": 118,
+    "status": "state_limit",
+    "evaluated_states": 25000,
+    "candidate_probes": 9814,
+    "python_prepare_seconds": 5.283041915856302,
+    "python_search_seconds": 44.266154209151864,
+    "rust_prepare_seconds": 0.519426459,
+    "rust_search_seconds": 3.9995105,
+    "issues": []
+  }
+]

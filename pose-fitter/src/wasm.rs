@@ -139,10 +139,27 @@ pub unsafe extern "C" fn pipeline_stage_json(ptr: u32, len: u32) -> u64 {
     )
 }
 
-#[cfg(feature="cpu-pipeline")]
+#[cfg(feature = "cpu-pipeline")]
 #[no_mangle]
-pub unsafe extern "C" fn pipeline_job_json(ptr:u32,len:u32)->u64 {
-    let input:crate::pipeline::jobs::Job=serde_json::from_slice(std::slice::from_raw_parts(ptr as *const u8,len as usize)).unwrap();
-    let guard=STATE.lock().unwrap();
-    output(serde_json::to_vec(&crate::pipeline::jobs::run(&guard.as_ref().unwrap().fixtures.geometry,input)).unwrap())
+pub unsafe extern "C" fn pipeline_job_json(ptr: u32, len: u32) -> u64 {
+    let input: crate::pipeline::jobs::Job =
+        serde_json::from_slice(std::slice::from_raw_parts(ptr as *const u8, len as usize)).unwrap();
+    let guard = STATE.lock().unwrap();
+    output(
+        serde_json::to_vec(&crate::pipeline::jobs::run(
+            &guard.as_ref().unwrap().fixtures.geometry,
+            input,
+        ))
+        .unwrap(),
+    )
+}
+
+static MOVE_SEARCH: std::sync::Mutex<Option<crate::move_search::Engine>> =
+    std::sync::Mutex::new(None);
+#[no_mangle]
+pub unsafe extern "C" fn move_search_json(ptr: u32, len: u32) -> u64 {
+    let result = serde_json::from_slice(std::slice::from_raw_parts(ptr as *const u8, len as usize))
+        .map_err(|e| e.to_string())
+        .and_then(|request| crate::move_search::request(&mut MOVE_SEARCH.lock().unwrap(), request));
+    output(serde_json::to_vec(&result).unwrap())
 }

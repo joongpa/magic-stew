@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { FramePresenter } from "./lib/frame-presenter";
   import { DetectionRecording } from "./lib/detection-recording";
   import type { RecordingContext } from "./lib/detection-recording";
@@ -20,6 +20,14 @@
   import { OrderedStage } from "./lib/ordered-stage";
   import { VideoResultCache, videoResultKey } from "./lib/video-result-cache";
   import type { SavedVideoResult } from "./lib/video-result-cache";
+  import { MoveSearch } from "./lib/move-search";
+  import type { MoveSearchResult,MoveSearchConfig } from "./lib/move-search-types";
+  import { trimRange, timecode } from "./lib/solve-range";
+  import { projectedWireframe, projectedGeometryIndex } from "./lib/reconstruction-view";
+  import { buildColorTimeline, stateAtFrame } from "./lib/cube-colors";
+  import { makeCubePose } from "./lib/cube-motion";
+  import { reviewIndex, steppedTimestamp, frameArrow } from "./lib/frame-review";
+  import ProjectedCube from "./lib/ProjectedCube.svelte";
 
   let manifest = $state<ModelManifest>();
   let size = $state(256);
@@ -43,6 +51,10 @@
     roiPadding = $state(0.4);
   let showRoi = $state(false);
   let showPose = $state(false);
+  let searchEnabled = $state(true), initialScramble = $state("");
+  let openingHoldSeconds = $state(0);
+  let searchResult = $state<MoveSearchResult>(), searchError = $state("");
+  let moveSearch: MoveSearch | undefined;
   let poseFitting = $state(false);
   let poseError = $state("");
   let poseFitter: PoseFitter | undefined;
@@ -50,11 +62,43 @@
   let fitBufferedFrames = $state(0);
   const videoResults = new VideoResultCache();
   let cachedVideoFrames = $state(0), viewingSavedResult = $state(false);
+  let presentedTimestamp=$state(0);
+  let requestedReviewTimestamp:number|undefined,reviewInProgress=false;
+  let videoInputComplete = $state(false);
+  let trimming = $state(false), solveStart = $state(0), solveEnd = $state(0);
+  let thumbnails = $state<string[]>([]);
+  let previewVersion = 0, searchOriginTimestamp = 0;
+  let projectedAfterPass = $state(false);
+  const reconstructionChoices = $derived(new Map(searchResult?.steps.map(step => [step.frame_index, step.geometry_option_index] as const) ?? []));
+  const reconstructionComplete = $derived(videoInputComplete && (!searchEnabled || !!searchError ||
+    !!searchResult && ["solved", "already_solved", "exhausted", "state_limit"].includes(searchResult.status)));
   const recording = new DetectionRecording();
   let savedFrames = $state(0);
   let thresholds = $state([0.25, 0.4, 0.25, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]);
   let presenceThreshold = $state(0.05);
   let result = $state<FrameResult>();
+  const colorTimeline = $derived.by(() => {
+    if (!searchResult || !moveSearch) return;
+    try { return buildColorTimeline(moveSearch.config.scramble,searchResult.steps); }
+    catch { return; }
+  });
+  const cubeSolved = $derived(searchResult?.status === "solved" || searchResult?.status === "already_solved");
+  const coloredProjection = $derived.by(() => {
+    const pose = result?.fittedPose;
+    if (!pose?.pose || !colorTimeline) return;
+    const sourceFrame=pose.sourceFrame ?? Math.round(position*sourceFps),staticEnd=moveSearch?.config.turning_start_frame;
+    const state=stateAtFrame(colorTimeline,sourceFrame,cubeSolved);
+    const fit=pose.bank[projectedGeometryIndex(pose,reconstructionChoices.get(sourceFrame),staticEnd!=null&&sourceFrame<=staticEnd)];
+    return state&&fit?makeCubePose(fit,state):undefined;
+  });
+  const reviewRows=$derived.by(()=>{
+    cachedVideoFrames;
+    if(sourceKind!=="video")return [];
+    const rows=videoResults.entries(currentCacheKey());
+    const saved=rows.length?rows:(!needsPose()?videoResults.entries(currentCacheKey(true)):[]);
+    return saved.filter(row=>row.timestamp>=solveStart-0.00001&&row.timestamp<solveEnd);
+  });
+  const currentReviewIndex=$derived(reviewIndex(reviewRows,presentedTimestamp));
   let frameTiming = $state<{
     acquireMs: number;
     drawMs: number;
@@ -146,12 +190,146 @@
       ? Math.max(0, Math.min(2, roiPadding))
       : 0.4,
   });
-  const currentCacheKey = (fitPose = showPose) => videoResultKey(size, backend, settings(), fitPose);
+  const needsPose = () => showPose || searchEnabled;
+  const displayPose = () => showPose && (sourceKind !== "video" || reconstructionComplete && !trimming);
+  $effect(() => {
+    if (!projectedAfterPass && sourceKind === "video" && reconstructionComplete && !trimming && result?.fittedPose) {
+      projectedAfterPass = true; showPose = true; untrack(redrawOverlay);
+    }
+  });
+  const currentCacheKey = (fitPose = needsPose()) => videoResultKey(size, backend, settings(), fitPose);
   const savedFrameCount = () => Math.max(videoResults.count(currentCacheKey()),
-    showPose ? 0 : videoResults.count(currentCacheKey(true)));
+    needsPose() ? 0 : videoResults.count(currentCacheKey(true)));
   function findSavedResult(timestamp: number, tolerance = 0.00001) {
     return videoResults.get(currentCacheKey(), timestamp, tolerance) ??
-      (!showPose ? videoResults.get(currentCacheKey(true), timestamp, tolerance) : undefined);
+      (!needsPose() ? videoResults.get(currentCacheKey(true), timestamp, tolerance) : undefined);
+  }
+  function startMoveSearch() {
+    moveSearch?.dispose(); moveSearch = undefined; searchResult = undefined; searchError = "";
+    if (!searchEnabled || sourceKind === "none") return;
+    if (!initialScramble.trim()) { searchError = "Enter the initial scramble to start move search."; return; }
+    const token = generation;
+    const config: MoveSearchConfig = { scramble: initialScramble.trim(), fps: sourceFps || 30, max_tps: 54,
+      turning_start_frame: openingHoldSeconds > 0 ? Math.floor((searchOriginTimestamp + openingHoldSeconds) * (sourceFps || 30)) : null,
+      branch_widths: [3], branch_stage_expansions: 10000,
+      state_limit: 1_000_000, mismatch_window_weight: 1, unrestricted_sticker_count: 3,
+      source_origin_seconds: sourceKind === "video" ? searchOriginTimestamp : 0,
+      requested_start_seconds: sourceKind === "video" ? solveStart : undefined,
+      source_end_seconds: sourceKind === "video" ? solveEnd : undefined };
+    moveSearch = new MoveSearch(baseUrl, config, value => {
+      if (token !== generation || disposed) return;
+      searchResult = value; recording.saveSearch(token, config, value);
+    }, message => { if (token === generation) searchError = message; }, sourceKind === "video");
+  }
+  async function finishMoveSearch() {
+    const token = generation, activeSearch = moveSearch;
+    await flushPose();
+    await completionQueue.whenIdle();
+    if (token !== generation || disposed) return;
+    if (sourceKind === "video") videoInputComplete = true;
+    try { await activeSearch?.end(); } catch (cause) { if (token === generation) searchError = cause instanceof Error ? cause.message : String(cause); }
+  }
+  function seedCachedSearch() {
+    const rows = videoResults.entries(currentCacheKey(true));
+    const target = Math.min(30, sourceFps || 30), origin = searchOriginTimestamp;
+    let count = 0, last: SavedVideoResult | undefined;
+    for (const row of rows) {
+      if (row.timestamp < origin - 0.00001 || row.timestamp >= solveEnd) continue;
+      const offset = sourceFps > 30.001 ? Math.ceil(count * sourceFps / target - 0.0001) : count;
+      const expected = origin + offset / (sourceFps || 30);
+      if (row.timestamp < expected - 0.00001) continue;
+      if (row.timestamp > expected + 0.00001 || !row.result.fittedPose) break;
+      moveSearch?.submit(row.timestamp, row.result, Promise.resolve(row.result.fittedPose)); count++; last = row;
+    }
+    return { last, complete: count >= Math.ceil((solveEnd - origin) * target - 0.00001) };
+  }
+  async function changeMoveSearch() {
+    if (!searchEnabled) { moveSearch?.dispose(); moveSearch = undefined; if (!showPose) void flushPose(); return; }
+    if (trimming) return;
+    if (!initialScramble.trim()) { searchEnabled = false; searchError = "Enter the initial scramble to start move search."; return; }
+    const wasRunning = running;
+    if (sourceKind === "video") videoInputComplete = false;
+    running = false; cancelScheduled();
+    await waitForPipelineIdle(); startMoveSearch();
+    if (!moveSearch) { running = wasRunning; scheduleNext(); return; }
+    if (sourceKind === "video" && fileSource) {
+      const {last,complete} = seedCachedSearch();
+      if (last && complete) {
+        await moveSearch.end(); videoInputComplete = true; running = wasRunning; scheduleNext(); return;
+      }
+      // Newly requested fitting starts at the first missing frame, never at an
+      // arbitrary mid-solve state carrying the opening scramble.
+      const next = last ? last.timestamp + 1 / Math.min(30, sourceFps || 30) : solveStart;
+      seeking = false; running = true; await seekFile(next); scheduleNext();
+    } else {
+      running = wasRunning; resetPose = true;
+      if (sourceKind === "image") void inferFrame(); else scheduleNext();
+    }
+  }
+  async function previewTrim(timestamp: number) {
+    const request = ++previewVersion, token = generation, source = fileSource;
+    if (!source || !trimming) return;
+    try {
+      const frame = await source.preview(timestamp);
+      if (!frame) return;
+      try {
+        if (request !== previewVersion || token !== generation || !trimming) return;
+        presenter.presentFrame(stage, presenter.captureFrame(frame.bitmap));
+        position = frame.timestamp; result = undefined;
+      } finally { frame.bitmap.close(); }
+    } catch (cause) { if (token === generation) mediaError = cause instanceof Error ? cause.message : String(cause); }
+  }
+  function changeTrim(edge: "start" | "end", value: number) {
+    const range = trimRange({ start: solveStart, end: solveEnd }, edge, value, duration, sourceFps);
+    solveStart = range.start; solveEnd = range.end;
+    void previewTrim(edge === "start" ? solveStart : Math.max(solveStart, solveEnd - 1 / (sourceFps || 30)));
+  }
+  async function makeThumbnails(token: number) {
+    const source = fileSource; if (!source) return;
+    for (let index = 0; index < 10 && token === generation; index++) {
+      try {
+        const frame = await source.preview(duration * (index + 0.5) / 10, true); if (!frame) continue;
+        let url = "";
+        try {
+          const canvas = new OffscreenCanvas(frame.bitmap.width, frame.bitmap.height);
+          canvas.getContext("2d")!.drawImage(frame.bitmap, 0, 0);
+          url = URL.createObjectURL(await canvas.convertToBlob({ type: "image/jpeg", quality: 0.75 }));
+        } finally { frame.bitmap.close(); }
+        if (token !== generation) { URL.revokeObjectURL(url); return; }
+        thumbnails[index] = url;
+      } catch { /* The range remains usable if an optional thumbnail cannot decode. */ }
+    }
+  }
+  async function beginReconstruction() {
+    if (!fileSource || !trimming || status !== "ready") return;
+    if (searchEnabled && !initialScramble.trim()) { searchError = "Enter the initial scramble."; return; }
+    const token = generation; mediaError = ""; previewVersion++; busy = true;
+    try {
+      fileSource.seek(solveStart); const frame = await fileSource.next();
+      if (!frame) throw new Error("There are no video frames in this solve range.");
+      if (token !== generation || disposed) { frame.bitmap.close(); return; }
+      if (frame.timestamp >= solveEnd) { frame.bitmap.close(); throw new Error("There are no video frames in this solve range."); }
+      searchOriginTimestamp = frame.timestamp; startMoveSearch();
+      // Existing completed fits can be prepared immediately, even while the
+      // viewer has not yet presented those cached frames again.
+      const cached = seedCachedSearch();
+      trimming = false; videoInputComplete = false; fileEnded = false; running = true;
+      projectedAfterPass = false;
+      resetTracking = true; resetPose = true; seekVersion++; processedFrames = 0; fps = 0;
+      lastResultTime = 0; previousFrameStart = 0; lastStarted = performance.now(); acquireMs = 0; pacingMs = 0;
+      const firstSaved = findSavedResult(frame.timestamp);
+      if (cached.complete && firstSaved?.result.fittedPose) {
+        presentSavedFrame(frame.bitmap, firstSaved); markIdle(); running = false; fileEnded = true;
+        void finishMoveSearch(); return;
+      }
+      admitFrame(frame);
+    } catch (cause) { if (token === generation) { markIdle(); mediaError = cause instanceof Error ? cause.message : String(cause); } }
+  }
+  async function editSolveRange() {
+    if (!reconstructionComplete) return;
+    running = false; cancelScheduled(); await waitForPipelineIdle();
+    moveSearch?.dispose(); moveSearch = undefined; searchResult = undefined; searchError = "";
+    trimming = true; videoInputComplete = false; await previewTrim(solveStart);
   }
   function send(message: WorkerRequest, transfer: Transferable[] = []) {
     worker?.postMessage(message, transfer);
@@ -204,7 +382,7 @@
     }
     if (token !== generation || disposed) return;
     const overlayStart = performance.now();
-    presenter.presentFrame(stage, completed.snapshot, showRoi || showPose
+    presenter.presentFrame(stage, completed.snapshot, showRoi || displayPose()
       ? (context, width, height) => drawOverlay(context, width, height, packet.result) : undefined);
     const presentedAtMs = performance.now();
     packet.result.pipeline = {
@@ -214,6 +392,7 @@
       presentationMs: presentedAtMs - overlayStart,
     };
     result = packet.result;
+    presentedTimestamp=completed.timestamp;
     viewingSavedResult = false;
     if (completed.recording.sourceKind === "video" && (!completed.fitPose || packet.result.fittedPose))
       cachedVideoFrames = videoResults.put(completed.cacheKey, completed.timestamp, packet.result);
@@ -254,6 +433,7 @@
     // and camera FIFO intact while the new sessions initialize.
     await waitForPipelineIdle();
     if (disposed || request !== modelGeneration) return;
+    if (moveSearch) { moveSearch.dispose(); moveSearch = undefined; searchError = "Model changed. Restart move search to use the new results."; }
     error = "";
     result = undefined;
     refreshPending = false;
@@ -353,6 +533,7 @@
               } catch (cause) { packet.fitting = Promise.reject(cause); }
               // Admission continues while the ordered presenter awaits an earlier fit.
               void packet.fitting.catch(() => {});
+              moveSearch?.submit(completed.timestamp, data.result, packet.fitting);
             }
             completionQueue.enqueue(packet);
           }
@@ -396,6 +577,7 @@
     resetPose = true;
     poseFitter?.dispose();
     poseFitter = undefined;
+    moveSearch?.dispose(); moveSearch = undefined; searchResult = undefined; searchError = "";
     completionQueue.clear();
     poseFitting = false;
     poseError = "";
@@ -406,6 +588,11 @@
     fileSource?.close();
     fileSource = undefined;
     videoResults.clear(); cachedVideoFrames = 0; viewingSavedResult = false;
+    presentedTimestamp=0;requestedReviewTimestamp=undefined;reviewInProgress=false;
+    videoInputComplete = false;
+    projectedAfterPass = false;
+    trimming = false; solveStart = 0; solveEnd = 0; previewVersion++; searchOriginTimestamp = 0;
+    thumbnails.forEach(url => URL.revokeObjectURL(url)); thumbnails = [];
     cameraQueue.clear();
     queuedFrames = 0;
     captureStopped = false;
@@ -481,6 +668,7 @@
       capture = activeCapture;
       sourceKind = "camera";
       sourceName = "Live camera";
+      startMoveSearch();
       running = true;
       scheduleNext();
     } catch (cause) {
@@ -512,6 +700,7 @@
         still = image;
         sourceKind = "image";
         sourceName = file.name;
+        startMoveSearch();
         await inferFrame();
       } else if (file.type.startsWith("video/")) {
         const decoded = await openVideoFile(file);
@@ -524,8 +713,8 @@
         sourceFps = decoded.sourceFps;
         sourceKind = "video";
         sourceName = file.name;
-        running = true;
-        scheduleNext();
+        solveStart = 0; solveEnd = duration; trimming = true;
+        await previewTrim(0); void makeThumbnails(token);
       } else throw new Error("Choose an image or a video file.");
     } catch (cause) {
       if (token === generation)
@@ -560,7 +749,7 @@
     currentFrame = {
       snapshot,
       generation,
-      fitPose: showPose,
+      fitPose: needsPose(),
       resetPose,
       timestamp,
       counted,
@@ -575,7 +764,7 @@
         backend,
         settings: appliedSettings,
       },
-      cacheKey: videoResultKey(size, backend, appliedSettings, showPose),
+      cacheKey: videoResultKey(size, backend, appliedSettings, needsPose()),
       sentAt,
       drawMs: sentAt - drawStart,
       acquireMs: counted ? acquireMs : 0,
@@ -594,11 +783,12 @@
       [bitmap],
     );
     resetTracking = false;
-    if (showPose) resetPose = false;
+    if (needsPose()) resetPose = false;
     if (counted) previousFrameStart = lastStarted;
   }
 
   async function inferFrame() {
+    if (trimming) return;
     if (busy || completionQueue.size || disposed || sourceKind === "none") {
       if (!disposed && sourceKind !== "none") refreshPending = true;
       return;
@@ -647,17 +837,31 @@
         frame?.bitmap.close();
         return;
       }
+      if (frame && sourceKind === "video" && frame.timestamp >= solveEnd) {
+        frame.bitmap.close(); markIdle(); fileEnded = true; running = false; void finishMoveSearch(); return;
+      }
       if (!frame) {
         markIdle();
         if (sourceKind === "video") {
           fileEnded = true;
           running = false;
         } else if (captureStopped) running = false;
-        if (!running) void flushPose();
+        if (!running) void finishMoveSearch();
         return;
       }
+      admitFrame(frame);
+    } catch (cause) {
+      if (token !== generation) return;
+      markIdle();
+      running = false;
+      capture?.pause();
+      mediaError = cause instanceof Error ? cause.message : String(cause);
+    }
+  }
+  function admitFrame(frame: SourceFrame) {
       const saved = sourceKind === "video" ? findSavedResult(frame.timestamp) : undefined;
       if (saved) {
+        if (saved.result.fittedPose) moveSearch?.submit(saved.timestamp, saved.result, Promise.resolve(saved.result.fittedPose));
         // A cached island closes the preceding numerical segment. Present it
         // through the same queue so it cannot overtake an earlier pending fit.
         void flushPose(); resetTracking = true; resetPose = true;
@@ -667,13 +871,6 @@
         markIdle();
         continuePipeline();
       } else dispatch(frame.bitmap, frame.timestamp, true);
-    } catch (cause) {
-      if (token !== generation) return;
-      markIdle();
-      running = false;
-      capture?.pause();
-      mediaError = cause instanceof Error ? cause.message : String(cause);
-    }
   }
 
   function presentSavedFrame(bitmap: ImageBitmap, saved: SavedVideoResult) {
@@ -683,9 +880,10 @@
     } finally { bitmap.close(); }
   }
   function presentSavedSnapshot(snapshot: OffscreenCanvas, saved: SavedVideoResult) {
-    presenter.presentFrame(stage, snapshot, showRoi || showPose
+    presenter.presentFrame(stage, snapshot, showRoi || displayPose()
       ? (ctx, width, height) => drawOverlay(ctx, width, height, saved.result) : undefined);
     result = saved.result; position = saved.timestamp; viewingSavedResult = true;
+    presentedTimestamp=saved.timestamp;
     cachedVideoFrames = savedFrameCount(); frameTiming = undefined;
   }
 
@@ -698,12 +896,13 @@
       !running ||
       status !== "ready" ||
       disposed ||
+      trimming ||
       sourceKind === "none" ||
       sourceKind === "image"
     )
       return;
     if (sourceKind === "camera" && !cameraQueue.length) {
-      if (captureStopped) { running = false; void flushPose(); }
+      if (captureStopped) { running = false; void finishMoveSearch(); }
       return;
     }
     const interval = 1000 / Math.min(30, sourceFps || 30);
@@ -718,6 +917,13 @@
     timer = window.setTimeout(() => void processNext(), Math.ceil(remaining));
   }
 
+  function projectionForFrame(frame?: FrameResult): [number, number][][] {
+    if (!frame?.fittedPose?.pose) return [];
+    const sourceFrame = frame.fittedPose.sourceFrame ?? Math.round(position * sourceFps);
+    const staticEnd = moveSearch?.config.turning_start_frame;
+    return projectedWireframe(frame.fittedPose, reconstructionChoices.get(sourceFrame),
+      staticEnd != null && sourceFrame <= staticEnd);
+  }
   function drawOverlay(
     ctx: OffscreenCanvasRenderingContext2D,
     width: number,
@@ -741,11 +947,12 @@
       );
       ctx.setLineDash([]);
     }
-    if (showPose && frame.fittedPose?.pose) {
+    if (displayPose() && frame.fittedPose?.pose) {
       ctx.strokeStyle = "#64f6dd";
       ctx.lineWidth = Math.max(1.5, width / 650);
       ctx.lineJoin = "round";
-      for (const polygon of frame.fittedPose.wireframe) {
+      const polygons = projectionForFrame(frame);
+      for (const polygon of polygons) {
         if (!polygon.length) continue;
         ctx.beginPath();
         ctx.moveTo(polygon[0][0] * sx, polygon[0][1] * sy);
@@ -757,12 +964,12 @@
   }
 
   function redrawOverlay() {
-    if (result) presenter.redraw(stage, showRoi || showPose ? drawOverlay : undefined);
+    if (result) presenter.redraw(stage, showRoi || displayPose() ? drawOverlay : undefined);
   }
   function changePoseDisplay() {
     poseError = "";
     cachedVideoFrames = savedFrameCount();
-    if (!showPose) void flushPose();
+    if (!needsPose()) void flushPose();
     const saved = sourceKind === "video" ? findSavedResult(position) : undefined;
     if (saved) { result = saved.result; viewingSavedResult = true; }
     redrawOverlay();
@@ -794,6 +1001,7 @@
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   function refresh() {
+    if (moveSearch) { moveSearch.dispose(); moveSearch = undefined; searchError = "Detection settings changed. Restart move search to use the new results."; }
     resetTracking = true;
     resetPose = true;
     cachedVideoFrames = savedFrameCount();
@@ -814,8 +1022,33 @@
     refresh();
   }
 
+  async function requestReview(timestamp:number) {
+    if(!reconstructionComplete||trimming)return;
+    requestedReviewTimestamp=timestamp;
+    running=false;seekResume=false;cancelScheduled();
+    if(reviewInProgress)return;
+    reviewInProgress=true;const token=generation;
+    try {
+      while(requestedReviewTimestamp!=null&&token===generation){
+        const target:number=requestedReviewTimestamp;
+        await seekFile(target);
+        if(requestedReviewTimestamp===target)requestedReviewTimestamp=undefined;
+      }
+    } finally { if(token===generation)reviewInProgress=false; }
+  }
+  function stepReview(direction:-1|1) {
+    if(sourceKind!=="video"||!reconstructionComplete||trimming)return;
+    const timestamp=steppedTimestamp(reviewRows,requestedReviewTimestamp??presentedTimestamp,direction);
+    if(timestamp!=null)void requestReview(timestamp);
+  }
+  function reviewKeydown(event:KeyboardEvent) {
+    if(sourceKind!=="video"||!reconstructionComplete||trimming||event.defaultPrevented)return;
+    const direction=frameArrow(event,event.target instanceof Element?event.target:null);
+    if(direction){event.preventDefault();stepReview(direction);}
+  }
   async function seekFile(timestamp: number) {
     if (!fileSource) return;
+    timestamp = Math.max(solveStart, Math.min(timestamp, solveEnd - 1 / (sourceFps || 30)));
     const request = ++seekVersion;
     if (!seeking) {
       seekResume = running;
@@ -844,7 +1077,10 @@
       try {
         const frame = await fileSource.next();
         if (token !== generation || request !== seekVersion || !fileSource) { frame?.bitmap.close(); return; }
-        if (frame && Math.abs(frame.timestamp - saved.timestamp) < 0.00001) presentSavedFrame(frame.bitmap, saved);
+        if (frame && Math.abs(frame.timestamp - saved.timestamp) < 0.00001) {
+          if (saved.result.fittedPose) moveSearch?.submit(saved.timestamp, saved.result, Promise.resolve(saved.result.fittedPose));
+          presentSavedFrame(frame.bitmap, saved);
+        }
         else {
           frame?.bitmap.close();
           fileSource.seek(timestamp);
@@ -865,6 +1101,7 @@
     seeking = false;
   }
   async function togglePlayback() {
+    if (sourceKind === "video" && !reconstructionComplete) return;
     if (running) {
       running = false;
       cancelScheduled();
@@ -893,11 +1130,13 @@
     disposed = true;
     generation++;
     cancelScheduled();
+    previewVersion++; thumbnails.forEach(url => URL.revokeObjectURL(url));
     capture?.stop();
     cameraQueue.clear();
     fileSource?.close();
     worker?.terminate();
     poseFitter?.dispose();
+    moveSearch?.dispose();
     completionQueue.clear();
     stream?.getTracks().forEach((track) => track.stop());
     markIdle();
@@ -909,7 +1148,7 @@
 </script>
 
 <svelte:head><title>Live Recognition · Detector</title></svelte:head>
-<svelte:window onpagehide={cleanup} />
+<svelte:window onpagehide={cleanup} onkeydown={reviewKeydown} />
 
 <div class="shell">
   <header class="topbar">
@@ -952,8 +1191,10 @@
             ></span>{sourceName}</span
           ><span class="input-badge">POSE {size} × {size}</span>
         </div>
+        <div class="reconstruction-pair" class:with-projection={sourceKind === "video" && reconstructionComplete && !trimming}>
         <div
           class="stage"
+          class:video-view={sourceKind === "video"}
           class:dragging
           ondragover={(e) => {
             e.preventDefault();
@@ -992,6 +1233,10 @@
               <span class="spinner"></span>{loadingText}
             </div>{/if}
         </div>
+        {#if sourceKind === "video" && reconstructionComplete && !trimming}
+          <ProjectedCube pose={coloredProjection} sourceTimestamp={presentedTimestamp} timestamp={timecode(presentedTimestamp)} solved={cubeSolved} />
+        {/if}
+        </div>
         <div class="transport">
           <div class="transport-actions">
             {#if sourceKind !== "none"}<button
@@ -1001,7 +1246,7 @@
                 class="small"
                 onclick={camera}
                 disabled={status !== "ready"}>Camera</button
-              >{#if sourceKind === "video" || sourceKind === "camera"}<button
+              >{#if sourceKind === "camera" || sourceKind === "video" && reconstructionComplete && !trimming}<button
                   class="small"
                   onclick={togglePlayback}
                   >{running ? "Pause" : "Resume"}</button
@@ -1013,20 +1258,49 @@
           <span class="local-label"
             >ON DEVICE <span aria-hidden="true">↗</span></span
           >
+              {#if sourceKind === "video" && reconstructionComplete && !trimming}<button class="small" onclick={editSolveRange}>Adjust range</button>{/if}
         </div>
-        {#if sourceKind === "video" && duration > 0}<div class="scrubber">
+        {#if sourceKind === "video" && duration > 0 && reconstructionComplete && !trimming}<div class="scrubber">
             <span>{position.toFixed(1)}s</span><input
               aria-label="Video position"
               type="range"
-              min="0"
-              max={duration}
+              min={solveStart}
+              max={solveEnd}
               step="0.01"
               value={position}
               oninput={(e) => {
-                void seekFile(Number(e.currentTarget.value));
+                void requestReview(Number(e.currentTarget.value));
               }}
-            /><span>{duration.toFixed(1)}s</span>
+            /><span>{solveEnd.toFixed(1)}s</span>
+          </div>
+          <div class="frame-review" aria-label="Frame review">
+            <button class="small" aria-label="Previous frame" title="Previous frame (←)" disabled={currentReviewIndex<=0} onclick={()=>stepReview(-1)}>←</button>
+            <span aria-label="Frame counter">Frame {currentReviewIndex+1} / {reviewRows.length}
+              <span class="source-frame">· Source frame {result?.fittedPose?.sourceFrame??Math.round(presentedTimestamp*sourceFps)}</span></span>
+            <button class="small" aria-label="Next frame" title="Next frame (→)" disabled={currentReviewIndex>=reviewRows.length-1} onclick={()=>stepReview(1)}>→</button>
+            <span class="frame-key-hint">← / → to step</span>
           </div>{/if}
+        {#if sourceKind === "video" && trimming}<section class="solve-setup" aria-label="Solve setup">
+          <div class="trim-heading"><strong>Trim your solve</strong><span>{timecode(solveEnd - solveStart)} selected</span></div>
+          <div class="trim-timeline" role="group" aria-label="Solve range">
+            <div class="trim-thumbnails">{#each Array(10) as _, index}<div>{#if thumbnails[index]}<img src={thumbnails[index]} alt="" />{/if}</div>{/each}</div>
+            <div class="trim-shade" style:left="0" style:width={`${duration ? solveStart / duration * 100 : 0}%`}></div>
+            <div class="trim-shade" style:right="0" style:width={`${duration ? (1 - solveEnd / duration) * 100 : 0}%`}></div>
+            <div class="trim-selection" style:left={`${duration ? solveStart / duration * 100 : 0}%`} style:right={`${duration ? (1 - solveEnd / duration) * 100 : 0}%`}></div>
+            <input class="trim-handle" type="range" aria-label="Solve start" min="0" max={duration} step={1 / (sourceFps || 30)} value={solveStart} oninput={e => changeTrim("start", Number(e.currentTarget.value))} />
+            <input class="trim-handle trim-end" type="range" aria-label="Solve end" min="0" max={duration} step={1 / (sourceFps || 30)} value={solveEnd} oninput={e => changeTrim("end", Number(e.currentTarget.value))} />
+          </div>
+          <div class="trim-times"><label>Start <input aria-label="Solve start time (seconds)" type="number" min="0" max={solveEnd} step="0.01" value={solveStart.toFixed(2)} onchange={e => changeTrim("start", Number(e.currentTarget.value))} /></label>
+            <span>{timecode(solveStart)} → {timecode(solveEnd)}</span>
+            <label>End <input aria-label="Solve end time (seconds)" type="number" min={solveStart} max={duration} step="0.01" value={solveEnd.toFixed(2)} onchange={e => changeTrim("end", Number(e.currentTarget.value))} /></label></div>
+          <label class="field-label" for="solve-scramble">Initial scramble</label>
+          <input id="solve-scramble" aria-label="Initial scramble" bind:value={initialScramble} placeholder="R U R' U'…" />
+          <div class="trim-actions"><p class="hint">Include a clear cube before the first move.</p>
+            <button class="primary" disabled={status !== "ready" || searchEnabled && !initialScramble.trim()} onclick={beginReconstruction}>Reconstruct selected range</button></div>
+        </section>{/if}
+        {#if sourceKind === "video" && !trimming && !reconstructionComplete}<p class="hint" role="status" aria-label="Reconstruction progress">
+          Reconstructing first pass… Playback and scrubbing will be available when it finishes.
+        </p>{/if}
         {#if sourceKind === "video" || sourceKind === "camera"}
           <div class="frame-policy" aria-label="Frame processing status">
             <span
@@ -1191,10 +1465,10 @@
         <section class="control-section">
           <h2>Fitted pose</h2>
           <label class="toggle">
-            <input type="checkbox" bind:checked={showPose} onchange={changePoseDisplay} />
+            <input type="checkbox" bind:checked={showPose} onchange={changePoseDisplay} disabled={sourceKind === "video" && !reconstructionComplete} />
             <span>Show fitted pose</span>
           </label>
-          <p class="hint">Fit and display a cube wireframe. Points remain hidden.</p>
+          <p class="hint">{sourceKind === "video" ? "The projected cube appears when reconstruction finishes." : "Fit and display a cube wireframe. Points remain hidden."}</p>
           {#if showPose}
             <p class="hint" role="status" aria-label="Pose fitting status">
               {poseError || result?.fittedPose?.message || (poseFitting ? "Fitting pose…" : "Waiting for a cube")}
@@ -1205,6 +1479,24 @@
               {/if}
             </p>
           {/if}
+        </section>
+        <section class="control-section">
+          <h2>Move search</h2>
+          {#if !trimming}<label class="field-label" for="initial-scramble">Initial scramble</label>
+          <input id="initial-scramble" aria-label="Search scramble" bind:value={initialScramble} placeholder="R U R' U'…" />{/if}
+          <label class="field-label" for="opening-hold">Opening hold (seconds)</label>
+          <input id="opening-hold" aria-label="Opening hold (seconds)" type="number" min="0" step="0.01" bind:value={openingHoldSeconds} />
+          <label class="toggle"><input type="checkbox" bind:checked={searchEnabled} onchange={changeMoveSearch} />
+            <span>Search moves as poses arrive</span></label>
+          <p class="hint">Forward search · shared 54 TPS limit · five fits plus flat. Fitting runs even when its overlay is hidden.</p>
+          <button class="small" disabled={!searchEnabled || sourceKind === "none" || trimming} onclick={changeMoveSearch}>Restart move search</button>
+          <p class="hint" role="status" aria-label="Move search status">
+            {searchError || (searchResult ? ({running:"Searching",waiting_for_frames:"Waiting for fitted frames",solved:"Solved",already_solved:"Already solved",exhausted:"Search exhausted",state_limit:"Search state limit reached"}[searchResult.status]) : searchEnabled ? "Waiting for a source" : "Move search is off")}
+            {#if searchResult} · {searchResult.frames_prepared} prepared · {searchResult.stats.furthest_frames} searched · {searchResult.stats.evaluated_states.toLocaleString()} states{/if}
+          </p>
+          {#if searchResult?.steps.length}<p class="hint" aria-label="Move search path">
+            {searchResult.status === "solved" ? "Solution" : "Current candidate"}: {searchResult.steps.flatMap(step => step.state_moves).join(" ") || "Hold"}
+          </p>{/if}
         </section>
         <section class="control-section">
           <div class="section-heading">

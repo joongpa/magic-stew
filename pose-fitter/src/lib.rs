@@ -1,4 +1,5 @@
 pub mod browser;
+pub mod move_search;
 mod math;
 #[cfg(feature = "cpu-pipeline")]
 mod opencv;

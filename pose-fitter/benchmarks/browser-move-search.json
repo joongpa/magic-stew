@@ -1,0 +1,30 @@
+{
+  "source": "mattySolve.mov",
+  "selection": {
+    "start": 5.8,
+    "end": 10.4
+  },
+  "frames": 138,
+  "first_timestamp": 5.800716145833333,
+  "last_timestamp": 10.3673828125,
+  "result": "solved",
+  "expanded_states": 17436,
+  "worker_computation_ms": {
+    "prepareMs": 489.139999628067,
+    "searchMs": 2457.4400000572205
+  },
+  "manual_checks": {
+    "upload_produces_zero_inference_records": true,
+    "trim_and_scramble_controls": true,
+    "pause_and_scrubbing_hidden_during_first_pass": true,
+    "automatic_projected_cube_after_completion": true,
+    "projection_uses_search_geometry": 1,
+    "review_frame": 390,
+    "review_adds_zero_records": true
+  },
+  "artifacts": {
+    "recording": "pose-fitter/results/matty-browser-reconstruction.json",
+    "editor": "pose-fitter/results/solve-editor-final.jpg",
+    "projection": "pose-fitter/results/projected-cube-final.jpg"
+  }
+}

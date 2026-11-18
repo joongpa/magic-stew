@@ -27,6 +27,7 @@ export class VideoResultCache {
     return nearest && Math.abs(nearest.timestamp - timestamp) <= tolerance ? nearest : undefined;
   }
   count(key: string) { return this.variants.get(key)?.length ?? 0; }
+  entries(key: string): readonly SavedVideoResult[] { return [...(this.variants.get(key) ?? [])]; }
   clear() { this.variants.clear(); }
   private lowerBound(rows: SavedVideoResult[], timestamp: number) {
     let lo = 0, hi = rows.length;

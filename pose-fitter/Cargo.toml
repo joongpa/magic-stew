@@ -14,6 +14,10 @@ crate-type = ["rlib", "cdylib"]
 name = "pose-benchmark"
 path = "src/main.rs"
 
+[[bin]]
+name = "move-search-benchmark"
+path = "src/move_search_main.rs"
+
 [dependencies]
 nalgebra = { version = "0.34", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }

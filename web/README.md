@@ -28,12 +28,99 @@ count. Threading requires cross-origin isolation; without it, CPU mode runs
 single-threaded and the viewer reports that limitation. Changing backend finishes the current
 frame, retains queued source frames, and restarts both model sessions.
 
+## Video reconstruction
+
+Upload opens a preview and a video-editor trim control before inference starts.
+Drag the two handles or edit the start/end seconds, enter the initial scramble,
+and choose **Reconstruct selected range**. The thumbnail strip shades excluded
+footage. Thumbnail/handle previews decode video only and create no inference
+records. The selected interval is start-inclusive/end-exclusive on the source
+clock; the 30fps selector establishes its origin at the first included frame.
+
+The first pass has no pause/resume button or playback scrubber. Those controls
+appear after the selected frames have finished and move search reaches a terminal
+status. Clear/replacing the source still cancels the run. When complete, the
+projected cube appears automatically in an enlarged panel beside the video.
+The panel renders full reconstructed sticker colors from the applied scramble
+and recovered moves. It stays synchronized during cached playback and scrubbing.
+Its camera, cube origin and scale are fixed: only the selected fit's rotation,
+residual layer turns and reconstructed sticker state animate. Source-camera
+translation, distance and lens distortion do not affect this separate view.
+The frame counter shows the saved-frame ordinal and the zero-based source frame.
+After reconstruction, Left/Right or the previous/next buttons pause playback and
+step one saved result (two source frames for a 60fps source sampled at 30fps).
+Keyboard shortcuts leave text fields and other editing controls alone.
+**Smooth cube motion** eases rotations and turns over 100ms at the screen's refresh
+rate with `requestAnimationFrame`, independently of detector/video frame cadence.
+When a new target arrives, the previous ease curve is cut off immediately and
+the new curve starts from the currently displayed pose; curves never queue up.
+Animation stores one global rotation and three shared slab angles. Every sticker,
+center and solid body on a slab uses the same transform. Committed moves rebase
+the shared angles, preserving continuity through quarter-turn resets and reverse
+scrubbing. Perpendicular turns meet at an aligned cube before the next axis moves;
+there are no per-sticker motion paths. Distant seeks snap to their frame; adjacent steps ease to
+the exact saved state. Disable smoothing for immediate frame inspection. The video
+and its wireframe always show the exact selected frame without this easing.
+The video retains its separate wireframe overlay. Its mesh uses the geometry selected by
+search for that frame, including the reserved sixth flat fit; all six meshes
+were computed when the finalized fit bank became available. Visible physical-face IDs and camera depths are
+saved with every candidate mesh. The side panel uses the fitter's physical geometry,
+applies the scramble and recovered moves using the CPU cube permutations.
+A small WebGL renderer draws closed, opaque slab bodies and inset colored stickers
+with a depth buffer, including the exposed black caps between turned layers.
+Surfaces are occluded per pixel rather than sorted by their average depth.
+Seeking reads immutable state snapshots; it
+does not apply moves again or change the video wireframe overlay. Reviewing the saved
+reconstruction runs neither fitting nor search again. **Adjust range** returns
+to setup and preserves reusable completed results for the loaded file.
+
+The layer planner and mesh builder are independent TypeScript modules. From
+`web`, `npx tsx tools/check-cube-motion.mts recording.json [report.json]` checks
+physical sticker continuity at every phase boundary, forwards and backwards,
+while simulating 120Hz refreshes interrupting 100ms eases on 30fps input. This
+checks geometry; it does not measure browser/GPU frame rate.
+
+## Incremental forward move search
+
+Move search is enabled by default and requires an initial scramble. The Rust
+engine preserves the CPU scorer used by
+`search_independent_keypoint_bidirectional.py`, using only its forward search:
+54-byte cube states, directional 26m color-confusion costs, unique-sticker duplicate
+semantics, balanced geometry/color ranks, geometry contexts, eight-frame mismatch
+history, dominance, sibling ties, sparse branching and deferred widening. There
+is one shared **54 TPS** limit; no double-turn witness/classification is used.
+The browser defaults to width 3, sparse threshold 3 and a 1,000,000-state budget.
+The optional opening hold is measured from the first included frame.
+
+A separate CPU WASM worker prepares each immutable fit bank immediately when its
+promise resolves. Source ordinals are assigned before completion, so out-of-order
+fits can be prepared without skipping an earlier frame. States needing an
+unavailable frame remain parked; eligible states continue, and newly arrived
+frames wake the frontier. Waiting does not count as exhaustion or consume search
+expansions. End-of-input is explicit. Search has no dependency on Svelte, video
+pixels or OpenCV. Shared cube/permutation conventions are embedded in the module.
+
+Progress displays prepared/searched frames and expanded states. Unfinished paths
+are labeled **Current candidate**, and only a verified solved state is labeled
+**Solution**. Downloads include `moveSearches`, its configuration/source range,
+chosen geometry indices, moves, state/queue scores and computation timings.
+State-limit/exhausted results are explicit, not presented as solved.
+
+The standalone checks in [the fitter/search documentation](../pose-fitter/README.md)
+compare both native Rust and WASM with Python on identical saved banks. A streaming
+run can explore a different valid path because it works on other eligible states
+while the deepest branch waits; it is not claimed to reproduce batch expansion
+order. Matty's streamed path is independently checked against Python transitions. The selected-range browser run also validates every path edge against Python;
+its fit banks match the standalone fitter. See
+[the browser check](../pose-fitter/benchmarks/browser-move-search.json).
+
 ## Fitted-pose preview
 
-Enable **Show fitted pose** in the sidebar to run the Rust/WASM geometry fitter
-and display its best-fit wireframe. It is off by default. Landmark/sticker
-points remain hidden, and each frame is presented only after its matching fit
-and overlay are complete. Saved detection data also includes `fittedPose`, its
+The video reconstruction computes Rust/WASM poses for move search while keeping
+the overlay hidden during its first pass. It automatically enables **Show fitted
+pose** when complete. The checkbox remains available for camera/images and for
+hiding the completed overlay. Landmark/sticker points remain hidden, and each
+review frame is presented with its matching saved projection. Saved detection data also includes `fittedPose`, its
 candidate bank, sticker assignments, mesh, and fitting time when enabled.
 
 Detection and fitting overlap through a CPU worker pool (up to three workers).

@@ -1,0 +1,67 @@
+[
+  {
+    "name": "matty",
+    "runtime": "wasm",
+    "frames": 289,
+    "status": "solved",
+    "evaluated_states": 1366,
+    "candidate_probes": 5271,
+    "python_prepare_seconds": 3.810381666989997,
+    "python_search_seconds": 1.8854116660077125,
+    "rust_prepare_seconds": 0.3650724530220032,
+    "rust_search_seconds": 0.13769729089736937,
+    "issues": []
+  },
+  {
+    "name": "nahm",
+    "runtime": "wasm",
+    "frames": 384,
+    "status": "solved",
+    "evaluated_states": 917,
+    "candidate_probes": 5834,
+    "python_prepare_seconds": 5.587496208027005,
+    "python_search_seconds": 1.5693674159701914,
+    "rust_prepare_seconds": 0.6156389291286468,
+    "rust_search_seconds": 0.08930191707611083,
+    "issues": []
+  },
+  {
+    "name": "xuanyi",
+    "runtime": "wasm",
+    "frames": 235,
+    "status": "state_limit",
+    "evaluated_states": 25000,
+    "candidate_probes": 47376,
+    "python_prepare_seconds": 12.254846332827583,
+    "python_search_seconds": 216.0905177500099,
+    "rust_prepare_seconds": 3.8797894175052643,
+    "rust_search_seconds": 16.446558375120162,
+    "issues": []
+  },
+  {
+    "name": "tommy",
+    "runtime": "wasm",
+    "frames": 221,
+    "status": "solved",
+    "evaluated_states": 14507,
+    "candidate_probes": 8212,
+    "python_prepare_seconds": 12.411121417069808,
+    "python_search_seconds": 23.38658304209821,
+    "rust_prepare_seconds": 1.1526994595527649,
+    "rust_search_seconds": 1.6451098339557648,
+    "issues": []
+  },
+  {
+    "name": "yiheng",
+    "runtime": "wasm",
+    "frames": 118,
+    "status": "state_limit",
+    "evaluated_states": 25000,
+    "candidate_probes": 9814,
+    "python_prepare_seconds": 5.283041915856302,
+    "python_search_seconds": 44.266154209151864,
+    "rust_prepare_seconds": 0.4320341689586639,
+    "rust_search_seconds": 3.2251258330345154,
+    "issues": []
+  }
+]

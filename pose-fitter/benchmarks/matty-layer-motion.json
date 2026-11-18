@@ -1,0 +1,12 @@
+{
+  "input": "../pose-fitter/results/matty-browser-reconstruction.json",
+  "simulatedRefreshRate": 120,
+  "inputRate": 30,
+  "easeDurationMs": 100,
+  "savedFrames": 138,
+  "transitions": 274,
+  "boundaryChecks": 721,
+  "sampledStates": 2192,
+  "maxBoundaryErrorCubeUnits": 8.886119947416683e-16,
+  "elapsedMs": 175.4826250076294
+}

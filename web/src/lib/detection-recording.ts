@@ -1,4 +1,5 @@
 import type { FrameResult, InferenceBackend, Settings } from "./detector";
+import type { MoveSearchConfig,MoveSearchResult } from "./move-search-types";
 
 export interface RecordingContext {
   sourceId: number;
@@ -27,6 +28,8 @@ export class DetectionRecording {
     settings: Settings;
     result: FrameResult;
   }[] = [];
+  private readonly searches = new Map<number,{sourceId:number;config:MoveSearchConfig;result:MoveSearchResult}>();
+  saveSearch(sourceId:number,config:MoveSearchConfig,result:MoveSearchResult){this.searches.set(sourceId,{sourceId,config,result});}
 
   get length() {
     return this.frames.length;
@@ -62,6 +65,10 @@ export class DetectionRecording {
           "Separate cube bbox detector score from the last acquisition",
       },
       fittingFields: {
+        "result.fittedPose.wireframes": "Projected meshes in the same order as all retained geometry options",
+        "result.fittedPose.wireframeFaces": "Physical face IDs in each projected mesh, for reconstructed sticker colors",
+        "result.fittedPose.wireframeDepths": "Camera depths for far-to-near face rendering",
+        "moveSearches[].result.steps[].state_score": "Balanced geometry/color cost; lower is better, not detector confidence",
         "result.fittedPose.stage": "cpu_pipeline means startup, initial, neighbors, orientation and recovery are complete",
         "result.fittedPose.pipelineVersion": "Content-addressed Rust/WASM asset loaded by the fitter",
         "result.fittedPose.fittingConfig": "Frame sequence configuration and buffered fitting segment for standalone replay",
@@ -72,6 +79,7 @@ export class DetectionRecording {
       },
       sources: [...this.sources.values()],
       frames: this.frames,
+      moveSearches: [...this.searches.values()],
     };
   }
 }

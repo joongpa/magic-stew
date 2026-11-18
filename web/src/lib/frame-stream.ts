@@ -5,10 +5,11 @@ export class FrameSelector {
   constructor(
     readonly sourceFps: number,
     readonly targetFps = 30,
+    readonly minimumTimestamp = -Infinity,
   ) {}
 
   accept(timestamp: number): boolean {
-    if (!Number.isFinite(timestamp)) return false;
+    if (!Number.isFinite(timestamp) || timestamp < this.minimumTimestamp - 0.0000001) return false;
     if (this.sourceFps > 0 && this.sourceFps <= this.targetFps + 0.001)
       return true;
     this.origin ??= timestamp;
@@ -103,6 +104,8 @@ export async function openVideoFile(file: File) {
     const duration = await track.computeDuration();
     const metrics = await track.computeFrameRateMetrics();
     const sink = new CanvasSink(track, { poolSize: 2 });
+    const previewSink = new CanvasSink(track, { poolSize: 1 });
+    const thumbnailSink = new CanvasSink(track, { width: 144, height: 80, fit: "cover", poolSize: 1 });
     let iterator = sink.canvases();
     const samplingFps =
       metrics.maxFrameRate <= 30.001
@@ -133,11 +136,18 @@ export async function openVideoFile(file: File) {
       duration,
       sourceFps: metrics.averageFrameRate,
       next: () => prefetch.next(),
+      async preview(timestamp: number, thumbnail = false) {
+        const selectedSink = thumbnail ? thumbnailSink : previewSink;
+        const value = await selectedSink.getCanvas(Math.max(timestamp, 0.001)) ??
+          (timestamp < 1 / metrics.averageFrameRate ? await selectedSink.getCanvas(1 / metrics.averageFrameRate) : null);
+        if (!value || closed) return null;
+        return { bitmap: await createImageBitmap(value.canvas), timestamp: value.timestamp };
+      },
       seek(timestamp: number) {
         prefetch.reset();
         void iterator.return().catch(() => {});
         iterator = sink.canvases(timestamp);
-        selector = new FrameSelector(samplingFps);
+        selector = new FrameSelector(samplingFps, 30, timestamp);
       },
       close() {
         closed = true;

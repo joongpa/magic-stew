@@ -1,0 +1,9 @@
+{
+  "case": "matty",
+  "status": "solved",
+  "checked_frames": 287,
+  "solved": true,
+  "expanded_states": 11972,
+  "python_validation_seconds": 4.561586417024955,
+  "scope": "Every streamed edge, geometry index, state score and queue priority checked against the Python forward scorer; no future-frame traversal"
+}
