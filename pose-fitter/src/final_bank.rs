@@ -1,7 +1,11 @@
 //! Final output alternatives. Internal fitting, camera seeds, continuity anchors
-//! and recovery keep the original score-first bank. Only weakly supported outer
-//! layers are flattened, at the parent's exact camera and remaining angle.
-use crate::{math::rodrigues, search, Fit, Geometry, Workload};
+//! and recovery keep the original score-first bank. Weakly supported slabs can
+//! flatten; a weak middle is re-expressed through the rigid pose while keeping
+//! supported outer slab geometry fixed.
+use crate::{
+    math::{axis_rotation, matrix_rvec, mm, rodrigues},
+    search, Fit, Geometry, Workload,
+};
 use serde::Serialize;
 use std::{cmp::Ordering, collections::HashMap};
 
@@ -25,19 +29,30 @@ fn flatter(a: &Fit, b: &Fit, g: &Geometry) -> Ordering {
 }
 fn qualifies(g: &Geometry, parent: &Fit, candidate: &Fit) -> bool {
     search::cost(g, &candidate.metrics) <= search::cost(g, &parent.metrics) + 1e-9
-        || (candidate.valid == parent.valid
-            && candidate.nearest.len() == parent.nearest.len()
-            && candidate
-                .nearest
-                .iter()
-                .zip(&parent.nearest)
-                .zip(&parent.valid)
-                .all(|((&a, &b), &valid)| !valid || a == b))
+        || same_assignments(parent, candidate)
+}
+fn same_assignments(parent: &Fit, candidate: &Fit) -> bool {
+    candidate.valid == parent.valid
+        && candidate.nearest.len() == parent.nearest.len()
+        && candidate
+            .nearest
+            .iter()
+            .zip(&parent.nearest)
+            .zip(&parent.valid)
+            .all(|((&a, &b), &valid)| !valid || a == b)
 }
 /// Generate at most three alternatives, without any solver or camera call.
 /// Support is the existing geometric-proximity count, not detector confidence
 /// or a count of distinct assigned sticker/landmark objects.
 pub fn alternatives(g: &Geometry, w: &Workload, parent: &Fit) -> (Vec<Fit>, Diagnostics) {
+    alternatives_with_middle(g, w, parent, true)
+}
+fn alternatives_with_middle(
+    g: &Geometry,
+    w: &Workload,
+    parent: &Fit,
+    allow_middle: bool,
+) -> (Vec<Fit>, Diagnostics) {
     let weak = [
         parent.params[6] != 0. && parent.metrics.layer_support[0] <= 1,
         parent.params[7] != 0. && parent.metrics.layer_support[2] <= 1,
@@ -64,6 +79,58 @@ pub fn alternatives(g: &Geometry, w: &Workload, parent: &Fit) -> (Vec<Fit>, Diag
             }
         }
     }
+    // The middle slab is represented by the rigid pose, not a third angle.
+    // Align a weak middle to either supported outer slab, then re-express all
+    // three slab angles in that middle frame. Optional weak outers can flatten
+    // in the same proposal; supported slab projections remain fixed.
+    if allow_middle && parent.metrics.layer_support[1] <= 1 {
+        for anchor in [0, 2] {
+            let angle = parent.angles[anchor];
+            if parent.metrics.layer_support[anchor] <= 1 || angle == 0. {
+                continue;
+            }
+            for mask in [[false, false], [true, false], [false, true], [true, true]] {
+                if (mask[0] && parent.metrics.layer_support[0] > 1)
+                    || (mask[1] && parent.metrics.layer_support[2] > 1)
+                {
+                    continue;
+                }
+                let mut angles = parent.angles;
+                angles[1] = angle;
+                if mask[0] {
+                    angles[0] = angle;
+                }
+                if mask[1] {
+                    angles[2] = angle;
+                }
+                let rotation = mm(
+                    rodrigues([parent.params[0], parent.params[1], parent.params[2]]).0,
+                    axis_rotation(parent.axis, angle),
+                );
+                let mut params = parent.params;
+                params[..3].copy_from_slice(&matrix_rvec(rotation));
+                params[6] = (angles[0] - angle + 45.).rem_euclid(90.) - 45.;
+                params[7] = (angles[2] - angle + 45.).rem_euclid(90.) - 45.;
+                // materialize snaps sub-half-degree angles to zero. Do not
+                // let that convention move a supported outer slab on rebasing.
+                if [(0, 6), (2, 7)].iter().any(|&(layer, param)| {
+                    parent.metrics.layer_support[layer] > 1
+                        && params[param].abs() > 1e-9
+                        && params[param].abs() < 0.5
+                }) {
+                    continue;
+                }
+                diagnostics.attempted_materializations += 1;
+                if let Some(mut candidate) = search::materialize(g, w, parent.axis, params) {
+                    if qualifies(g, parent, &candidate) {
+                        candidate.source = "final_weak_middle_flatten".into();
+                        diagnostics.qualified_variants += 1;
+                        fits.push(candidate);
+                    }
+                }
+            }
+        }
+    }
     (fits, diagnostics)
 }
 /// Freeze the first five original regular fits, select their qualified flatter
@@ -87,8 +154,12 @@ pub fn select(g: &Geometry, w: &Workload, bank: &[Fit]) -> Output {
     let reference = rodrigues([first.params[0], first.params[1], first.params[2]]).0;
     let mut diagnostics = Diagnostics::default();
     let mut preferred = vec![];
+    // A weaker interpretation must not erase middle-layer evidence already
+    // established by the best fit. The same <=1 support threshold gates the
+    // middle extension; ordinary outer-layer cleanup is unchanged.
+    let allow_middle = first.metrics.layer_support[1] <= 1;
     for parent in &original {
-        let (alternatives, count) = alternatives(g, w, parent);
+        let (alternatives, count) = alternatives_with_middle(g, w, parent, allow_middle);
         diagnostics.attempted_materializations += count.attempted_materializations;
         diagnostics.qualified_variants += count.qualified_variants;
         let best = alternatives
@@ -137,6 +208,131 @@ pub fn select(g: &Geometry, w: &Workload, bank: &[Fit]) -> Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn weak_middle_case(frame: usize) -> (Geometry, Workload, Vec<Fit>) {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/weak-middle-flat.json")).unwrap();
+        let geometry: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/final-bank-reviewed.json"))
+                .unwrap();
+        let g: Geometry = serde_json::from_value(geometry["geometry"].clone()).unwrap();
+        let c = fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["frame"]["frame"] == frame)
+            .unwrap();
+        let bank: Vec<Fit> = serde_json::from_value(c["bank"].clone()).unwrap();
+        let p = bank[0].params;
+        let width = c["frame"]["width"].as_f64().unwrap();
+        let height = c["frame"]["height"].as_f64().unwrap();
+        let focal = width.max(height) * 1.2;
+        let w = Workload {
+            name: "single-layer".into(),
+            frame,
+            stage: "final".into(),
+            camera: crate::Camera {
+                rvec: [p[0], p[1], p[2]],
+                tvec: [p[3], p[4], p[5]],
+                k: [
+                    [focal, 0., width / 2.],
+                    [0., focal, height / 2.],
+                    [0., 0., 1.],
+                ],
+                dist: vec![0.; 4],
+            },
+            observations: serde_json::from_value(c["frame"]["observations"].clone()).unwrap(),
+            prior: None,
+            neighbors: vec![],
+            retained: vec![],
+            static_mode: false,
+            refinement_traces: vec![],
+        };
+        (g, w, bank)
+    }
+    #[test]
+    fn single_layer_ambiguity_is_flat_without_moving_observed_geometry() {
+        for frame in [71, 73, 89] {
+            let (g, w, bank) = weak_middle_case(frame);
+            let before = serde_json::to_value(&bank).unwrap();
+            let output = select(&g, &w, &bank);
+            let parent = &bank[0];
+            let flat = &output.bank[0];
+            assert_eq!(parent.metrics.layer_support[0..2], [0, 0]);
+            assert_eq!(flat.source, "final_weak_middle_flatten");
+            assert_eq!(flat.angles, [0.; 3]);
+            assert_eq!(flat.params[3..6], parent.params[3..6]);
+            assert!(same_assignments(parent, flat));
+            assert!(parent
+                .assignment_projected
+                .iter()
+                .zip(&flat.assignment_projected)
+                .all(|(&a, &b)| crate::math::distance(a, b) <= 1e-6));
+            assert_eq!(serde_json::to_value(&bank).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(output.bank.last().unwrap()).unwrap(),
+                serde_json::to_value(bank.last().unwrap()).unwrap()
+            );
+        }
+    }
+    #[test]
+    fn supported_multilayer_best_fit_cannot_be_flattened_by_a_weaker_hypothesis() {
+        for frame in [99, 105, 119] {
+            let (g, w, bank) = weak_middle_case(frame);
+            let output = select(&g, &w, &bank);
+            assert_eq!(
+                serde_json::to_value(output.bank).unwrap(),
+                serde_json::to_value(bank).unwrap(),
+                "frame {frame}"
+            );
+        }
+    }
+    #[test]
+    fn middle_uses_the_same_support_threshold_as_outer_layers() {
+        let (g, w, bank) = weak_middle_case(71);
+        let mut parent = bank[0].clone();
+        parent.metrics.layer_support[1] = 2;
+        let (fits, d) = alternatives(&g, &w, &parent);
+        assert_eq!(d.attempted_materializations, 0);
+        assert!(fits.is_empty());
+        parent.metrics.layer_support[1] = 1;
+        let (fits, d) = alternatives(&g, &w, &parent);
+        assert!(d.attempted_materializations > 0);
+        assert!(fits.iter().any(|fit| fit.angles == [0.; 3]));
+    }
+    #[test]
+    fn weak_middle_generalizes_to_two_supported_outer_layers() {
+        let (g, w, bank) = weak_middle_case(620);
+        let parent = &bank[0];
+        assert!(parent.metrics.layer_support[0] > 1 && parent.metrics.layer_support[2] > 1);
+        assert_eq!(parent.metrics.layer_support[1], 1);
+        let (fits, d) = alternatives(&g, &w, parent);
+        assert_eq!(d.attempted_materializations, 2);
+        assert!(!fits.is_empty());
+        let old = rodrigues([parent.params[0], parent.params[1], parent.params[2]]).0;
+        for fit in fits {
+            let new = rodrigues([fit.params[0], fit.params[1], fit.params[2]]).0;
+            for layer in [0, 2] {
+                let a = mm(old, axis_rotation(parent.axis, parent.angles[layer]));
+                let b = mm(new, axis_rotation(fit.axis, fit.angles[layer]));
+                assert!(a
+                    .iter()
+                    .flatten()
+                    .zip(b.iter().flatten())
+                    .all(|(a, b)| (a - b).abs() < 1e-9));
+            }
+            assert!(qualifies(&g, parent, &fit));
+        }
+    }
+    #[test]
+    fn rebasing_cannot_snap_away_a_supported_outer_difference() {
+        let (g, w, bank) = weak_middle_case(620);
+        let mut parent = bank[0].clone();
+        parent.angles[2] = parent.angles[0] + 0.2;
+        parent.params[7] = parent.angles[2];
+        let (fits, diagnostics) = alternatives(&g, &w, &parent);
+        assert_eq!(diagnostics.attempted_materializations, 0);
+        assert!(fits.is_empty());
+    }
     fn case(frame: usize) -> (Geometry, Workload, Vec<Fit>) {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/final-bank-reviewed.json"))

@@ -247,6 +247,55 @@ def test_final_flat_variants_do_no_projection_for_supported_layers(observation, 
     assert diagnostics['attempted_materializations'] == 0
 
 
+def _saved_weak_middle_fit(observation, source_frame):
+    fixture = json.loads((Path(__file__).parents[1]/'pose-fitter/tests/fixtures/weak-middle-flat.json').read_text())
+    case = next(c for c in fixture['cases'] if c['frame']['frame'] == source_frame)
+    frame, fit = case['frame'], case['bank'][0]
+    width, height = frame['width'], frame['height']
+    focal = max(width, height)*1.2
+    base = replace(observation[0], rvec=np.asarray(fit['params'][:3]).reshape(3, 1),
+        tvec=np.asarray(fit['params'][3:6]).reshape(3, 1),
+        camera_matrix=np.array([[focal, 0, width/2], [0, focal, height/2], [0, 0, 1.]]),
+        dist_coeffs=np.zeros(4), image_size=(width, height),
+        assignment_image_points=np.asarray(frame['observations']['points']),
+        assignment_observed_class_ids=np.asarray(frame['observations']['classes']),
+        sticker_mask_centers=tuple(np.asarray(p) for p in frame['observations']['stickers']),
+        sticker_mask_center_uncertainties=tuple(frame['observations']['uncertainties']),
+        sticker_color_names=tuple(frame['colors']))
+    return geometry._materialize(m, base, fit['axis'], np.asarray(fit['params']))
+
+
+@pytest.mark.parametrize('source_frame', [71, 73, 89, 99])
+def test_single_layer_flat_output_preserves_kyle_observations(observation, source_frame):
+    parent = _saved_weak_middle_fit(observation, source_frame)
+    bank = geometry.final_assignment_bank(m, [parent])
+    if source_frame == 99:
+        assert bank[0] is parent  # This frame has evidence on multiple layers.
+        return
+    flat = bank[0]
+    assert flat.angles == (0., 0., 0.)
+    assert flat.proposal_source == 'final_weak_middle_flatten'
+    np.testing.assert_array_equal(flat.valid, parent.valid)
+    np.testing.assert_array_equal(flat.nearest[flat.valid], parent.nearest[parent.valid])
+    np.testing.assert_allclose(flat.option['assignment_projected_points'],
+                               parent.option['assignment_projected_points'], atol=1e-6, rtol=0)
+    np.testing.assert_array_equal(flat.candidate.tvec, parent.candidate.tvec)
+
+
+def test_weak_middle_flattening_preserves_both_supported_outer_poses(observation):
+    parent = _saved_weak_middle_fit(observation, 620)
+    assert parent.option['layer_support'][0] > 1 and parent.option['layer_support'][2] > 1
+    assert parent.option['layer_support'][1] <= 1
+    selected = geometry.final_assignment_bank(m, [parent])[0]
+    assert selected.proposal_source == 'final_weak_middle_flatten'
+    old = cv2.Rodrigues(parent.candidate.rvec)[0]
+    new = cv2.Rodrigues(selected.candidate.rvec)[0]
+    for layer in (0, 2):
+        before = old @ cv2.Rodrigues(np.eye(3)[parent.axis]*np.deg2rad(parent.angles[layer]))[0]
+        after = new @ cv2.Rodrigues(np.eye(3)[selected.axis]*np.deg2rad(selected.angles[layer]))[0]
+        np.testing.assert_allclose(before, after, atol=1e-9, rtol=0)
+
+
 def test_assignment_bank_collapses_symmetry_relabeling_but_keeps_validity_changes(observation):
     base = geometry._materialize(m, observation[0], 0, np.r_[
         observation[0].rvec.ravel(), observation[0].tvec.ravel(), -15., 0.])

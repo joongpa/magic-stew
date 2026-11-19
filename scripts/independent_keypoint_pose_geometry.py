@@ -500,8 +500,10 @@ def assignment_shortlist(renderer, fits, size=5):
 def final_assignment_bank(renderer, fits, size=5, *, diagnostics=None):
     """Try cheap weak-layer flattening only after temporal fitting is finished.
 
-    Camera and supported angles are fixed. Existing proximity support <=1
-    gates each nonzero outer angle. A variant must preserve valid sticker
+    Proximity support <=1 gates every slab. Outer cleanup fixes the camera;
+    weak-middle cleanup rebases it while preserving supported outer geometry.
+    A best fit with supported middle blocks the middle extension for its bank.
+    A variant must preserve valid sticker
     assignments or have non-worse balanced reprojection cost. No solver runs.
     The reserved whole-flat fallback never displaces regular candidates.
     """
@@ -526,6 +528,41 @@ def final_assignment_bank(renderer, fits, size=5, *, diagnostics=None):
         return (np.array_equal(first.valid, second.valid)
                 and np.array_equal(first.nearest[first.valid], second.nearest[second.valid]))
 
+    allow_middle = ordinary[0].option.get('layer_support', (math.inf,)*3)[1] <= 1
+
+    def middle_variants(original):
+        support = original.option.get('layer_support', (math.inf,)*3)
+        if not allow_middle or support[1] > 1:
+            return [], 0
+        variants, attempts = [], 0
+        for anchor in (0, 2):
+            angle = original.angles[anchor]
+            if support[anchor] <= 1 or angle == 0.:
+                continue
+            for mask in ((False, False), (True, False), (False, True), (True, True)):
+                if (mask[0] and support[0] > 1) or (mask[1] and support[2] > 1):
+                    continue
+                angles = list(original.angles)
+                angles[1] = angle
+                if mask[0]:
+                    angles[0] = angle
+                if mask[1]:
+                    angles[2] = angle
+                rotation = cv2.Rodrigues(original.candidate.rvec)[0] @ cv2.Rodrigues(
+                    np.eye(3)[original.axis] * np.deg2rad(angle))[0]
+                parameters = np.r_[cv2.Rodrigues(rotation)[0].ravel(), original.candidate.tvec.ravel(),
+                                   (angles[0]-angle+45.) % 90.-45., (angles[2]-angle+45.) % 90.-45.]
+                if any(support[layer] > 1 and 1e-9 < abs(parameters[param]) < .5
+                       for layer, param in ((0, 6), (2, 7))):
+                    continue
+                attempts += 1
+                variant = _materialize(renderer, original.candidate, original.axis, parameters)
+                if variant is not None and (same_assignments(original, variant)
+                                            or cost(variant) <= cost(original)+1e-9):
+                    variant.proposal_source = 'final_weak_middle_flatten'
+                    variants.append(variant)
+        return variants, attempts
+
     preferred, attempts, qualified = [], 0, 0
     for original in ordinary:
         support = original.option.get('layer_support', (math.inf,)*3)
@@ -546,6 +583,12 @@ def final_assignment_bank(renderer, fits, size=5, *, diagnostics=None):
                 continue
             qualified += 1
             variant.proposal_source = 'weak_layer_flat_output'
+            if order(variant) < order(selected):
+                selected = variant
+        variants, attempted = middle_variants(original)
+        attempts += attempted
+        qualified += len(variants)
+        for variant in variants:
             if order(variant) < order(selected):
                 selected = variant
         preferred.append(selected)
@@ -863,7 +906,15 @@ def process_pose_geometry(renderer, cache, args, colors, fps, progress=None):
             # Recovery is uncommon. Materialize its returned candidates from
             # this frame's observations, without another fitting/solver pass.
             options = record.pose_candidate.joint_geometry_candidates
-            if not any(any(angle != 0. and option.get('layer_support', (math.inf,)*3)[layer] <= 1
+            middle_support = options[0].get('layer_support', (math.inf,)*3)[1] if options else math.inf
+            def has_middle_anchor(candidate, option):
+                support = option.get('layer_support', (math.inf,)*3)
+                angles = renderer.parallel_layer_angles(candidate.layer_rotations)
+                return support[1] <= 1 and any(support[layer] > 1 and angles[layer] != 0.
+                                               for layer in (0, 2))
+            middle_possible = middle_support <= 1 and any(has_middle_anchor(candidate, option)
+                for candidate, option in zip(record.pose_candidates, options, strict=True))
+            if not middle_possible and not any(any(angle != 0. and option.get('layer_support', (math.inf,)*3)[layer] <= 1
                            for layer, angle in enumerate(renderer.parallel_layer_angles(candidate.layer_rotations)))
                        for candidate, option in zip(record.pose_candidates, options, strict=True)):
                 continue

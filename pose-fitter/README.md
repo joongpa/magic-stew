@@ -910,13 +910,21 @@ when producing the final output bank. Initial fits, immutable neighbor cameras,
 orientation references and finalized camera-continuity anchors retain the
 original score-first selection. The final alternatives cannot seed later fits.
 
-Only a nonzero outer angle whose existing `layer_support` is at most one is
-eligible. This counter measures geometric proximity support, not detector
-confidence, keypoint presence or unique assigned observations. A supported
-outer layer stays fixed. Each eligible mask zeros one or both weak angles at
-the parent's exact camera; it performs one projection/assignment evaluation,
-without a sweep, optimizer or PnP solve. There are at most three masks per fit
-and usually no attempts at all.
+The same `layer_support <= 1` rule applies to all three slabs. This counter
+measures geometric proximity support, not detector confidence, keypoint presence
+or unique assigned observations. Weak outer angles can be zeroed at the parent's
+exact camera. A weak middle can instead align to either supported outer layer:
+the rigid rotation absorbs that alignment and the outer angles are re-expressed
+in the new middle frame. Supported outer geometry stays fixed. Proposals that
+would snap away a supported sub-half-degree difference are skipped. A best fit
+with middle support greater than one prevents weaker hypotheses from enabling
+middle flattening for that bank; ordinary outer cleanup is unchanged.
+
+Each eligible mask performs one projection/assignment evaluation, without a
+sweep, optimizer or PnP solve. There are at most three masks per fit and usually
+no attempts at all. This is a generalization of the final weak-layer policy,
+including views with two supported outer layers; it has no solve-specific or
+opening-frame condition.
 
 A variant qualifies if balanced reprojection cost is no worse (1e-9 numerical
 tolerance), **or** valid sticker assignments are unchanged. Invalid placeholder

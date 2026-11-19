@@ -336,3 +336,19 @@ fn final_output_alternatives_keep_original_continuity_source_and_internal_bank()
     assert_eq!(output["bank"][0]["params"][6],0.);
     assert_ne!(output["bank"][0]["params"][6],before[0]["params"][6]);
 }
+
+#[test]
+fn single_layer_flat_camera_is_not_used_for_internal_continuity() {
+    let fixture: serde_json::Value=serde_json::from_str(include_str!("../../tests/fixtures/weak-middle-flat.json")).unwrap();
+    let geometry: serde_json::Value=serde_json::from_str(include_str!("../../tests/fixtures/final-bank-reviewed.json")).unwrap();
+    let g:Geometry=serde_json::from_value(geometry["geometry"].clone()).unwrap();
+    let c=&fixture["cases"][0];
+    let frame:Frame=serde_json::from_value(c["frame"].clone()).unwrap();
+    let bank:Vec<Fit>=serde_json::from_value(c["bank"].clone()).unwrap();
+    let source=pose(&bank[0]);let core=jobs::continuity_core(&frame,&bank);
+    let output=jobs::run(&g,jobs::Job::Finalize{frame,source:None,bank,target:None,static_mode:false});
+    assert_eq!(output["bank"][0]["angles"],serde_json::json!([0.,0.,0.]));
+    assert_ne!(output["pose"]["rvec"],serde_json::to_value(source.rvec).unwrap());
+    assert_eq!(output["continuity_source_pose"],serde_json::to_value(source).unwrap());
+    assert_eq!(output["continuity_core"],serde_json::to_value(core).unwrap());
+}
