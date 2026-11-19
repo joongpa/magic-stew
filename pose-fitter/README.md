@@ -940,6 +940,106 @@ camera seeds. Final-only raw-input regression results and before/after pictures
 are under `results/search-failure-audit/final-flat-controls` and
 `results/search-failure-audit/final-flat-control-visuals`.
 
+## Post-solve cleanup and display notation
+
+The app enables **Remove move/undo artifacts** by default. Cleanup runs once
+when a solution is found; it does not change the search frontier, queue order,
+TPS limits or expansion budgets. Rust's legacy defaults keep cleanup off.
+
+With `postprocess_pose_cleanup: true` (the new app policy), an exact coordinate
+change first fixes the center-color frame. Slice/wide turns become outer turns
+and the corresponding rigid symmetry is carried into each selected fitted pose.
+Every original sticker remains on exactly the same physical surface. This makes
+closed walks discoverable even when their net effect included a whole-cube
+rotation. Identity checks still compare all 54 stickers in that common frame.
+The ordering DAG explores every order obtainable by swapping simultaneous moves
+on disjoint layers of the same axis; U/R and other noncommuting moves keep their
+recorded order.
+
+Each candidate removal holds the entry state and compares the arithmetic mean
+of normalized frame color errors with the original segment's mean. Both endpoint
+frames belong to the interval; frames without color observations carry no weight.
+Unchanged frames outside the move interval cannot pad its mean. The default
+`postprocess_color_tolerance` is **0.02**, adjustable in the app. This is a segment
+mean allowance, not a per-frame ceiling. The held state may use an already fitted
+bank alternative or rigid symmetry whose balanced geometric reprojection error
+is no worse than the original selected fit. This performs no new fitting or
+projection. The legacy mode without pose cleanup keeps the selected poses fixed.
+
+Dynamic programming favors more removed turn tokens and fewer sections on ties.
+A final exact per-frame reduction combines consecutive turns on the same axis,
+including opposite layers: `R' R2` becomes `R`. All commits in that frame have
+one after-frame observation, so this reduction preserves every observed sticker
+state and color score. Cross-frame move/undo removals still require the segment
+color check. `simplified_frames` and `simplified_moves` distinguish these exact
+reductions from removed identity sections.
+A combined replay rechecks each accepted segment's mean and the exact normalized
+final sticker state. Frame count and solved timestamp are preserved. Geometry
+bank indices can change inside removed sections. Final coordinates can differ by
+a rigid cube orientation, carried by the poses; the physical final stickers do
+not change. `moves_before` counts the normalized input tokens; `raw_moves_before`
+retains the original count, since wide/slice decomposition can change token count.
+
+With diagnostics enabled, `unprocessed_steps` retains the original search path;
+`postprocess.sections` records both means and the scored frame count. Reprocessing
+uses that baseline so tolerance never accumulates. Diagnostics off gives the same
+cleanup decisions with no original path or per-section logs. Changed steps lose
+stale ranking and physical-travel telemetry. Use the original steps for physical
+TPS analysis: this pass checks color and geometric fit, without re-searching
+motion mechanics.
+
+The explicit `postprocess` request accepts a solved result after its fitted banks
+have been loaded. `tools/postprocess-saved-solution.mjs INPUT RESULT OUTPUT
+[TOLERANCE] [--pose-cleanup]` replays it without search. The separate
+`tools/verify-postprocess.mjs INPUT ORIGINAL CLEANED` independently verifies color
+means, fit quality, physical stickers outside removed sections, final solved
+state and unchanged search statistics. Results for the latest Teodor run and
+eight controls are in `results/teodor-cleanup/README.md`; earlier fixed-pose
+measurements remain in `results/postprocess-loops/README.md`.
+
+The web display independently requires a **75 degree** orientation change held
+for **100 ms** before showing a cube rotation. Move labels follow that same
+stabilized grip. It stops at the solved path and combines matching quarter turns
+into half turns; it does not cancel move/undo pairs without color validation.
+This filter changes only notation, leaving search and the tracked cube untouched.
+
+After a solution is known, colored-cube playback also hides residual layer-offset
+excursions which return to flat without a commit on that axis and layer. The
+return/axis-change endpoint counts, as do commits in a rejected-pose gap. Residual
+wraps across a real commit are preserved. Slice and wide turns support their
+affected layers; rigid cube rotations alone do not justify a layer offset. The
+rule applies independently to each layer, including trailing uncommitted offsets.
+Running candidates retain their fitted offsets. This changes rendered layer
+angles only: original fit banks, camera rotation, sticker states and search
+results remain intact.
+
+Display notation uses the fitted poses and the stabilized camera grip. The
+experimental readable-solution optimizer was removed: it chose an equivalent
+starting grip for notation rather than recovering the cuber's actual grip.
+No reference solution enters search, cleanup or notation generation.
+
+### Native slice notation
+
+Two equal outer-slab commits can be a middle slice expressed in a different
+core basis. The display checks the measured core rotation against the opposing
+quarter/half turn (at least 60 degrees of motion, at most 30 degrees residual
+error). It uses the earlier video renderer's 0.12s approach and 0.085s settling
+windows, stopping at other commits. Independent outer commits on adjacent
+samples can be grouped within 0.085s. The resulting basis change plus the
+commits must have exactly the single-layer M/E/S permutation before conversion.
+With a stationary core or unsupported geometry it keeps the simultaneous turns.
+The inferred compensation is carried forward in the existing camera-based
+notation grip; no alternative starting orientation is selected for readability.
+The same slice interpretation preserves the middle-layer approach/settle offsets
+in playback, even if the search represented its commit with two outer turns.
+
+`tools/compare-displayed-reference.ts CAPTURE REFERENCE OUTPUT` independently
+compares the generated display with a reference, including exact rigid-orientation,
+wide-turn and commuting disjoint-layer equivalences. It loads the reference only
+after generating the notation. The latest Tommy comparison matches all 83
+reference prefixes (initial plus 82 moves) with 13 native slice turns and no
+unmatched displayed events. Details are in `results/slice-notation/README.md`.
+
 ## Recent motion cost
 
 New web runs explicitly record `motion_cost_weight: 0.025`. Legacy/native inputs

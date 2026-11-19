@@ -5,6 +5,8 @@ import type { CubePose, Quaternion, V3 } from "./cube-motion";
 import type { MoveStep } from "./move-search-types";
 import { projectedCubeAtFrame } from "./projected-cube";
 import type { ProjectedCubeFrame } from "./projected-cube";
+import {displaySliceCommits} from './cube-display-slices';
+import type {DisplaySlice} from './cube-display-slices';
 
 const moveTurns=turns as Record<string,{axis:number;angles:number[]}>;
 const clean=(move:string)=>move.replaceAll("’","'").replace(/2'$/,"2");
@@ -18,15 +20,20 @@ const orientationIndices=new Map(orientations.matrices.map((matrix,index)=>[matr
 const normals:V3[]=[[0,0,1],[0,0,-1],[0,-1,0],[0,1,0],[1,0,0],[-1,0,0]];
 const dot=(a:V3,b:V3)=>a.reduce((sum,v,i)=>sum+v*b[i],0);
 const cross=(a:V3,b:V3):V3=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+// Orthographic isometric notation reference: equally visible U/F/R faces,
+// with U straight up, F down-left, R down-right. This does not set the camera.
+const notationFront:V3=[-1/Math.sqrt(2),1/Math.sqrt(6),-1/Math.sqrt(3)];
+const notationRight:V3=[1/Math.sqrt(2),1/Math.sqrt(6),-1/Math.sqrt(3)];
 
-/** Map model axes to displayed cube faces. Choose U first, then the most
- * viewer-facing perpendicular face as F. OpenCV screen-up is -Y, toward us -Z.
- * Fixed candidate order resolves exact ties without floating-point chatter. */
+/** Name faces using the orthographic isometric notation reference. U is the
+ * nearest face to screen-up; jointly align F down-left and R down-right rather
+ * than naming whichever face is most viewer-facing as F. */
 export function displayCubeBasis(rotation:Quaternion):number {
  const best=(candidates:V3[],direction:V3)=>candidates.reduce((chosen,normal)=>
   dot(rotate(rotation,normal),direction)>dot(rotate(rotation,chosen),direction)+1e-10?normal:chosen);
  const up=best(normals,[0,-1,0]);
- const front=best(normals.filter(normal=>dot(normal,up)===0),[0,0,-1]);
+ const score=(front:V3)=>dot(rotate(rotation,front),notationFront)+dot(rotate(rotation,cross(up,front)),notationRight);
+ const front=normals.filter(normal=>dot(normal,up)===0).reduce((chosen,normal)=>score(normal)>score(chosen)+1e-10?normal:chosen);
  const right=cross(up,front);
  return orientationIndices.get([...right,...front.map(v=>-v),...up].join(","))!;
 }
@@ -85,25 +92,65 @@ const rotationWords=(()=>{
 })();
 
 export interface ReorientedMoveStep { frame:number; moves:string[]; rotation:boolean }
+export interface RotationDisplayOptions { fps?:number;rotationThresholdDegrees?:number;minimumRotationSeconds?:number;nativeSlices?:boolean }
+/** Fold the observed coordinate-basis jump and simultaneous layer commits
+ * into a native slice only when their exact same-axis effect is M/E/S. */
+function sliceFromBasisChange(slice:DisplaySlice,previous:number):{move:string;basis:number}|undefined {
+ const vector:V3=[0,0,0];vector[slice.axis]=slice.coreDegrees*Math.PI/180;
+ const expected=axisAngle(vector);
+ const candidate=nearestOrientation(multiply(orientationQuaternions[previous],expected));
+ const delta=nearestOrientation(multiply(orientationQuaternions[candidate],inverse(orientationQuaternions[previous])));
+ const batch=[...rotationWords.get(delta)!,...slice.moves.map(move=>reorientedMove(move,candidate))].map(move=>moveTurns[move]);
+ if(batch.some(turn=>turn.axis!==batch[0].axis))return;
+ const angles=[0,1,2].map(layer=>quarter(batch.reduce((sum,turn)=>sum+turn.angles[layer],0)));
+ const move=Object.entries(moveTurns).find(([name,turn])=>/^[MES](?:2|')?$/.test(name)&&
+  turn.axis===batch[0].axis&&turn.angles.every((angle,i)=>quarter(angle)===angles[i]))?.[0];
+ return move?{move,basis:candidate}:undefined;
+}
 /** Both turns and tracked rotations use the same absolute displayed-face
  * assignment as the controls, including the opening frame's camera angle. */
-export function reorientedMoveTimeline(rows:readonly ProjectedCubeFrame[],steps:readonly MoveStep[],view:Quaternion):ReorientedMoveStep[] {
+export function reorientedMoveTimeline(rows:readonly ProjectedCubeFrame[],steps:readonly MoveStep[],view:Quaternion,
+ options:RotationDisplayOptions={}):ReorientedMoveStep[] {
  if(!rows.length)return [];
+ const fps=options.fps??30,threshold=options.rotationThresholdDegrees??75,minimumSeconds=options.minimumRotationSeconds??.1;
  const byFrame=new Map(steps.map(step=>[step.frame_index,step]));
- const frames=[...new Set([...rows.map(row=>row.frame),...steps.map(step=>step.frame_index)])].sort((a,b)=>a-b);
+ const end=steps.at(-1)?.frame_index??rows.at(-1)!.frame;
+ const frames=[...new Set([...rows.map(row=>row.frame),...steps.map(step=>step.frame_index)])].filter(frame=>frame<=end).sort((a,b)=>a-b);
+ const poses=frames.map(frame=>multiply(view,projectedCubeAtFrame(rows,frame)!.rotation));
+ const bases=poses.map(displayCubeBasis);
  const result:ReorientedMoveStep[]=[];
- let previous:number|undefined;
- for(const frame of frames){
-  const pose=projectedCubeAtFrame(rows,frame)!;
-  const basis=displayCubeBasis(multiply(view,pose.rotation));
-  if(previous!=null&&basis!==previous){
-   const delta=nearestOrientation(multiply(orientationQuaternions[basis],inverse(orientationQuaternions[previous])));
+ const slices=new Map((options.nativeSlices===false?[]:displaySliceCommits(rows,steps,fps)).map(slice=>[slice.startFrame,slice]));
+ const frameIndices=new Map(frames.map((frame,i)=>[frame,i]));
+ const appendMoves=(frame:number,converted:string[])=>{
+  const last=result.at(-1);
+  // Do not cancel inverse pairs here; that requires the color-checked pass.
+  if(last&&!last.rotation&&last.moves.length===1&&converted.length===1&&last.moves[0]===converted[0]&&/^[RLUDFBMESrludfb]'?$/.test(converted[0])){
+   last.moves=[converted[0][0]+'2'];last.frame=frame;
+  }else result.push({frame,moves:converted,rotation:false});
+ };
+ let previous=bases[0],anchor=poses[0];
+ for(let index=0;index<frames.length;index++){
+  const frame=frames[index],candidate=bases[index];
+  const moves=byFrame.get(frame)?.state_moves;
+  const observed=slices.get(frame),slice=observed?sliceFromBasisChange(observed,previous):undefined;
+  if(slice){
+   const last=frameIndices.get(observed!.frame)!;
+   appendMoves(frames[last],[slice.move]);previous=slice.basis;anchor=poses[last];index=last;continue;
+  }
+  const angle=2*Math.acos(Math.min(1,Math.abs(multiply(poses[index],inverse(anchor))[3])))*180/Math.PI;
+  let stableUntil=index;
+  if(candidate!==previous&&angle>=threshold){
+   while(stableUntil+1<frames.length&&bases[stableUntil+1]===candidate)stableUntil++;
+  }
+  if(candidate!==previous&&angle>=threshold&&(frames[stableUntil]-frame)/fps+1e-9>=minimumSeconds){
+   const delta=nearestOrientation(multiply(orientationQuaternions[candidate],inverse(orientationQuaternions[previous])));
    const moves=rotationWords.get(delta)!;
    if(moves.length)result.push({frame,moves,rotation:true});
+   previous=candidate;anchor=poses[index];
   }
-  const moves=byFrame.get(frame)?.state_moves;
-  if(moves?.length)result.push({frame,moves:moves.map(move=>reorientedMove(move,basis)),rotation:false});
-  previous=basis;
+  if(moves?.length){
+   appendMoves(frame,moves.map(move=>reorientedMove(move,previous)));
+  }
  }
  return result;
 }

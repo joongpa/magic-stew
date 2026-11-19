@@ -6,7 +6,7 @@ import type { CubePose } from "./cube-motion";
 import type { FrameResult } from "./detector";
 import type { MoveStep } from "./move-search-types";
 import type { FittedPose } from "./pose-types";
-import { buildProjectedCubeTimeline, projectedCubeAtFrame } from "./projected-cube";
+import { buildProjectedCubeTimeline, projectedCubeAtFrame, hideUncommittedMisalignments } from "./projected-cube";
 import type { SavedVideoResult } from "./video-result-cache";
 import turns from "../../../pose-fitter/tables/render-turns.json";
 
@@ -99,4 +99,55 @@ test("without any usable anchor the cube stays unavailable instead of using reje
  const frames=timeline([row(600,null),row(602,0,true),invalid],[step(600),step(602),step(604)]);
  assert.deepEqual(frames,[]);
  assert.equal(projectedCubeAtFrame(frames,602),undefined);
+});
+function partial(frame:number,axis:number,angles:number[]):SavedVideoResult {
+ const result=row(frame,0);result.result.fittedPose!.bank[0].axis=axis;result.result.fittedPose!.bank[0].angles=angles;
+ return result;
+}
+test("solved playback removes unsupported layer offsets independently and keeps real pre-commit motion",()=>{
+ const rows=[partial(600,0,[0,0,0]),partial(602,0,[12,6,25]),partial(604,0,[0,0,0])];
+ const steps=[step(600),step(602),step(604,['R'])],saved=JSON.stringify(rows);
+ const cleaned=timeline(rows,steps);
+ assert.deepEqual(cleaned.find(r=>r.frame===602)!.pose.angles,[0,0,25]);
+ assert.equal(JSON.stringify(rows),saved,'raw fitted poses stay unchanged');
+ const original=buildProjectedCubeTimeline(rows,buildColorTimeline('',steps),{fps:60,solved:false,steps});
+ assert.deepEqual(original.find(r=>r.frame===602)!.pose.angles,[12,6,25],'a running candidate has no future commitment guarantee');
+ const unrelated=timeline(rows,[step(600),step(602),step(604,['U'])]);
+ assert.deepEqual(unrelated.find(r=>r.frame===602)!.pose.angles,[0,0,0]);
+});
+test("a later commit cannot justify an earlier offset that already returned to flat",()=>{
+ const rows=[partial(600,0,[0,0,0]),partial(602,0,[0,0,18]),partial(604,0,[0,0,0]),partial(606,0,[0,0,32]),partial(608,0,[0,0,0]),partial(610,0,[0,0,14])];
+ const steps=rows.map(r=>step(r.result.fittedPose!.sourceFrame!,r.result.fittedPose!.sourceFrame===608?['R']:[]));
+ const cleaned=timeline(rows,steps);
+ assert.deepEqual(cleaned.map(r=>r.pose.angles[2]),[0,0,0,32,0,0]);
+});
+test("a commit wrapping positive to negative residual offsets preserves the entire movement",()=>{
+ const rows=[partial(600,0,[0,0,0]),partial(602,0,[0,0,35]),partial(604,0,[0,0,-40]),partial(606,0,[0,0,-10]),partial(608,0,[0,0,0])];
+ const steps=rows.map(r=>step(r.result.fittedPose!.sourceFrame!,r.result.fittedPose!.sourceFrame===604?['R']:[]));
+ assert.deepEqual(timeline(rows,steps).map(r=>r.pose.angles[2]),[0,35,-40,-10,0]);
+});
+test("a slice commit keeps its middle offset; a cube rotation does not count as a layer commit",()=>{
+ const rows=[partial(600,0,[0,0,0]),partial(602,0,[7,19,11]),partial(604,0,[0,0,0])];
+ const middle=timeline(rows,[step(600),step(602),step(604,['M'])]);
+ assert.deepEqual(middle.find(r=>r.frame===602)!.pose.angles,[0,19,0]);
+ const rotation=timeline(rows,[step(600),step(602),step(604,['x'])]);
+ assert.deepEqual(rotation.find(r=>r.frame===602)!.pose.angles,[0,0,0]);
+ const saved=JSON.stringify(middle),again=hideUncommittedMisalignments(middle,[step(604,['M'])]);
+ assert.equal(JSON.stringify(middle),saved);
+ for(let i=0;i<again.length;i++){assert.equal(again[i].pose.rotation,middle[i].pose.rotation);assert.equal(again[i].pose.state,middle[i].pose.state);}
+});
+test("a known commit in a rejected pose gap still supports its preceding partial turn",()=>{
+ const rows=[partial(600,0,[0,0,0]),partial(602,0,[0,0,28]),row(604,null),partial(606,0,[0,0,0])];
+ const steps=[step(600),step(602),step(604,['R'],true),step(606)];
+ const result=timeline(rows,steps);
+ assert.deepEqual(result.find(r=>r.frame===602)!.pose.angles,[0,0,28]);
+ assert.deepEqual(result.find(r=>r.frame===604)!.pose.angles,[0,0,0]);
+});
+test("a slice encoded as outer commits retains its middle-layer approach",()=>{
+ const rows=[partial(600,0,[0,0,0]),partial(602,0,[7,24,9]),partial(604,0,[0,0,0])];
+ rows[2].result.fittedPose!.bank[0].params=[Math.PI/2,0,0];
+ const steps=[step(600),step(602),step(604,["L'",'R'])];
+ const result=timeline(rows,steps);
+ assert.deepEqual(result.find(row=>row.frame===602)!.pose.angles,[0,24,0]);
+ assert.deepEqual(result.at(-1)!.pose.state.moves,["L'",'R'],'display classification never rewrites committed state');
 });

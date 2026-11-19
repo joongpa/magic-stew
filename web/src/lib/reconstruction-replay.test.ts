@@ -31,6 +31,17 @@ test('new runs record motion cost explicitly while retaining source clocks and T
  assert.equal(createSearchConfig({scramble:'R U',motionCostWeight:0}).motion_cost_weight,0);
  for(const motionCostWeight of [-1,Infinity,NaN])assert.throws(()=>createSearchConfig({scramble:'R U',motionCostWeight}));
 });
+test('new runs enable post-solve identity cleanup with a configurable segment mean color tolerance',()=>{
+ const config=createSearchConfig({scramble:'R U'});
+ assert.equal(config.postprocess_identity_loops,true);
+ assert.equal(config.postprocess_color_tolerance,.02);
+ assert.equal(config.postprocess_pose_cleanup,true);
+ assert.equal(createSearchConfig({scramble:'R U',postprocessIdentityLoops:false}).postprocess_identity_loops,false);
+ assert.equal(createSearchConfig({scramble:'R U',postprocessIdentityLoops:false}).postprocess_pose_cleanup,false);
+ assert.equal(createSearchConfig({scramble:'R U',postprocessColorTolerance:0}).postprocess_color_tolerance,0);
+ for(const postprocessColorTolerance of [-.01,1.01,Infinity,NaN])
+  assert.throws(()=>createSearchConfig({scramble:'R U',postprocessColorTolerance}));
+});
 test('bidirectional workers buffer fitted frames without advancing until input closes',()=>{
  const requests:any[]=[],tasks:(()=>void)[]=[];
  const driver=new IncrementalSearch(request=>{requests.push(request);return {status:request.type==='end'?'running':'waiting_for_frames'};},

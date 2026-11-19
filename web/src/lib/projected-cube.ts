@@ -5,9 +5,43 @@ import type { CubePose } from "./cube-motion";
 import type { MoveStep } from "./move-search-types";
 import { poseIsFlagged, projectedGeometryIndex } from "./reconstruction-view";
 import type { SavedVideoResult } from "./video-result-cache";
+import turns from "../../../pose-fitter/tables/render-turns.json";
+import type { V3 } from "./cube-motion";
+import {displaySliceCommits} from './cube-display-slices';
 
 export interface ProjectedCubeFrame { frame:number; pose:CubePose }
 const linear=(t:number)=>t;
+const moveTurns=turns as Record<string,{axis:number;angles:number[]}>;
+
+/** Display-only: retain an offset excursion only if that layer commits before
+ * it returns to flat (including the flat/axis-change endpoint). A commit can
+ * wrap +45 to -45 within the same excursion. Camera rotation and sticker states
+ * stay untouched; inputs are never mutated. */
+export function hideUncommittedMisalignments(rows:readonly ProjectedCubeFrame[],steps:readonly MoveStep[],fps=30):ProjectedCubeFrame[] {
+ const commits=Array.from({length:3},()=>Array.from({length:3},()=>[] as number[]));
+ const slices=displaySliceCommits(rows,steps,fps),sliceFrames=new Set(slices.flatMap(slice=>slice.sourceFrames));
+ for(const slice of slices)commits[slice.axis][1].push(slice.frame);
+ for(const step of steps)for(const raw of step.state_moves){
+  if(sliceFrames.has(step.frame_index))continue;
+  const turn=moveTurns[raw.replaceAll('’',"'").replace(/2'$/,'2')];
+  if(!turn||turn.angles.every(angle=>angle===turn.angles[0]))continue;
+  turn.angles.forEach((angle,layer)=>{if(angle!==0)commits[turn.axis][layer].push(step.frame_index);});
+ }
+ const angles=rows.map(row=>[...row.pose.angles] as V3);
+ for(let axis=0;axis<3;axis++)for(let layer=0;layer<3;layer++){
+  const active=(index:number)=>rows[index].pose.axis===axis&&Math.abs(rows[index].pose.angles[layer])>1e-6;
+  let index=0;
+  while(index<rows.length){
+   if(!active(index)){index++;continue;}
+   const first=index;while(index+1<rows.length&&active(index+1))index++;
+   const last=index,end=rows[Math.min(last+1,rows.length-1)].frame;
+   const committed=commits[axis][layer].some(frame=>frame>=rows[first].frame&&frame<=end);
+   if(!committed)for(let i=first;i<=last;i++)angles[i][layer]=0;
+   index++;
+  }
+ }
+ return rows.map((row,i)=>angles[i].every((angle,layer)=>angle===row.pose.angles[layer])?row:{...row,pose:{...row.pose,angles:angles[i]}});
+}
 
 function lowerBound(rows:readonly ProjectedCubeFrame[],frame:number) {
  let lo=0,hi=rows.length;
@@ -50,5 +84,6 @@ export function buildProjectedCubeTimeline(rows:readonly SavedVideoResult[],colo
   const nearest=projectedCubeAtFrame(accepted,state.frame)!;
   timeline.set(state.frame,{frame:state.frame,pose:{...nearest,angles:[0,0,0],state}});
  }
- return [...timeline.values()].sort((a,b)=>a.frame-b.frame);
+ const result=[...timeline.values()].sort((a,b)=>a.frame-b.frame);
+ return options.solved?hideUncommittedMisalignments(result,options.steps,options.fps):result;
 }

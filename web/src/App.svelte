@@ -59,6 +59,8 @@
   let openingHoldSeconds = $state(0);
   let searchDiagnostics = $state(true);
   let searchBidirectional = $state(true);
+  let searchCleanup = $state(true);
+  let searchCleanupTolerance = $state(0.02);
   let searchResult = $state<MoveSearchResult>(), searchError = $state("");
   let moveSearch: MoveSearch | undefined;
   let poseFitting = $state(false);
@@ -226,9 +228,13 @@
     moveSearch?.dispose(); moveSearch = undefined; searchResult = undefined; searchError = "";
     if (!searchEnabled || sourceKind === "none") return;
     if (!initialScramble.trim()) { searchError = "Enter the initial scramble to start move search."; return; }
+    if(searchCleanup&&(!Number.isFinite(searchCleanupTolerance)||searchCleanupTolerance<0||searchCleanupTolerance>1)){
+      searchError="Cleanup color tolerance must be between 0 and 1.";return;
+    }
     const token = generation;
     const config = createSearchConfig({scramble:initialScramble,fps:sourceFps||30,
       openingHoldSeconds,diagnostics:searchDiagnostics,bidirectional:searchBidirectional&&sourceKind==="video",originSeconds:sourceKind==="video"?searchOriginTimestamp:0,
+      postprocessIdentityLoops:searchCleanup,postprocessColorTolerance:searchCleanup?searchCleanupTolerance:0.02,
       startSeconds:sourceKind==="video"?solveStart:undefined,endSeconds:sourceKind==="video"?solveEnd:undefined});
     const runId=recording.startRun(token,config,{policyVersion:POLICY_VERSION,appOrigin:location.origin,
       poseWorkers:poseWorkerCount(navigator.hardwareConcurrency),admissionCapacity:ADMISSION_CAPACITY,
@@ -1304,7 +1310,7 @@
         </div>
         {#if sourceKind === "video" && reconstructionComplete && !trimming}
           <ProjectedCube pose={coloredProjection} sourceTimestamp={presentedTimestamp} timestamp={timecode(presentedTimestamp)} solved={cubeSolved}
-            timeline={projectedTimeline} steps={searchResult?.steps??[]}
+            timeline={projectedTimeline} steps={searchResult?.steps??[]} {sourceFps}
             sourceFrame={result?.fittedPose?.sourceFrame??Math.round(presentedTimestamp*sourceFps)} />
         {/if}
         </div>
@@ -1561,6 +1567,12 @@
             <span>Reconstruct moves</span></label>
           <label class="toggle"><input type="checkbox" bind:checked={searchBidirectional} onchange={changeMoveSearch} />
             <span>Bidirectional video search</span></label>
+          <label class="toggle"><input type="checkbox" bind:checked={searchCleanup} onchange={changeMoveSearch} />
+            <span>Remove move/undo artifacts</span></label>
+          <label class="field-label" for="cleanup-tolerance">Cleanup color tolerance</label>
+          <input id="cleanup-tolerance" aria-label="Cleanup color tolerance" type="number" min="0" max="1" step="0.005"
+            disabled={!searchCleanup} bind:value={searchCleanupTolerance} />
+          <p class="hint">After solving, remove state-return sections when holding raises the segment's average color error by at most this amount. Applies to the next run.</p>
           <label class="toggle"><input type="checkbox" bind:checked={searchDiagnostics} />
             <span>Record search diagnostics</span></label>
           <p class="hint">Turn off for faster search. Applies to the next run.</p>
@@ -1578,6 +1590,17 @@
           {#if searchResult?.steps.length}<p class="hint" aria-label="Move search path">
             {searchResult.status === "solved" ? "Solution" : "Current candidate"}: {searchResult.steps.flatMap(step => step.state_moves).join(" ") || "Hold"}
           </p>{/if}
+          {#if searchResult?.postprocess}<p class="hint" role="status" aria-label="Solution cleanup">
+            {#if searchResult.postprocess.error}Cleanup skipped: {searchResult.postprocess.error}
+            {:else if searchResult.postprocess.removed_moves}
+              {#if searchResult.postprocess.removed_sections}Removed {searchResult.postprocess.removed_sections} move/undo {searchResult.postprocess.removed_sections===1?"section":"sections"}.{/if}
+              {#if searchResult.postprocess.simplified_frames}Simplified moves in {searchResult.postprocess.simplified_frames} {searchResult.postprocess.simplified_frames===1?"frame":"frames"}.{/if}
+            {:else}No removable move/undo sections found.{/if}
+          </p>{/if}
+          {#if searchResult?.unprocessed_steps?.length}<details>
+            <summary>Original move list</summary>
+            <p class="hint">{searchResult.unprocessed_steps.flatMap(step=>step.state_moves).join(" ")}</p>
+          </details>{/if}
         </section>
         <section class="control-section">
           <div class="section-heading">

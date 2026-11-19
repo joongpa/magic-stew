@@ -7,6 +7,7 @@ pub mod motion;
 mod motion_history;
 pub mod orientations;
 mod prepared;
+mod postprocess;
 pub mod reliability;
 pub mod routes;
 use crate::Fit;
@@ -47,6 +48,9 @@ pub struct Config {
     /// Wait for input closure, then search from both the scramble and a solved
     /// end-frame anchor. Legacy callers retain streaming forward exploration.
     pub bidirectional: bool,
+    pub postprocess_identity_loops: bool,
+    pub postprocess_color_tolerance: f64,
+    pub postprocess_pose_cleanup: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -69,6 +73,9 @@ impl Default for Config {
             preserve_hold: false,
             diagnostics: true,
             bidirectional: false,
+            postprocess_identity_loops: false,
+            postprocess_color_tolerance: 0.02,
+            postprocess_pose_cleanup: false,
         }
     }
 }
@@ -98,6 +105,7 @@ pub struct Engine {
     bidirectional_fallback: bool,
     external_result: Option<serde_json::Value>,
     external_side_used: bool,
+    postprocessed_result: Option<serde_json::Value>,
 }
 impl Engine {
     pub fn new(config: Config) -> Result<Self, String> {
@@ -114,6 +122,8 @@ impl Engine {
             || config.mismatch_window_weight < 0.
             || !config.motion_cost_weight.is_finite()
             || config.motion_cost_weight < 0.
+            || !config.postprocess_color_tolerance.is_finite()
+            || !(0.0..=1.0).contains(&config.postprocess_color_tolerance)
             || config
                 .max_rotation_tps
                 .is_some_and(|v| !v.is_finite() || v <= 0. || v >= config.max_tps)
@@ -135,6 +145,7 @@ impl Engine {
             bidirectional_fallback: false,
             external_result: None,
             external_side_used: false,
+            postprocessed_result: None,
         })
     }
     pub fn push(&mut self, input: Frame) -> Result<(), String> {
@@ -215,6 +226,7 @@ impl Engine {
         if self.config.bidirectional && !self.ended { return; }
         if let Some(search) = &mut self.bidirectional {
             search.run(&mut self.frontier, &self.tables, &self.config, &self.frames, budget.min(128));
+            self.finish_solution();
             return;
         }
         self.frontier.run(
@@ -224,8 +236,21 @@ impl Engine {
             self.ended,
             budget.min(100_000),
         );
+        self.finish_solution();
     }
     pub fn snapshot(&self) -> serde_json::Value {
+        let mut result=self.raw_snapshot();
+        self.apply_postprocess(&mut result);
+        result
+    }
+    fn apply_postprocess(&self,result:&mut serde_json::Value) {
+        if let Some(cleaned)=&self.postprocessed_result {
+            for key in ["steps","postprocess","unprocessed_steps"] {
+                if let Some(value)=cleaned.get(key){result[key]=value.clone();}
+            }
+        }
+    }
+    fn raw_snapshot(&self) -> serde_json::Value {
         if let Some(result)=&self.external_result {return result.clone();}
         if let Some(search) = &self.bidirectional {
             let mut result=search.snapshot(&self.frontier,&self.frames);
@@ -240,6 +265,20 @@ impl Engine {
             }
         }
         result
+    }
+    pub fn postprocess_result(&self,result:serde_json::Value)->Result<serde_json::Value,String>{
+        postprocess::clean(&self.tables,&self.config,&self.frames,result)
+    }
+    fn finish_solution(&mut self) {
+        if !self.config.postprocess_identity_loops || self.postprocessed_result.is_some() {return;}
+        if self.frontier.winner.is_none() && !self.bidirectional.as_ref().is_some_and(|b|b.has_winner())
+            && self.external_result.is_none() {return;}
+        let raw=self.raw_snapshot();
+        if raw["status"]!="solved" {return;}
+        self.postprocessed_result=Some(match self.postprocess_result(raw.clone()) {
+            Ok(cleaned)=>cleaned,
+            Err(error)=>{let mut raw=raw;raw["postprocess"]=serde_json::json!({"enabled":true,"error":error,"removed_moves":0,"removed_sections":0});raw},
+        });
     }
     /// Independent directional work for two native threads or browser workers.
     /// Direction zero invokes the original forward frontier without a wrapper
@@ -270,6 +309,9 @@ impl Engine {
             },
             _=>return Err("Search direction must be zero or one".into()),
         };
+        if direction==0 && self.config.postprocess_identity_loops && result["status"]=="solved" {
+            self.finish_solution();self.apply_postprocess(&mut result);
+        }
         result["meeting_states"]=meetings.into();
         Ok(result)
     }
@@ -363,7 +405,9 @@ impl Engine {
         result["furthest_admitted_frames"]=steps.len().into();result["steps"]=steps.into();result["stats"]=stats;
         result["join_frame_index"]=depth.checked_sub(1).map(|i|self.frames[i].frame).into();
         if let Some(search)=&self.bidirectional {result["solved_anchor_frame"]=search.anchor_frame(&self.frames).into();}
-        self.external_result=Some(result.clone());Ok(result)
+        self.postprocessed_result=None;
+        self.external_result=Some(result);
+        self.finish_solution();Ok(self.snapshot())
     }
     pub fn probe(
         &self,
@@ -395,6 +439,7 @@ pub enum Request {
     AdvanceSide { direction:usize, budget:usize },
     Path { direction:usize, node:usize },
     CompleteJoin { forward_node:usize, backward_steps:Vec<serde_json::Value>, backward_state:Option<Vec<u8>>, stats:serde_json::Value },
+    Postprocess { result:serde_json::Value },
     End,
     Status,
     Probe {
@@ -417,6 +462,7 @@ pub fn request(slot: &mut Option<Engine>, request: Request) -> Result<serde_json
         Request::AdvanceSide {direction,budget}=>return engine.advance_side(direction,budget),
         Request::Path {direction,node}=>return engine.node_path(direction,node),
         Request::CompleteJoin {forward_node,backward_steps,backward_state,stats}=>return engine.complete_join(forward_node,backward_steps,backward_state,stats),
+        Request::Postprocess {result}=>return engine.postprocess_result(result),
         Request::End => engine.end()?,
         Request::Probe {
             sequence,

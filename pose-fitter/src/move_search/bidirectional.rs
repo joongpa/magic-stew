@@ -241,6 +241,7 @@ fn held_step(frames: &[Prepared], index: usize, cue: Option<usize>) -> Step {
     step
 }
 impl Bidirectional {
+    pub(super) fn has_winner(&self)->bool {self.winner.is_some()}
     /// Start of the last corroborated cluster of flat solved views. This is the
     /// same boundary evidence used by the standalone Python search; no inference.
     pub(super) fn new(t: &Tables, c: &Config, frames: &[Prepared]) -> Option<Self> {
@@ -1048,12 +1049,34 @@ mod tests {
         }
     }
     #[test]
+    fn cleanup_runs_for_serial_and_parallel_forward_winners_without_changing_expansions() {
+        let (config, frames) = inputs("R");
+        for parallel in [false,true] {
+            let mut outputs=vec![];
+            for enabled in [false,true] {
+                let mut engine=Engine::new(Config{postprocess_identity_loops:enabled,postprocess_pose_cleanup:enabled,..config.clone()}).unwrap();
+                for frame in &frames {engine.push(frame.clone()).unwrap();}engine.end().unwrap();
+                let result=if parallel {
+                    let mut result=engine.snapshot();
+                    for _ in 0..100 {result=engine.advance_side(0,128).unwrap();if result["status"]!="running" {break;}}
+                    result
+                } else {finish(&mut engine,128)};
+                assert_eq!(result["status"],"solved");
+                assert_eq!(result.get("postprocess").is_some(),enabled);
+                assert!(result["postprocess"].get("error").is_none());
+                outputs.push(result);
+            }
+            assert_eq!(outputs[0]["steps"],outputs[1]["steps"]);
+            assert_eq!(outputs[0]["stats"],outputs[1]["stats"]);
+        }
+    }
+    #[test]
     fn remote_fragments_rebase_across_all_cube_pose_bases_without_changing_forward_search() {
         let (config,frames)=inputs("R");let t=Tables::load();let goal=t.solved_seeds("R").unwrap().remove(0);
         let mut changed_notation=false;
         for symmetry in 0..24 {
             if symmetry==super::super::orientations::tables().identity_index {continue;}
-            let mut engine=Engine::new(Config{resolve_orientation_ambiguity:true,max_rotation_tps:Some(20.),..config.clone()}).unwrap();
+            let mut engine=Engine::new(Config{postprocess_identity_loops:true,resolve_orientation_ambiguity:true,max_rotation_tps:Some(20.),..config.clone()}).unwrap();
             for frame in &frames {engine.push(frame.clone()).unwrap();}engine.end().unwrap();
             let initial=engine.advance_side(0,1).unwrap();
             let id=initial["meeting_states"].as_array().unwrap().iter().find(|row|row[1]==1).unwrap()[0].as_u64().unwrap() as usize;
@@ -1073,6 +1096,8 @@ mod tests {
             changed_notation|=step["state_moves"]!=serde_json::json!(["R'"]);
             let result=engine.complete_join(id,vec![step],Some(before),serde_json::json!({"evaluated_states":1})).unwrap();
             assert_eq!(result["status"],"solved");
+            assert_eq!(result["postprocess"]["color_aggregation"],"segment_mean");
+            assert!(result["postprocess"].get("error").is_none());
             assert_eq!(result["steps"][1]["state_moves"],serde_json::json!(["R'"]));
             assert!(result["steps"][1]["orientation_symmetry_index"].is_null());
             assert_eq!(engine.frontier.stats.evaluated_states,1);

@@ -10,9 +10,8 @@ import type { MoveStep } from "./move-search-types";
 import { CAMERA_ORIENTATION, displayCubeBasis, reorientedCubePose, reorientedMove, reorientedMoveTimeline, rotateCubeView } from "./cube-orientation";
 
 const initial=stateAtFrame(buildColorTimeline("",[]),0,true)!;
-// Canonical cube faces: R = +X, U = +Z, F = -Y. Camera: right +X,
-// screen-up -Y, toward the viewer -Z, so this pose aligns those frames.
-const camera=axisAngle([Math.PI/2,0,0]);
+// Orthographic isometric reference for notation, not a renderer camera preset.
+const camera=multiply(axisAngle([Math.PI-Math.asin(Math.sqrt(2/3)),0,0]),axisAngle([0,0,-Math.PI/4]));
 const inverse=(q:Quaternion):Quaternion=>[-q[0],-q[1],-q[2],q[3]];
 const pose=(rotation:Quaternion=camera,axis=0,angles:V3=[0,0,0]):CubePose=>({rotation,axis,angles,state:initial});
 const quaternion=(index:number)=>axisAngle(orientations.rvecs[index] as V3);
@@ -33,20 +32,40 @@ function relabel(state:CubeStateSnapshot,basis:number):CubeStateSnapshot {
  return {colors,stickers,moves:[]};
 }
 
-test("U is always the face closest to display-up, then F is the closest perpendicular face to the viewer",()=>{
+test("notation chooses U nearest display-up and balances F down-left with R down-right",()=>{
  const normals:V3[]=[[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
  const rotations=[...orientations.rvecs.map((_,i)=>multiply(camera,quaternion(i))),
   ...Array.from({length:80},(_,i)=>axisAngle([i*.37-1,i*.19+.2,i*.43-.3]))];
  for(const rotation of rotations){
   const basis=displayCubeBasis(rotation),matrix=orientations.matrices[basis];
   const up=matrix[2] as V3,front=matrix[1].map(v=>-v) as V3;
-  const upScore=-rotate(rotation,up)[1],frontScore=-rotate(rotation,front)[2];
+  const frontTarget=rotate(camera,[0,-1,0]),rightTarget=rotate(camera,[1,0,0]);
+  const cross=(a:V3,b:V3):V3=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+  const dot=(a:V3,b:V3)=>a.reduce((sum,v,i)=>sum+v*b[i],0);
+  const score=(normal:V3)=>dot(rotate(rotation,normal),frontTarget)+dot(rotate(rotation,cross(up,normal)),rightTarget);
+  const upScore=-rotate(rotation,up)[1];
   for(const normal of normals){
    assert.ok(upScore>=-rotate(rotation,normal)[1]-1e-9);
-   if(normal.reduce((sum,v,i)=>sum+v*up[i],0)===0)assert.ok(frontScore>=-rotate(rotation,normal)[2]-1e-9);
+   if(normal.reduce((sum,v,i)=>sum+v*up[i],0)===0)assert.ok(score(front)>=score(normal)-1e-9);
   }
  }
  for(let i=0;i<24;i++)assert.equal(displayCubeBasis(multiply(camera,quaternion(i))),i);
+});
+
+test("notation keeps the lower-left face as F when the right face is nearer the viewer",()=>{
+ const tilt=Math.PI-Math.asin(Math.sqrt(2/3));
+ for(const yaw of [-25,-45,-65]){
+  const rotation=multiply(axisAngle([tilt,0,0]),axisAngle([0,0,yaw*Math.PI/180]));
+  assert.equal(displayCubeBasis(rotation),orientations.identity_index,`yaw ${yaw}`);
+  assert.equal(reorientedMove("F",displayCubeBasis(rotation)),"F");
+  assert.equal(reorientedMove("R",displayCubeBasis(rotation)),"R");
+  const source=pose(rotation);
+  assert.equal(reorientedCubePose(source,CAMERA_ORIENTATION),source,"notation must not change the rendered pose");
+ }
+ const up=rotate(camera,[0,0,1]),front=rotate(camera,[0,-1,0]),right=rotate(camera,[1,0,0]);
+ close([up[0],front[0]+right[0],front[1]-right[1]],[0,0,0]);
+ close([Math.hypot(up[0],up[1]),Math.hypot(front[0],front[1])],
+  [Math.hypot(right[0],right[1]),Math.hypot(right[0],right[1])]);
 });
 
 test("x/y/z controls use the currently displayed R/U/F faces even on tilted cubes",()=>{
@@ -104,9 +123,9 @@ test("every face, wide, slice and explicit cube rotation is converted in the dis
 test("changing the view translates tracked cube rotations as well as face turns",()=>{
  const y=axisAngle([0,0,-Math.PI/2]),rows=[{frame:600,pose:pose()},{frame:602,pose:pose(multiply(camera,y))}];
  const steps=[step(600,["U"]),step(602,["R","x'"])];
- const original=reorientedMoveTimeline(rows,steps,CAMERA_ORIENTATION);
+ const original=reorientedMoveTimeline(rows,steps,CAMERA_ORIENTATION,{minimumRotationSeconds:0});
  assert.deepEqual(original[1],{frame:602,moves:["y"],rotation:true});
- const view=rotateCubeView(CAMERA_ORIENTATION,camera,"x"),changed=reorientedMoveTimeline(rows,steps,view);
+ const view=rotateCubeView(CAMERA_ORIENTATION,camera,"x"),changed=reorientedMoveTimeline(rows,steps,view,{minimumRotationSeconds:0});
  assert.deepEqual(changed[1],{frame:602,moves:["z'"],rotation:true},"tracked y must become z' after an x view change");
  for(const row of changed){
   if(row.rotation)continue;
@@ -115,7 +134,7 @@ test("changing the view translates tracked cube rotations as well as face turns"
   assert.deepEqual(row.moves,steps.find(step=>step.frame_index===row.frame)!.state_moves.map(move=>reorientedMove(move,basis)));
  }
  assert.notDeepEqual(original[0].moves,changed[0].moves);
- assert.deepEqual(reorientedMoveTimeline(rows,steps,CAMERA_ORIENTATION),original,"reset must restore notation without accumulating rotations");
+ assert.deepEqual(reorientedMoveTimeline(rows,steps,CAMERA_ORIENTATION,{minimumRotationSeconds:0}),original,"reset must restore notation without accumulating rotations");
 });
 
 test("tracked rotations and converted moves replay to the same physical stickers in every view",()=>{
@@ -125,7 +144,7 @@ test("tracked rotations and converted moves replay to the same physical stickers
   const view=multiply(multiply(camera,quaternion(setup)),inverse(camera));
   const target={...pose(multiply(camera,quaternion(grip))),state:finalState};
   const rows=[{frame:0,pose:pose()},{frame:1,pose:target}];
-  const events=reorientedMoveTimeline(rows,steps,view);
+  const events=reorientedMoveTimeline(rows,steps,view,{minimumRotationSeconds:0});
   let state=relabel(initial,setup);
   for(const move of events.flatMap(event=>event.moves))state=applyCubeMove(state,move,[]);
   sameStickers(poseSurfaces({...pose(),state}),poseSurfaces(reorientedCubePose(target,view)));
@@ -150,4 +169,72 @@ test("exact face-assignment ties are deterministic under quaternion sign and num
  const basis=displayCubeBasis(rotation);
  assert.equal(displayCubeBasis(rotation.map(v=>-v) as Quaternion),basis);
  assert.equal(displayCubeBasis(multiply(rotation,axisAngle([0,0,1e-13]))),basis);
+});
+test("notation ignores moderate tilts and brief quarter-turn pose jumps, but keeps a sustained rotation",()=>{
+ const y=(degrees:number)=>multiply(camera,axisAngle([0,0,-degrees*Math.PI/180]));
+ const steps=[step(0,["U"]),step(2,["R"]),step(8,[])];
+ for(const rows of [
+  [{frame:0,pose:pose()},{frame:2,pose:pose(y(60))},{frame:8,pose:pose(y(60))}],
+  [{frame:0,pose:pose()},{frame:2,pose:pose(y(90))},{frame:4,pose:pose()},{frame:8,pose:pose()}],
+ ]){
+  const events=reorientedMoveTimeline(rows,steps,CAMERA_ORIENTATION,{fps:50});
+  assert.equal(events.filter(event=>event.rotation).length,0);
+  assert.deepEqual(events.filter(event=>!event.rotation).flatMap(event=>event.moves),["U","R"]);
+ }
+ const sustained=[{frame:0,pose:pose()},{frame:2,pose:pose(y(90))},{frame:8,pose:pose(y(90))}];
+ const events=reorientedMoveTimeline(sustained,steps,CAMERA_ORIENTATION,{fps:50});
+ assert.deepEqual(events.find(event=>event.rotation),{frame:2,moves:["y"],rotation:true});
+ assert.equal(events.filter(event=>event.rotation).length,1);
+});
+test("notation stops at the solved path and joins matching quarter turns without cancelling an undo",()=>{
+ const rows=[{frame:0,pose:pose()},{frame:8,pose:pose()},{frame:10,pose:pose(multiply(camera,axisAngle([0,0,-Math.PI/2])))},{frame:20,pose:pose(multiply(camera,axisAngle([0,0,-Math.PI/2])))}];
+ const steps=[step(0,["R"]),step(2,["R"]),step(4,["U"]),step(8,["U'"])];
+ const events=reorientedMoveTimeline(rows,steps,CAMERA_ORIENTATION);
+ assert.deepEqual(events,[{frame:2,moves:["R2"],rotation:false},{frame:4,moves:["U"],rotation:false},{frame:8,moves:["U'"],rotation:false}]);
+});
+test("measured core-basis compensation displays native slices and preserves exact stickers in every starting orientation",()=>{
+ const definitions=turns as Record<string,{axis:number;angles:number[]}>;
+ const modulo=(v:number)=>((v%360)+360)%360;
+ for(const native of ['M',"M'",'M2','E',"E'",'E2','S',"S'",'S2']){
+  const turn=definitions[native],angle=turn.angles[1],vector:V3=[0,0,0];vector[turn.axis]=angle*Math.PI/180;
+  const raw=[0,2].map(layer=>Object.keys(definitions).find(name=>/^[RLUDFB](?:2|')?$/.test(name)&&
+   definitions[name].axis===turn.axis&&definitions[name].angles.every((value,i)=>modulo(value)===modulo(i===layer?-angle:0)))!);
+  assert.ok(raw.every(Boolean));
+  for(let grip=0;grip<24;grip++)for(const setup of [0,7,16]){
+   const before=multiply(camera,quaternion(grip)),after=multiply(before,axisAngle(vector));
+   const view=multiply(multiply(camera,quaternion(setup)),inverse(camera));
+   let final=initial;for(const move of [...raw,'R'])final=applyCubeMove(final,move,[]);
+   const rows=[{frame:0,pose:pose(before)},{frame:2,pose:pose(after)},{frame:4,pose:{...pose(after),state:final}}];
+   const events=reorientedMoveTimeline(rows,[step(2,raw),step(4,['R'])],view,{fps:60});
+   const basis=displayCubeBasis(multiply(view,before));
+   assert.deepEqual(events[0],{frame:2,moves:[reorientedMove(native,basis)],rotation:false},`${native}/${grip}/${setup}`);
+   assert.equal(events.filter(event=>event.rotation).length,0);
+   let shown=relabel(initial,basis);for(const name of events.flatMap(event=>event.moves))shown=applyCubeMove(shown,name,[]);
+   sameStickers(poseSurfaces({...pose(),state:shown}),poseSurfaces(reorientedCubePose(rows.at(-1)!.pose,view)));
+  }
+ }
+});
+test("genuine simultaneous outer turns and moderate tilts are not relabeled as slices",()=>{
+ for(const angle of [0,50]){
+  const rows=[{frame:0,pose:pose()},{frame:2,pose:pose(multiply(camera,axisAngle([angle*Math.PI/180,0,0])))}];
+  const events=reorientedMoveTimeline(rows,[step(2,["L'",'R'])],CAMERA_ORIENTATION,{fps:60});
+  assert.deepEqual(events,[{frame:2,moves:["L'",'R'],rotation:false}]);
+ }
+ const rows=[{frame:0,pose:pose()},{frame:2,pose:pose(multiply(camera,axisAngle([Math.PI/2,0,0])))}];
+ const opposite=reorientedMoveTimeline(rows,[step(2,['L','R'])],CAMERA_ORIENTATION,{fps:60});
+ assert.ok(opposite.every(event=>event.moves.every(move=>!move.startsWith('M'))));
+});
+test("a slice can settle across nearby samples without consuming unrelated commits",()=>{
+ const partial=multiply(camera,axisAngle([Math.PI/4,0,0])),settled=multiply(camera,axisAngle([Math.PI/2,0,0]));
+ const rows=[{frame:0,pose:pose()},{frame:2,pose:pose(partial)},{frame:4,pose:pose(settled)},{frame:6,pose:pose(settled)}];
+ const split=reorientedMoveTimeline(rows,[step(2,["L'"]),step(4,['R']),step(6,['U'])],CAMERA_ORIENTATION,{fps:60});
+ assert.deepEqual(split[0],{frame:4,moves:['M'],rotation:false});
+ assert.equal(split.length,2);
+ const sameFrame=reorientedMoveTimeline(rows,[step(2,["L'",'R']),step(6,[])],CAMERA_ORIENTATION,{fps:60});
+ assert.deepEqual(sameFrame,[{frame:2,moves:['M'],rotation:false}]);
+ const interrupted=reorientedMoveTimeline(rows,[step(2,["L'"]),step(3,['U']),step(4,['R']),step(6,[])],CAMERA_ORIENTATION,{fps:60});
+ assert.ok(interrupted.every(event=>event.moves.every(move=>!/^M/.test(move))));
+ const distant=reorientedMoveTimeline([{frame:0,pose:pose()},{frame:2,pose:pose()},{frame:20,pose:pose(settled)},{frame:28,pose:pose(settled)}],
+  [step(2,["L'"]),step(20,['R']),step(28,[])],CAMERA_ORIENTATION,{fps:60});
+ assert.ok(distant.every(event=>event.moves.every(move=>!/^M/.test(move))));
 });
