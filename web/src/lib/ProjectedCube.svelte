@@ -8,9 +8,10 @@
   import type { MoveStep } from "./move-search-types";
   import type { ProjectedCubeFrame } from "./projected-cube";
   import { CubeRenderer } from "./cube-renderer";
-  let { pose, sourceTimestamp = 0, timestamp = "", solved = false, steps = [], timeline = [], sourceFrame = 0, sourceFps = 30 }: {
+  import { playbackTiming } from "./playback-timing";
+  let { pose, sourceTimestamp = 0, timestamp = "", solved = false, steps = [], timeline = [], sourceFrame = 0, sourceFps = 30, playbackSpeed = 1 }: {
     pose?:CubePose;sourceTimestamp?:number;timestamp?:string;solved?:boolean;
-    steps?:readonly MoveStep[];timeline?:readonly ProjectedCubeFrame[];sourceFrame?:number;sourceFps?:number
+    steps?:readonly MoveStep[];timeline?:readonly ProjectedCubeFrame[];sourceFrame?:number;sourceFps?:number;playbackSpeed?:number
   } = $props();
   let smooth=$state(true),rendered=$state.raw<CubePose>();
   let mode=$state<"camera"|"adjustable">("camera");
@@ -76,13 +77,13 @@
   $effect(()=>{
     // Animate in the original basis, then reorient each sampled mesh. This
     // preserves signed half-turn paths and in-flight motion when the view changes.
-    const target=pose,stamp=sourceTimestamp,enabled=smooth;
+    const target=pose,stamp=sourceTimestamp,enabled=smooth,duration=playbackTiming(sourceFps,playbackSpeed).transitionMs;
     const previous=untrack(()=>rendered),adjacent=lastTimestamp!=null&&Math.abs(stamp-lastTimestamp)<=0.15;
     lastTimestamp=stamp;
     if(!enabled||!adjacent||!previous||!target){rendered=target;return;}
     const transition=layerTransition(previous,target),start=performance.now();let animation=0;
     const tick=(now:number)=>{
-      const progress=Math.min(1,(now-start)/100);rendered=transition.sample(progress);
+      const progress=Math.min(1,(now-start)/duration);rendered=transition.sample(progress);
       if(progress<1)animation=requestAnimationFrame(tick);
     };
     animation=requestAnimationFrame(tick);

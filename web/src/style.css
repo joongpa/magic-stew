@@ -413,9 +413,12 @@ h1 {
 }
 .transport-actions {
   display: flex;
+  align-items: center;
   gap: 7px;
   flex-wrap: wrap;
 }
+.playback-speed { display:flex; align-items:center; gap:5px; font-size:11px; color:#a6b49c; }
+.playback-speed select { width:auto; padding:5px 7px; font-size:11px; }
 .muted {
   font-size: 11px;
   color: #85947e;

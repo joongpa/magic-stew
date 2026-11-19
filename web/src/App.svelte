@@ -27,6 +27,8 @@
   import { buildColorTimeline } from "./lib/cube-colors";
   import { buildProjectedCubeTimeline, projectedCubeAtFrame } from "./lib/projected-cube";
   import { reviewIndex, steppedTimestamp, frameArrow } from "./lib/frame-review";
+  import { PLAYBACK_SPEEDS, playbackTiming } from "./lib/playback-timing";
+  import type { PlaybackSpeed } from "./lib/playback-timing";
   import ProjectedCube from "./lib/ProjectedCube.svelte";
   import {createSearchConfig,ADMISSION_CAPACITY,poseWorkerCount,POLICY_VERSION} from "../../pose-fitter/runtime/reconstruction-policy.mjs";
   import {runtimeFingerprints} from './lib/capture-provenance';
@@ -45,6 +47,7 @@
   let sourceName = $state("No source selected");
   let sourceKind = $state<"none" | "image" | "video" | "camera">("none");
   let running = $state(false);
+  let playbackSpeed=$state<PlaybackSpeed>(1);
   let processedFrames = $state(0);
   let queuedFrames = $state(0);
   let sourceFps = $state(0);
@@ -979,7 +982,7 @@
       if (captureStopped) { running = false; void finishMoveSearch(); }
       return;
     }
-    const interval = 1000 / Math.min(30, sourceFps || 30);
+    const interval = playbackTiming(sourceFps,sourceKind==="video"&&reconstructionComplete?playbackSpeed:1).frameIntervalMs;
     scheduledAt = performance.now();
     const remaining = interval - (scheduledAt - lastStarted);
     if (remaining <= 0) {
@@ -1196,6 +1199,12 @@
     capture?.resume();
     scheduleNext();
   }
+  function changePlaybackSpeed(event:Event){
+    const speed=Number((event.currentTarget as HTMLSelectElement).value);
+    if(!PLAYBACK_SPEEDS.includes(speed as PlaybackSpeed))return;
+    playbackSpeed=speed as PlaybackSpeed;
+    cancelScheduled();scheduleNext();
+  }
   function drop(event: DragEvent) {
     event.preventDefault();
     dragging = false;
@@ -1310,7 +1319,7 @@
         </div>
         {#if sourceKind === "video" && reconstructionComplete && !trimming}
           <ProjectedCube pose={coloredProjection} sourceTimestamp={presentedTimestamp} timestamp={timecode(presentedTimestamp)} solved={cubeSolved}
-            timeline={projectedTimeline} steps={searchResult?.steps??[]} {sourceFps}
+            timeline={projectedTimeline} steps={searchResult?.steps??[]} {sourceFps} playbackSpeed={running?playbackSpeed:1}
             sourceFrame={result?.fittedPose?.sourceFrame??Math.round(presentedTimestamp*sourceFps)} />
         {/if}
         </div>
@@ -1327,7 +1336,14 @@
                   class="small"
                   onclick={togglePlayback}
                   >{running ? "Pause" : "Resume"}</button
-                >{/if}<button class="small subtle" onclick={stopSource}
+                >{/if}
+              {#if sourceKind==="video"&&reconstructionComplete&&!trimming}
+                <label class="playback-speed">Speed
+                  <select aria-label="Playback speed" bind:value={playbackSpeed} onchange={changePlaybackSpeed}>
+                    {#each PLAYBACK_SPEEDS as speed}<option value={speed}>{speed}×</option>{/each}
+                  </select>
+                </label>
+              {/if}<button class="small subtle" onclick={stopSource}
                 >Clear</button
               >{:else}<span class="muted">Images, videos, or a live camera</span
               >{/if}
