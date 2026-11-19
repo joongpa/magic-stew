@@ -24,10 +24,23 @@ test('trim clock and hold use one absolute source-frame convention',()=>{
  assert.deepEqual(videoFrameIdentity(6+1/30,run.config),{sourceFrame:362,sequence:1});
  const {recording}=capture();assert.equal(validateRun(recording,run,{fingerprints,runtime:'cpu-pipeline.test.wasm'}).poseSize,256);
 });
+test('camera diagnostics validate irregular millisecond ticks separately from nominal capture FPS',()=>{
+ const {recording,run}=capture();
+ run.config=createSearchConfig({scramble:'R U',fps:30,camera:true,originSeconds:11.584281,startSeconds:11.58,endSeconds:12});
+ recording.sources[0].fps=30;
+ const times=[11.584281,11.607686,11.649204];
+ recording.frames.forEach((row,i)=>{
+  row.timestampSeconds=times[i];row.result.fittedPose.fittingConfig={fps:1000,turningStartFrame:null as any};
+ });
+ assert.equal(validateRun(recording,run,{diagnostic:true}).frames,3);
+ recording.frames[1].timestampSeconds=recording.frames[0].timestampSeconds;
+ assert.throws(()=>validateRun(recording,run,{diagnostic:true}),/Camera source timestamps/);
+});
 test('new runs record motion cost explicitly while retaining source clocks and TPS limits',()=>{
  const config=createSearchConfig({scramble:'R U',fps:60});
  assert.equal(config.motion_cost_weight,.025);
- assert.equal(config.max_tps,54);assert.equal(config.max_rotation_tps,20);
+ assert.equal(config.max_tps,40);assert.equal(config.max_rotation_tps,20);
+ assert.equal(createSearchConfig({scramble:'R U',camera:true}).max_tps,40);
  assert.equal(createSearchConfig({scramble:'R U',motionCostWeight:0}).motion_cost_weight,0);
  for(const motionCostWeight of [-1,Infinity,NaN])assert.throws(()=>createSearchConfig({scramble:'R U',motionCostWeight}));
 });
@@ -56,6 +69,20 @@ test('bidirectional workers buffer fitted frames without advancing until input c
  assert.equal(requests.some(request=>request.type==='advance'),false);
  driver.request({type:'end'});assert.equal(tasks.length,1);
  tasks.shift()!();assert.equal(requests.at(-1).type,'advance');driver.dispose();
+});
+test('both camera and uploaded-video forward search expand from the first available fit before input ends',()=>{
+ for(const camera of [false,true]){
+  const requests:any[]=[],tasks:(()=>void)[]=[];
+  const driver=new IncrementalSearch(request=>{
+   requests.push(request);return {status:request.type==='advance'?'waiting_for_frames':'running'};
+  },{report:()=>{},error:error=>{throw error;},
+   schedule:((fn:()=>void)=>{tasks.push(fn);return tasks.length;}) as any,cancel:(()=>{}) as any});
+  driver.request({type:'init',config:createSearchConfig({scramble:'R U',fps:30,camera,bidirectional:false})});
+  assert.equal(tasks.length,0);
+  driver.request({type:'frame',frame:{sequence:0}});assert.equal(tasks.length,1);
+  tasks.shift()!();assert.deepEqual(requests.map(request=>request.type),['init','frame','advance']);
+  driver.dispose();
+ }
 });
 test('old 160px detections cannot silently stand in for a 256px browser run',()=>{
  const {recording,run}=capture(160);
@@ -107,6 +134,24 @@ test('host timers receive the global receiver, as browser WebIDL timers require'
   schedule:(function(this:unknown){assert.equal(this,globalThis);return 7;}) as any,
   cancel:(function(this:unknown,id:number){assert.equal(this,globalThis);assert.equal(id,7);cancelled=true;}) as any});
  driver.request({type:'frame',frame:{sequence:0}});driver.dispose();assert.equal(cancelled,true);
+});
+test('paused streaming searches keep admitting finalized frames and resume without losing their frontier',()=>{
+ const requests:any[]=[],scheduled=new Map<number,()=>void>();let next=0;
+ const driver=new IncrementalSearch(request=>{requests.push(request);return {status:'running'};},{report:()=>{},error:error=>{throw error;},
+  schedule:((fn:()=>void)=>{scheduled.set(++next,fn);return next;}) as any,cancel:((id:number)=>scheduled.delete(id)) as any});
+ driver.request({type:'init',config:{}});driver.request({type:'frame',frame:{sequence:0}});
+ assert.equal(scheduled.size,1);driver.pause();assert.equal(scheduled.size,0);
+ driver.request({type:'frame',frame:{sequence:1}});driver.request({type:'end'});
+ assert.equal(scheduled.size,0);assert.deepEqual(requests.map(r=>r.type),['init','frame','frame','end']);
+ driver.resume();assert.equal(scheduled.size,1);driver.dispose();assert.equal(scheduled.size,0);
+});
+test('camera load spaces search chunks but never parks the frontier indefinitely',()=>{
+ const delays:number[]=[];let callback!:()=>void;
+ const driver=new IncrementalSearch(()=>({status:'running'}),{report:()=>{},error:error=>{throw error;},
+  schedule:((fn:()=>void,delay:number)=>{callback=fn;delays.push(delay);return delays.length;}) as any,cancel:(()=>{}) as any});
+ driver.setPacing(25);driver.request({type:'frame',frame:{sequence:0}});
+ assert.deepEqual(delays,[25]);callback();assert.deepEqual(delays,[25,25]);
+ driver.setPacing(0);callback();assert.deepEqual(delays,[25,25,0]);driver.dispose();
 });
 test('diagnostics can be disabled without changing worker scheduling or results',()=>{
  assert.equal(createSearchConfig({scramble:'R U'}).diagnostics,true);

@@ -1,14 +1,14 @@
-import type {Plugin} from 'vite';
+import type {Plugin,Connect} from 'vite';
 import {mkdir,writeFile,rename} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {join} from 'node:path';
-/** Development only. Save actual app inputs locally so diagnostics never need
+/** Local dev/preview only. Save actual app inputs locally so diagnostics never need
  * hand-reconstructed settings or another interactive browser test. */
 export function localDiagnostics(directory=fileURLToPath(new URL('../../pose-fitter/results/browser-runs/',import.meta.url))):Plugin {
   const revisions=new Map<string,number>();
   const writes=new Map<string,Promise<void>>();
-  return {name:'local-reconstruction-diagnostics',apply:'serve',configureServer(server){
-    server.middlewares.use('/__diagnostics/run',async(req,res)=>{
+  function install(middlewares:Connect.Server) {
+    middlewares.use('/__diagnostics/run',async(req,res)=>{
       try {
         if(req.method!=='POST'){res.statusCode=405;res.end('POST required');return;}
         if(req.headers.origin&&new URL(req.headers.origin).host!==req.headers.host){res.statusCode=403;res.end('Same origin required');return;}
@@ -37,5 +37,7 @@ export function localDiagnostics(directory=fileURLToPath(new URL('../../pose-fit
         res.setHeader('Content-Type','application/json');res.end(JSON.stringify({saved:id}));
       }catch(error){res.statusCode=500;res.end(error instanceof Error?error.message:String(error));}
     });
-  }};
+  }
+  return {name:'local-reconstruction-diagnostics',apply:'serve',
+    configureServer(server){install(server.middlewares);},configurePreviewServer(server){install(server.middlewares);}};
 }

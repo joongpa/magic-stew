@@ -5,6 +5,7 @@ export class IncrementalSearch {
   constructor(call,{report,error,live=true,version='',now=()=>performance.now(),schedule=setTimeout,cancel=clearTimeout}) {
     Object.assign(this,{call,report,error,live,version,now,schedule,cancel});
     this.timer=undefined;this.prepareMs=0;this.searchMs=0;this.lastReport=0;this.ended=false;this.actions=[];this.diagnostics=true;
+    this.paused=false;this.delayMs=0;
   }
   request(request) {
     if(request.type==='init'){this.diagnostics=request.config?.diagnostics!==false;this.bidirectional=!!request.config?.bidirectional;}
@@ -32,11 +33,14 @@ export class IncrementalSearch {
     }
   }
   wake() {
-    if(this.timer!==undefined)return;
+    if(this.paused||this.timer!==undefined)return;
     this.timer=this.schedule.call(globalThis,()=>{
       this.timer=undefined;
       try{this.request({type:'advance',budget:SEARCH_CHUNK});}catch(error){this.dispose();this.error(error);}
-    },0);
+    },this.delayMs);
   }
+  pause(){this.paused=true;this.dispose();}
+  resume(){if(!this.paused)return;this.paused=false;this.wake();}
+  setPacing(delayMs){this.delayMs=Number.isFinite(delayMs)?Math.max(0,delayMs):0;}
   dispose(){if(this.timer!==undefined)this.cancel.call(globalThis,this.timer);this.timer=undefined;}
 }

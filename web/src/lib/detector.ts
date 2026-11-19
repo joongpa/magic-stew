@@ -96,6 +96,7 @@ export interface FrameProfile {
 export interface FrameResult {
   detectorHashes?:{pose:string;bbox:string};
   fittedPose?: FittedPose;
+  fittingError?: string;
   pipeline?: {
     detectorStartedAtMs: number;
     detectorCompletedAtMs: number;
@@ -103,6 +104,7 @@ export interface FrameResult {
     fitCompletedAtMs?: number;
     presentedAtMs: number;
     presentationMs: number;
+    camera?:{captureFps:number;queuedFrames:number;bufferedFits:number;sourceAgeMs:number;skippedFrames:number;browserSkippedFrames:number;copyMs?:number;deliveryMs?:number};
   };
   detections: Detection[];
   transform: Transform;

@@ -1,4 +1,5 @@
 import type { SourceFrame } from "./frame-stream";
+import type {CameraCaptureMetrics} from './camera-metrics';
 
 interface Processor {
   readable: ReadableStream<VideoFrame>;
@@ -8,11 +9,13 @@ type ProcessorConstructor = new (options: {
   track: MediaStreamTrack;
   maxBufferSize: number;
 }) => Processor;
+export type CameraStopReason='ended'|'error';
 
 export async function startCameraCapture(
   original: MediaStreamTrack,
-  onFrame: (frame: SourceFrame) => void,
-  onStopped: (message: string) => void,
+  onFrame: (frame: SourceFrame & { clockOriginMs: number }) => void,
+  onStopped: (message: string,reason:CameraStopReason) => void,
+  onMetrics?: (metrics:CameraCaptureMetrics)=>void,
 ) {
   const worker = new Worker(new URL("./capture.worker.ts", import.meta.url), {
     type: "module",
@@ -20,6 +23,12 @@ export async function startCameraCapture(
   const track = original.clone();
   let monitor: ReturnType<typeof setInterval> | undefined;
   let ended = false;
+  let browserSkippedFrames=0;
+  let metrics:CameraCaptureMetrics={captureFps:0,skippedFrames:0,browserSkippedFrames:0};
+  const updateMetrics=(value:Partial<CameraCaptureMetrics>)=>{
+    metrics={...metrics,...value,browserSkippedFrames:Math.max(value.browserSkippedFrames??0,browserSkippedFrames)};
+    onMetrics?.(metrics);return metrics;
+  };
   const stop = () => {
     ended = true;
     clearInterval(monitor);
@@ -28,6 +37,7 @@ export async function startCameraCapture(
   };
   const ready = new Promise<void>((resolve, reject) => {
     let started = false;
+    let notified=false;
     worker.onmessage = ({ data }) => {
       if (ended) {
         data.bitmap?.close();
@@ -38,14 +48,17 @@ export async function startCameraCapture(
         resolve();
       }
       if (data.type === "frame")
-        onFrame({ bitmap: data.bitmap, timestamp: data.timestamp });
+        onFrame({ bitmap: data.bitmap, timestamp: data.timestamp, clockOriginMs: data.clockOriginMs,captureMetrics:updateMetrics({...data.metrics,
+          deliveryMs:Math.max(0,performance.timeOrigin+performance.now()-data.sentAtEpochMs)}) });
+      if(data.type==='stats')updateMetrics(data.metrics);
       if (data.type === "stopped") {
+        notified=true;
         if (!started) reject(new Error(data.message));
-        else onStopped(data.message);
+        else onStopped(data.message,data.reason??'error');
       }
       if (data.type === "ended") {
         clearInterval(monitor);
-        onStopped("");
+        if(!notified)onStopped('Camera stream ended.','ended');
       }
     };
     worker.onerror = () => {
@@ -53,6 +66,7 @@ export async function startCameraCapture(
       else
         onStopped(
           "Camera frame capture failed. Buffered frames will finish processing.",
+          'error',
         );
     };
   });
@@ -68,11 +82,9 @@ export async function startCameraCapture(
       const readable = processor.readable;
       worker.postMessage({ type: "start", readable, sourceFps }, [readable]);
       monitor = setInterval(() => {
-        if (processor.discardedFrames) {
-          stop();
-          onStopped(
-            "The browser discarded camera frames. Capture stopped; buffered frames will finish processing.",
-          );
+        if ((processor.discardedFrames??0)>browserSkippedFrames) {
+          browserSkippedFrames=processor.discardedFrames!;
+          updateMetrics({});
         }
       }, 50);
     } else
@@ -81,6 +93,9 @@ export async function startCameraCapture(
       ]);
     await ready;
     return {
+      idle() {
+        worker.postMessage({type:'idle'});
+      },
       pause() {
         worker.postMessage({ type: "pause" });
       },

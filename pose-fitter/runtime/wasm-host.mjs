@@ -40,5 +40,5 @@ export async function loadCpuFitter(bytes, fixtureBytes, cv, options = {}) {
   new Uint8Array(e.memory.buffer,ptr,fixtureBytes.length).set(fixtureBytes);
   try{if(e.load_fixtures(ptr,fixtureBytes.length)<0)throw new Error('Invalid geometry fixture');}
   finally{e.dealloc(ptr,fixtureBytes.length);}
-  return {call};
+  return {call,get memoryBytes(){return e.memory.buffer.byteLength;}};
 }

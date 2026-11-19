@@ -7,6 +7,7 @@ export interface RunMetadata {
     models?:{pose:{file:string;size:number;bytes:number;sha256:string};bbox:{file:string;size:number;bytes:number;sha256:string}}};
   source?:{name:string;bytes:number;lastModified:number;sha256?:string};
   fingerprints?:{scheduler:string;policy:string;searchDriver:string;frameAdapter:string;colors:string};
+  timer?:{solveId:string;startClockMs:number;cameraClockOriginMs:number};
 }
 const canonical=(value:any):string=>JSON.stringify(value,(_key,v)=>v&&typeof v==='object'&&!Array.isArray(v)
   ?Object.fromEntries(Object.entries(v).sort(([a],[b])=>a.localeCompare(b))):v);
@@ -25,7 +26,7 @@ export function validateRun(recording:any,run:any,options:{diagnostic?:boolean;e
   if(rows.some((r:any)=>r.timestampSeconds<(config.requested_start_seconds??0)-1e-6||
     config.source_end_seconds!=null&&r.timestampSeconds>=config.source_end_seconds+1e-6))throw Error('Raw frames lie outside the recorded solve range');
   const source=recording.sources.find((s:any)=>s.id===run.sourceId);
-  if(!source||Math.abs(source.fps-config.fps)>1e-6)throw Error('Source FPS differs from the reconstruction clock');
+  if(!source||Math.abs(source.fps-(config.source_fps??config.fps))>1e-6)throw Error('Source FPS differs from the reconstruction clock');
   const sizes=[...new Set<number>(rows.map((r:any)=>r.result.transform.size))];
   if(new Set(rows.map((r:any)=>`${r.result.transform.sourceWidth}x${r.result.transform.sourceHeight}`)).size!==1)
     throw Error('Source dimensions changed inside the run');
@@ -47,7 +48,10 @@ export function validateRun(recording:any,run:any,options:{diagnostic?:boolean;e
     if(meta&&row.result.profile?.pose?.preprocessing&&row.result.profile.pose.preprocessing!==meta.detector.preprocessing)
       throw Error('Preprocessing differs from saved run configuration');
     const identity=videoFrameIdentity(row.timestampSeconds,config);
-    if(identity.sequence!==index)throw Error(`Missing/duplicated source frame at ordinal ${index}: got ${identity.sequence}`);
+    if(config.frame_clock==='camera_milliseconds') {
+      if(index&&identity.sourceFrame<=videoFrameIdentity(rows[index-1].timestampSeconds,config).sourceFrame)
+        throw Error(`Camera source timestamps do not increase at ordinal ${index}`);
+    } else if(identity.sequence!==index)throw Error(`Missing/duplicated source frame at ordinal ${index}: got ${identity.sequence}`);
     const fit=row.result.fittedPose;
     if(fit?.fittingConfig&&(fit.fittingConfig.fps!==config.fps||fit.fittingConfig.turningStartFrame!==config.turning_start_frame))
       throw Error('Recorded fitting and search used different source clocks or holds');

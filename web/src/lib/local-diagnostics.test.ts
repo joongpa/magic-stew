@@ -24,3 +24,9 @@ test('automatic local captures save exact run data and cannot overwrite a newer 
  const latest=JSON.parse(await readFile(join(directory,'latest.json'),'utf8'));
  assert.equal(latest.revision,2);assert.equal(latest.path,join(directory,'protocol-capture-test.json'));
 });
+
+test('production preview installs the same local diagnostic endpoint',()=>{
+ let path='';const plugin=localDiagnostics();
+ (plugin.configurePreviewServer as Function)({middlewares:{use(value:string){path=value;}}});
+ assert.equal(path,'/__diagnostics/run');
+});

@@ -21,6 +21,8 @@ export interface FittedPose {
   bootstrap: boolean;
   message: string;
   elapsedMs: number;
+  stageMs?: Record<string,number>;
+  workerQueueMs?: number;
   stage?: string;
   pipelineVersion?: string;
   pipelineAssets?:{rust:string;geometry:string;opencvWasm:string;opencvModule:string};
@@ -35,6 +37,7 @@ export interface FittedPose {
   startup_reference_core?: [number, number] | null;
   startup_motion_allowance?: number;
   fittingConfig?: { segment: number; fps: number; turningStartFrame: number | null;
+    sourceFps?:number;frameClock?:'camera_milliseconds';
     centers: { axis: number; side: number; color: string }[] };
 }
 

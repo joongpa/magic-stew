@@ -60,4 +60,7 @@ export class MoveSearch {
     }
   }
   dispose(){this.closed=true;this.worker.terminate();}
+  pause(){if(!this.closed)this.worker.postMessage({type:'pause'});}
+  resume(){if(!this.closed)this.worker.postMessage({type:'resume'});}
+  setPacing(delayMs:number){if(!this.closed)this.worker.postMessage({type:'pace',delayMs});}
 }

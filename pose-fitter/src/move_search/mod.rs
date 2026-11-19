@@ -57,7 +57,7 @@ impl Default for Config {
         Self {
             scramble: String::new(),
             fps: 30.,
-            max_tps: 54.,
+            max_tps: 40.,
             max_slice_tps: None,
             turning_start_frame: None,
             branch_widths: vec![3],
@@ -111,7 +111,8 @@ impl Engine {
     pub fn new(config: Config) -> Result<Self, String> {
         if !config.fps.is_finite()
             || config.fps <= 0.
-            || config.max_tps != 54.
+            || !config.max_tps.is_finite()
+            || config.max_tps <= 0.
             || config.max_slice_tps.is_some_and(|v| !v.is_finite() || v <= 0. || v > config.max_tps)
             || config.branch_widths.is_empty()
             || config.branch_widths.iter().any(|&v| v == 0)
@@ -128,7 +129,7 @@ impl Engine {
                 .max_rotation_tps
                 .is_some_and(|v| !v.is_finite() || v <= 0. || v >= config.max_tps)
         {
-            return Err("Move search requires positive FPS, ordered branch widths, finite weights and the shared 54 TPS limit".into());
+            return Err("Move search requires positive finite FPS and TPS, ordered branch widths, finite weights, and rotation TPS below move TPS".into());
         }
         let tables = cube::Tables::load();
         let frontier = frontier::Frontier::new(&tables, &config)?;

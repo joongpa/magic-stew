@@ -48,11 +48,20 @@ export class DetectionRecording {
     const id=`${this.startedAt}-${sourceId}-${this.runs.size}`;
     this.runs.set(id,{id,sourceId,config:structuredClone(config),metadata:structuredClone(metadata),actions:[],frameSequences:[]});return id;
   }
+  updateRunConfig(id:string,config:MoveSearchConfig) {
+    const run=this.runs.get(id);if(run){run.config=structuredClone(config);this.revision++;}
+  }
+  linkFrame(id:string,sequence:number) {
+    const run=this.runs.get(id),frame=this.frames[sequence];
+    if(!run)return;
+    if(!frame||frame.sourceId!==run.sourceId)throw Error('Run references an absent/different source frame');
+    if(!run.frameSequences.includes(sequence)){run.frameSequences.push(sequence);this.revision++;}
+  }
   linkCachedFrame(id:string,timestamp:number,result:FrameResult) {
     const run=this.runs.get(id);if(!run)return;
     const sequence=this.frames.findIndex(row=>row.sourceId===run.sourceId&&row.result===result&&Math.abs(row.timestampSeconds-timestamp)<0.00001);
     if(sequence<0)throw Error('Cached reconstruction frame lacks its original raw detection record');
-    if(!run.frameSequences.includes(sequence))run.frameSequences.push(sequence);
+    this.linkFrame(id,sequence);
   }
   setFingerprints(id:string,fingerprints:Promise<NonNullable<RunMetadata['fingerprints']>>) {
     const pending=(async()=>{const run=this.runs.get(id);
@@ -73,8 +82,8 @@ export class DetectionRecording {
     this.revision++;
     const run=runId?this.runs.get(runId):undefined;if(run){run.result=result;run.actions=actions;}
   }
-  saveError(runId:string,error:string,actions:SearchAction[]) {
-    const run=this.runs.get(runId);if(run){run.error=error;run.actions=actions;this.revision++;}
+  saveError(runId:string,error:string,actions?:SearchAction[]) {
+    const run=this.runs.get(runId);if(run){run.error=error;if(actions)run.actions=actions;this.revision++;}
   }
 
   get length() {
@@ -101,6 +110,7 @@ export class DetectionRecording {
       runId:context.runId,
     });
     if(context.runId)this.runs.get(context.runId)?.frameSequences.push(this.frames.length-1);
+    return this.frames.length-1;
   }
 
   toJSON() {
@@ -115,6 +125,7 @@ export class DetectionRecording {
           "Separate cube bbox detector score from the last acquisition",
       },
       fittingFields: {
+        "result.fittingError": "Original CPU pose fitting rejection for this frame; absent when fitting succeeded",
         "result.fittedPose.wireframes": "Projected meshes in the same order as all retained geometry options",
         "result.fittedPose.wireframeFaces": "Physical face IDs in each projected mesh, for reconstructed sticker colors",
         "result.fittedPose.wireframeDepths": "Camera depths for far-to-near face rendering",
@@ -127,6 +138,10 @@ export class DetectionRecording {
         "moveSearches[].result.steps[].orientation_symmetry_index": "Search-selected cube-frame symmetry from pose-fitter/tables/orientations.json; the six fitted geometries are unchanged",
         "result.fittedPose.stage": "cpu_pipeline means startup, initial, neighbors, orientation and recovery are complete",
         "result.fittedPose.pipelineVersion": "Content-addressed Rust/WASM asset loaded by the fitter",
+        "result.fittedPose.stageMs": "Numerical worker elapsed time by fitting stage; includes worker preemption, excludes worker queueing and lookahead",
+        "result.fittedPose.workerQueueMs": "Sum of fitting jobs' waiting times before assignment to a CPU worker; stages overlap across frames",
+        "result.pipeline.camera.copyMs": "Capture worker time copying the native camera frame into an independently retained bitmap",
+        "result.pipeline.camera.deliveryMs": "Elapsed time transferring the bitmap from the capture worker to the UI thread",
         "result.fittedPose.pose_flag_reason": "Display/evidence flag: geometry may be unreliable or assigned sticker-color evidence may be insufficient; fitted data is retained",
         "result.fittedPose.pose_geometry_flag_reason": "Geometry-specific reliability flag, separate from insufficient sticker-color evidence",
         "result.fittedPose.continuity_source_pose": "Original finalized geometric winner used for camera continuity before output-only weak-layer alternatives",
@@ -135,6 +150,8 @@ export class DetectionRecording {
         "result.fittedPose.startup_reference_core": "Screen-plane core of the latest eligible finalized pose with reliable geometry; color-only flags retain geometry eligibility; null during reference warmup",
         "result.fittedPose.startup_motion_allowance": "Pixels of normal core motion allowed for the finalized reference's lag, estimated from its last two unflagged cores",
         "result.fittedPose.fittingConfig": "Frame sequence configuration and buffered fitting segment for standalone replay",
+        "result.fittedPose.sourceFrame": "Frame-clock tick; divide by fittingConfig.fps for source seconds. Cameras use millisecond ticks, videos use source-frame indices",
+        "moveSearches[].config.source_fps": "Nominal camera capture FPS; config.fps is the numerical frame-clock rate when frame_clock is camera_milliseconds",
         "result.fittedPose.bank[].score": "Geometry cost, or recovery cost when recovery_score_components is present; lower is better, not detector confidence",
         "result.fittedPose.bank[].recovery_score_components": "Capped reprojection loss, pose-prior loss, active-layer count and projection weight used to rank sparse depth-recovery proposals",
         "result.fittedPose.bank[].nearest": "Projected sticker-face ID for each observed sticker keypoint",

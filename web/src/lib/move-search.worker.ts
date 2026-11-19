@@ -25,5 +25,8 @@ self.onmessage=({data}:MessageEvent)=>{
   void initialized?.then(()=>{
     if(data.type==="frame")driver.request({type:"frame",frame:data.frame});
     else if(data.type==="end")driver.request({type:"end"});
+    else if(data.type==='pause')driver.pause();
+    else if(data.type==='resume')driver.resume();
+    else if(data.type==='pace')driver.setPacing(data.delayMs);
   }).catch(fail);
 };

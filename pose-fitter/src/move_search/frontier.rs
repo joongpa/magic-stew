@@ -237,7 +237,7 @@ impl ScoredChoices<'_> {
                 .then_some(g.symmetry as u8),
             cube_rotation_motion: row.motion,
             cube_rotation_budget_degrees: p.rotation_limit,
-            state_moves: row.moves.clone(),
+            state_moves: row.moves.as_ref().clone(),
             state_score: choice.rank[0],
             color_error: choice.error,
             color_match_count: choice.match_count(),
@@ -440,7 +440,7 @@ pub(super) fn reverse_step(t: &Tables, p: &Prepared, row: &Row, state: &[u8], co
         orientation_symmetry_index: (g.symmetry != super::orientations::tables().identity_index).then_some(g.symmetry as u8),
         cube_rotation_motion: row.motion,
         cube_rotation_budget_degrees: p.rotation_limit,
-        state_moves: row.moves.clone(),
+        state_moves: row.moves.as_ref().clone(),
         state_score: score, color_error: error,
         color_match_count: count, color_correct_count: correct,
         color_confusion_count: confused, color_forbidden_count: forbidden,
@@ -830,7 +830,11 @@ impl Frontier {
                 }
                 let preserve_hold = c.preserve_hold && options.moves(candidate).is_empty();
                 if !unrestricted && admission > *c.branch_widths.last().unwrap() && !preserve_hold {
-                    if c.preserve_hold || c.resolve_orientation_ambiguity {
+                    // Candidates are sorted by rank and admission only grows.
+                    // Once outside the final width, later orientation aliases
+                    // cannot re-enter it. Only an explicitly preserved hold can
+                    // still be admitted from the remainder of this list.
+                    if c.preserve_hold {
                         continue;
                     } else {
                         break;

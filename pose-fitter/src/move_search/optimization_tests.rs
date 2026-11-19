@@ -97,7 +97,7 @@ fn compact_scoring_matches_full_permutations_and_raw_first_row_order() {
                             ),
                             (e.4, e.5, e.6)
                         );
-                        assert_eq!(a.step.state_moves, e.0.moves);
+                        assert_eq!(a.step.state_moves, *e.0.moves);
                         assert_eq!(a.step.angular_travel_degrees, e.0.degrees);
                         assert_eq!(a.step.rotation_budget_degrees, e.0.budget);
                         assert_eq!(a.step.cube_rotation_motion, e.0.motion);

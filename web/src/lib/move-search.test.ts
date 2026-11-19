@@ -4,6 +4,9 @@ import { MoveSearch } from "./move-search";
 import type { MoveSearchConfig } from "./move-search-types";
 import type { FrameResult } from "./detector";
 import type { FittedPose } from "./pose-types";
+import {createSearchConfig} from '../../../pose-fitter/runtime/reconstruction-policy.mjs';
+import {TimerReconstruction} from './timer-reconstruction';
+import {fakeTimers} from './test-clock';
 const config:MoveSearchConfig={scramble:"R U",fps:60,max_tps:54,turning_start_frame:null,branch_widths:[3],
  branch_stage_expansions:10000,state_limit:1000,mismatch_window_weight:1,unrestricted_sticker_count:3};
 const frame={detections:[{classId:3,x:2,y:3,score:0.94,presence:0.99},{classId:0,x:3,y:4,score:0.8,presence:0.99}]} as FrameResult;
@@ -23,6 +26,16 @@ function setup(t:any){
  return {search,worker:WorkerStub.instances[0],errors};
 }
 const tick=()=>new Promise<void>(resolve=>setImmediate(resolve));
+test('timer deadline terminates the worker directly without waiting for a stuck WASM call to reply',t=>{
+ setup(t);const clock=fakeTimers(t),updates:any[]=[];
+ const pipeline=new TimerReconstruction((config,onResult,onError)=>new MoveSearch('http://localhost/',config,onResult,onError),(_id,value)=>updates.push(value));
+ pipeline.start('a','R',0,30);pipeline.submit(0,frame,new Promise<FittedPose>(()=>{}));
+ const worker=WorkerStub.instances.at(-1)!;
+ pipeline.stop('a',1);clock.tick(10_300);
+ assert.equal(worker.terminated,true);
+ assert.equal(worker.messages.some(message=>message.type==='end'),false,'termination works without an input-close acknowledgement');
+ assert.equal(updates.at(-1).message,'Reconstruction timed out after 10 seconds');pipeline.cancel();
+});
 function gate(){let resolve!:(pose:FittedPose)=>void;const promise=new Promise<FittedPose>(r=>{resolve=r;});return{promise,resolve};}
 test("completed future poses are prepared immediately with their original sequence",async t=>{
  const {search,worker}=setup(t),first=gate(),second=gate();
@@ -138,4 +151,44 @@ test("color-only warnings keep good geometry authoritative while legacy flags re
  assert.deepEqual(worker.messages.filter(message=>message.type==="frame").map(message=>
   [message.frame.flagged,message.frame.geometry_flagged]),[[true,false],[true,true],[false,false],[true,undefined]]);
  search.dispose();
+});
+
+test('camera search keeps frames that collided under nominal FPS and preserves their elapsed motion allowance', async t => {
+ setup(t);
+ const camera = createSearchConfig({scramble:'R U',fps:30,camera:true,originSeconds:11.584281});
+ const search = new MoveSearch('http://localhost/',camera,()=>{},()=>{}),worker=WorkerStub.instances.at(-1)!;
+ search.submit(11.584281,frame,Promise.resolve(pose));search.submit(11.607686,frame,Promise.resolve(pose));await search.end();
+ const frames=worker.messages.filter(m=>m.type==='frame').map(m=>m.frame);
+ assert.deepEqual(frames.map(f=>f.sequence),[0,1]);assert.deepEqual(frames.map(f=>f.frame),[11584,11608]);
+ assert.equal(worker.messages[0].config.fps,1000);assert.equal(worker.messages[0].config.source_fps,30);
+ assert.ok(Math.abs((frames[1].frame-frames[0].frame)/camera.fps-(11.607686-11.584281))<.001);
+ search.dispose();
+});
+
+test('timer forward search prepares fitting promises immediately, independently of display and timer stop',async t=>{
+ setup(t);
+ const pipeline=new TimerReconstruction((config,onResult,onError)=>new MoveSearch('http://localhost/',config,onResult,onError),()=>{});
+ t.after(()=>pipeline.cancel());
+ pipeline.start('solve','R U',10,30);
+ const first=gate(),second=gate();
+ pipeline.submit(9.99,frame,Promise.resolve(pose));
+ pipeline.submit(10,frame,first.promise);pipeline.submit(10.033,frame,second.promise);
+ const worker=WorkerStub.instances.at(-1)!;
+ assert.equal(worker.messages[0].type,'init');
+ assert.equal(worker.messages.some(m=>m.type==='frame'||m.type==='end'),false,'no bank is available before either fit resolves');
+ second.resolve(pose);await tick();
+ assert.deepEqual(worker.messages.filter(m=>m.type==='frame').map(m=>m.frame.sequence),[1],
+  'a finalized future fit is prepared while the earlier fit and display remain blocked');
+ assert.equal(worker.messages.some(m=>m.type==='end'),false,'timer is still running');
+ first.resolve(pose);await tick();
+ assert.deepEqual(worker.messages.filter(m=>m.type==='frame').map(m=>m.frame.sequence),[1,0]);
+ pipeline.stop('solve',11);
+ pipeline.accept(10,{...frame,fittedPose:pose});pipeline.accept(10.033,{...frame,fittedPose:pose});
+ pipeline.submit(11.299,frame,Promise.resolve(pose));pipeline.submit(11.3,frame,Promise.resolve(pose));
+ await tick();
+ assert.deepEqual(worker.messages.filter(m=>m.type==='frame').map(m=>m.frame.frame),[10033,10000,11299],
+  'display never resubmits a bank and range-end input stays excluded');
+ assert.equal(worker.messages.some(m=>m.type==='end'),false);
+ pipeline.accept(11.299,{...frame,fittedPose:pose});pipeline.accept(11.3,{...frame,fittedPose:pose});
+ await tick();assert.equal(worker.messages.at(-1).type,'end');
 });

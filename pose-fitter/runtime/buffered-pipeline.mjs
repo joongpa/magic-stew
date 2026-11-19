@@ -14,7 +14,7 @@ export class BufferedPosePipeline {
   push(frame) {
     if(this.closed||this.ended)throw new Error('Pose segment is closed');
     if(this.entries.length&&frame.frame<=this.entries.at(-1).meta.frame)throw new Error('Pose frame indices must increase');
-    const entry={frame,meta:{frame:frame.frame,width:frame.width,height:frame.height,pixel_scale:frame.pixel_scale},elapsedMs:0,prepared:false};
+    const entry={frame,meta:{frame:frame.frame,width:frame.width,height:frame.height,pixel_scale:frame.pixel_scale},elapsedMs:0,stageMs:{},workerQueueMs:0,prepared:false};
     const result=new Promise((resolve,reject)=>{entry.resolve=resolve;entry.reject=reject;});
     entry.result=result;
     result.catch(()=>{}); // A later ordered presenter still receives the error.
@@ -33,6 +33,8 @@ export class BufferedPosePipeline {
   async job(request,entry) {
     const value=await this.execute(request);
     entry.elapsedMs+=value.elapsedMs??0;
+    entry.stageMs[request.type]=(entry.stageMs[request.type]??0)+(value.elapsedMs??0);
+    entry.workerQueueMs+=value.queueMs??0;
     return value;
   }
   async pumpStartup() {
@@ -141,8 +143,11 @@ export class BufferedPosePipeline {
         target:value.target,static_mode:this.isStatic(entry)},entry)).then(value=>{
         if(this.closed)return;
         entry.finalized=true;this.finished++;
-        entry.resolve({...value,elapsedMs:entry.elapsedMs,startup_reference_core:entry.startupReferenceCore,
+        entry.resolve({...value,elapsedMs:entry.elapsedMs,stageMs:entry.stageMs,workerQueueMs:entry.workerQueueMs,startup_reference_core:entry.startupReferenceCore,
           startup_motion_allowance:entry.startupMotionAllowance});
+        // Startup only needs the finalized core. Keeping the fulfilled promise
+        // retained every full bank/mesh for an indefinitely connected camera.
+        entry.result=Promise.resolve({continuity_core:value.continuity_core??null});
         entry.resolve=entry.reject=undefined;entry.frame=null;entry.oriented=undefined;
         this.notify();
       }).catch(error=>this.cancel(error));

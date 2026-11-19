@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { pipelineFrame, poseObservations } from "./pose-fitter";
+import { PoseFitter, pipelineFrame, poseObservations } from "./pose-fitter";
 import type { FrameResult } from "./detector";
+import cameraTiming from './fixtures/camera-timer-timestamps.json';
 
 test("pose fitting receives source coordinates and already-filtered object classes", () => {
   const frame = {
@@ -18,6 +19,32 @@ test("pose fitting receives source coordinates and already-filtered object class
   });
   assert.equal(frame.detections[0].score, 0.5);
   assert.equal(frame.detections[0].presence, 0.9);
+});
+
+test('the failed camera recording preserves all 187 irregular frames in one fitting segment', async () => {
+  const admitted: number[] = [];
+  const pool = { dispose() {}, async execute(job: Record<string, any>) {
+    if (job.type === 'prepare') { admitted.push(job.frame.frame); return { candidates: [] }; }
+    if (job.type === 'select_startup') return { source: null, anchor: false };
+    if (job.type === 'orient') return { bank: [], reference: null };
+    return { bank: [], wireframe: [], pose: null };
+  } };
+  const fitter = new PoseFitter('http://localhost/', pool);
+  const frame = { transform: { sourceWidth: 640, sourceHeight: 480, cropWidth: 200, cropHeight: 200 }, detections: [] } as unknown as FrameResult;
+  const nominal = cameraTiming.timestamps.map(time => Math.round(time * cameraTiming.sourceFps));
+  assert.equal(nominal.filter((value, i) => i > 0 && value <= nominal[i - 1]).length, 2, 'reproduces both original collisions');
+  const pending = cameraTiming.timestamps.map((time, index) => fitter.fit(frame, index === 0, time, cameraTiming.sourceFps,
+    { scramble: '', turningStartFrame: null, camera: true }));
+  await fitter.flush();
+  const poses = await Promise.all(pending);
+  assert.equal(poses.length, 187); assert.equal(admitted.length, 187);
+  assert.ok(admitted.every((value, i) => !i || value > admitted[i - 1]));
+  assert.deepEqual([...new Set(poses.map(pose => pose.fittingConfig?.segment))], [1]);
+  for (const [index, pose] of poses.entries()) {
+    assert.equal(pose.fittingConfig?.fps, 1000); assert.equal(pose.fittingConfig?.sourceFps, 30);
+    assert.ok(Math.abs(pose.sourceFrame! / pose.fittingConfig!.fps - cameraTiming.timestamps[index]) <= .0005);
+  }
+  fitter.dispose();
 });
 
 test("CPU pipeline gets ROI pixel scale, source frame number, colors and presence scores", () => {

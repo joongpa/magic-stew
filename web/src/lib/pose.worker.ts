@@ -35,7 +35,8 @@ self.onmessage = async ({ data }: MessageEvent<
         result: { ...result, elapsedMs: performance.now() - start, pipelineVersion: fingerprint,pipelineAssets } });
     }
   } catch (error) {
+    const stage = data.type === 'job' ? String(data.job.type ?? 'job') : 'initialization';
     self.postMessage({ type: "error", id: data.type === "job" ? data.id : undefined,
-      message: error instanceof Error ? error.message : String(error) });
+      message: `CPU pose ${stage}: ${error instanceof Error ? error.message : String(error)}` });
   }
 };

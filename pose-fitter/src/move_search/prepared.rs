@@ -26,8 +26,8 @@ pub struct Geometry {
 pub struct Row {
     pub before: Option<usize>,
     pub after: usize,
-    pub moves: Vec<String>,
-    pub sources: Vec<usize>,
+    pub moves: Arc<Vec<String>>,
+    pub sources: Arc<Vec<usize>>,
     pub degrees: f64,
     pub budget: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,7 +92,7 @@ impl Prepared {
 }
 pub struct MechanicalRoute {
     route: routes::Route,
-    material: Vec<crate::M3>,
+    material: Box<[crate::M3]>,
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ShapeKey(Option<usize>, [u64; 3]);
@@ -252,7 +252,7 @@ fn rows(t: &Tables, frame: &Prepared, previous: Option<&Prepared>) -> Vec<Row> {
     for (&after, shape) in &frame.shapes {
         for (before_index, old) in &before {
             for route in routes::between_with_slice_limit(old, shape, frame.limit, frame.slice_limit) {
-                let (sources, moves) = t.permutation(&route.groups);
+                let (sources, moves) = t.shared_permutation(&route.groups);
                 let key = (*before_index, after, moves.clone());
                 if let Some(&index) = seen.get(&key) {
                     let row: &mut Row = &mut rows[index];
@@ -299,18 +299,15 @@ pub fn orientation_rows(
                     .into_iter()
                     .map(|route| {
                         let material = if measure_motion {
-                            super::motion::prepare(old, &geometry.shape, &route.groups)
+                            t.material_cache.prepare(old, &geometry.shape, &route.groups)
                         } else {
-                            vec![]
+                            Box::new([])
                         };
                         MechanicalRoute { route, material }
                     })
                     .collect(),
             );
-            frame
-                .mechanical_cache
-                .borrow_mut()
-                .insert(shapes, Arc::clone(&routes));
+            frame.mechanical_cache.borrow_mut().insert(shapes, Arc::clone(&routes));
             routes
         });
         for prepared in routes.iter() {
@@ -334,7 +331,7 @@ pub fn orientation_rows(
             }) {
                 continue;
             }
-            let (sources, moves) = t.permutation(&route.groups);
+            let (sources, moves) = t.shared_permutation(&route.groups);
             if let Some(&i) = seen.get(&moves) {
                 let row: &mut Row = &mut result[i];
                 row.degrees = row.degrees.min(route.degrees);
@@ -357,10 +354,7 @@ pub fn orientation_rows(
         scoring_indices: scoring_indices(&result),
         rows: result,
     });
-    frame
-        .orientation_cache
-        .borrow_mut()
-        .insert(key, Arc::clone(&result));
+    frame.orientation_cache.borrow_mut().insert(key, Arc::clone(&result));
     result
 }
 /// Equal 54/54 limits need no future double-turn classification. Each bank
@@ -398,14 +392,14 @@ mod tests {
         let first = Row {
             before: Some(0),
             after: 1,
-            moves: vec!["R".into()],
-            sources: (0..54).collect(),
+            moves: Arc::new(vec!["R".into()]),
+            sources: Arc::new((0..54).collect()),
             degrees: 90.,
             budget: 162.,
             motion: None,
         };
         let mut alias = first.clone();
-        alias.moves = vec!["different spelling".into()];
+        alias.moves = Arc::new(vec!["different spelling".into()]);
         alias.degrees = 180.;
         let mut other_parent = first.clone();
         other_parent.before = Some(2);

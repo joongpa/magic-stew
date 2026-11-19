@@ -148,7 +148,7 @@ fn missing_opening_poses_do_not_accumulate_hidden_turns_even_out_of_order() {
     assert_eq!(engine.frames.len(), 4);
     assert!(engine.frames[..3].iter().all(|p| p.held));
     assert_eq!(engine.frames[3].previous, None);
-    assert!((engine.frames[3].limit - 90. * 54. / 50.).abs() < 1e-9);
+    assert!((engine.frames[3].limit - 90. * engine.config.max_tps / 50.).abs() < 1e-9);
     assert_eq!(engine.baseline, Some(16));
 }
 #[test]
@@ -161,7 +161,28 @@ fn missing_poses_after_search_starts_preserve_the_full_motion_gap() {
     engine.push(Frame { sequence: 1, frame: 18, ..Frame::default() }).unwrap();
     engine.push(opening_gap_pose(2, 20)).unwrap();
     assert_eq!(engine.frames[2].previous, Some(0));
-    assert!((engine.frames[2].limit - 90. * 54. * 3. / 50.).abs() < 1e-9);
+    assert!((engine.frames[2].limit - 90. * engine.config.max_tps * 3. / 50.).abs() < 1e-9);
+}
+#[test]
+fn lower_turn_limit_excludes_a_hidden_quarter_turn_over_twenty_ms_and_replays_legacy_rates() {
+    assert_eq!(Config::default().max_tps, 40.);
+    for (rate, allows_quarter) in [(40., false), (54., true)] {
+        let mut engine=Engine::new(Config {
+            scramble:"R U".into(),fps:1000.,max_tps:rate,
+            resolve_orientation_ambiguity:true,max_rotation_tps:Some(20.),
+            ..Config::default()
+        }).unwrap();
+        engine.push(opening_gap_pose(0,100)).unwrap();
+        engine.push(opening_gap_pose(1,120)).unwrap();
+        let frame=&engine.frames[1];
+        assert!((frame.limit-90.*rate*0.020).abs()<1e-9);
+        assert!((frame.rotation_limit.unwrap()-36.).abs()<1e-9);
+        let routes=between(&Shape::flat(),&Shape::flat(),frame.limit);
+        assert_eq!(routes.iter().any(|route|route.degrees==90.),allows_quarter);
+    }
+    for rate in [0.,-1.,f64::NAN,f64::INFINITY] {
+        assert!(Engine::new(Config {max_tps:rate,..Config::default()}).is_err());
+    }
 }
 #[test]
 fn saved_cpu_scorer_and_widening_oracle() {

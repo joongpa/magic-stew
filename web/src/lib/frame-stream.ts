@@ -1,3 +1,4 @@
+import type {CameraCaptureMetrics} from './camera-metrics';
 /** Source-time sampling is independent of inference speed. */
 export class FrameSelector {
   private origin: number | undefined;
@@ -26,6 +27,7 @@ export class FrameSelector {
 export interface SourceFrame {
   bitmap: ImageBitmap;
   timestamp: number;
+  captureMetrics?:CameraCaptureMetrics;
 }
 
 /** One-frame lookahead overlaps decoding with inference without evicting frames. */

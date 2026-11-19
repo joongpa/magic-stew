@@ -421,6 +421,36 @@ pub(crate) fn sweep(g: &Geometry, w: &Workload, camera: &Pose) -> Vec<Fit> {
                 (rv, dia)
             })
             .collect();
+        // Diameter depends only on the middle angle, not the two outer angles.
+        // Keep the round trip through rvec: using `arot` here changes rounding.
+        let diameters: Vec<f64> = (-45..=45).step_by(15).map(|angle| {
+            let rv = matrix_rvec(mm(rodrigues(rvec).0, axis_rotation(axis, angle as f64)));
+            projection::cube_diameter(g, &c, rv, c.tvec)
+        }).collect();
+        // A point's occlusion by one layer depends only on its own angle and
+        // that layer's angle. Cache those pairs instead of intersecting the
+        // same ray for every one of the 7^3 angle combinations.
+        let visibility = |count: usize, face: bool| -> Vec<[[u8; 3]; 7]> {
+            (0..count).map(|p| std::array::from_fn(|row| {
+                let source = if row == 6 {
+                    if face { a.face_aliases[p] } else { a.point_aliases[p] }
+                } else { p };
+                let data = &cached[if row == 6 { 0 } else { row }];
+                let front = if face { data.face_front[source] } else { data.point_front[source] };
+                if !front { return [0; 3]; }
+                let object = if face {
+                    let world = scale(g.faces[source].iter().copied().fold([0.; 3], add), 0.25);
+                    mv(data.matrices[0], world)
+                } else { data.objects[source] };
+                let ray = sub(object, cached[0].origin);
+                std::array::from_fn(|layer| (0..7).fold(0, |mask, angle| {
+                    let matrix = cached[if angle == 6 { 0 } else { angle }].matrices[0];
+                    mask | (u8::from(projection::entry(g, cached[0].origin, ray, matrix, axis, layer) >= 1. - 1e-5) << angle)
+                }))
+            })).collect()
+        };
+        let point_visibility = visibility(a.points.len(), false);
+        let face_visibility = visibility(g.faces.len(), true);
         for i in 0..7 {
             for j in 0..7 {
                 for k in 0..7 {
@@ -438,17 +468,8 @@ pub(crate) fn sweep(g: &Geometry, w: &Workload, camera: &Pose) -> Vec<Fit> {
                         s.objects[p] = data.objects[source];
                         s.points[p] = cached[row].points[p];
                         s.point_front[p] = data.point_front[source];
-                        s.point_visible[p] = s.point_front[p]
-                            && (0..3).all(|l| {
-                                projection::entry(
-                                    g,
-                                    s.origin,
-                                    sub(s.objects[p], s.origin),
-                                    s.matrices[l],
-                                    axis,
-                                    l,
-                                ) >= 1. - 1e-5
-                            });
+                        s.point_visible[p] = (0..3).all(|l|
+                            point_visibility[p][row][l] & (1 << indices[l]) != 0);
                     }
                     for f in 0..g.faces.len() {
                         let row = indices[a.face_layers[f]];
@@ -457,24 +478,11 @@ pub(crate) fn sweep(g: &Geometry, w: &Workload, camera: &Pose) -> Vec<Fit> {
                         s.centers[f] = data.centers[source];
                         s.face_polygons[f] = data.face_polygons[source];
                         s.face_front[f] = data.face_front[source];
-                        let world = scale(g.faces[source].iter().copied().fold([0.; 3], add), 0.25);
-                        let object = mv(cached[if row == 6 { 0 } else { row }].matrices[0], world);
-                        s.face_visible[f] = s.face_front[f]
-                            && (0..3).all(|l| {
-                                projection::entry(
-                                    g,
-                                    s.origin,
-                                    sub(object, s.origin),
-                                    s.matrices[l],
-                                    axis,
-                                    l,
-                                ) >= 1. - 1e-5
-                            });
+                        s.face_visible[f] = (0..3).all(|l|
+                            face_visibility[f][row][l] & (1 << indices[l]) != 0);
                     }
                     let (rv, _) = middle[j];
-                    let norm_rvec =
-                        matrix_rvec(mm(rodrigues(rvec).0, axis_rotation(axis, angles[1])));
-                    let d = projection::cube_diameter(g, &c, norm_rvec, c.tvec);
+                    let d = diameters[j];
                     let (m, _, _, _) = metrics(
                         g,
                         w,

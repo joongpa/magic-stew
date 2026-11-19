@@ -10,6 +10,7 @@ export interface PipelineGeometry {
 export interface PipelinePose {
   bank:PipelineGeometry[];wireframe:[number,number][][];pose:{rvec:number[];tvec:number[]}|null;
   elapsedMs:number;bootstrap:boolean;message:string;stage:string;depth_recovery:boolean;
+  stageMs?:Record<string,number>;workerQueueMs?:number;
   wireframes?:[number,number][][][];
   wireframeFaces?:number[][];wireframeDepths?:number[][];
   continuity_core?:[number,number]|null;pose_flag_reason?:string|null;

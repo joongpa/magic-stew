@@ -5,6 +5,93 @@
 //! mistaken for a whole-cube rotation just because its middle angle is in R.
 use super::{cube::Group, routes::Shape};
 use crate::math::*;
+use std::{cell::RefCell, collections::HashMap};
+
+struct CubiePath {
+    start: [i32; 3],
+    end: [i32; 3],
+    rotation: M3,
+}
+const MAX_MATERIAL_PATHS: usize = 4096;
+#[derive(Default)]
+pub struct MaterialCache {
+    paths: RefCell<HashMap<Vec<Group>, Box<[CubiePath]>>>,
+}
+impl MaterialCache {
+    /// The discrete cubie path depends on the moves alone. Reuse it across
+    /// fitted shape pairs; residual slab rotations still use their exact angles.
+    pub fn prepare(&self, old: &Shape, new: &Shape, groups: &[Group]) -> Box<[M3]> {
+        let axis = old
+            .axis
+            .or(new.axis)
+            .or_else(|| groups.first().map(|group| group.axis));
+        if axis.is_some_and(|axis| {
+            old.axis.is_none_or(|a| a == axis)
+                && new.axis.is_none_or(|a| a == axis)
+                && groups.iter().all(|group| group.axis == axis)
+        }) || groups.is_empty() && old.axis.is_none() && new.axis.is_none()
+        {
+            return prepare(old, new, groups).into_boxed_slice();
+        }
+        let mut cache = self.paths.borrow_mut();
+        if !cache.contains_key(groups) && cache.len() < MAX_MATERIAL_PATHS {
+            cache.insert(groups.to_vec(), cubie_paths(groups));
+        }
+        let uncached;
+        let paths = if let Some(paths) = cache.get(groups) {
+            paths.as_ref()
+        } else {
+            uncached = cubie_paths(groups);
+            uncached.as_ref()
+        };
+        let slabs = |shape: &Shape| {
+            std::array::from_fn::<_, 3, _>(|layer| {
+                shape
+                    .axis
+                    .map(|axis| turn(axis, shape.angles[layer]))
+                    .unwrap_or_else(identity)
+            })
+        };
+        let before = slabs(old).map(transpose);
+        let after = slabs(new);
+        let mut result = vec![];
+        for path in paths {
+            let first = old.axis.map_or(0, |axis| (path.start[axis] + 1) as usize);
+            let last = new.axis.map_or(0, |axis| (path.end[axis] + 1) as usize);
+            let delta = mm(mm(after[last], path.rotation), before[first]);
+            if !result.contains(&delta) {
+                result.push(delta);
+            }
+        }
+        result.into_boxed_slice()
+    }
+}
+fn cubie_paths(groups: &[Group]) -> Box<[CubiePath]> {
+    let mut paths = Vec::with_capacity(27);
+    for x in -1..=1 {
+        for y in -1..=1 {
+            for z in -1..=1 {
+                let start = [x, y, z];
+                let mut end = start;
+                let mut rotation = identity();
+                for group in groups {
+                    let q = turn(
+                        group.axis,
+                        90. * group.offsets[(end[group.axis] + 1) as usize] as f64,
+                    );
+                    rotation = mm(q, rotation);
+                    end = mv(q, end.map(|v| v as f64)).map(|v| v.round() as i32);
+                }
+                paths.push(CubiePath {
+                    start,
+                    end,
+                    rotation,
+                });
+            }
+        }
+    }
+    paths.into_boxed_slice()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
 pub struct Motion {
@@ -100,6 +187,85 @@ pub fn measure(before: M3, old: &Shape, after: M3, new: &Shape, groups: &[Group]
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_full_material_cache_preserves_exact_motion_without_growing() {
+        let cache = MaterialCache::default();
+        for index in 0..MAX_MATERIAL_PATHS {
+            cache.paths.borrow_mut().insert(
+                vec![Group {
+                    axis: 0,
+                    offsets: [index as i32, 0, 0],
+                }],
+                Box::default(),
+            );
+        }
+        let old = Shape::new(1, [30., 0., -15.]);
+        let new = Shape::new(2, [-45., 0., 45.]);
+        let groups = [
+            Group {
+                axis: 0,
+                offsets: [0, 0, 1],
+            },
+            Group {
+                axis: 1,
+                offsets: [1, 0, 0],
+            },
+        ];
+        for _ in 0..2 {
+            assert_eq!(
+                cache.prepare(&old, &new, &groups).as_ref(),
+                prepare(&old, &new, &groups)
+            );
+            assert_eq!(cache.paths.borrow().len(), MAX_MATERIAL_PATHS);
+        }
+    }
+    #[test]
+    fn cached_cubie_paths_match_every_original_matrix_bit_for_bit() {
+        let cache = MaterialCache::default();
+        let shapes = [
+            Shape::flat(),
+            Shape::new(0, [30., 0., -15.]),
+            Shape::new(1, [-45., 0., 45.]),
+            Shape::new(2, [0., 0., 18.]),
+        ];
+        let group = |axis, offsets| Group { axis, offsets };
+        let moves = [
+            vec![],
+            vec![group(0, [0, 0, 1])],
+            vec![group(1, [-1, -1, 0])],
+            vec![group(0, [0, 0, -1]), group(1, [1, 0, 0])],
+            vec![
+                group(2, [0, 1, 0]),
+                group(0, [2, 2, 0]),
+                group(1, [0, 0, -1]),
+            ],
+        ];
+        let bits = |matrices: &[M3]| {
+            matrices
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        for old in &shapes {
+            for new in &shapes {
+                for groups in &moves {
+                    let expected = prepare(old, new, groups);
+                    let actual = cache.prepare(old, new, groups);
+                    assert_eq!(bits(&actual), bits(&expected));
+                    assert_eq!(
+                        measure_prepared(identity(), axis_rotation(1, 12.), &actual),
+                        measure_prepared(identity(), axis_rotation(1, 12.), &expected)
+                    );
+                }
+            }
+        }
+        assert!(
+            cache.paths.borrow().len() <= moves.len(),
+            "Discrete paths must be shared across fitted shape pairs"
+        );
+    }
     #[test]
     fn rotation_and_turn_combine_before_limits() {
         // R x' = Lw in the immutable renderer convention.

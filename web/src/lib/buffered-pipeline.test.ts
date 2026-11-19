@@ -115,3 +115,12 @@ test("cancelling rejects outstanding frames and a pending flush", async () => {
   await assert.rejects(pending, /Source changed/);
   await assert.rejects(flushed, /Source changed/);
 });
+test('completed live fits retain only continuity cores internally while callers receive full banks',async()=>{
+ const stream=new BufferedPosePipeline(executor([]),config);
+ const pending=[0,1,2].map(i=>stream.push(frame(i)));await stream.flush();
+ const results=await Promise.all(pending);
+ assert.ok(results.every(result=>result.bank.length===1));
+ for(const entry of (stream as any).entries){
+  assert.deepEqual(Object.keys(await entry.result),['continuity_core']);assert.equal(entry.frame,null);
+ }
+});

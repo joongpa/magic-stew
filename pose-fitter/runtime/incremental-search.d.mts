@@ -5,5 +5,8 @@ export class IncrementalSearch {
   error:(error:unknown)=>void;live?:boolean;version?:string;now?:()=>number;
   schedule?:typeof setTimeout;cancel?:typeof clearTimeout});
  request(request:any):any;
+ pause():void;
+ resume():void;
+ setPacing(delayMs:number):void;
  dispose():void;
 }

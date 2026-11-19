@@ -9,7 +9,7 @@ usable points. The pose input defaults to 256px, matching the search scripts; 16
 
 ## Run
 
-From the repository root (Node 18.18+; Node 22 LTS recommended):
+From the repository root (Node 22.3+ recommended for cubing.js):
 
 ```sh
 cd web
@@ -27,6 +27,104 @@ worker and does not require WebGPU. The viewer reports the actual CPU thread
 count. Threading requires cross-origin isolation; without it, CPU mode runs
 single-threaded and the viewer reports that limitation. Changing backend finishes the current
 frame, retains queued source frames, and restarts both model sessions.
+
+## Cube timer (testing)
+
+Open **[/timer](/timer)** directly or select the **Cube timer** tab and connect a camera.
+The detector stays at `/`; tab navigation supports browser back/forward.
+Hold space for 0.3 seconds,
+then release to start; **any newly pressed key stops** the solve. The on-screen
+button supports the same hold/release interaction, and tapping it stops a solve.
+Camera interruption stops the timer and records a DNF.
+
+Scrambles are generated locally by [cubing.js](https://js.cubing.net/cubing/scramble/)
+using `randomScrambleForEvent("333")`.
+The flat cube net shows the resulting scrambled state. No Java or scramble server
+is required. Use Node 22.3+ for dependency installation (as required by cubing.js).
+
+The camera keeps streaming between solves, with detection and pose fitting idle.
+An idle preview uses the connected stream directly. The capture reader continues
+draining native frames and reporting capture FPS without creating inference
+bitmaps; starting a solve resumes inference-frame delivery on the same source
+clock. The processed-frame counter counts inference, so it stays at zero before
+the first solve even while the preview is streaming.
+Starting a solve resumes capture admission and starts fresh tracking/fitting context
+while retaining the loaded workers. Frames are admitted by camera source timestamp
+in **[timer start, timer stop + 0.3s)**. At the end of that window, an ordered boundary
+flushes remaining fitting lookahead, drains admitted frames, and closes search input.
+Idle camera frames are neither inferred nor retained. The camera source clock is anchored
+once in the capture worker, before bitmap transfer and inference queues; timer
+boundaries do not use the delayed viewer position. This mapping uses the first
+frame's capture-worker arrival time, so it does not calibrate camera/driver latency.
+Camera fitting and search use integer millisecond timestamps (`fps: 1000` is the
+numerical clock rate; `source_fps` retains the nominal capture FPS). This preserves
+irregular camera timing without rounding two admitted frames onto the same index.
+The clock conversion itself does not discard frames. Video keeps its source-frame clock.
+Forward move search starts with the first finalized pose inside the timed range
+and receives each later finalized pose immediately, while timing/capture/fitting
+continue. As with uploaded-video forward search, fitting promises are submitted
+in source order and their banks are prepared as soon as they resolve, even if
+an earlier fit is holding up display. The ordered display/recording queue does
+not delay search preparation. Input closes after the stop + 0.3s tail has finished fitting. A newer
+solve pauses older search expansions; camera backpressure spaces expansion chunks
+apart only while its input remains open, to leave CPU time for fitting without
+starving search. Closed solves have no camera pacing delay. Finalized frames
+continue to be prepared immediately, and neither mechanism resets the frontier.
+Finding a solution leaves the camera connected; detection pauses after the tail drains. Disconnecting the camera preserves
+searches whose complete input window has already been received. Incomplete capture or failed fitting
+is reported explicitly. Keep the scrambled/solved cube visible around timer input.
+Reconstruction has a 10-second wall-clock deadline starting after the 0.3-second
+capture tail. The main thread terminates the search worker at that deadline,
+including a worker blocked inside WASM or still waiting for fits. The solve time,
+last candidate, diagnostics and pose replay remain available after a timeout.
+Detection records are retained only within timed solve windows, including the
+0.3-second tail. The detector and fitter do no work on idle frames between solves.
+
+During capture and tail draining, the timer displays the furthest fully processed
+camera frame, with the fitted pose drawn on that same frame by default. Once the
+tail drains, it returns to the live idle preview. **Show fitted pose** remains
+available in the timer tab; disabling overlays still shows processed frames during
+a solve.
+Its throughput row separates measured capture FPS from processing
+FPS, processing delay and skipped frames. A full buffer keeps draining at the rate
+the processor can sustain: queued frames are preserved, and newly arriving frames
+are skipped until a slot is available. Capture does not stop, and no Resume action
+is needed. Browser-discarded frames are counted as well; real timestamp gaps remain
+in fitting/search. Processing drains the camera FIFO without an additional 30fps
+admission timer. Finalized fit banks/meshes are released from internal pipeline
+history once only their continuity core is needed.
+
+Timer diagnostics are enabled by default and create a separate run as soon as
+timing starts, including attempts that fail before move search. On local Vite dev
+and preview servers, captures are checkpointed during the solve and saved on stop,
+failure and completion under `pose-fitter/results/browser-runs/`; `latest.json`
+identifies the most recent capture. Each capture contains only that solve's
+detections, model/settings and source clock, original per-frame `fittingError`,
+and the search journal if search ran. **Download diagnostics** in the solve details
+exports the same run while that page session remains open. The visible failure
+message includes the first underlying fitting error and its source timestamp.
+The Detector tab's **Record search diagnostics** setting also controls timer logs.
+Large diagnostic JSON is serialized in a separate worker, with one snapshot in
+flight and repeated queued saves coalesced. Ongoing search progress updates memory
+without repeatedly rewriting the full detection capture or browser-local session.
+
+The session includes +2/DNF edits, deletion, best time, ao5/ao12 (dropping best and
+worst), scramble/reconstruction details and JSON export. Times and compact results
+are retained in browser local storage; raw camera images are not stored there.
+New solves also retain compressed processed-frame snapshots in page-session memory
+for replay. Already processed frames become available immediately when the timer
+stops, with remaining solve/tail frames appended as they finish. Replay does not
+wait for reconstruction to finish or succeed. Solve details show the same `ProjectedCube` viewer used by uploads,
+including reconstructed colors, moves/rotations, smooth motion and adjustable view,
+beside the matching processed camera frame and selected pose overlay. Play/pause,
+0.25×/0.5×/1× speed, scrubbing, and frame buttons/arrow keys use the original irregular
+source timestamps. Deleting a solve releases its replay. Reloading preserves times
+and compact results but releases replay images; historical solves from before this
+feature have no camera images to replay. Snapshots are encoded asynchronously only
+inside solve windows, without waiting before search submission.
+
+This initial version has no inspection countdown or hardware timer input.
+The existing Detector tab retains file reconstruction.
 
 ## Video reconstruction
 
@@ -88,7 +186,9 @@ engine preserves the CPU scorer used by
 54-byte cube states, directional 26m color-confusion costs, unique-sticker duplicate
 semantics, balanced geometry/color ranks, geometry contexts, eight-frame mismatch
 history, dominance, sibling ties, sparse branching and deferred widening. There
-is one shared **54 TPS** limit; no double-turn witness/classification is used.
+is one shared **40 TPS** move limit; cube rotation remains at **20 TPS**.
+No double-turn witness/classification is used. Saved runs retain their recorded
+TPS setting for diagnostic replay.
 The browser defaults to width 3, sparse threshold 3 and a 1,000,000-state budget.
 The optional opening hold is measured from the first included frame.
 
@@ -160,10 +260,50 @@ the JSON download remains available for saving results to disk.
 The sidebar reports CPU computation and draw/presentation time separately. CPU
 computation sums all numerical jobs for that frame; it excludes queueing and
 lookahead waiting, and can exceed the frame interval because workers overlap.
+Downloaded results include per-stage numerical times (`fittedPose.stageMs`), summed
+CPU worker queue waits (`fittedPose.workerQueueMs`), and camera bitmap copy/worker
+delivery times (`pipeline.camera.copyMs` / `deliveryMs`). These separate a slow
+camera source from CPU saturation and delayed UI delivery. Worker elapsed times
+include preemption by concurrent work; they are not exclusive CPU measurements.
+
 Downloaded results include main-thread `pipeline` timestamps, `fittedPose.stage`
 (`cpu_pipeline`), the content-addressed WASM version, source frame index and
 fitting segment/configuration for standalone replay. FPS measures presentation
 throughput over a window so simultaneous completions do not inflate it.
+
+To profile CPU fitting on a saved diagnostic run, using fresh fits from its raw
+detections and the shared scheduler:
+
+```sh
+cd web
+npx tsx scripts/profile-live-pipeline.mts CAPTURE.json REPORT.json
+# Optional exact fitted-output comparison against an older WASM asset:
+npx tsx scripts/profile-live-pipeline.mts CAPTURE.json REPORT.json --baseline-wasm OLD.wasm
+```
+
+The report includes per-stage durations, input/runtime hashes and exact output
+parity when a baseline is supplied. This isolates fitting; it does not measure
+camera capture, GPU detection, concurrent search or browser worker scheduling.
+Only recorded solve frames are replayed, so the unrecorded camera prelude is not
+reproduced.
+
+Upload and timer reconstruction share the Rust route generator, motion checks,
+scorer and frontier. The timer adds source-window admission and scheduling. Search
+candidate rows share immutable cached sticker permutations and move strings;
+discrete cubie paths are reused across fitted shapes, with a 4,096-entry cache
+bound. The fitted angles, motion limits, candidate ordering and search rules are
+unchanged. Cached material matrices use exact-sized storage.
+
+For a search-only comparison using the fitted-input format accepted by
+`benchmark-parallel-search.mjs`, run from the repository root:
+
+```sh
+node web/scripts/benchmark-search-memory.mjs INPUT.json OLD.wasm NEW.wasm REPORT.json 4096 2
+```
+
+It alternates fresh workers, compares every search snapshot, and reports elapsed
+search time and WASM allocated-memory high-water marks. These are isolated search
+measurements, not live browser FPS or live-object heap sizes.
 
 Build the complete fitter from the repository root before starting/building the
 app. See [the fitter build instructions](../pose-fitter/README.md#build-and-run-without-the-app)
@@ -307,9 +447,10 @@ inference worker is busy. The viewer shows the remaining FIFO queue length.
 The app never replaces an older buffered frame with the newest frame.
 
 Live capture cannot slow physical time. A 60-frame buffer accommodates transient
-inference stalls. If that buffer fills, capture stops with an explicit message
-and every admitted buffered frame finishes processing; frames are not silently
-evicted. Browser-reported camera discards also stop capture with a message.
+inference stalls. If that buffer fills, processing continues and new incoming
+frames are skipped until space opens. Every admitted buffered frame finishes in
+order. Browser-reported discards are counted rather than stopping the stream.
+The timer preview advances with completed processing and reports skipped frames.
 This bounds raw-frame memory use. Cameras require a browser supporting frame
 streams; unsupported browsers report the limitation rather than falling back to
 presentation callbacks. Video files remain available through sequential decoding.

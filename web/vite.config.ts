@@ -20,5 +20,9 @@ export default defineConfig({
     ],
   },
   worker: { format: "es" },
-  build: { target: "es2022" },
+  // cubing.js dynamically imports its worker entry. Keep Vite's preload helper
+  // separate from the Svelte entry, so workers never import/execute the app.
+  build: { target: "es2022", modulePreload: false, rollupOptions: { output: {
+    manualChunks(id) { if (id.includes('vite/preload-helper')) return 'preload-helper'; },
+  } } },
 });

@@ -1,4 +1,5 @@
 import { FrameSelector } from "./frame-stream";
+import {CameraFrameRate,CameraFrameBuffer} from './camera-metrics';
 
 interface Processor {
   readable: ReadableStream<VideoFrame>;
@@ -14,25 +15,27 @@ interface CaptureScope {
   postMessage: (message: unknown, transfer?: Transferable[]) => void;
 }
 const scope = self as unknown as CaptureScope;
-let paused = false,
-  pending = 0,
-  stopped = false;
+let paused = false, stopped = false, resetRate=false, processing=true;
+const buffer=new CameraFrameBuffer();
 let track: MediaStreamTrack | undefined;
 let reader: ReadableStreamDefaultReader<VideoFrame> | undefined;
-const MAX_PENDING = 60;
 let canvas: OffscreenCanvas | undefined;
 
 scope.onmessage = async ({ data }) => {
   if (data.type === "ack") {
-    pending = Math.max(0, pending - 1);
+    buffer.acknowledge();
     return;
   }
   if (data.type === "pause") {
     paused = true;
     return;
   }
+  if(data.type==='idle'){
+    processing=false;
+    return;
+  }
   if (data.type === "resume") {
-    paused = false;
+    paused = false;processing=true;resetRate=true;
     return;
   }
   if (data.type !== "start") return;
@@ -51,18 +54,32 @@ scope.onmessage = async ({ data }) => {
       reader = processor.readable.getReader();
     }
     const selector = new FrameSelector(data.sourceFps || 30);
+    const rate=new CameraFrameRate();let lastStats=-Infinity;
     let firstTimestamp: number | undefined;
+    let clockOriginMs: number | undefined;
     scope.postMessage({ type: "started" });
     while (!stopped) {
       const { value: frame, done } = await reader.read();
       if (done) break;
       try {
-        if (processor?.discardedFrames)
-          throw new Error(
-            "The browser discarded camera frames. Capture stopped; buffered frames will finish processing.",
-          );
         if (paused || !selector.accept(frame.timestamp / 1e6)) continue;
         firstTimestamp ??= frame.timestamp;
+        // Anchor once at capture, before bitmap transfer or inference queues.
+        // timeOrigin makes this clock comparable across worker/window realms.
+        clockOriginMs ??= performance.timeOrigin + performance.now();
+        const timestamp=(frame.timestamp-firstTimestamp)/1e6;
+        if(resetRate){rate.reset();resetRate=false;}
+        const captureFps=rate.observe(timestamp);
+        if(!processing){
+          if(timestamp-lastStats>=.5){lastStats=timestamp;scope.postMessage({type:'stats',metrics:{captureFps,
+            skippedFrames:buffer.skipped,browserSkippedFrames:processor?.discardedFrames??0}});}
+          continue;
+        }
+        if(!buffer.admit()){
+          if(timestamp-lastStats>=.5){lastStats=timestamp;scope.postMessage({type:'stats',metrics:{captureFps,
+            skippedFrames:buffer.skipped,browserSkippedFrames:processor?.discardedFrames??0}});}
+          continue;
+        }
         if (
           !canvas ||
           canvas.width !== frame.displayWidth ||
@@ -73,25 +90,21 @@ scope.onmessage = async ({ data }) => {
         const context = canvas.getContext("2d", { alpha: false });
         if (!context) throw new Error("Camera frame copying is unavailable.");
         // Copy out of the camera's native buffer pool before retaining a frame.
+        const copyStart=performance.now();
         context.drawImage(frame, 0, 0);
         const bitmap = canvas.transferToImageBitmap();
-        pending++;
+        const copyMs=performance.now()-copyStart;
         scope.postMessage(
           {
             type: "frame",
             bitmap,
-            timestamp: (frame.timestamp - firstTimestamp) / 1e6,
+            timestamp,
+            clockOriginMs,
+            sentAtEpochMs:performance.timeOrigin+performance.now(),
+            metrics:{captureFps,skippedFrames:buffer.skipped,browserSkippedFrames:processor?.discardedFrames??0,copyMs},
           },
           [bitmap],
         );
-        if (pending >= MAX_PENDING) {
-          scope.postMessage({
-            type: "stopped",
-            message:
-              "Camera processing fell behind the 60-frame buffer. Capture stopped; every buffered frame will finish processing. Resume to start a new capture.",
-          });
-          stopped = true;
-        }
       } finally {
         frame.close();
       }
@@ -99,6 +112,7 @@ scope.onmessage = async ({ data }) => {
   } catch (error) {
     scope.postMessage({
       type: "stopped",
+      reason:'error',
       message: error instanceof Error ? error.message : String(error),
     });
   } finally {

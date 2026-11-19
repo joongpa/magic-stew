@@ -30,8 +30,80 @@
   import { PLAYBACK_SPEEDS, playbackTiming } from "./lib/playback-timing";
   import type { PlaybackSpeed } from "./lib/playback-timing";
   import ProjectedCube from "./lib/ProjectedCube.svelte";
-  import {createSearchConfig,ADMISSION_CAPACITY,poseWorkerCount,POLICY_VERSION} from "../../pose-fitter/runtime/reconstruction-policy.mjs";
+  import {createSearchConfig,ADMISSION_CAPACITY,poseWorkerCount,POLICY_VERSION,CAMERA_CLOCK_HZ,MOVE_TPS_LIMIT} from "../../pose-fitter/runtime/reconstruction-policy.mjs";
   import {runtimeFingerprints} from './lib/capture-provenance';
+  import CubeTimer from './lib/CubeTimer.svelte';
+  import { TimerReconstruction } from './lib/timer-reconstruction';
+  import type { TimerReconstructionResult } from './lib/cube-timer';
+  import { TimerDiagnostics } from './lib/timer-diagnostics';
+  import { DiagnosticWriter } from './lib/diagnostic-writer';
+  import type {CameraCaptureMetrics} from './lib/camera-metrics';
+  import {TimerReplayStore,type TimerReplay} from './lib/timer-replay';
+  import {TimerCaptureGate} from './lib/timer-capture';
+  import {workspacePath,workspaceFromPath,type WorkspaceTab} from './lib/workspace-route';
+
+  const workspaceBase=new URL(import.meta.env.BASE_URL,location.origin).pathname;
+  let activeTab = $state<WorkspaceTab>(workspaceFromPath(location.pathname,workspaceBase));
+  let timerBusy = $state(false);
+  let timerCamera = $state(false);
+  let cameraClockOriginMs = $state<number>();
+  let timerReconstructions = $state<Record<string, TimerReconstructionResult>>({});
+  let timerReplays=$state<Record<string,TimerReplay>>({});
+  const timerReplayStore=new TimerReplayStore(clip=>{timerReplays={...timerReplays,[clip.id]:clip};});
+  const timerCaptureGate=new TimerCaptureGate();
+  let timerCapturePhase=$state<'idle'|'capturing'|'draining'>('idle');
+  const timerReconstruction = new TimerReconstruction(
+    (config, onResult, onError, id) => {
+      const search = new MoveSearch(baseUrl, config, (value, ended) => {
+        timerDiagnostics.search(id, config, value, search.actions, ended);
+        onResult(value, ended);
+      }, onError);
+      return search;
+    },
+    (id, value) => { timerReconstructions = { ...timerReconstructions, [id]: timerDiagnostics.update(id, value) }; });
+  function selectTab(tab:WorkspaceTab,pushHistory=true) {
+    if (timerBusy || tab === activeTab) return;
+    if (tab === 'timer') {
+      if (sourceKind !== 'none' && sourceKind !== 'camera') stopSource();
+      moveSearch?.dispose(); moveSearch = undefined; searchResult = undefined; searchError = '';
+      activeRunId = undefined;
+      if (sourceKind === 'camera') timerCamera = true;
+    }
+    activeTab = tab;
+    if(pushHistory)history.pushState(null,'',workspacePath(tab,workspaceBase));
+    document.getElementById('workspace-panel')?.focus({ preventScroll: true });
+  }
+  function navigateTab(event:MouseEvent,tab:WorkspaceTab){
+    if(timerBusy){event.preventDefault();return;}
+    if(event.button!==0||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey)return;
+    event.preventDefault();selectTab(tab);
+  }
+  function followHistory(){
+    if(timerBusy){history.replaceState(history.state,'',workspacePath(activeTab,workspaceBase));return;}
+    selectTab(workspaceFromPath(location.pathname,workspaceBase),false);
+  }
+  function startTimerSolve(id: string, scramble: string, clockMs: number) {
+    if (cameraClockOriginMs === undefined) return;
+    const config = timerReconstruction.start(id, scramble, (clockMs - cameraClockOriginMs) / 1000, sourceFps || 30, searchDiagnostics);
+    timerReplayStore.start(id,config.requested_start_seconds!,config.fps);
+    timerCaptureGate.start(id,config.requested_start_seconds!);timerCapturePhase='capturing';capture?.resume();
+    const runId = timerDiagnostics.start(id, generation, config, {
+      policyVersion: POLICY_VERSION, appOrigin: location.origin, poseWorkers: poseWorkerCount(navigator.hardwareConcurrency),
+      admissionCapacity: ADMISSION_CAPACITY,
+      detector: { poseSize: size, backend, preprocessing: detectorPreprocessing, settings: settings(), models: detectorIdentity },
+      timer: { solveId: id, startClockMs: clockMs, cameraClockOriginMs },
+    });
+    if (config.diagnostics !== false) void recording.setFingerprints(runId, runtimeFingerprints()).catch(() => {});
+    timerReconstructions = { ...timerReconstructions, [id]: { status: 'collecting', diagnosticRunId: runId } };
+  }
+  function stopTimerSolve(id: string, clockMs: number) {
+    if (cameraClockOriginMs !== undefined) {
+      const timestamp=(clockMs-cameraClockOriginMs)/1000;
+      timerReconstruction.stop(id,timestamp);timerReplayStore.stop(id,timestamp);
+      timerCaptureGate.stop(id,timestamp);
+    }
+  }
+  function deleteTimerSolve(id:string){timerReplayStore.remove(id);delete timerReplays[id];}
 
   let manifest = $state<ModelManifest>();
   let size = $state(256);
@@ -85,6 +157,11 @@
   const reconstructionComplete = $derived(videoInputComplete && (!searchEnabled || !!searchError ||
     !!searchResult && ["solved", "already_solved", "exhausted", "state_limit"].includes(searchResult.status)));
   const recording = new DetectionRecording();
+  const timerDiagnostics = new TimerDiagnostics(recording, persistDiagnostics);
+  let diagnosticsWorker:Worker|undefined;
+  let diagnosticResponse:{resolve():void;reject(error:Error):void}|undefined;
+  const diagnosticWriter=new DiagnosticWriter(id=>({id,...recording.exportRun(id),model:$state.snapshot(manifest)}),sendDiagnostics);
+  let captureFps=$state(0),cameraDelayMs=$state(0),skippedCameraFrames=$state(0);
   let savedFrames = $state(0);
   let thresholds = $state([0.25, 0.4, 0.25, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]);
   let presenceThreshold = $state(0.05);
@@ -137,15 +214,28 @@
   let stage: HTMLCanvasElement, fileInput: HTMLInputElement;
   let still: HTMLImageElement | undefined;
   let worker: Worker | undefined;
-  let stream: MediaStream | undefined;
+  let stream=$state.raw<MediaStream>();
+  let cameraPreview=$state<HTMLVideoElement>();
+  $effect(()=>{
+    const element=cameraPreview,source=stream;
+    if(!element)return;
+    element.srcObject=source??null;
+    if(source)void element.play().catch(cause=>{
+      if(element.srcObject===source)mediaError=cause instanceof Error?cause.message:String(cause);
+    });
+    return()=>{if(element.srcObject===source)element.srcObject=null;};
+  });
   let fileSource: VideoFileSource | undefined;
   let capture: CameraCapture | undefined;
   let seekVersion = 0;
   let seekResume = false,
     seeking = false;
-  let captureStopped = false,
-    fileEnded = false;
-  const cameraQueue = new FrameQueue<SourceFrame & { close(): void }>();
+  let captureStopped = $state(false);
+  const showCameraPreview=$derived(sourceKind==='camera'&&timerCamera&&timerCapturePhase==='idle'&&!captureStopped);
+  let fileEnded = false;
+  type CameraEnd={timerEnd:true;id:string;timestamp:number;close():void};
+  type CameraFrame=SourceFrame&{close():void;timerReset?:boolean};
+  const cameraQueue = new FrameQueue<CameraFrame|CameraEnd>();
   const presenter = new FramePresenter();
   let timer = 0,
     generation = 0,
@@ -163,6 +253,7 @@
         timestamp: number;
         counted: boolean;
         camera: boolean;
+        captureMetrics?:CameraCaptureMetrics;
         sentAt: number;
         drawMs: number;
         acquireMs: number;
@@ -174,11 +265,12 @@
     | undefined;
   type FrameContext = NonNullable<typeof currentFrame>;
   type DetectedFrame = { context: FrameContext; result: FrameResult; detectorCompletedAt: number;
-    fitting?: Promise<FittedPose>; fitStartedAtMs?: number; fitCompletedAtMs?: number };
+    fitting?: Promise<FittedPose>; fitter?: PoseFitter; fitStartedAtMs?: number; fitCompletedAtMs?: number };
   type CachedFrame = { saved: SavedVideoResult; context: Pick<FrameContext, "snapshot" | "generation" | "timestamp"> };
+  type TimerEnd={timerEnd:true;id:string;timestamp:number;generation:number};
   // Recovery needs 180ms of future source context, plus the adjacent initial fit.
-  const completionQueue = new OrderedStage<DetectedFrame | CachedFrame>(ADMISSION_CAPACITY, completeFrame,
-    (packet) => presenter.releaseFrame(packet.context.snapshot),
+  const completionQueue = new OrderedStage<DetectedFrame | CachedFrame | TimerEnd>(ADMISSION_CAPACITY, completeFrame,
+    (packet) => {if('context' in packet)presenter.releaseFrame(packet.context.snapshot);},
     (size) => { fitBufferedFrames = size; continuePipeline(); },
     (cause) => {
       mediaError = cause instanceof Error ? cause.message : String(cause);
@@ -208,16 +300,17 @@
       ? Math.max(0, Math.min(2, roiPadding))
       : 0.4,
   });
-  const needsPose = () => showPose || searchEnabled;
-  const inferenceAllowed = () => !moveSearch?.solved && !(sourceKind === "video" && videoInputComplete);
+  const needsPose = () => timerCamera || activeTab === 'timer' || showPose || searchEnabled;
+  const inferenceAllowed = () => (timerCamera || !moveSearch?.solved) && !(sourceKind === "video" && videoInputComplete);
   const displayPose = () => showPose && (sourceKind !== "video" || !trimming);
   $effect(() => {
     if (!projectedAfterPass && sourceKind === "video" && reconstructionComplete && !trimming && result?.fittedPose) {
       projectedAfterPass = true; showPose = true; untrack(redrawOverlay);
     }
   });
-  const poseFittingOptions = () => ({scramble:moveSearch?.config.scramble ?? initialScramble.trim(),
-    turningStartFrame:moveSearch ? moveSearch.config.turning_start_frame : openingHoldSeconds>0 ? Math.floor((searchOriginTimestamp+openingHoldSeconds)*(sourceFps||30)) : null,
+  const poseFittingOptions = () => timerCamera ? {scramble:'',turningStartFrame:null,originSeconds:0,camera:true} : ({scramble:moveSearch?.config.scramble ?? initialScramble.trim(),
+    camera:sourceKind==='camera',
+    turningStartFrame:moveSearch ? moveSearch.config.turning_start_frame : openingHoldSeconds>0 ? Math.floor((searchOriginTimestamp+openingHoldSeconds)*(sourceKind==='camera'?CAMERA_CLOCK_HZ:sourceFps||30)) : null,
     originSeconds:moveSearch?.config.source_origin_seconds??searchOriginTimestamp,
     endSeconds:sourceKind==="video"?(moveSearch?.config.source_end_seconds??solveEnd):undefined});
   const currentCacheKey = (fitPose = needsPose()) => videoResultKey(size, backend, settings(), fitPose, poseFittingOptions());
@@ -229,13 +322,13 @@
   }
   function startMoveSearch() {
     moveSearch?.dispose(); moveSearch = undefined; searchResult = undefined; searchError = "";
-    if (!searchEnabled || sourceKind === "none") return;
+    if (timerCamera || activeTab === 'timer' || !searchEnabled || sourceKind === "none") return;
     if (!initialScramble.trim()) { searchError = "Enter the initial scramble to start move search."; return; }
     if(searchCleanup&&(!Number.isFinite(searchCleanupTolerance)||searchCleanupTolerance<0||searchCleanupTolerance>1)){
       searchError="Cleanup color tolerance must be between 0 and 1.";return;
     }
     const token = generation;
-    const config = createSearchConfig({scramble:initialScramble,fps:sourceFps||30,
+    const config = createSearchConfig({scramble:initialScramble,fps:sourceFps||30,camera:sourceKind==='camera',
       openingHoldSeconds,diagnostics:searchDiagnostics,bidirectional:searchBidirectional&&sourceKind==="video",originSeconds:sourceKind==="video"?searchOriginTimestamp:0,
       postprocessIdentityLoops:searchCleanup,postprocessColorTolerance:searchCleanup?searchCleanupTolerance:0.02,
       startSeconds:sourceKind==="video"?solveStart:undefined,endSeconds:sourceKind==="video"?solveEnd:undefined});
@@ -270,18 +363,31 @@
     const token = generation, activeSearch = moveSearch;
     await waitForPipelineIdle();
     if (token !== generation || disposed || activeSearch !== moveSearch) return;
+    if (timerCamera && captureStopped) {timerReplayStore.closeInput();timerReconstruction.closeInput();}
     if (sourceKind === "video") videoInputComplete = true;
     if(activeRunId)void persistDiagnostics(activeRunId);
     try { await activeSearch?.end(); } catch (cause) { if (token === generation) searchError = cause instanceof Error ? cause.message : String(cause); }
   }
   async function persistDiagnostics(runId:string) {
-    if(!import.meta.env.DEV||!recording.diagnosticsEnabled(runId))return;
+    if((!import.meta.env.DEV&&!['localhost','127.0.0.1','[::1]'].includes(location.hostname))||!recording.diagnosticsEnabled(runId))return;
     try {
       await recording.ready(runId);
-      const response=await fetch(new URL('__diagnostics/run',baseUrl),{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({id:runId,...recording.exportRun(runId),model:$state.snapshot(manifest)})});
-      if(!response.ok)console.error('Local diagnostic capture failed',await response.text());
+      await diagnosticWriter.write(runId);
     }catch(cause){console.error('Local diagnostic capture failed',cause);}
+  }
+  function sendDiagnostics(capture:unknown):Promise<void> {
+    if(disposed)return Promise.resolve();
+    diagnosticsWorker??=new Worker(new URL('./lib/diagnostics.worker.ts',import.meta.url),{type:'module'});
+    const active=diagnosticsWorker;
+    return new Promise((resolve,reject)=>{
+      diagnosticResponse={resolve,reject};
+      active.onmessage=({data})=>{
+        diagnosticResponse=undefined;
+        if(data.ok)resolve();else reject(new Error(data.error));
+      };
+      active.onerror=event=>{diagnosticResponse=undefined;active.terminate();diagnosticsWorker=undefined;reject(new Error(event.message||'Diagnostic writer stopped'));};
+      active.postMessage({baseUrl,capture});
+    });
   }
   function seedCachedSearch() {
     const rows = videoResults.entries(currentCacheKey(true));
@@ -299,6 +405,7 @@
     return { last, complete: count >= Math.ceil((solveEnd - origin) * target - 0.00001) };
   }
   async function changeMoveSearch() {
+    if (timerCamera || activeTab === 'timer') return;
     if (!searchEnabled) { moveSearch?.dispose(); moveSearch = undefined; if (!showPose) void flushPose(); return; }
     if (trimming) return;
     if (!initialScramble.trim()) { searchEnabled = false; searchError = "Enter the initial scramble to start move search."; return; }
@@ -404,6 +511,7 @@
   }
   function continuePipeline() {
     if (disposed) return;
+    updateSearchPressure();
     if(!inferenceAllowed())refreshPending=false;
     if (!busy && (refreshPending || !running || status !== "ready")) void flushPose();
     if (refreshPending && !busy && !completionQueue.size && !seeking && status === "ready") {
@@ -411,7 +519,20 @@
       void inferFrame();
     } else scheduleNext();
   }
-  async function completeFrame(packet: DetectedFrame | CachedFrame) {
+  function updateSearchPressure(){
+    if(!timerCamera||queuedFrames<=2)timerReconstruction.setBackpressure(false);
+    else if(queuedFrames>=8)timerReconstruction.setBackpressure(true);
+  }
+  async function completeFrame(packet: DetectedFrame | CachedFrame | TimerEnd) {
+    if('timerEnd' in packet){
+      if(packet.generation===generation&&!disposed){
+        timerReplayStore.finishThrough(packet.timestamp);timerReconstruction.finishThrough(packet.timestamp);
+        if(timerCaptureGate.finish(packet.id)){
+          timerCapturePhase='idle';presentationTimes=[];lastResultTime=0;fps=0;previousFrameStart=0;
+        }
+      }
+      return;
+    }
     if ("saved" in packet) {
       if (packet.context.generation === generation && !disposed)
         presentSavedSnapshot(packet.context.snapshot, packet.saved);
@@ -428,9 +549,13 @@
       } catch (cause) {
         if (token === generation) {
           poseError = cause instanceof Error ? cause.message : String(cause);
-          poseFitter?.dispose();
-          poseFitter = undefined;
-          resetPose = true;
+          packet.result.fittingError = poseError;
+          // Old queued rejections must not dispose a newly recovered fitter.
+          if (poseFitter === packet.fitter) {
+            poseFitter?.dispose();
+            poseFitter = undefined;
+            resetPose = true;
+          }
         }
       } finally {
         if (token === generation) poseFitting = false;
@@ -446,15 +571,29 @@
       detectorCompletedAtMs: packet.detectorCompletedAt,
       fitStartedAtMs: packet.fitStartedAtMs, fitCompletedAtMs: packet.fitCompletedAtMs, presentedAtMs,
       presentationMs: presentedAtMs - overlayStart,
+      ...(completed.camera&&cameraClockOriginMs!==undefined?{camera:{captureFps:completed.captureMetrics?.captureFps??captureFps,
+        copyMs:completed.captureMetrics?.copyMs,deliveryMs:completed.captureMetrics?.deliveryMs,
+        skippedFrames:completed.captureMetrics?.skippedFrames??0,browserSkippedFrames:completed.captureMetrics?.browserSkippedFrames??0,
+        queuedFrames,bufferedFits:fitBufferedFrames,
+        sourceAgeMs:Math.max(0,performance.timeOrigin+presentedAtMs-cameraClockOriginMs-completed.timestamp*1000)}}:{}),
     };
+    if(packet.result.pipeline.camera)cameraDelayMs=packet.result.pipeline.camera.sourceAgeMs;
     result = packet.result;
     presentedTimestamp=completed.timestamp;
     viewingSavedResult = false;
     if (completed.recording.sourceKind === "video" && (!completed.fitPose || packet.result.fittedPose))
       cachedVideoFrames = videoResults.put(completed.cacheKey, completed.timestamp, packet.result);
-    if (completed.counted || completed.recording.sourceKind === "image" || completed.recording.sourceKind === "video") {
-      recording.append(packet.result, completed.recording);
+    const retainDetection = completed.recording.sourceKind !== 'camera' || !timerCamera || timerReconstruction.includes(completed.timestamp);
+    if (retainDetection && (completed.counted || completed.recording.sourceKind === "image" || completed.recording.sourceKind === "video")) {
+      const sequence = recording.append(packet.result, completed.recording);
+      if (completed.camera && timerCamera) {
+        for (const id of timerReconstruction.solveIds(completed.timestamp)) timerDiagnostics.frame(id, sequence);
+      }
       savedFrames = recording.length;
+    }
+    if (completed.camera && timerCamera) {
+      timerReplayStore.capture(completed.timestamp,packet.result,()=>completed.snapshot.convertToBlob({type:'image/jpeg',quality:.8}));
+      timerReconstruction.accept(completed.timestamp, packet.result);
     }
     if (completed.counted) {
       if (!processedFrames || !lastResultTime) presentationTimes = [];
@@ -581,6 +720,7 @@
               detectorCompletedAt: performance.now() };
             if (completed.fitPose) {
               poseFitter ??= new PoseFitter(baseUrl);
+              packet.fitter = poseFitter;
               packet.fitStartedAtMs = performance.now();
               try {
                 packet.fitting = poseFitter.fit(data.result, completed.resetPose,
@@ -591,6 +731,8 @@
               // Admission continues while the ordered presenter awaits an earlier fit.
               void packet.fitting.catch(() => {});
               moveSearch?.submit(completed.timestamp, data.result, packet.fitting);
+              if(completed.camera&&timerCamera&&completed.generation===generation)
+                timerReconstruction.submit(completed.timestamp,data.result,packet.fitting);
             }
             completionQueue.enqueue(packet);
           }
@@ -624,6 +766,11 @@
   }
 
   function stopSource() {
+    timerCaptureGate.clear();timerCapturePhase='idle';
+    timerReplayStore.closeInput();
+    timerReconstruction.closeInput('Camera disconnected before the complete solve window was processed');
+    captureFps=0;cameraDelayMs=0;skippedCameraFrames=0;
+    timerCamera = false; cameraClockOriginMs = undefined;
     activeRunId=undefined;
     generation++;
     seekVersion++;
@@ -680,6 +827,7 @@
 
   async function camera() {
     stopSource();
+    timerCamera = activeTab === 'timer';
     mediaError = "";
     const token = generation;
     try {
@@ -707,8 +855,24 @@
             frame.bitmap.close();
             return;
           }
-          cameraQueue.push({ ...frame, close: () => frame.bitmap.close() });
+          cameraClockOriginMs = frame.clockOriginMs;
+          let timerReset=false;
+          if(timerCamera){
+            const admission=timerCaptureGate.admit(frame.timestamp);
+            if(admission.type!=='frame'){
+              frame.bitmap.close();capture?.acknowledge();
+              if(admission.type==='end'){
+                capture?.idle();timerCapturePhase='draining';
+                cameraQueue.push({timerEnd:true,id:admission.id,timestamp:admission.timestamp,close(){}});
+                queuedFrames=cameraQueue.length;scheduleNext();
+              }else if(timerCapturePhase==='idle')capture?.idle();
+              return;
+            }
+            timerReset=admission.reset;
+          }
+          cameraQueue.push({ ...frame,timerReset, close: () => frame.bitmap.close() });
           queuedFrames = cameraQueue.length;
+          updateSearchPressure();
           scheduleNext();
         },
         (message) => {
@@ -718,6 +882,7 @@
           if (message) mediaError = message;
           if (!cameraQueue.length && !busy) running = false;
         },
+        metrics=>{if(token===generation&&!disposed){captureFps=metrics.captureFps;skippedCameraFrames=metrics.skippedFrames+metrics.browserSkippedFrames;}},
       );
       if (token !== generation || disposed) {
         activeCapture.stop();
@@ -729,6 +894,7 @@
       startMoveSearch();
       running = true;
       scheduleNext();
+      if (activeTab === 'timer') document.getElementById('workspace-panel')?.focus({ preventScroll: true });
     } catch (cause) {
       if (token !== generation) return;
       capture?.stop();
@@ -800,7 +966,7 @@
     }
   }
 
-  function dispatch(bitmap: ImageBitmap, timestamp: number, counted: boolean) {
+  function dispatch(bitmap: ImageBitmap, timestamp: number, counted: boolean,captureMetrics?:CameraCaptureMetrics) {
     // Recheck after asynchronous decoding/bitmap creation: search can finish
     // while a frame is being acquired, before it reaches the neural worker.
     if(!inferenceAllowed()){
@@ -818,6 +984,7 @@
       timestamp,
       counted,
       camera: sourceKind === "camera" && counted,
+      captureMetrics,
       recording: {
         sourceId: generation,
         sourceName,
@@ -853,6 +1020,7 @@
   }
 
   async function inferFrame() {
+    if(timerCamera)return;
     if (trimming || !inferenceAllowed()) { refreshPending=false;return; }
     if (busy || completionQueue.size || disposed || sourceKind === "none") {
       if (!disposed && sourceKind !== "none") refreshPending = true;
@@ -898,6 +1066,14 @@
         sourceKind === "video" ? await fileSource?.next() : cameraQueue.shift();
       acquireMs = performance.now() - acquireStart;
       queuedFrames = cameraQueue.length;
+      if(frame&&'timerEnd' in frame){
+        if(token===generation&&activeWorker===worker&&!disposed){
+          // No later idle-camera work enters the fitter. Flush its remaining
+          // lookahead and close the solve after ordered presentation drains.
+          void flushPose();completionQueue.enqueue({timerEnd:true,id:frame.id,timestamp:frame.timestamp,generation:token});
+        }
+        markIdle();continuePipeline();return;
+      }
       if (token !== generation || activeWorker !== worker || disposed) {
         frame?.bitmap.close();
         return;
@@ -917,6 +1093,7 @@
         if (!running) void finishMoveSearch();
         return;
       }
+      if('timerReset' in frame&&frame.timerReset){resetPose=true;resetTracking=true;}
       admitFrame(frame);
     } catch (cause) {
       if (token !== generation) return;
@@ -947,7 +1124,7 @@
           viewingSavedResult=false;frameTiming=undefined;
         } finally {frame.bitmap.close();markIdle();}
         continuePipeline();
-      } else dispatch(frame.bitmap, frame.timestamp, true);
+      } else dispatch(frame.bitmap, frame.timestamp, true,frame.captureMetrics);
   }
 
   function presentSavedFrame(bitmap: ImageBitmap, saved: SavedVideoResult) {
@@ -982,7 +1159,9 @@
       if (captureStopped) { running = false; void finishMoveSearch(); }
       return;
     }
-    const interval = playbackTiming(sourceFps,sourceKind==="video"&&reconstructionComplete?playbackSpeed:1).frameIntervalMs;
+    // Camera timestamps already pace frame admission. Drain its FIFO as fast as
+    // inference/backpressure permit, so short UI stalls can be caught up.
+    const interval = sourceKind==='camera'?0:playbackTiming(sourceFps,sourceKind==="video"&&reconstructionComplete?playbackSpeed:1).frameIntervalMs;
     scheduledAt = performance.now();
     const remaining = interval - (scheduledAt - lastStarted);
     if (remaining <= 0) {
@@ -1076,6 +1255,12 @@
     link.href = url;
     link.download = "cube-detections.json";
     link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  function downloadTimerDiagnostics(id: string) {
+    const data = { ...timerDiagnostics.export(id), model: $state.snapshot(manifest) };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' }));
+    const link = document.createElement('a'); link.href = url; link.download = `cube-timer-diagnostics-${id}.json`; link.click();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   function refresh() {
@@ -1208,9 +1393,13 @@
   function drop(event: DragEvent) {
     event.preventDefault();
     dragging = false;
+    if (activeTab === 'timer' || timerBusy) return;
     void openFile(event.dataTransfer?.files[0]);
   }
   function cleanup() {
+    timerReconstruction.cancel('Page closed before reconstruction finished');
+    timerReplayStore.clear();timerReplays={};
+    timerCaptureGate.clear();
     disposed = true;
     generation++;
     cancelScheduled();
@@ -1219,6 +1408,7 @@
     cameraQueue.clear();
     fileSource?.close();
     worker?.terminate();
+    diagnosticsWorker?.terminate();diagnosticResponse?.resolve();diagnosticResponse=undefined;
     poseFitter?.dispose();
     moveSearch?.dispose();
     completionQueue.clear();
@@ -1231,17 +1421,20 @@
   });
 </script>
 
-<svelte:head><title>Live Recognition · Detector</title></svelte:head>
-<svelte:window onpagehide={cleanup} onkeydown={reviewKeydown} />
+<svelte:head><title>Live Recognition · {activeTab === 'timer' ? 'Cube timer' : 'Detector'}</title></svelte:head>
+<svelte:window onpagehide={cleanup} onkeydown={reviewKeydown} onpopstate={followHistory} />
 
 <div class="shell">
   <header class="topbar">
-    <a class="brand" href="./" aria-label="Live Recognition home"
+    <a class="brand" href={workspacePath('detector',workspaceBase)} aria-label="Live Recognition home"
       ><span class="cube-mark" aria-hidden="true"
         ><i></i><i></i><i></i><i></i></span
       >live<span>recognition</span></a
     >
-    <span class="build-label">DETECTOR <span class="version">01</span></span>
+    <div class="app-tabs" role="tablist" aria-label="Workspace">
+      <a id="detector-tab" role="tab" aria-selected={activeTab === 'detector'} aria-controls="workspace-panel" aria-disabled={timerBusy} href={workspacePath('detector',workspaceBase)} onclick={event=>navigateTab(event,'detector')}>Detector</a>
+      <a id="timer-tab" role="tab" aria-selected={activeTab === 'timer'} aria-controls="workspace-panel" aria-disabled={timerBusy} href={workspacePath('timer',workspaceBase)} onclick={event=>navigateTab(event,'timer')}>Cube timer</a>
+    </div>
     <div class="device-badge">
       <span class="status-dot" class:ready={status === "ready"}
       ></span>{status === "ready"
@@ -1255,19 +1448,25 @@
   </header>
 
   <main>
+  <div id="workspace-panel" role="tabpanel" tabindex="0" aria-labelledby={activeTab === 'timer' ? 'timer-tab' : 'detector-tab'}>
     <div class="page-heading">
       <div>
         <p class="eyebrow">CUBE VISION / LOCAL INFERENCE</p>
-        <h1>See every point.</h1>
+        <h1>{activeTab === 'timer' ? 'Time it. Reconstruct it.' : 'See every point.'}</h1>
         <p class="subtitle">
-          Landmarks and sticker colors, straight from your camera.
+          {activeTab === 'timer' ? 'A simple 3×3 timer with automatic camera reconstruction.' : 'Landmarks and sticker colors, straight from your camera.'}
         </p>
       </div>
       <span class="privacy"
         ><span aria-hidden="true">◈</span> Your media stays on this device</span
       >
     </div>
-    <div class="workspace">
+    <div hidden={activeTab !== 'timer'}>
+      <CubeTimer active={activeTab === 'timer'} cameraReady={sourceKind === 'camera' && running && !captureStopped && status === 'ready' && cameraClockOriginMs !== undefined}
+        reconstructions={timerReconstructions} replays={timerReplays} ondelete={deleteTimerSolve} onstart={startTimerSolve} onstop={stopTimerSolve} onbusychange={value => timerBusy = value}
+        ondownloaddiagnostics={downloadTimerDiagnostics} />
+    </div>
+    <div class="workspace" class:timer-workspace={activeTab === 'timer'}>
       <section class="viewer" aria-label="Detection viewer">
         <div class="viewer-toolbar">
           <span class="source-label"
@@ -1291,26 +1490,30 @@
         >
           <canvas
             bind:this={stage}
+            hidden={showCameraPreview}
             class:empty={sourceKind === "none"}
             aria-label="Processed source frame"
           ></canvas>
+          {#if sourceKind==='camera'&&timerCamera}
+            <video bind:this={cameraPreview} hidden={!showCameraPreview} autoplay muted playsinline aria-label="Camera preview"></video>
+          {/if}
           {#if sourceKind === "none"}
             <div class="empty-state">
               <div class="viewfinder" aria-hidden="true"><span>＋</span></div>
               <p class="eyebrow">READY WHEN YOU ARE</p>
               <h2>Bring your cube into view.</h2>
-              <p>Start your camera or drop an image or video here.</p>
+              <p>{activeTab === 'timer' ? 'Connect the camera, then start a solve to begin processing.' : 'Start your camera or drop an image or video here.'}</p>
               <div class="source-actions">
                 <button
                   class="primary"
                   onclick={camera}
                   disabled={status !== "ready"}
                   >Start camera <span aria-hidden="true">↗</span></button
-                ><button onclick={() => fileInput.click()}>Open file</button>
+                >{#if activeTab !== 'timer'}<button onclick={() => fileInput.click()}>Open file</button>{/if}
               </div>
-              <button class="text-button" onclick={sample}
+              {#if activeTab !== 'timer'}<button class="text-button" onclick={sample}
                 >Try a sample image <span aria-hidden="true">→</span></button
-              >
+              >{/if}
             </div>
           {/if}
           {#if status === "loading"}<div class="loading-badge" role="status">
@@ -1325,14 +1528,14 @@
         </div>
         <div class="transport">
           <div class="transport-actions">
-            {#if sourceKind !== "none"}<button
+            {#if sourceKind !== "none"}{#if activeTab !== 'timer'}<button
                 class="small"
                 onclick={() => fileInput.click()}>Open file</button
-              ><button
+              >{/if}<button
                 class="small"
                 onclick={camera}
-                disabled={status !== "ready"}>Camera</button
-              >{#if sourceKind === "camera" || sourceKind === "video" && reconstructionComplete && !trimming}<button
+                disabled={status !== "ready" || timerBusy}>Camera</button
+              >{#if sourceKind === "camera" && !timerCamera || sourceKind === "video" && reconstructionComplete && !trimming}<button
                   class="small"
                   onclick={togglePlayback}
                   >{running ? "Pause" : "Resume"}</button
@@ -1343,8 +1546,8 @@
                     {#each PLAYBACK_SPEEDS as speed}<option value={speed}>{speed}×</option>{/each}
                   </select>
                 </label>
-              {/if}<button class="small subtle" onclick={stopSource}
-                >Clear</button
+              {/if}<button class="small subtle" onclick={stopSource} disabled={timerBusy}
+                >{timerCamera ? 'Disconnect camera' : 'Clear'}</button
               >{:else}<span class="muted">Images, videos, or a live camera</span
               >{/if}
           </div>
@@ -1353,6 +1556,9 @@
           >
               {#if sourceKind === "video" && reconstructionComplete && !trimming}<button class="small" onclick={editSolveRange}>Adjust range</button>{/if}
         </div>
+        {#if sourceKind==='camera'&&timerCamera&&timerCapturePhase==='idle'}
+          <p class="hint" role="status" aria-label="Camera idle status">Camera preview · Detection starts when you start a solve.</p>
+        {/if}
         {#if sourceKind === "video" && duration > 0 && reconstructionComplete && !trimming}<div class="scrubber">
             <span>{position.toFixed(1)}s</span><input
               aria-label="Video position"
@@ -1397,7 +1603,7 @@
         {#if sourceKind === "video" || sourceKind === "camera"}
           <div class="frame-policy" aria-label="Frame processing status">
             <span
-              >{sourceFps.toFixed(2)} fps source → {Math.min(
+              >{sourceFps.toFixed(2)} fps {sourceKind==='camera'?'configured':'source'} → {Math.min(
                 30,
                 sourceFps || 30,
               ).toFixed(2)} fps target</span
@@ -1407,8 +1613,16 @@
                 : ""}{fitBufferedFrames ? ` · ${fitBufferedFrames} fitting/presentation buffered` : ""}</span
             >
             {#if sourceKind === "video"}<span>{cachedVideoFrames} saved frames{viewingSavedResult ? " · Showing saved result" : ""}</span>{/if}
+            {#if sourceKind==='camera'}<span aria-label="Camera throughput">
+              {#if timerCamera&&timerCapturePhase==='idle'}Preview {captureFps?captureFps.toFixed(1):'—'} fps · Detector idle
+              {:else}Capture {captureFps?captureFps.toFixed(1):'—'} fps · Processing {fps?fps.toFixed(1):'—'} fps · Processing delay {(cameraDelayMs/1000).toFixed(2)}s · {skippedCameraFrames} frames skipped{/if}
+            </span>{/if}
           </div>
         {/if}
+        {#if sourceKind==='camera'&&captureStopped}<p class="hint" role="status" aria-label="Camera stopped status">
+          Camera stream ended. {queuedFrames||fitBufferedFrames||running?'Finishing buffered frames.':''}
+          Completed solve windows continue searching.
+        </p>{/if}
         <div class="pipeline-status" role="status">
           <span class="status-dot" class:ready={!!result?.roi}></span><span
             >{!result
@@ -1498,7 +1712,7 @@
           </div>{/if}
       </section>
 
-      <aside class="controls">
+      <aside class="controls" inert={timerBusy}>
         <section class="control-section">
           <div class="section-heading">
             <h2>Detector</h2>
@@ -1561,7 +1775,7 @@
             <input type="checkbox" bind:checked={showPose} onchange={changePoseDisplay} />
             <span>Show fitted pose</span>
           </label>
-          <p class="hint">{sourceKind === "video" ? "Show the fitted wireframe on each processed frame, including the first pass. The colored cube appears when reconstruction finishes." : "Fit and display a cube wireframe. Points remain hidden."}</p>
+          <p class="hint">{sourceKind === "video" ? "Show the fitted wireframe on each processed frame, including the first pass. The colored cube appears when reconstruction finishes." : activeTab==='timer' ? "Draw the fitted pose on its matching camera frame. The camera display always shows the latest fully processed frame." : "Fit and display a cube wireframe. Points remain hidden."}</p>
           {#if showPose}
             <p class="hint" role="status" aria-label="Pose fitting status">
               {poseError || (displayedPoseFlagged ? "Flagged pose hidden" : result?.fittedPose?.message) || (poseFitting ? "Fitting pose…" : "Waiting for a cube")}
@@ -1573,7 +1787,7 @@
             </p>
           {/if}
         </section>
-        <section class="control-section">
+        <section class="control-section" hidden={activeTab === 'timer' || timerCamera}>
           <h2>Move search</h2>
           {#if !trimming}<label class="field-label" for="initial-scramble">Initial scramble</label>
           <input id="initial-scramble" aria-label="Search scramble" bind:value={initialScramble} placeholder="R U R' U'…" />{/if}
@@ -1592,7 +1806,7 @@
           <label class="toggle"><input type="checkbox" bind:checked={searchDiagnostics} />
             <span>Record search diagnostics</span></label>
           <p class="hint">Turn off for faster search. Applies to the next run.</p>
-          <p class="hint">{searchBidirectional ? "Video search starts after all poses are fitted and searches from both ends. Camera search stays forward." : "Forward search starts as poses arrive."} Shared 54 TPS limit · five fits plus flat.</p>
+          <p class="hint">{searchBidirectional ? "Video search starts after all poses are fitted and searches from both ends. Camera search stays forward." : "Forward search starts as poses arrive."} Shared {MOVE_TPS_LIMIT} TPS limit · five fits plus flat.</p>
           <button class="small" disabled={!searchEnabled || sourceKind === "none" || trimming} onclick={changeMoveSearch}>Restart move search</button>
           <p class="hint" role="status" aria-label="Move search status">
             {searchError || (searchResult ? ({running:"Searching",waiting_for_frames:"Waiting for fitted frames",solved:"Solved",already_solved:"Already solved",exhausted:"Search exhausted",state_limit:"Search state limit reached"}[searchResult.status]) : searchEnabled ? "Waiting for a source" : "Move search is off")}
@@ -1638,6 +1852,7 @@
             {savedFrames} frame records retained in this tab. Coordinates and scores
             are recorded without drawing points.
           </p>
+          {#if timerCamera || activeTab === 'timer'}<p class="hint">Only timed solve windows (including stop + 0.3s) are recorded. Detection and pose fitting are idle between solves.</p>{/if}
           <button
             class="small"
             onclick={downloadDetections}
@@ -1704,6 +1919,7 @@
         </details>
       </aside>
     </div>
+  </div>
     <footer>
       <span>LIVE RECOGNITION</span>
       <p>Two models. One continuous view of the cube.</p>
