@@ -2,6 +2,7 @@ import { loadCpuFitter, type OpenCvModule } from "../../../pose-fitter/runtime/w
 
 let engine: Awaited<ReturnType<typeof loadCpuFitter>>;
 let fingerprint = "";
+let pipelineAssets:Record<string,string>;
 self.onmessage = async ({ data }: MessageEvent<
   | { type: "init"; baseUrl: string }
   | { type: "job"; id: number; job: Record<string, unknown> }
@@ -25,12 +26,13 @@ self.onmessage = async ({ data }: MessageEvent<
       const fixture = new TextEncoder().encode(JSON.stringify({ geometry: await geometry.json(), workloads: [], probes: [] }));
       engine = await loadCpuFitter(await binary.arrayBuffer(), fixture, cv);
       fingerprint = manifest.rust;
+      pipelineAssets={rust:manifest.rust,geometry:manifest.geometry,opencvWasm:manifest.opencvWasm,opencvModule:manifest.opencvModule};
       self.postMessage({ type: "ready", engine: manifest.engine, fingerprint });
     } else {
       const start = performance.now();
       const result = engine.call("pipeline_job_json", data.job);
       self.postMessage({ type: "result", id: data.id,
-        result: { ...result, elapsedMs: performance.now() - start, pipelineVersion: fingerprint } });
+        result: { ...result, elapsedMs: performance.now() - start, pipelineVersion: fingerprint,pipelineAssets } });
     }
   } catch (error) {
     self.postMessage({ type: "error", id: data.type === "job" ? data.id : undefined,

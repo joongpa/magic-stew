@@ -48,6 +48,16 @@ def _relative(angles):
     return angles[0]-angles[1], angles[2]-angles[1]
 
 
+def _phase_travel(delta):
+    """Count a slice once while retaining combined opposing-outer travel.
+
+    The two outer-to-middle angles both change during a middle-slab turn.
+    Taking the span, including the middle's zero reference, counts that one
+    physical turn once and is invariant to a common rigid orientation.
+    """
+    return max(0., *delta) - min(0., *delta)
+
+
 def _direct_cost(start, end):
     """Concurrent outer-slab motion, each measured relative to the middle."""
     return max(abs(b-a) for a, b in zip(_relative(start), _relative(end), strict=True))
@@ -106,7 +116,7 @@ def _hidden_routes(count):
 
 
 @lru_cache(maxsize=16384)
-def routes_between(previous, current, budget, double_budget=None, double_support=frozenset(), optimistic_doubles=False):
+def routes_between(previous, current, budget, double_budget=None, double_support=frozenset(), optimistic_doubles=False, *, slice_budget=None):
     """Enforce individual rates plus one shared budget across all slabs.
 
     double_support identifies components in a geometry-supported 180-degree
@@ -114,6 +124,9 @@ def routes_between(previous, current, budget, double_budget=None, double_support
     otherwise uses the single-turn rate, regardless of another slab's motion.
     """
     double_budget = budget if double_budget is None else double_budget
+    slice_budget = double_budget if slice_budget is None else slice_budget
+    if not math.isfinite(slice_budget) or slice_budget < 0:
+        raise ValueError('Slice budget must be finite and nonnegative')
     if not all(math.isfinite(v) for v in (budget, double_budget)) or budget < 0 or double_budget < budget:
         raise ValueError('Rotation budgets must be finite, nonnegative and ordered')
     unique = {}
@@ -144,9 +157,9 @@ def routes_between(previous, current, budget, double_budget=None, double_support
             merged.append((axis, delta, quarters, double))
         degrees, fraction = 0., 0.
         for _axis, delta, quarters, double in merged:
-            # Concurrent slabs still obey their individual speed limits, but
-            # their travel also spends one pooled double-rate allowance.
-            degrees += sum(map(abs, delta))
+            # Same-direction relative deltas can be a single slice turn.
+            # Opposing outer motion and sequential axes still share the pool.
+            degrees += _phase_travel(delta)
             fractions = []
             for distance, quarter, fast in zip(map(abs, delta), quarters, double, strict=True):
                 # A residual seam can legitimately represent a q=2 state
@@ -160,7 +173,11 @@ def routes_between(previous, current, budget, double_budget=None, double_support
                 limit = double_budget if fast else budget
                 fractions.append(distance/limit if limit > 0 else
                                  (0. if distance == 0 else float('inf')))
-            fraction += max(fractions)
+            # The common relative component is a slice even when represented
+            # by two outer turns and a changed rigid camera basis.
+            slice_degrees = min(map(abs, delta)) if delta[0]*delta[1] > 0 else 0.
+            slice_fraction = slice_degrees/slice_budget if slice_budget else (0. if slice_degrees == 0 else float('inf'))
+            fraction += max(*fractions, slice_fraction)
         fraction = max(fraction, degrees/double_budget if double_budget else
                        (0. if degrees == 0 else float('inf')))
         if fraction <= 1.+1e-9:
@@ -272,7 +289,7 @@ class RotationBudgetScorerMixin:
 
     rotation_budget_enabled = False
 
-    def configure_rotation_budget(self, frames, source_fps, max_tps=40., max_double_tps=None):
+    def configure_rotation_budget(self, frames, source_fps, max_tps=40., max_double_tps=None, *, max_slice_tps=None):
         frames = tuple(frames)
         max_double_tps = max_tps if max_double_tps is None else max_double_tps
         if (not frames or any(b <= a for a, b in zip(frames, frames[1:]))
@@ -280,7 +297,9 @@ class RotationBudgetScorerMixin:
                 or not math.isfinite(max_tps) or max_tps <= 0
                 or not math.isfinite(max_double_tps) or max_double_tps < max_tps):
             raise ValueError('Rotation budgeting requires ordered frames, positive FPS and positive TPS')
-        parameters = frames, float(source_fps), float(max_tps), float(max_double_tps)
+        if max_slice_tps is not None and (not math.isfinite(max_slice_tps) or not 0 < max_slice_tps <= max_tps):
+            raise ValueError('Slice TPS must be positive and no greater than the turn TPS')
+        parameters = frames, float(source_fps), float(max_tps), float(max_double_tps), max_slice_tps
         if getattr(self, '_rotation_parameters', None) == parameters:
             return
         self._rotation_parameters = parameters
@@ -291,6 +310,7 @@ class RotationBudgetScorerMixin:
         self.rotation_previous = {}
         self.rotation_limits = {}
         self.rotation_double_limits = {}
+        self.rotation_slice_limits = {}
         self._rotation_double_edges = None
         self._rotation_route_limits = {}
         self._rotation_finalized = max_double_tps == max_tps
@@ -311,6 +331,8 @@ class RotationBudgetScorerMixin:
             self.rotation_previous[frame] = previous
             self.rotation_limits[frame] = 90. * max_tps * (source-prior_source) / source_fps
             self.rotation_double_limits[frame] = 90. * max_double_tps * (source-prior_source) / source_fps
+            self.rotation_slice_limits[frame] = (None if max_slice_tps is None else
+                90. * max_slice_tps * (source-prior_source) / source_fps)
             previous = frame
         self.compiled_frames.clear()
         self.prepared.clear()
@@ -388,7 +410,8 @@ class RotationBudgetScorerMixin:
                                     support.add((kind, component, quarter))
                 optimistic = self._rotation_double_edges is None and not self._rotation_finalized
                 for route in routes_between(before, after, self.rotation_limits[frame],
-                        self.rotation_double_limits[frame], frozenset(support), optimistic):
+                        self.rotation_double_limits[frame], frozenset(support), optimistic,
+                        slice_budget=self.rotation_slice_limits[frame]):
                     moves = self._rotation_move_cache.get(route.groups)
                     if moves is None:
                         moves = tuple(self.m.cube_rotation_to_notation(rotation)

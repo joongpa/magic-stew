@@ -1,5 +1,10 @@
 use super::assignment::assign;
 use super::*;
+
+// Sparse recovery ranks the same proposals and preserves the existing camera
+// solver. Give their observed image evidence more weight than pose priors and
+// the per-active-layer model-selection penalty.
+pub(super) const RECOVERY_REPROJECTION_WEIGHT: f64 = 4.;
 fn outside(point: V2, poly: &[V2; 4]) -> f64 {
     let mut best = f64::INFINITY;
     let mut positive = true;
@@ -376,12 +381,20 @@ pub fn recover(
                     rodrigues([f.params[0], f.params[1], f.params[2]]).0,
                     transpose(rodrigues(source.rvec).0),
                 ));
-                cost += ((f.params[5] - target) / sigma).powi(2)
+                let pose_prior_loss = ((f.params[5] - target) / sigma).powi(2)
                     + ((core[0] - uv[0]) / image_sigma).powi(2)
                     + ((core[1] - uv[1]) / image_sigma).powi(2)
                     + norm(rotation).powi(2) / 0.36;
                 let active = f.angles.iter().filter(|&&a| a.abs() >= 0.5).count();
-                f.score = (0.5 * cost + active as f64) / (values.len() / 2).max(1) as f64;
+                let components = crate::RecoveryScoreComponents {
+                    observation_loss: cost,
+                    pose_prior_loss,
+                    active_layers: active,
+                    observation_count: values.len() / 2,
+                    reprojection_weight: RECOVERY_REPROJECTION_WEIGHT,
+                };
+                f.score = components.cost();
+                f.recovery_score_components = Some(components);
                 let _ = refined;
                 fits.push(f);
             }

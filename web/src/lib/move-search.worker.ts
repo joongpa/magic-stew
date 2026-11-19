@@ -1,29 +1,9 @@
 import { loadCpuFitter, type OpenCvModule } from "../../../pose-fitter/runtime/wasm-host.mjs";
-import type { MoveSearchResult } from "./move-search-types";
+import {IncrementalSearch} from "../../../pose-fitter/runtime/incremental-search.mjs";
 let engine: Awaited<ReturnType<typeof loadCpuFitter>>;
 let initialized: Promise<void>;
-let timer:ReturnType<typeof setTimeout>|undefined;
-let prepareMs=0,searchMs=0,lastReport=0,fingerprint="";
-function call(request:Record<string,unknown>):MoveSearchResult {
-  const result=engine.call("move_search_json",request);
-  if (result.Err) throw new Error(result.Err);
-  return result.Ok;
-}
-function report(result:MoveSearchResult,force=false) {
-  const now=performance.now();
-  if (force||now-lastReport>=100||result.status!=="running") {
-    lastReport=now;self.postMessage({type:"result",result:{...result,timings:{prepareMs,searchMs},pipelineVersion:fingerprint}});
-  }
-}
-function schedule(){if(timer===undefined)timer=setTimeout(tick,0);}
-function tick(){
-  timer=undefined;
-  try {
-    const start=performance.now(),result=call({type:"advance",budget:128});searchMs+=performance.now()-start;
-    report(result);if(result.status==="running")schedule();
-  }catch(cause){fail(cause);}
-}
-function fail(cause:unknown){if(timer!==undefined)clearTimeout(timer);timer=undefined;
+let driver:IncrementalSearch;
+function fail(cause:unknown){driver?.dispose();
   self.postMessage({type:"error",message:cause instanceof Error?cause.message:String(cause)});}
 self.onmessage=({data}:MessageEvent)=>{
   if(data.type==="init"){
@@ -36,13 +16,14 @@ self.onmessage=({data}:MessageEvent)=>{
       // Move search imports no camera kernels and downloads no OpenCV module.
       const noCamera={_pose_cv(){throw new Error("Move search attempted camera inference");}} as unknown as OpenCvModule;
       engine=await loadCpuFitter(await binary.arrayBuffer(),new TextEncoder().encode(JSON.stringify({geometry:await geometry.json(),workloads:[],probes:[]})),noCamera);
-      fingerprint=manifest.rust;report(call({type:"init",config:data.config}),true);
+      driver=new IncrementalSearch(request=>{
+        const result=engine.call("move_search_json",request);if(result.Err)throw new Error(result.Err);return result.Ok;
+      },{version:manifest.rust,report:message=>self.postMessage({type:"result",...message}),error:fail});
+      driver.request({type:"init",config:data.config});
     })();void initialized.catch(fail);return;
   }
   void initialized?.then(()=>{
-    if(data.type==="frame"){
-      const start=performance.now(),result=call({type:"frame",frame:data.frame});prepareMs+=performance.now()-start;
-      report(result);schedule();
-    }else if(data.type==="end"){report(call({type:"end"}),true);schedule();}
+    if(data.type==="frame")driver.request({type:"frame",frame:data.frame});
+    else if(data.type==="end")driver.request({type:"end"});
   }).catch(fail);
 };

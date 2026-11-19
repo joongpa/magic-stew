@@ -83,6 +83,34 @@ impl Tables {
             .all(|(g, c)| g.iter().all(|&p| &colors[state[p] as usize] == *c))
             && (0..6).all(|i| (0..i).all(|j| first[i] != first[j]))
     }
+    /// Scramble inversion followed by all 24 rigid orientations. No observed
+    /// move sequence or fitted pose is used to construct the solved boundary.
+    pub fn solved_seeds(&self, scramble: &str) -> Result<Vec<Vec<u8>>, String> {
+        let normalized = scramble.replace('’', "'");
+        let mut state = self.identity.clone();
+        for token in normalized.split_whitespace().rev() {
+            let inverse = if token.ends_with('2') || token.ends_with("2'") {
+                token.trim_end_matches('\'').to_string()
+            } else if token.ends_with('\'') {
+                token.trim_end_matches('\'').to_string()
+            } else {
+                format!("{token}'")
+            };
+            let sources = self.moves.get(&inverse).ok_or_else(|| format!("Unknown scramble move: {token}"))?;
+            state = sources.iter().map(|&i| state[i]).collect();
+        }
+        let mut states = vec![state];
+        let mut seen = std::collections::HashSet::from([states[0].clone()]);
+        let mut index = 0;
+        while index < states.len() {
+            for name in ["x", "y", "z"] {
+                let next: Vec<_> = self.moves[name].iter().map(|&i| states[index][i]).collect();
+                if seen.insert(next.clone()) { states.push(next); }
+            }
+            index += 1;
+        }
+        Ok(states)
+    }
 }
 pub fn normalize(groups: &[Group]) -> Vec<Group> {
     let mut result: Vec<Group> = vec![];

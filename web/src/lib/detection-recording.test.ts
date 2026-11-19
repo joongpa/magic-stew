@@ -4,6 +4,19 @@ import { DetectionRecording } from "./detection-recording";
 import type { RecordingContext } from "./detection-recording";
 import type { FrameResult } from "./detector";
 import { letterbox } from "./detector";
+import {createSearchConfig} from '../../../pose-fitter/runtime/reconstruction-policy.mjs';
+
+test('automatic diagnostic capture uses the setting recorded for each run',()=>{
+ const recording=new DetectionRecording();
+ const config=createSearchConfig({scramble:'R U',diagnostics:false});
+ const metadata={policyVersion:1,appOrigin:'http://localhost',poseWorkers:1,admissionCapacity:12,
+  detector:{poseSize:256,backend:'webgpu',preprocessing:'gpu',settings:{}}} as any;
+ const quiet=recording.startRun(1,config,metadata);
+ config.diagnostics=true;
+ const logged=recording.startRun(1,config,metadata);
+ assert.equal(recording.diagnosticsEnabled(quiet),false);
+ assert.equal(recording.diagnosticsEnabled(logged),true);
+});
 
 function frame(score: number): FrameResult {
   return {
@@ -90,4 +103,18 @@ test("download data retains every result, source, seek segment and separate conf
     saved.confidenceFields["result.detections[].presence"],
     /presence/,
   );
+});
+test('run exports isolate sources and preserve cached raw-frame links without cached-fit inputs',()=>{
+ const recording=new DetectionRecording(),config=createSearchConfig({scramble:'R U',fps:60});
+ const metadata={policyVersion:1,appOrigin:'http://localhost',poseWorkers:3,admissionCapacity:12,
+  detector:{poseSize:160,backend:'webgpu',preprocessing:'gpu',settings:context.settings}};
+ const first=recording.startRun(1,config,metadata),result=frame(.9);
+ recording.append(result,{...context,runId:first});
+ recording.append(frame(.8),{...context,sourceId:2,sourceName:'other.mp4'});
+ const restarted=recording.startRun(1,config,metadata);recording.linkCachedFrame(restarted,0,result);
+ const saved=recording.exportRun(restarted);
+ assert.equal(saved.frames.length,1);assert.equal(saved.frames[0].result,result);
+ assert.deepEqual(saved.runs[0].frameSequences,[0]);assert.equal(saved.sources.length,1);
+ assert.equal(saved.runs[0].id,restarted);
+ assert.equal(saved.frames[0].result.detections[0].score,.9);
 });

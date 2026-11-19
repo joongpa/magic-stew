@@ -1,8 +1,9 @@
 import type { FrameResult, InferenceBackend, Settings } from "./detector";
 
-export function videoResultKey(size: number, backend: InferenceBackend, settings: Settings, fitPose: boolean) {
+export function videoResultKey(size: number, backend: InferenceBackend, settings: Settings, fitPose: boolean,
+  fittingConfig?:{scramble:string;turningStartFrame:number|null;originSeconds?:number;endSeconds?:number}) {
   return JSON.stringify([size, backend, settings.thresholds, settings.presenceThreshold,
-    settings.bboxThreshold, settings.roiPadding, fitPose]);
+    settings.bboxThreshold, settings.roiPadding, fitPose, fitPose ? fittingConfig : null]);
 }
 export interface SavedVideoResult { timestamp: number; result: FrameResult }
 

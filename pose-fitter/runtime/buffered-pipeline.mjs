@@ -6,7 +6,8 @@ const emptyFrame = meta => ({...meta,observations:{points:[],classes:[],stickers
 
 export class BufferedPosePipeline {
   constructor(execute,config) {
-    this.execute=execute;this.config=config;this.entries=[];this.initialCursor=0;this.orientCursor=0;
+    this.execute=execute;this.config=config;this.entries=[];this.startupCursor=0;this.initialCursor=0;this.orientCursor=0;
+    this.startupBusy=false;this.referenceCursor=0;this.startupReferences=[];this.hasStartup=false;
     this.initialBusy=false;this.orientBusy=false;this.ended=false;this.closed=false;
     this.previous=null;this.reference=null;this.finished=0;this.waiters=[];this.finalScan=0;
   }
@@ -15,12 +16,16 @@ export class BufferedPosePipeline {
     if(this.entries.length&&frame.frame<=this.entries.at(-1).meta.frame)throw new Error('Pose frame indices must increase');
     const entry={frame,meta:{frame:frame.frame,width:frame.width,height:frame.height,pixel_scale:frame.pixel_scale},elapsedMs:0,prepared:false};
     const result=new Promise((resolve,reject)=>{entry.resolve=resolve;entry.reject=reject;});
+    entry.result=result;
     result.catch(()=>{}); // A later ordered presenter still receives the error.
     this.entries.push(entry);
+    // Arrival can close an older recovery window before this frame's startup
+    // is selected; release it before waiting for its finalized reference.
+    this.scheduleFinals();
     this.job({type:'prepare',frame},entry).then(value=>{
       if(this.closed)return;
-      entry.source=value.source;entry.anchor=value.anchor;entry.prepared=true;
-      void this.pumpInitial();this.scheduleFinals();
+      entry.candidates=value.candidates;entry.candidatesReady=true;
+      void this.pumpStartup();
     }).catch(error=>this.cancel(error));
     return result;
   }
@@ -29,6 +34,38 @@ export class BufferedPosePipeline {
     const value=await this.execute(request);
     entry.elapsedMs+=value.elapsedMs??0;
     return value;
+  }
+  async pumpStartup() {
+    if(this.closed||this.startupBusy)return;
+    this.startupBusy=true;
+    try {
+      while(this.startupCursor<this.entries.length&&!this.closed) {
+        const entry=this.entries[this.startupCursor];if(!entry.candidatesReady)break;
+        // Only use the fixed eligible prefix, even if faster workers already
+        // finalized newer poses. Recovery needs <=180ms plus the next initial
+        // neighbor, so eligible frames cannot depend on this startup selection.
+        while(this.hasStartup&&this.referenceCursor+1<this.startupCursor&&
+          entry.meta.frame/this.config.fps-this.entries[this.referenceCursor].meta.frame/this.config.fps>0.18) {
+          const value=await this.entries[this.referenceCursor].result;
+          if(this.closed)return;
+          if(value.continuity_core) {
+            this.startupReferences.push({frame:this.entries[this.referenceCursor].meta.frame,core:value.continuity_core});
+            if(this.startupReferences.length>2)this.startupReferences.shift();
+          }
+          this.referenceCursor++;
+        }
+        const value=await this.job({type:'select_startup',frame:entry.frame,candidates:entry.candidates,
+          references:[...this.startupReferences]},entry);
+        if(this.closed)return;
+        entry.source=value.source;entry.anchor=value.anchor;entry.prepared=true;
+        entry.startupReferenceCore=value.reference_core??null;
+        entry.startupMotionAllowance=value.motion_allowance??0;
+        if(value.source)this.hasStartup=true;
+        entry.candidates=undefined;this.startupCursor++;
+        void this.pumpInitial();this.scheduleFinals();
+      }
+    }catch(error){this.cancel(error);}
+    finally{this.startupBusy=false;this.notify();}
   }
   async pumpInitial() {
     if(this.closed||this.initialBusy)return;
@@ -104,7 +141,8 @@ export class BufferedPosePipeline {
         target:value.target,static_mode:this.isStatic(entry)},entry)).then(value=>{
         if(this.closed)return;
         entry.finalized=true;this.finished++;
-        entry.resolve({...value,elapsedMs:entry.elapsedMs});
+        entry.resolve({...value,elapsedMs:entry.elapsedMs,startup_reference_core:entry.startupReferenceCore,
+          startup_motion_allowance:entry.startupMotionAllowance});
         entry.resolve=entry.reject=undefined;entry.frame=null;entry.oriented=undefined;
         this.notify();
       }).catch(error=>this.cancel(error));

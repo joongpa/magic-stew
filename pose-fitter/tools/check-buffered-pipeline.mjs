@@ -16,7 +16,9 @@ if(batch.Err)throw new Error(batch.Err);
 const reference=batch.Ok.frames;
 const issues=[];
 for(let i=0;i<reference.length;i++){
- if(!isDeepStrictEqual(reference[i].bank,poses[i].bank)||reference[i].depth_recovery!==poses[i].depth_recovery)issues.push(reference[i].frame);
+ if(!isDeepStrictEqual(reference[i].bank,poses[i].bank)||reference[i].depth_recovery!==poses[i].depth_recovery||
+   !isDeepStrictEqual(reference[i].startup_reference_core,poses[i].startup_reference_core)||
+   reference[i].startup_motion_allowance!==poses[i].startup_motion_allowance)issues.push(reference[i].frame);
 }
 writeFileSync(outputPath,JSON.stringify({name:data.name,frames:reference.length,issues,poses}));
 console.log(data.name,reference.length,'frames; streaming/batch differing frames:',issues);

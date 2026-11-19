@@ -1,5 +1,6 @@
 import geometry from "../../../pose-fitter/tables/render-geometry.json";
 import turns from "../../../pose-fitter/tables/render-turns.json";
+import orientations from "../../../pose-fitter/tables/orientations.json";
 import { applyCubeMove } from "./cube-colors";
 import type { CubeColor, CubeStateSnapshot } from "./cube-colors";
 import type { FittedGeometry } from "./pose-types";
@@ -17,7 +18,7 @@ export function axisAngle(v:V3):Quaternion {
  const angle=Math.hypot(...v);if(angle<1e-15)return [0,0,0,1];
  const s=Math.sin(angle/2)/angle;return [v[0]*s,v[1]*s,v[2]*s,Math.cos(angle/2)];
 }
-function multiply(a:Quaternion,b:Quaternion):Quaternion {return [
+export function multiply(a:Quaternion,b:Quaternion):Quaternion {return [
  a[3]*b[0]+a[0]*b[3]+a[1]*b[2]-a[2]*b[1],
  a[3]*b[1]-a[0]*b[2]+a[1]*b[3]+a[2]*b[0],
  a[3]*b[2]+a[0]*b[1]-a[1]*b[0]+a[2]*b[3],
@@ -34,10 +35,19 @@ function slerp(a:Quaternion,b:Quaternion,t:number):Quaternion {
  const q=a.map((v,i)=>v*left+b[i]*right),length=Math.hypot(...q);
  return q.map(v=>v/length) as Quaternion;
 }
-export function makeCubePose(fit:Pick<FittedGeometry,"axis"|"params"|"angles">,state:CubeStateSnapshot):CubePose|undefined {
+export function makeCubePose(fit:Pick<FittedGeometry,"axis"|"params"|"angles">,state:CubeStateSnapshot,
+ orientationSymmetry?:number|null):CubePose|undefined {
  if(!geometry.layers[fit.axis]||fit.params.length<3||fit.angles.length!==3||
   ![...fit.params.slice(0,3),...fit.angles].every(Number.isFinite))return;
- return {rotation:axisAngle(fit.params.slice(0,3) as V3),axis:fit.axis,angles:[...fit.angles] as V3,state};
+ let rotation=axisAngle(fit.params.slice(0,3) as V3),axis=fit.axis,angles=[...fit.angles] as V3;
+ if(orientationSymmetry!=null){
+  const symmetry=orientations.matrices[orientationSymmetry],vector=orientations.rvecs[orientationSymmetry];
+  if(!symmetry||!vector)return;
+  rotation=multiply(rotation,axisAngle(vector.map(v=>-v) as V3));
+  axis=symmetry.findIndex(row=>row[fit.axis]!==0);
+  if(symmetry[axis][fit.axis]<0)angles=[-angles[2],-angles[1],-angles[0]];
+ }
+ return {rotation,axis,angles,state};
 }
 /** Exactly three shared matrices. No face or cubie owns an animation path. */
 export function layerRotations(pose:CubePose):Quaternion[] {
@@ -106,9 +116,9 @@ export function layerTransition(from:CubePose,to:CubePose) {
   last.end=to.angles;last.state=to.state;if(span(last)<1e-8)phases.pop();
  } else add(to.axis,current.angles,to.angles,to.state);
  const total=phases.reduce((sum,phase)=>sum+span(phase),0);
- return {phases,sample(progress:number):CubePose {
+ return {phases,sample(progress:number,easing:(t:number)=>number=easeOutCubic):CubePose {
   if(progress<=0)return from;if(progress>=1)return to;
-  const t=easeOutCubic(progress),rotation=slerp(from.rotation,to.rotation,t);
+  const t=easing(progress),rotation=slerp(from.rotation,to.rotation,t);
   let distance=t*total;
   for(const phase of phases){
    const length=span(phase);

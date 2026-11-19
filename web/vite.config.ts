@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
+import {localDiagnostics} from './scripts/local-diagnostics';
 
 const isolationHeaders = {
   "Cross-Origin-Opener-Policy": "same-origin",
@@ -9,7 +10,7 @@ const isolationHeaders = {
 export default defineConfig({
   server: { headers: isolationHeaders },
   preview: { headers: isolationHeaders },
-  plugins: [svelte()],
+  plugins: [svelte(),localDiagnostics()],
   resolve: {
     conditions: [
       "onnxruntime-web-use-extern-wasm",

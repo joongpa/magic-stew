@@ -3,6 +3,7 @@ import test from "node:test";
 import type { FittedPose } from "./pose-types";
 import { projectedWireframe } from "./reconstruction-view";
 import { projectedColoredFaces } from "./reconstruction-view";
+import { poseIsFlagged } from "./reconstruction-view";
 import type { CubeColor } from "./cube-colors";
 import { fixedCubeProjection, CUBE_VIEW_BOX } from "./cube-projection";
 import oracle from "../../../pose-fitter/tests/fixtures/cube-projection.json";
@@ -14,6 +15,26 @@ test("the projected cube uses the search geometry, including reserved flat slot 
  assert.equal(projectedWireframe(pose,3,true),wireframes[5]);
  assert.equal(projectedWireframe(pose,null),wireframes[0]);
  assert.equal(projectedWireframe(pose,9),wireframes[0]);
+});
+test("flagged frames hide every fitted projection without mutating saved geometry",()=>{
+ const fit={...oracle.cases[0],flat_fallback:false,score:0,nearest:[],valid:[]};
+ const mesh=[[[10,20],[30,40]]] as [number,number][][];
+ const pose:FittedPose={bank:[fit],wireframe:mesh,wireframes:[mesh],
+  pose:{rvec:[0,0,0],tvec:[0,0,500]},bootstrap:false,message:"Test fit",elapsedMs:0,
+  pose_flag_reason:"insufficient_assigned_sticker_evidence",pose_geometry_flag_reason:null};
+ const snapshot=JSON.stringify(pose);
+ assert.equal(poseIsFlagged(pose),true);
+ assert.deepEqual(projectedWireframe(pose),[]);
+ assert.deepEqual(projectedWireframe(pose,0,true),[]);
+ assert.deepEqual(projectedColoredFaces(pose,Array(54).fill("white")),[]);
+ assert.equal(JSON.stringify(pose),snapshot,"saved data must stay available for scrubbing and diagnostics");
+ const next={...pose,pose_flag_reason:null};
+ assert.equal(poseIsFlagged(next),false);
+ assert.equal(poseIsFlagged(next,true),true,"a sparse selected search context can flag an otherwise supported frame");
+ assert.equal(poseIsFlagged(pose,false),true,"a search result cannot override a finalized frame flag");
+ assert.equal(projectedWireframe(next),mesh,"the next unflagged frame renders normally");
+ assert.ok(projectedColoredFaces(next,Array(54).fill("white")).length);
+ assert.equal(poseIsFlagged(undefined),false);
 });
 test("colored geometry uses physical face IDs and paints distant faces before near ones",()=>{
  const pose={bank:[oracle.cases[0],oracle.cases[1]],wireframe:[]} as unknown as FittedPose;

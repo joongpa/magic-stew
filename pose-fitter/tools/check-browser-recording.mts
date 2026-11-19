@@ -33,7 +33,10 @@ for (const [segment, rows] of groups) {
   for (let i = 0; i < rows.length; i++) {
     const actual = rows[i].result.fittedPose, reference = batch.Ok.frames[i];
     if (actual.stage !== "cpu_pipeline" || actual.pipelineVersion !== expectedVersion ||
-        !isDeepStrictEqual(actual.bank, reference.bank) || actual.depth_recovery !== reference.depth_recovery)
+        !isDeepStrictEqual(actual.bank, reference.bank) || actual.depth_recovery !== reference.depth_recovery ||
+        !isDeepStrictEqual(actual.startup_reference_core, reference.startup_reference_core) ||
+        actual.startup_motion_allowance !== reference.startup_motion_allowance ||
+        (actual.pose_flag_reason != null && actual.continuity_core != null))
       issues.push({ segment, frame: frames[i].frame });
   }
   checked += rows.length;

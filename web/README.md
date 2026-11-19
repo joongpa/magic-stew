@@ -80,11 +80,11 @@ physical sticker continuity at every phase boundary, forwards and backwards,
 while simulating 120Hz refreshes interrupting 100ms eases on 30fps input. This
 checks geometry; it does not measure browser/GPU frame rate.
 
-## Incremental forward move search
+## Move search
 
 Move search is enabled by default and requires an initial scramble. The Rust
 engine preserves the CPU scorer used by
-`search_independent_keypoint_bidirectional.py`, using only its forward search:
+`search_independent_keypoint_bidirectional.py`. Its forward frontier uses:
 54-byte cube states, directional 26m color-confusion costs, unique-sticker duplicate
 semantics, balanced geometry/color ranks, geometry contexts, eight-frame mismatch
 history, dominance, sibling ties, sparse branching and deferred widening. There
@@ -92,7 +92,19 @@ is one shared **54 TPS** limit; no double-turn witness/classification is used.
 The browser defaults to width 3, sparse threshold 3 and a 1,000,000-state budget.
 The optional opening hold is measured from the first included frame.
 
-A separate CPU WASM worker prepares each immutable fit bank immediately when its
+Videos default to **Bidirectional video search**. Once every selected frame's
+pose fit completes, two separate Rust/WASM workers search from the scramble and
+a corroborated solved end pose. They exchange admitted states and validate a
+joined path in Rust before publishing a solution. Each direction retains its
+full configured expansion allowance; backward work does not change the existing
+forward queue or consume its allowance. Two workers can still add startup,
+messaging and CPU/memory overhead, especially on easy solves. Missing solved
+anchors or backward-worker failures fall back to forward search. The optional
+geometry-derived one-second TPS gate remains an isolated experiment and is not
+enabled here.
+
+Turning the video option off, or using the camera, selects streaming forward
+search. A separate CPU WASM worker prepares each immutable fit bank immediately when its
 promise resolves. Source ordinals are assigned before completion, so out-of-order
 fits can be prepared without skipping an earlier frame. States needing an
 unavailable frame remain parked; eligible states continue, and newly arrived
@@ -123,7 +135,7 @@ hiding the completed overlay. Landmark/sticker points remain hidden, and each
 review frame is presented with its matching saved projection. Saved detection data also includes `fittedPose`, its
 candidate bank, sticker assignments, mesh, and fitting time when enabled.
 
-Detection and fitting overlap through a CPU worker pool (up to three workers).
+Detection and fitting overlap through a CPU worker pool (up to four workers).
 The app uses the complete validated CPU pipeline: OpenCV sticker/PnP startup,
 initial geometry, immutable-neighbor refinement, color/continuity orientation,
 and sparse depth/outlier recovery. Initial priors and orientation advance in

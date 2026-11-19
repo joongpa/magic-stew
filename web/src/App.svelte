@@ -23,17 +23,21 @@
   import { MoveSearch } from "./lib/move-search";
   import type { MoveSearchResult,MoveSearchConfig } from "./lib/move-search-types";
   import { trimRange, timecode } from "./lib/solve-range";
-  import { projectedWireframe, projectedGeometryIndex } from "./lib/reconstruction-view";
-  import { buildColorTimeline, stateAtFrame } from "./lib/cube-colors";
-  import { makeCubePose } from "./lib/cube-motion";
+  import { projectedWireframe, poseIsFlagged } from "./lib/reconstruction-view";
+  import { buildColorTimeline } from "./lib/cube-colors";
+  import { buildProjectedCubeTimeline, projectedCubeAtFrame } from "./lib/projected-cube";
   import { reviewIndex, steppedTimestamp, frameArrow } from "./lib/frame-review";
   import ProjectedCube from "./lib/ProjectedCube.svelte";
+  import {createSearchConfig,ADMISSION_CAPACITY,poseWorkerCount,POLICY_VERSION} from "../../pose-fitter/runtime/reconstruction-policy.mjs";
+  import {runtimeFingerprints} from './lib/capture-provenance';
 
   let manifest = $state<ModelManifest>();
   let size = $state(256);
   let backend = $state<"webgpu" | "wasm">("webgpu");
   let runtimeThreads = $state(1);
   let runtimeIsolated = $state(false);
+  let detectorIdentity:Extract<WorkerResponse,{type:'ready'}>['models'],detectorPreprocessing='gpu';
+  let activeRunId:string|undefined;
   let status = $state<"loading" | "ready" | "error">("loading");
   let loadingText = $state("Checking WebGPU…");
   let error = $state("");
@@ -50,9 +54,11 @@
   let bboxThreshold = $state(0.25),
     roiPadding = $state(0.4);
   let showRoi = $state(false);
-  let showPose = $state(false);
+  let showPose = $state(true);
   let searchEnabled = $state(true), initialScramble = $state("");
   let openingHoldSeconds = $state(0);
+  let searchDiagnostics = $state(true);
+  let searchBidirectional = $state(true);
   let searchResult = $state<MoveSearchResult>(), searchError = $state("");
   let moveSearch: MoveSearch | undefined;
   let poseFitting = $state(false);
@@ -70,6 +76,7 @@
   let previewVersion = 0, searchOriginTimestamp = 0;
   let projectedAfterPass = $state(false);
   const reconstructionChoices = $derived(new Map(searchResult?.steps.map(step => [step.frame_index, step.geometry_option_index] as const) ?? []));
+  const reconstructionFlags = $derived(new Map(searchResult?.steps.map(step => [step.frame_index,step.pose_flagged === true] as const) ?? []));
   const reconstructionComplete = $derived(videoInputComplete && (!searchEnabled || !!searchError ||
     !!searchResult && ["solved", "already_solved", "exhausted", "state_limit"].includes(searchResult.status)));
   const recording = new DetectionRecording();
@@ -77,20 +84,20 @@
   let thresholds = $state([0.25, 0.4, 0.25, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]);
   let presenceThreshold = $state(0.05);
   let result = $state<FrameResult>();
+  const displayedPoseFlagged = $derived(poseIsFlagged(result?.fittedPose,
+    reconstructionFlags.get(result?.fittedPose?.sourceFrame ?? Math.round(presentedTimestamp*sourceFps))));
+  $effect(() => {
+    // Search can flag the displayed frame after its fitted overlay was drawn.
+    // Redraw the saved base immediately, including when no next frame is due.
+    displayedPoseFlagged;
+    untrack(redrawOverlay);
+  });
   const colorTimeline = $derived.by(() => {
     if (!searchResult || !moveSearch) return;
     try { return buildColorTimeline(moveSearch.config.scramble,searchResult.steps); }
     catch { return; }
   });
   const cubeSolved = $derived(searchResult?.status === "solved" || searchResult?.status === "already_solved");
-  const coloredProjection = $derived.by(() => {
-    const pose = result?.fittedPose;
-    if (!pose?.pose || !colorTimeline) return;
-    const sourceFrame=pose.sourceFrame ?? Math.round(position*sourceFps),staticEnd=moveSearch?.config.turning_start_frame;
-    const state=stateAtFrame(colorTimeline,sourceFrame,cubeSolved);
-    const fit=pose.bank[projectedGeometryIndex(pose,reconstructionChoices.get(sourceFrame),staticEnd!=null&&sourceFrame<=staticEnd)];
-    return state&&fit?makeCubePose(fit,state):undefined;
-  });
   const reviewRows=$derived.by(()=>{
     cachedVideoFrames;
     if(sourceKind!=="video")return [];
@@ -99,6 +106,12 @@
     return saved.filter(row=>row.timestamp>=solveStart-0.00001&&row.timestamp<solveEnd);
   });
   const currentReviewIndex=$derived(reviewIndex(reviewRows,presentedTimestamp));
+  const projectedTimeline=$derived(colorTimeline?buildProjectedCubeTimeline(reviewRows,colorTimeline,{
+    fps:sourceFps,solved:cubeSolved,steps:searchResult?.steps??[],
+    turningStartFrame:moveSearch?.config.turning_start_frame,
+  }):[]);
+  const coloredProjection=$derived(projectedCubeAtFrame(projectedTimeline,
+    result?.fittedPose?.sourceFrame??Math.round(presentedTimestamp*sourceFps)));
   let frameTiming = $state<{
     acquireMs: number;
     drawMs: number;
@@ -159,7 +172,7 @@
     fitting?: Promise<FittedPose>; fitStartedAtMs?: number; fitCompletedAtMs?: number };
   type CachedFrame = { saved: SavedVideoResult; context: Pick<FrameContext, "snapshot" | "generation" | "timestamp"> };
   // Recovery needs 180ms of future source context, plus the adjacent initial fit.
-  const completionQueue = new OrderedStage<DetectedFrame | CachedFrame>(12, completeFrame,
+  const completionQueue = new OrderedStage<DetectedFrame | CachedFrame>(ADMISSION_CAPACITY, completeFrame,
     (packet) => presenter.releaseFrame(packet.context.snapshot),
     (size) => { fitBufferedFrames = size; continuePipeline(); },
     (cause) => {
@@ -191,13 +204,18 @@
       : 0.4,
   });
   const needsPose = () => showPose || searchEnabled;
-  const displayPose = () => showPose && (sourceKind !== "video" || reconstructionComplete && !trimming);
+  const inferenceAllowed = () => !moveSearch?.solved && !(sourceKind === "video" && videoInputComplete);
+  const displayPose = () => showPose && (sourceKind !== "video" || !trimming);
   $effect(() => {
     if (!projectedAfterPass && sourceKind === "video" && reconstructionComplete && !trimming && result?.fittedPose) {
       projectedAfterPass = true; showPose = true; untrack(redrawOverlay);
     }
   });
-  const currentCacheKey = (fitPose = needsPose()) => videoResultKey(size, backend, settings(), fitPose);
+  const poseFittingOptions = () => ({scramble:moveSearch?.config.scramble ?? initialScramble.trim(),
+    turningStartFrame:moveSearch ? moveSearch.config.turning_start_frame : openingHoldSeconds>0 ? Math.floor((searchOriginTimestamp+openingHoldSeconds)*(sourceFps||30)) : null,
+    originSeconds:moveSearch?.config.source_origin_seconds??searchOriginTimestamp,
+    endSeconds:sourceKind==="video"?(moveSearch?.config.source_end_seconds??solveEnd):undefined});
+  const currentCacheKey = (fitPose = needsPose()) => videoResultKey(size, backend, settings(), fitPose, poseFittingOptions());
   const savedFrameCount = () => Math.max(videoResults.count(currentCacheKey()),
     needsPose() ? 0 : videoResults.count(currentCacheKey(true)));
   function findSavedResult(timestamp: number, tolerance = 0.00001) {
@@ -209,25 +227,52 @@
     if (!searchEnabled || sourceKind === "none") return;
     if (!initialScramble.trim()) { searchError = "Enter the initial scramble to start move search."; return; }
     const token = generation;
-    const config: MoveSearchConfig = { scramble: initialScramble.trim(), fps: sourceFps || 30, max_tps: 54,
-      turning_start_frame: openingHoldSeconds > 0 ? Math.floor((searchOriginTimestamp + openingHoldSeconds) * (sourceFps || 30)) : null,
-      branch_widths: [3], branch_stage_expansions: 10000,
-      state_limit: 1_000_000, mismatch_window_weight: 1, unrestricted_sticker_count: 3,
-      source_origin_seconds: sourceKind === "video" ? searchOriginTimestamp : 0,
-      requested_start_seconds: sourceKind === "video" ? solveStart : undefined,
-      source_end_seconds: sourceKind === "video" ? solveEnd : undefined };
-    moveSearch = new MoveSearch(baseUrl, config, value => {
+    const config = createSearchConfig({scramble:initialScramble,fps:sourceFps||30,
+      openingHoldSeconds,diagnostics:searchDiagnostics,bidirectional:searchBidirectional&&sourceKind==="video",originSeconds:sourceKind==="video"?searchOriginTimestamp:0,
+      startSeconds:sourceKind==="video"?solveStart:undefined,endSeconds:sourceKind==="video"?solveEnd:undefined});
+    const runId=recording.startRun(token,config,{policyVersion:POLICY_VERSION,appOrigin:location.origin,
+      poseWorkers:poseWorkerCount(navigator.hardwareConcurrency),admissionCapacity:ADMISSION_CAPACITY,
+      detector:{poseSize:size,backend,preprocessing:detectorPreprocessing,settings:settings(),models:detectorIdentity}});
+    activeRunId=runId;
+    if(config.diagnostics!==false)void recording.setFingerprints(runId,runtimeFingerprints()).catch(()=>{});
+    void persistDiagnostics(runId);
+    let endCaptured = false;
+    moveSearch = new MoveSearch(baseUrl, config, (value, ended) => {
       if (token !== generation || disposed) return;
-      searchResult = value; recording.saveSearch(token, config, value);
-    }, message => { if (token === generation) searchError = message; }, sourceKind === "video");
+      const wasSolved=searchResult?.status==="solved"||searchResult?.status==="already_solved";
+      searchResult = value; recording.saveSearch(token, config, value,runId,moveSearch?.actions);
+      if(!wasSolved&&(value.status==="solved"||value.status==="already_solved")){
+        running=false;seekResume=false;refreshPending=false;cancelScheduled();
+        if(sourceKind==="video")fileEnded=true;
+        if(sourceKind==="camera"){
+          captureStopped=true;capture?.stop();capture=undefined;
+          stream?.getTracks().forEach(track=>track.stop());stream=undefined;
+          cameraQueue.clear();queuedFrames=0;
+        }
+        void finishMoveSearch();
+      }
+      if(videoInputComplete&&((ended&&!endCaptured)||['solved','already_solved','state_limit','exhausted'].includes(value.status)))void persistDiagnostics(runId);
+      if(ended)endCaptured = true;
+    }, message => { if (token === generation) {
+      searchError = message;recording.saveError(runId,message,moveSearch?.actions??[]);void persistDiagnostics(runId);
+    } }, sourceKind === "video");
   }
   async function finishMoveSearch() {
     const token = generation, activeSearch = moveSearch;
-    await flushPose();
-    await completionQueue.whenIdle();
-    if (token !== generation || disposed) return;
+    await waitForPipelineIdle();
+    if (token !== generation || disposed || activeSearch !== moveSearch) return;
     if (sourceKind === "video") videoInputComplete = true;
+    if(activeRunId)void persistDiagnostics(activeRunId);
     try { await activeSearch?.end(); } catch (cause) { if (token === generation) searchError = cause instanceof Error ? cause.message : String(cause); }
+  }
+  async function persistDiagnostics(runId:string) {
+    if(!import.meta.env.DEV||!recording.diagnosticsEnabled(runId))return;
+    try {
+      await recording.ready(runId);
+      const response=await fetch(new URL('__diagnostics/run',baseUrl),{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({id:runId,...recording.exportRun(runId),model:$state.snapshot(manifest)})});
+      if(!response.ok)console.error('Local diagnostic capture failed',await response.text());
+    }catch(cause){console.error('Local diagnostic capture failed',cause);}
   }
   function seedCachedSearch() {
     const rows = videoResults.entries(currentCacheKey(true));
@@ -239,6 +284,7 @@
       const expected = origin + offset / (sourceFps || 30);
       if (row.timestamp < expected - 0.00001) continue;
       if (row.timestamp > expected + 0.00001 || !row.result.fittedPose) break;
+      if(activeRunId)recording.linkCachedFrame(activeRunId,row.timestamp,row.result);
       moveSearch?.submit(row.timestamp, row.result, Promise.resolve(row.result.fittedPose)); count++; last = row;
     }
     return { last, complete: count >= Math.ceil((solveEnd - origin) * target - 0.00001) };
@@ -255,7 +301,7 @@
     if (sourceKind === "video" && fileSource) {
       const {last,complete} = seedCachedSearch();
       if (last && complete) {
-        await moveSearch.end(); videoInputComplete = true; running = wasRunning; scheduleNext(); return;
+        await moveSearch.end(); videoInputComplete = true; running = wasRunning&&!moveSearch.solved; scheduleNext(); return;
       }
       // Newly requested fitting starts at the first missing frame, never at an
       // arbitrary mid-solve state carrying the opening scramble.
@@ -349,6 +395,7 @@
   }
   function continuePipeline() {
     if (disposed) return;
+    if(!inferenceAllowed())refreshPending=false;
     if (!busy && (refreshPending || !running || status !== "ready")) void flushPose();
     if (refreshPending && !busy && !completionQueue.size && !seeking && status === "ready") {
       refreshPending = false;
@@ -499,6 +546,7 @@
               ? `Downloading ${data.stage.toLowerCase()} · ${Math.round(data.fraction * 100)}%`
               : `${data.stage} · preparing ${backend === "webgpu" ? "GPU" : "CPU"}…`;
         if (data.type === "ready") {
+          detectorIdentity=data.models;detectorPreprocessing=data.preprocessing;
           runtimeThreads = data.threads;
           runtimeIsolated = data.isolated;
           status = "ready";
@@ -527,7 +575,7 @@
               packet.fitStartedAtMs = performance.now();
               try {
                 packet.fitting = poseFitter.fit(data.result, completed.resetPose,
-                  completed.timestamp, completed.recording.sourceFps).finally(() => {
+                  completed.timestamp, completed.recording.sourceFps, poseFittingOptions()).finally(() => {
                     packet.fitCompletedAtMs = performance.now();
                   });
               } catch (cause) { packet.fitting = Promise.reject(cause); }
@@ -567,6 +615,7 @@
   }
 
   function stopSource() {
+    activeRunId=undefined;
     generation++;
     seekVersion++;
     seeking = false;
@@ -686,6 +735,7 @@
     stopSource();
     mediaError = "";
     const token = generation;
+    recording.setSourceFile(token,file);
     try {
       if (file.type.startsWith("image/")) {
         const url = URL.createObjectURL(file);
@@ -742,6 +792,11 @@
   }
 
   function dispatch(bitmap: ImageBitmap, timestamp: number, counted: boolean) {
+    // Recheck after asynchronous decoding/bitmap creation: search can finish
+    // while a frame is being acquired, before it reaches the neural worker.
+    if(!inferenceAllowed()){
+      bitmap.close();markIdle();continuePipeline();return;
+    }
     const drawStart = performance.now();
     const snapshot = presenter.captureFrame(bitmap);
     const sentAt = performance.now();
@@ -763,8 +818,9 @@
         timestampSeconds: timestamp,
         backend,
         settings: appliedSettings,
+        runId:activeRunId,
       },
-      cacheKey: videoResultKey(size, backend, appliedSettings, needsPose()),
+      cacheKey: videoResultKey(size, backend, appliedSettings, needsPose(), poseFittingOptions()),
       sentAt,
       drawMs: sentAt - drawStart,
       acquireMs: counted ? acquireMs : 0,
@@ -788,7 +844,7 @@
   }
 
   async function inferFrame() {
-    if (trimming) return;
+    if (trimming || !inferenceAllowed()) { refreshPending=false;return; }
     if (busy || completionQueue.size || disposed || sourceKind === "none") {
       if (!disposed && sourceKind !== "none") refreshPending = true;
       return;
@@ -837,6 +893,9 @@
         frame?.bitmap.close();
         return;
       }
+      if(!running&&!inferenceAllowed()){
+        frame?.bitmap.close();markIdle();return;
+      }
       if (frame && sourceKind === "video" && frame.timestamp >= solveEnd) {
         frame.bitmap.close(); markIdle(); fileEnded = true; running = false; void finishMoveSearch(); return;
       }
@@ -869,6 +928,15 @@
         frame.bitmap.close();
         completionQueue.enqueue({ saved, context: { snapshot, generation, timestamp: frame.timestamp } });
         markIdle();
+        continuePipeline();
+      } else if(!inferenceAllowed()){
+        // Completed-video playback is decoding only. An uncached frame (for
+        // example after an early solution) must never restart neural inference.
+        try {
+          presenter.presentFrame(stage,presenter.captureFrame(frame.bitmap));
+          result=undefined;position=frame.timestamp;presentedTimestamp=frame.timestamp;
+          viewingSavedResult=false;frameTiming=undefined;
+        } finally {frame.bitmap.close();markIdle();}
         continuePipeline();
       } else dispatch(frame.bitmap, frame.timestamp, true);
   }
@@ -920,6 +988,7 @@
   function projectionForFrame(frame?: FrameResult): [number, number][][] {
     if (!frame?.fittedPose?.pose) return [];
     const sourceFrame = frame.fittedPose.sourceFrame ?? Math.round(position * sourceFps);
+    if (poseIsFlagged(frame.fittedPose,reconstructionFlags.get(sourceFrame))) return [];
     const staticEnd = moveSearch?.config.turning_start_frame;
     return projectedWireframe(frame.fittedPose, reconstructionChoices.get(sourceFrame),
       staticEnd != null && sourceFrame <= staticEnd);
@@ -1234,7 +1303,9 @@
             </div>{/if}
         </div>
         {#if sourceKind === "video" && reconstructionComplete && !trimming}
-          <ProjectedCube pose={coloredProjection} sourceTimestamp={presentedTimestamp} timestamp={timecode(presentedTimestamp)} solved={cubeSolved} />
+          <ProjectedCube pose={coloredProjection} sourceTimestamp={presentedTimestamp} timestamp={timecode(presentedTimestamp)} solved={cubeSolved}
+            timeline={projectedTimeline} steps={searchResult?.steps??[]}
+            sourceFrame={result?.fittedPose?.sourceFrame??Math.round(presentedTimestamp*sourceFps)} />
         {/if}
         </div>
         <div class="transport">
@@ -1319,7 +1390,7 @@
         <div class="pipeline-status" role="status">
           <span class="status-dot" class:ready={!!result?.roi}></span><span
             >{!result
-              ? "Cube acquisition → pose tracking"
+              ? sourceKind==="video"&&videoInputComplete?"Reviewing video · no saved detections for this frame":"Cube acquisition → pose tracking"
               : result.roiSource === "none"
                 ? "Searching for cube · pose skipped"
                 : result.trackingLost
@@ -1465,13 +1536,13 @@
         <section class="control-section">
           <h2>Fitted pose</h2>
           <label class="toggle">
-            <input type="checkbox" bind:checked={showPose} onchange={changePoseDisplay} disabled={sourceKind === "video" && !reconstructionComplete} />
+            <input type="checkbox" bind:checked={showPose} onchange={changePoseDisplay} />
             <span>Show fitted pose</span>
           </label>
-          <p class="hint">{sourceKind === "video" ? "The projected cube appears when reconstruction finishes." : "Fit and display a cube wireframe. Points remain hidden."}</p>
+          <p class="hint">{sourceKind === "video" ? "Show the fitted wireframe on each processed frame, including the first pass. The colored cube appears when reconstruction finishes." : "Fit and display a cube wireframe. Points remain hidden."}</p>
           {#if showPose}
             <p class="hint" role="status" aria-label="Pose fitting status">
-              {poseError || result?.fittedPose?.message || (poseFitting ? "Fitting pose…" : "Waiting for a cube")}
+              {poseError || (displayedPoseFlagged ? "Flagged pose hidden" : result?.fittedPose?.message) || (poseFitting ? "Fitting pose…" : "Waiting for a cube")}
               {#if result?.fittedPose}
                 · Fit {result.fittedPose.elapsedMs.toFixed(1)}ms
                 · Draw {(result.pipeline?.presentationMs ?? 0).toFixed(1)}ms
@@ -1487,12 +1558,22 @@
           <label class="field-label" for="opening-hold">Opening hold (seconds)</label>
           <input id="opening-hold" aria-label="Opening hold (seconds)" type="number" min="0" step="0.01" bind:value={openingHoldSeconds} />
           <label class="toggle"><input type="checkbox" bind:checked={searchEnabled} onchange={changeMoveSearch} />
-            <span>Search moves as poses arrive</span></label>
-          <p class="hint">Forward search · shared 54 TPS limit · five fits plus flat. Fitting runs even when its overlay is hidden.</p>
+            <span>Reconstruct moves</span></label>
+          <label class="toggle"><input type="checkbox" bind:checked={searchBidirectional} onchange={changeMoveSearch} />
+            <span>Bidirectional video search</span></label>
+          <label class="toggle"><input type="checkbox" bind:checked={searchDiagnostics} />
+            <span>Record search diagnostics</span></label>
+          <p class="hint">Turn off for faster search. Applies to the next run.</p>
+          <p class="hint">{searchBidirectional ? "Video search starts after all poses are fitted and searches from both ends. Camera search stays forward." : "Forward search starts as poses arrive."} Shared 54 TPS limit · five fits plus flat.</p>
           <button class="small" disabled={!searchEnabled || sourceKind === "none" || trimming} onclick={changeMoveSearch}>Restart move search</button>
           <p class="hint" role="status" aria-label="Move search status">
             {searchError || (searchResult ? ({running:"Searching",waiting_for_frames:"Waiting for fitted frames",solved:"Solved",already_solved:"Already solved",exhausted:"Search exhausted",state_limit:"Search state limit reached"}[searchResult.status]) : searchEnabled ? "Waiting for a source" : "Move search is off")}
-            {#if searchResult} · {searchResult.frames_prepared} prepared · {searchResult.stats.furthest_frames} searched · {searchResult.stats.evaluated_states.toLocaleString()} states{/if}
+            {#if searchResult?.bidirectional_fallback}<span> · {searchResult.bidirectional_fallback}</span>{/if}
+            {#if searchResult} · {searchResult.frames_prepared} prepared
+              {#if searchResult.search_direction === "bidirectional"} · {(searchResult.stats.forward_expanded ?? 0).toLocaleString()} forward · {(searchResult.stats.backward_expanded ?? 0).toLocaleString()} backward
+              {:else} · {searchResult.stats.furthest_frames} searched{/if}
+              · {searchResult.stats.evaluated_states.toLocaleString()} states
+            {/if}
           </p>
           {#if searchResult?.steps.length}<p class="hint" aria-label="Move search path">
             {searchResult.status === "solved" ? "Solution" : "Current candidate"}: {searchResult.steps.flatMap(step => step.state_moves).join(" ") || "Hold"}

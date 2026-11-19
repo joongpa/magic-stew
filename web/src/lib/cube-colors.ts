@@ -1,4 +1,5 @@
 import tables from "../../../pose-fitter/tables/move-tables.json";
+import geometry from "../../../pose-fitter/tables/render-geometry.json";
 import type { MoveStep } from "./move-search-types";
 
 export type CubeColor = "white" | "yellow" | "orange" | "red" | "blue" | "green";
@@ -24,6 +25,16 @@ function apply<T>(colors:T[],moves:readonly string[]) {
   return colors;
 }
 const faceColors = (positions:CubeColor[]) => tables.geometry_positions.map(index => positions[index]);
+const centerFaces = geometry.faces.flatMap((face,index) => {
+ const center = [0,1,2].map(axis=>face.reduce((sum,point)=>sum+point[axis]/4,0));
+ const normal=geometry.normals[index],axis=normal.findIndex(value=>value!==0);
+ return center.every((value,k)=>k===axis||Math.abs(value)<1e-5)?[{index,axis,side:Math.sign(normal[axis])}]:[];
+});
+/** Wide/slice/whole-cube scramble moves also move the center-color frame. */
+export function centerColorsForScramble(scramble:string) {
+ const colors=buildColorTimeline(scramble,[]).initial;
+ return centerFaces.map(({index,axis,side})=>({axis,side,color:colors[index]}));
+}
 /** Same physical position permutations as the CPU search. Commits are applied
  * before drawing the current residual geometry, exactly once per frame. */
 export function buildColorTimeline(scramble:string,steps:readonly Pick<MoveStep,"frame_index"|"state_moves">[]):ColorTimeline {

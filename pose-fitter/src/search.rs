@@ -175,7 +175,7 @@ fn metrics(
     }
     (m, nearest, valid, columns)
 }
-fn cost(g: &Geometry, m: &Metrics) -> f64 {
+pub(crate) fn cost(g: &Geometry, m: &Metrics) -> f64 {
     if !m.keypoint_error.is_finite() || !m.sticker_error.is_finite() {
         return f64::INFINITY;
     }
@@ -205,6 +205,7 @@ pub(crate) fn materialize(g: &Geometry, w: &Workload, axis: usize, mut x: [f64; 
         params: x,
         angles,
         score,
+        recovery_score_components: None,
         source: "angle_sweep".into(),
         flat_fallback: false,
         metrics: m,
@@ -320,7 +321,7 @@ fn compare_fits(a: &Fit, b: &Fit) -> Ordering {
 
 // Observed sticker order is fixed. Invalid rows use None, never the arbitrary
 // argmin index left behind when every projected face is ineligible.
-fn assignment_key(
+pub(crate) fn assignment_key(
     g: &Geometry,
     fit: &Fit,
     reference: M3,
@@ -512,6 +513,7 @@ pub(crate) fn sweep(g: &Geometry, w: &Workload, camera: &Pose) -> Vec<Fit> {
                         ],
                         angles: relative,
                         score,
+                        recovery_score_components: None,
                         source: "angle_sweep".into(),
                         flat_fallback: false,
                         metrics: m,
@@ -545,6 +547,7 @@ pub(crate) fn sweep(g: &Geometry, w: &Workload, camera: &Pose) -> Vec<Fit> {
                 ],
                 angles: [0.; 3],
                 score,
+                recovery_score_components: None,
                 source: "angle_sweep".into(),
                 flat_fallback: false,
                 metrics: m,

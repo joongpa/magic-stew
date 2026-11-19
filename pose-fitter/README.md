@@ -1,9 +1,33 @@
 # CPU pose fitter: Rust and WASM
 
+## Sparse recovery reprojection weighting
+
+Depth-recovery proposals now rank with four times the capped observation-loss
+weight. Pose priors and the existing per-active-layer penalty remain unchanged;
+the camera optimizer and number of fitting passes are unchanged. This intentional
+ranking change follows the reviewed Jeff1551 pose at 8.687 seconds, where the
+correct articulated candidate previously ranked behind a rigid candidate.
+`bank[].recovery_score_components` records the observation loss, pose-prior loss,
+active-layer count, observation count and reprojection weight separately. Ordinary
+geometry scores are unaffected. The original Python reference retains its old
+recovery ranking for comparison.
+
+The acceptance check preserves sticker assignments in the five regular geometry
+options, after aligning equivalent cube frames; the sixth flat fallback does not
+count toward that check. Every changed previous primary retains its assignments
+in the top five across the eight paired raw-observation datasets. Tommy2 frame
+710's reviewed correct old fit remains candidate 2. Matty, Nahm and Tommy2 also
+still reconstruct after fresh browser-input fitting with the current search
+settings, with unchanged state counts. See
+[`benchmarks/recovery-reprojection-weight.json`](benchmarks/recovery-reprojection-weight.json)
+for scope and results. Full timestamp-matched wireframe videos for the six new
+failed browser captures are in `results/recovery-weight/videos/`.
+
 ## Incremental move search
 
-`move_search::Engine` is a forward-only CPU port of the scorer/transition and
-best-first widening logic used by `search_independent_keypoint_bidirectional.py`.
+`move_search::Engine` supports streaming forward search and post-fitting
+bidirectional search over the same scorer and mechanical transitions. The
+standalone Python implementation is `search_independent_keypoint_bidirectional.py`.
 Both rate limits are fixed at 54 TPS; the separate double-turn classification is
 removed. Input banks retain the five assignment-distinct fits plus reserved flat
 sixth option. Identical shape-and-assignment contexts are collapsed by the same
@@ -24,6 +48,87 @@ The WASM ABI `move_search_json` accepts `init`, `frame`, `advance`, `end`, `stat
 and `probe`. Waiting for input consumes no expansion budget. `advance` is bounded
 for cooperative workers. Configuration, full input banks and transitions are
 serializable; diagnostics run with neither the app nor OpenCV.
+
+Set `bidirectional: true` in the search config to buffer every fitted frame and
+start both frontiers only after `end`. The browser's **Bidirectional video
+search** option enables this by default for videos; turning it off retains the
+streaming forward search. Camera search remains forward. `MoveSearch.end()`
+waits for its fitting promises and complete frame sequence before closing the
+worker input, and the worker schedules no expansions before that closure.
+Existing serialized configs default to `bidirectional: false`.
+
+`move_search/bidirectional.rs` starts from the scramble and from its inverse in
+all 24 solved cube orientations. It chooses the start of the last corroborated
+cluster of flat solved views, requiring at least two frames with at least 12
+assigned sticker observations and color error at most 0.1. These are color-fit
+criteria, not detector confidence thresholds. Without a corroborated anchor it
+falls back to forward search after fitting and reports that fallback in the UI.
+Special handling of timer-stop drops or long unreliable trailing pose runs is
+not part of this change.
+
+Pose-less opening frames are skipped: the initial motion clock advances through
+them, so the first usable pose gets only the interval since the last skipped
+frame. They cannot accumulate a large hidden-turn allowance before the cube is
+observed. Missing poses after the first usable pose retain the full elapsed
+motion allowance. This rule applies to both forward and bidirectional search,
+including out-of-order fit completion. Search reports `running` as soon as its
+workers finish preparation, before the first expansion batch returns.
+
+The browser runs two Rust/WASM instances in separate workers. Direction zero
+calls the original forward frontier: its candidate admission, dominance, queue
+order and full state allowance are unchanged. Direction one independently
+inverts the existing forward mechanical rows, retaining the 54 TPS turn/combined
+limits, configured slice limit and rigid-rotation limit. Reverse ties use the
+predecessor frame's color agreement. Each direction has the configured state
+limit, so total expansions can reach twice that limit. Workers still compete
+for CPU and memory, and preparing a second instance and exchanging meetings
+adds overhead; independent queues do not guarantee lower elapsed time.
+
+Workers exchange admitted states as fixed 64-byte records. Meetings require the
+same frame depth, sticker state and geometry cue after cube-orientation
+canonicalization. Rust rebases the backward suffix into the forward cube basis,
+validates every suffix edge against the existing mechanical compiler and checks
+the final solved cube. A rebased edge can lie outside the forward scorer's
+orientation shortlist; validating that edge does not add it to the forward
+frontier. Histories and best-first priorities remain separate. This remains a
+heuristic search, without an optimality guarantee. A backward-worker failure
+leaves forward search running. Cancellation terminates both workers.
+
+The parallel API adds `advance_side`, `path` and `complete_join`; the action
+journal records directional chunks and the selected join for replay. The serial
+`advance` API remains available. Result statistics include `forward_expanded`,
+`backward_expanded`, `solved_anchor_frame`, `join_frame_index` and
+`search_direction`. Tests check unchanged forward progress while backward work
+runs, independent budget exhaustion, cube-basis rebasing, final goals and
+worker cancellation/failure. Diagnostics-off retains the essential solution.
+
+The geometry-derived one-second gate is **experimental and disabled in
+production**. The isolated comparison checks forward, reverse and join-crossing
+windows using `min(54, 1.25 * geometry_TPS + 2)`. It is not consistently beneficial
+on the cached cohort; see `results/bidirectional/parallel-benchmarks/` for inputs,
+raw trials, CSV results and the temporary gate builder. Its geometry feature
+uses the previously evaluated strict greater-than-six-degree commit estimate.
+The earlier Kyle comparison remains a strong positive result under cached
+travel accounting: 57,642 to 13,051 expansions, preserving exact steps. A control
+restoring only that travel calculation reproduces 13,051 in the new experiment.
+That result must be distinguished from trials using the current shared-motion
+travel calculation; the change predates bidirectional search.
+
+The fresh 97-frame Yiheng277 capture reconstructs with approximately 21,000
+combined expansions using the parallel coordinator; forward alone reaches its
+50,000-state cap. Parallel totals and elapsed times vary with worker completion
+order. Independent final cube checks pass. A mechanically legal solved path is
+not a full manual review of move timing. Reproduce a production parallel trial
+with already fitted input banks:
+
+```sh
+node pose-fitter/tools/benchmark-parallel-search.mjs \
+  pose-fitter/results/geometry-tps/search-experiment/yiheng277-fresh/input.json \
+  pose-fitter/results/bidirectional/yiheng277-parallel.json parallel --states 50000
+node pose-fitter/tools/replay-parallel-journal.mjs \
+  pose-fitter/results/bidirectional/yiheng277-parallel.json \
+  pose-fitter/results/bidirectional/yiheng277-replayed.json
+```
 
 ```sh
 # Immutable conventions only; never includes fitted poses or scored rows:
@@ -54,13 +159,58 @@ The small checked-in CPU oracle also exercises deferred widening with widths
 1/2/3 and a short expansion budget. Native tests cover explicit EOF, parked
 frontiers, out-of-order preparation and six separate projection meshes.
 
-Streaming deliberately retains alternatives and continues eligible work while
-waiting for new frames, so its expansion order can differ from a batch run.
+Streaming retains alternatives but, by default, pauses exploration once an
+admitted path reaches the newest contiguous searchable frame. New frames resume
+exploration; EOF releases the pause for remaining backtracking. Set
+`pause_at_live_frontier: false` to continue exploring while waiting for frames.
+The app also enables `expand_flagged_frames`. The read-only reliability check
+uses existing robust geometry error, inlier counts and observation counts; it
+does not fit additional poses. Flagged frames admit every legal move/geometry
+continuation under the existing 54/54 TPS rules, including shared move sequences
+with distinct geometry contexts. Their scores do not affect queue priority or
+the mismatch window; the next unflagged frame resumes normal queuing. No undo
+filter is applied. Standalone parity fixtures leave this option disabled unless
+explicitly testing it. A frame can provide `landmark_count` and optionally
+override automatic classification with `flagged`.
 Its candidate scores and legality remain the reference rules. Reported CPU/WASM
 times exclude detection, fitting, module loading and file I/O; they are local
 single-pass diagnostic measurements, not whole-app FPS promises.
 
 ## Complete standalone CPU pipeline
+
+### Flag-aware PnP continuity selection
+
+The browser and `pipeline_json` use the same 25% image-plane core-displacement
+rule. Among finite raw PnP roots, prefer the existing <=0.1 reprojection-metric
+pool when it is nonempty. Keep its visual winner unless its projected core jump
+exceeds 25% of its projected cube diameter **plus a motion allowance**, and the
+closest eligible root reduces the jump by more than half. No depth/world-space
+displacement participates and no extra PnP solves or geometry fits are run.
+
+The reference is the most recent eligible **finalized, unflagged** fitted core.
+Eligibility has a fixed source-time boundary: the frame is more than 180 ms old
+and its following initial neighbor precedes the current frame. This avoids a
+dependency cycle with recovery and makes the result independent of worker speed.
+Flags use the same existing residual/inlier/count rule as move search. Missing
+or flagged poses cannot enter the reference history. Two unflagged finalized
+cores are required; their screen-plane speed times the reference age supplies
+the motion allowance. Until then, keep the visual ranking. The allowance avoids
+mistaking ordinary motion during the older reference's lag for a PnP jump.
+
+`src/pipeline/sequence.rs` interleaves the unchanged numerical stages once per
+frame for synchronous replay; `runtime/buffered-pipeline.mjs` schedules those
+same operations across workers. Saved poses expose `pose_flag_reason`,
+`continuity_core`, `startup_reference_core`, and `startup_motion_allowance` for
+diagnostics. Batch stage checkpoints retain the per-frame reference cores and
+allowances. The isolated `startup` stage requires explicit reference cores;
+use `pipeline_json` for the automatic finalized-reference policy. The pure
+threshold/root-selection oracle remains separately reproducible:
+
+```sh
+node pose-fitter/tools/check-quarter-pnp.mjs
+node pose-fitter/tools/check-guarded-pnp.mjs
+node pose-fitter/tools/check-buffered-pipeline.mjs INPUT.json OUTPUT.json
+```
 
 The `cpu-pipeline` feature adds the complete standard joint-pose pipeline outside
 the browser app: per-frame sticker grouping and OpenCV camera hypotheses,
@@ -98,7 +248,7 @@ batch runner. It matches complete batch banks and recovery flags on all 1,247
 saved frames across the five solves. This scheduling check uses identical
 inputs; fresh browser detection/ROI differences remain a separate concern.
 
-The app uses up to three compute workers, an ordered twelve-frame presentation
+The app uses up to four compute workers, an ordered twelve-frame presentation
 queue, and 180 ms of future source context for recovery. The causal initial and
 orientation passes preserve source order; neighbor jobs use immutable initial
 winners. Pause, seek and settings boundaries flush the available tail. See
@@ -528,3 +678,464 @@ and `benchmarks/refit-gate.csv`. Reproduce with:
 # Recompute assignment policies from the saved timing replay:
 .venv/bin/python scripts/analyze_pose_refit_gate.py --reuse-timings
 ```
+
+## Cube rotation and layer motion
+
+The production search enables `resolve_orientation_ambiguity` and
+`max_rotation_tps: 20`, alongside the existing 54/54 layer-turn limit. One TPS
+unit is 90 degrees per second. The rotation limit comes from the selected
+Python reference paths: Matty's maximum is 14.34, Nahm's is 13.69, and the
+largest across all five references is 15.63. Twenty gives at least 28% margin.
+Calibration details are in `benchmarks/cube-rotation-budget.json`; regenerate
+the interval measurements with:
+
+```sh
+.venv/bin/python scripts/calibrate_cube_rotation_budget.py \
+  --output pose-fitter/results/search-failure-audit/rotation-budget-reference.json
+```
+
+`move_search/motion.rs` composes the fitted cameras, residual slab angles and
+committed turns before measuring material-cubie motion. The least-moving
+cubie bounds common rotation; the fastest bounds combined motion. Both caps
+must pass, in addition to the original relative layer-turn budget. A rotation
+therefore reduces available turn speed when their physical motions reinforce.
+Same-axis cancellation is applied first: `R x'` has the same cost as `Lw`.
+A middle-slab fit's rotation absorbed into its camera is composed with its
+outer angles, so an M turn is not automatically charged as whole-cube rotation.
+These are endpoint constraints; they do not infer hidden full revolutions.
+
+The six numerical fit banks stay unchanged. Search derives immutable cube
+symmetry permutations, keeps the original orientation, and checks its nearest
+camera continuation after a large change. The initial frame can also use its
+best full-sticker color orientation because it has no motion reference. Normal
+search scoring uses all classified sticker observations and the current cube
+state, including moved centers after slices. Geometry aliases share a physical
+search key. Mechanical routes and their material rotations are prepared once
+per shape pair and reused; no PnP, projection or numerical refit is added.
+Rotation/motion gates are omitted when either endpoint has a finalized bad-pose
+flag. Flagged frames retain the existing unrestricted legal-move expansion.
+
+The browser and independent runner share `runtime/reconstruction-policy.mjs`,
+`runtime/buffered-pipeline.mjs` and `runtime/incremental-search.mjs`. Source-frame
+numbering, opening holds, admission capacity, worker limits, search chunking and
+configuration defaults are defined once.
+
+Search scoring caches first-permutation row deduplication during preparation,
+scores observed colors directly through each permutation, and stably sorts
+compact candidate descriptors. Full successor states are created for sibling
+deduplication; step telemetry is created only after branch admission. Raw probe
+rows, first-row selection, tied ranks, queue priorities and search counters are
+preserved.
+
+**Record search diagnostics** controls the next browser run (`diagnostics` in
+the search configuration, default `true`). When disabled, search stores only
+essential path data: frame, geometry/orientation, moves and pose flag. It skips
+optional step telemetry, the worker action journal, timing telemetry, runtime
+fingerprint collection and automatic development-run diagnostic exports. Search
+costs, history windows, pruning and progress counters remain active and unchanged.
+Reconstruction and cached review still work. Explicit `probe` requests continue
+to return full diagnostics. Runs without journals cannot be exact action-order
+replays; use diagnostics when collecting a regression capture. This setting
+does not disable detector/fitter output or the in-memory detection recording.
+
+The fixed-action WASM comparison in
+[`benchmarks/move-search-optimization.json`](benchmarks/move-search-optimization.json)
+uses three repetitions, 128-expansion requests, saved fitted banks and a
+10,000-expansion cap. With diagnostics enabled, median batch search times changed
+from 779 to 597 ms (Matty), 4,236 to 2,638 ms (Kyle trim90), and 5,096 to 2,585 ms
+(Yiheng277). Every response, including probes and counters, matches the earlier
+build. Disabling diagnostics preserves every essential response and further
+reduces median streamed Matty search time from 691 to 586 ms. These are search
+ABI timings, not fresh-fitting or end-to-end browser reconstruction timings.
+Saved build/input artifacts are under `results/move-search-optimization/`.
+To compare another pair of builds with the same input and action order:
+
+```sh
+node pose-fitter/tools/compare-move-search.mjs \
+  BEFORE.wasm AFTER.wasm REPORT.json INPUT.json \
+  --repeats=3 --states=10000 --mode=stream
+```
+
+Development runs automatically save raw detections, exact run settings, file and
+loaded ONNX hashes, runtime fingerprints and the search action journal under
+`results/browser-runs/`. `latest.json` points to the newest run. Captures are scoped
+to one reconstruction, including explicit links when the app reuses saved raw
+frames. No automatic upload exists in a production build.
+
+The default replay consumes that recorded configuration unchanged, recomputes
+every fit and replays the recorded frame-arrival/expansion order without video
+playback or wall-clock waits:
+
+```sh
+web/node_modules/.bin/tsx pose-fitter/tools/replay-browser-flow.mts \
+  RECORDING.json OUTPUT.json
+```
+
+It explicitly discards recorded fits, cameras and startup seeds. Recorded banks
+are used only for an output comparison. A resolution, source clock, settings,
+runtime or shared-driver mismatch fails before fitting. Legacy captures and any
+configuration overrides require `--diagnostic`; those outputs are explicitly
+marked ablations, not exact browser reproductions. `--action-journal FLOW.json`
+can verify a standalone driver journal with another completely fresh fit pass.
+
+Reference trajectories are used only to calibrate/diagnose, never as replay
+inputs. Earlier timing examples in `benchmarks/cube-rotation-search.json` describe
+the captured in-app-browser runs only. They do not establish success for a
+different browser/configuration. In particular, the old Tommy3 raw capture was
+160px and is not a valid regression comparison with the current 256px browser.
+
+For pose-only investigations, `replay-browser-flow.mts RECORD OUTPUT
+--diagnostic --fit-only` recomputes every bank from raw observations without
+running search, and reports differences from captured banks. These fresh results
+include `search_frames` for the native `move-search-benchmark` tool. Its `journal`
+mode accepts recorded `actions`, replays them against the fresh frames, then
+appends any messages still queued at the EOF snapshot before closing input and
+continuing search. An incomplete journal continuation is diagnostic rather than
+an exact completed-browser reproduction. The WASM replay tool also supports
+`--continue-after-journal` for this case.
+
+`scripts/render_browser_run_review.py` renders fresh-fit review sheets from a
+JSON list of `{fits, video, frames}` specifications. It verifies source hashes
+and associates each captured timestamp with actual video presentation timestamps,
+then decodes sequentially. A browser `sourceFrame` is a time-derived clock and
+must not be used as a decoder index for variable-rate video. The JSON beside each
+image records the selected decoder indices and timestamp differences.
+
+The earlier reviewed Jeff annotations remain in
+`results/search-failure-audit/jeff-review/user-labels.json`. They refer to
+`jeffSolve.mov`, independently of the newer `jeff1551.MOV` browser capture. The
+fresh current-runtime check in
+`results/search-failure-audit/current-browser/jeff-earlier-reviewed-current-check.json`
+preserves the reviewed primary sticker assignments at all twelve labeled frames.
+All nine labeled bad poses remain flagged. The newer contact sheet's original
+Jeff overlays had an incorrect timestamp association; the corrected review
+accepted frames 468/469 and candidate 2 at 471 independently of the older file.
+
+## Pose support flags
+
+Two additive checks use fitting results already available. Sparse observations
+(at most ten landmarks and five stickers) are flagged when mean landmark
+reprojection error exceeds 0.025 of the projected cube diameter. A second check
+flags combined mean error above 0.03 when at most 70% of observed landmarks have
+distinct assigned 3D landmarks and at most 70% of stickers have valid assignments.
+Neither check uses detection scores or keypoint-presence scores, and neither
+adds inference, PnP, projections, fitting passes or future buffering.
+
+These checks flag the reviewed Jeff1551 frame 379 and Azdaba1304 frame 133, plus
+the previously reviewed bad pose at frame 410 of the earlier Jeff video. Fresh
+paired fitting of twelve datasets leaves every geometry bank unchanged. Three
+paired raw-browser controls also preserve solved outcomes and state counts.
+Finalized geometry flags exclude those poses from the startup-core reference and are sent
+to search as authoritative per-frame flags; subsequent unflagged frames resume
+normal search queuing. Legacy inputs without an explicit flag retain metric-based
+derivation. Yiheng305 and Xuanyi308 are excluded from further acceptance checks.
+
+See [`benchmarks/pose-support-rollout.json`](benchmarks/pose-support-rollout.json)
+and `scripts/validate_pose_support_rollout.py`. Jeff1551 and Azdaba1304 wireframe
+videos in `results/recovery-weight/videos/` include the new flags. Other renders
+retain their recorded fitter version, shown in each video's caption and JSON.
+
+An additional, separate warning identifies insufficient assigned sticker
+evidence: every usable five-plus-flat option has at most three distinct valid
+projected sticker IDs. This follows the Python search's assigned-count meaning;
+it is not a raw detection-count or color-accuracy test. One usable option with
+more evidence prevents the frame-wide warning. Seven independently assigned
+stickers are sufficient. Empty geometry banks remain unavailable.
+
+`pose_flag_reason` covers either geometric unreliability or insufficient color
+evidence; `pose_geometry_flag_reason` distinguishes unreliable geometry. Color-
+only warnings preserve the fitted camera as a finalized geometry reference and
+retain current/previous geometry in motion constraints. Both frame fields are
+forwarded to search. Older untyped explicit flags retain their previous bad-
+geometry meaning. No pose, bank, correspondence or saved result is erased.
+
+For a particular search state/cue, the existing <=3 assigned-sticker predicate
+can also find insufficient evidence when the whole frame's bank is not sparse.
+With the flag feature enabled, such a node retains every mechanically legal
+context, inherits its incoming queue priority and omits color mismatch history;
+the next adequately observed node resumes normal queuing. Static opening holds
+are excluded because their synthetic hold row deliberately contains no color
+scoring. Reliable geometry still limits moves. All-zero assigned-color rows get
+a neutral placeholder only if no mechanically legal candidate has adequate
+color evidence; a supported candidate excludes zero-assignment artifacts.
+Disabled flag mode retains Python's original branch-only sparse handling and
+zero-assignment rejection. Rates, branching thresholds and normal width remain
+unchanged.
+
+See [`benchmarks/sticker-evidence-rollout.json`](benchmarks/sticker-evidence-rollout.json)
+and `scripts/validate_sticker_evidence_rollout.py`. The four included browser
+wireframe videos (Jeff1551, Azdaba1304, Kyle and Yiheng277) hide warned overlays
+while preserving source images, timestamp captions and saved geometry. Their
+JSON companions record the exact runtime and warning frames.
+
+## Independent search-divergence diagnostics
+
+`tools/lib/move-path-comparison.mjs` compares saved move paths as exact sticker
+permutations modulo the 24 whole-cube rotations. It separates temporary
+excursions that rejoin the reference from persistent departures. Its word
+normalizer cancels adjacent inverse turns after transporting explicit cube
+rotations; it never cancels inverses across noncommuting intervening moves.
+Run its standalone behavioral checks with:
+
+```sh
+node --test pose-fitter/tools/lib/move-path-comparison.test.mjs
+```
+
+`tools/compare-saved-move-paths.mjs ORDINARY REFERENCE FLOW OUTPUT.json`
+produces JSON and Markdown, including same-parent transition probes. A chosen
+partial path differing from the reference does not imply that every reference
+branch was pruned. Witness-bank/cue compatibility must be explicitly asserted
+with `--compatible-witness-banks` before replaying those parents; a trimmed
+restart can change cube-coordinate labels while preserving projected geometry.
+Clock frame/FPS is labeled separately from the actual recorded source timestamp.
+
+`tools/diagnose-local-followthrough.mjs FLOW WITNESS OUTPUT FRAME HORIZON`
+uses published WASM probes to compare the first 25 distinct local choices and
+ordinary admitted successors. The reference only selects the incoming state
+and labels results; it never affects successor scores. Exact raw state/cue
+keys avoid assumptions about canonical basis aliases. Output records any
+context truncation. JSON probe timings are diagnostic overhead, not app speed.
+
+The current investigation is indexed in
+[`benchmarks/search-history-investigation.json`](benchmarks/search-history-investigation.json).
+Source/expected-color review panels use recorded timestamps and sequential PTS
+association, and independently reproduce native color costs before rendering.
+These tools do not perform inference or fitting. Fresh fitting from raw
+observations remains the responsibility of the replay tools described above.
+
+## Final weak-layer alternatives
+
+`final_bank::alternatives`/`select` and Python `final_assignment_bank` run only
+when producing the final output bank. Initial fits, immutable neighbor cameras,
+orientation references and finalized camera-continuity anchors retain the
+original score-first selection. The final alternatives cannot seed later fits.
+
+Only a nonzero outer angle whose existing `layer_support` is at most one is
+eligible. This counter measures geometric proximity support, not detector
+confidence, keypoint presence or unique assigned observations. A supported
+outer layer stays fixed. Each eligible mask zeros one or both weak angles at
+the parent's exact camera; it performs one projection/assignment evaluation,
+without a sweep, optimizer or PnP solve. There are at most three masks per fit
+and usually no attempts at all.
+
+A variant qualifies if balanced reprojection cost is no worse (1e-9 numerical
+tolerance), **or** valid sticker assignments are unchanged. Invalid placeholder
+IDs do not count as assignments. Qualified duplicates prefer fewer active
+layers, then smaller absolute angles. The bank retains at most five distinct
+regular assignment patterns and its original reserved whole-flat fallback.
+`final_bank_diagnostics` counts work; `continuity_source_pose` documents the
+original fit used for continuity separately from the output alternatives.
+
+The rejected broad flatter-first experiment is archived under
+`results/search-failure-audit/flatter-dedup-controls`; it altered intermediate
+camera seeds. Final-only raw-input regression results and before/after pictures
+are under `results/search-failure-audit/final-flat-controls` and
+`results/search-failure-audit/final-flat-control-visuals`.
+
+## Recent motion cost
+
+New web runs explicitly record `motion_cost_weight: 0.025`. Legacy/native inputs
+that omit it keep zero weight. The 54 TPS turn limit and separate rigid-rotation
+limit remain unchanged. This is a queue preference, not an additional gate.
+
+Each candidate path carries the latest eight processed-frame requirements
+(including the current step). A requirement is existing route angular travel
+divided by that step's existing maximum-TPS travel budget. Its weighted rolling
+sum is added to color/history priority. These are endpoint lower bounds on
+required motion, not measured physical TPS. At 30 processed FPS the eight motion
+intervals cover about 0.27 seconds; a 60 FPS source still supplies alternate
+frames. No future-frame wait, projection, fitting or PnP pass is added.
+
+Color-only inheritance on flagged frames is tracked separately from motion
+priority, so old motion cost is not repeatedly added. Zero weight retains the
+legacy order and omits the new step telemetry. Saved enabled steps expose
+`required_tps_ratio` and `recent_motion_penalty` for diagnostics. The pure
+`move_search::motion_history` tests cover expiration and normalization; native
+and WASM raw-flow replays cover complete reconstruction behavior.
+
+## Geometry-only TPS curve experiment
+
+`scripts/analyze_geometry_tps.py` compares geometry-only estimates with ten saved
+successful 256px captures from nine solve families (the two Yiheng crops are one
+family). It independently applies each recorded scramble and recovered path to
+verify a solved cube. Predictions read the primary geometry's angles/axis and
+existing geometry flags, without selected search geometry, colors, inferred
+state, inference, projection or fitting. The target is selected-path angular
+travel divided by 90 and actual elapsed source time. It is inferred endpoint
+travel, not manually labeled physical TPS. Committed-token TPS is also logged;
+equivalent wide/slice spellings can change that counter.
+
+The requested strict `>6°` version counts one assumed quarter-turn per processed
+frame if either outer-to-middle residual exceeds six degrees from the nearest
+quarter-turn alignment. Other variants count layers, anticipated commit events,
+changes in raw/wrapped angles, or changes in a three-state angle signal. The
+three-state variant maps `[-6°, +6°]` to zero and residuals outside that interval
+to signed 45°. It measures changes using the existing shared-layer travel
+formula, with exit-to-flat plus entry-from-flat when axes differ. This is a
+geometry activity proxy, not a mechanically reconstructed route.
+
+For median within-solve curve correlation, the three-state variant is more
+consistent than per-frame counting: 0.85 versus 0.76 at 0.25s, 0.86 versus 0.79
+at 0.5s, 0.84 versus 0.78 at 1s, and 0.87 versus 0.72 at 2s. The worst 1s case
+improves from -0.30 to 0.69. A synthetic 2x/4x slowdown repeats the real poses at
+the original processing cadence: angle-change estimates scale down with speed,
+while per-frame occupancy estimates remain unchanged. This stress test is not
+an additional real slow-solver recording.
+
+`scripts/analyze_geometry_tps_curves.py` records zero-lag correlation, absolute
+error, bias, overestimate frequency and diagnostic lag sweeps. It also tests
+nonnegative blends with held-solve-family-out coefficients and margins. These
+can improve median error while degrading individual solves; they are not an
+accepted production estimator. Simple positive padding preserves the
+three-state curve shape: `1.25 * phase_tps + 2` exceeds the angular reference in
+99.8% of the observed full 1s windows, averaged equally across solve families,
+but still undershoots some shorter windows. This is empirical coverage on
+overlapping windows, not a guaranteed safe hard cap.
+
+All source hashes, compact input geometries, whole-solve results, trailing
+0.25/0.5/1/2-second and eight-processed-frame curves, causal prefixes, CSV logs
+and plots are under `results/geometry-tps/`. Full-window summaries exclude
+warmup; partial interval boundaries use actual elapsed time. The deployed TPS
+constraints are unchanged. Reproduce the saved-input analysis with:
+
+```sh
+python3 scripts/analyze_geometry_tps.py \
+  pose-fitter/results/geometry-tps/manifest.json \
+  pose-fitter/results/geometry-tps/report.json
+MPLCONFIGDIR=/private/tmp/geometry-tps-matplotlib \
+  .venv/bin/python scripts/analyze_geometry_tps_curves.py \
+  pose-fitter/results/geometry-tps/report.json
+.venv/bin/python -m pytest tests/test_geometry_tps_estimates.py -q
+```
+
+`scripts/evaluate_geometry_tps_limits.py` evaluates those estimates as
+counterfactual constraints on saved paths. With `min(54, 1.25*phase_tps+2)`, the
+0.25s/eight-frame windows cut nine of ten saved paths, 0.5s cuts six, 1s cuts one
+(a single 0.081-TPS shortfall), and 2s cuts none. These are saved-path checks,
+not full search reruns or evidence that another valid path would be absent.
+A margin fitted to every other solve family still misses held-out paths for
+windows up to 1s. Full 2s windows are available over only 56% of these short
+solves on average, with the original ceiling retained during warmup.
+
+Applying any of these rolling averages directly as a per-transition cap cuts
+transitions in every saved solve. A sustained-speed constraint must instead
+compare accumulated angular travel with a budget for the same time window,
+while retaining the existing per-transition ceiling for bursts. Hard rolling
+constraints also require sufficient motion history in state merging: the
+current dominance key omits that history. No production constraint or queue
+policy is changed by this evaluation. Results and per-window decisions are in
+`results/geometry-tps/window-limits.json` and `.csv`. Reproduce with:
+
+```sh
+python3 scripts/evaluate_geometry_tps_limits.py \
+  pose-fitter/results/geometry-tps/manifest.json \
+  pose-fitter/results/geometry-tps/curves.csv \
+  pose-fitter/results/geometry-tps/window-limits.json
+```
+
+The follow-up search experiment is indexed by
+`results/geometry-tps/search-experiment/wasm-summary.json`. It uses the cached
+successful cropped-Yiheng and Kyle banks and recorded action journals. The
+cached `c9c124df0f46095e` runtime reproduces 55,797 and 57,642 expansions exactly.
+Current source has since changed route-travel accounting from the sum of
+absolute outer-to-middle changes to shared physical travel. To avoid mixing
+that change into the gate experiment, a temporary WASM build restores only the
+cached travel convention; its gate-off stats and every step match the cached
+successes exactly. The workstation source and production runtime are not
+changed by that compatibility adjustment. Earlier native/current-source pilot
+failures are not classified as failures of the cached successful runs.
+
+On those matched baselines, a 1s rolling gate reduces Kyle to 13,051 expansions
+and cropped Yiheng to 51,199. A 0.5s gate with two additional quarter-turn travel
+units reduces them to 43,199 and 52,306. A 0.25s gate with one additional unit
+reduces Kyle to 5,700 but fails to solve cropped Yiheng within 100,000 states;
+three additional units retain both solves but save only 7% and 1% of expansions.
+Every completed gated variant retains the exact cached steps, including geometry
+and scores, and independently passes both final cube and rolling-budget checks.
+The travel allowance is added to the window budget, not to each interval's
+54-TPS ceiling. Larger allowance improves safety while weakening pruning.
+
+These measurements are isolated diagnostics with the existing dominance
+heuristic, not an accepted production policy. Single-pass search times include
+WASM JSON responses: Kyle's 1s variant improves from 7.7s to 3.5s; cropped
+Yiheng's roughly 8% expansion reduction does not produce a speedup. Limits and
+history tracking have overhead, and current-source physical-travel results must
+be assessed separately from the cached convention. Source hashes, compatibility
+build helper, input preparations, raw outputs and replay scripts are retained
+beside the summary.
+
+A broader matched-cache replay is in
+`results/geometry-tps/search-experiment/one-second-cohort-summary.json` and `.csv`.
+All ten gate-off runs reproduce their cached stats and steps exactly. All ten
+one-second gated runs reach independently verified solved cubes and pass 1,434
+independent winning-path budget checks. Eight retain every cached step. Tommy2
+differs at source frame 902 and rejoins at 904; Teodor finishes at frame 162
+instead of 164 with different final move timing. Those differences need video
+review before treating the gate as reconstruction-preserving.
+
+Expanded states, baseline to one-second gate:
+
+| Capture | Baseline | One-second gate | Change |
+| --- | ---: | ---: | ---: |
+| Matty | 1,280 | 1,280 | 0% |
+| Nahm | 3,032 | 2,333 | -23.1% |
+| Tommy2 | 5,175 | 4,997 | -3.4% |
+| Tommy short | 2,313 | 2,303 | -0.4% |
+| Tommy3 | 4,314 | 4,301 | -0.3% |
+| Charlie | 2,773 | 2,773 | 0% |
+| Teodor | 627 | 1,694 | +170.2% |
+| Kyle | 57,642 | 13,051 | -77.4% |
+| Yiheng cropped | 55,797 | 51,199 | -8.2% |
+| Yiheng uncropped | 96,931 | 94,653 | -2.4% |
+
+This is ten captures of nine solve families, since the two Yiheng recordings
+are related. Nahm and Tommy2 use newer successful captures with action journals.
+Single-pass times improve substantially for Kyle (7.57s to 3.57s) and Nahm
+(3.32s to 2.63s), but worsen for uncropped Yiheng (13.62s to 15.96s) and Teodor
+(1.27s to 1.55s). Small timing differences are inconclusive; fewer expansions
+do not always offset history-check overhead.
+
+`results/geometry-tps/search-experiment/combined-summary.json` tests requiring
+both the one-second gate and a half-second gate with two additional quarter-turn
+travel units. Compared with one second alone, Kyle expands 14,091 rather than
+13,051 states, and cropped Yiheng 50,461 rather than 51,199. Both retain the exact
+cached reconstruction and pass independent checks for both window budgets.
+There is no clear overall benefit from combining these gates on these two cases.
+All these experiments retain the eight-frame soft motion priority penalty and
+the separate eight-entry color penalty, as well as the original hard interval
+caps. The eight-frame motion calculation is not a hard TPS check to replace.
+Production remains unchanged, and the cached-convention/dominance limitations
+above still apply.
+
+The separate `results/geometry-tps/search-experiment/yiheng277-fresh/summary.json`
+uses 97 new 256px WebGPU detections and new current-runtime fits, captured in the
+browser rather than drawn from a historical successful run. Its temporary gate
+build retains current shared physical travel; gate-off matches production stats
+and essential steps at 100,000 states. Gate-off, 1s and combined 1s/0.5s all hit
+one million states without solving. The 1s gate prunes no candidates; combined
+prunes 2,620. Parallel single-pass times are not comparable speed benchmarks.
+
+The user-confirmed partial ends at source frame 158. A reference-compatible
+diagnostic continuation is L' at 160, F' at 164, R2 at 170, and F at 172/174.
+Production probes verify those mechanics and an independent permutation check
+verifies its final solved cube. R2 at 170 requires sibling width seven; the
+configured width three excludes it. On the same primary fit, hold scores
+0.209810808476 and R2 0.232538081203. One detected orange object (object/class
+score 0.9941, admitted at threshold 0.90) is assigned to a face that expects
+yellow for hold and white after R2. Directional confusion gives those costs
+0.5 and 1, respectively, accounting for the 0.022727 score gap. This object/class
+score is not a keypoint localization confidence. Both subsequent F transitions
+rank first once the R2 state is retained. The reference is used only for this
+diagnostic; ordinary search never receives it.
+
+Existing standalone Python bidirectional search on these same fresh banks finds
+a solved-cube candidate in 3,556 states with width three (no supplied reference).
+It is not policy-equivalent to current Rust. A later reference-constrained
+current-Rust audit finds a mechanically legal realization of its timed physical
+states, including the solved endpoint, with up to 24 retained contexts. That
+audit is not an ordinary Rust bidirectional run or a complete manual video
+accuracy review. Original pixels, fit/color overlays, scores and scripts are
+saved beside the summary. `geometry-curves.csv` logs geometry estimates over
+0.25s/0.5s/1s/2s/eight-frame windows; `diagnostic-route-curves.csv` also logs the
+reference-assisted route's minimum travel rates, explicitly not an unguided
+successful reconstruction or ground-truth physical TPS.

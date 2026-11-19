@@ -94,6 +94,7 @@ export interface FrameProfile {
   otherMs: number;
 }
 export interface FrameResult {
+  detectorHashes?:{pose:string;bbox:string};
   fittedPose?: FittedPose;
   pipeline?: {
     detectorStartedAtMs: number;
@@ -141,6 +142,7 @@ export type WorkerResponse =
       threads: number;
       isolated: boolean;
       preprocessing: "cpu" | "gpu";
+      models?:{pose:{file:string;size:number;bytes:number;sha256:string};bbox:{file:string;size:number;bytes:number;sha256:string}};
     }
   | { type: "error"; message: string }
   | { type: "result"; result: FrameResult };

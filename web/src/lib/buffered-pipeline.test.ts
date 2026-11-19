@@ -13,12 +13,15 @@ function executor(log: Record<string, any>[]) {
   return async (job: Record<string, any>) => {
     log.push(job);
     switch (job.type) {
-      case "prepare": return { source: camera(job.frame.frame), anchor: true };
+      case "prepare": return { candidates: [camera(job.frame.frame)] };
+      case "select_startup": return { source: job.candidates[0] ?? null,
+        core: job.candidates.length ? [job.frame.frame, 0] : null, anchor: job.candidates.length > 0 };
       case "initial": return { bank: [fit(job.frame.frame)] };
       case "neighbors": return { bank: [fit(job.frame.frame + 100)] };
       case "orient": return { bank: job.bank, reference: { frame: job.frame.frame, rvec: [0, 0, 0] } };
       case "target": return { target: 500 };
-      default: return { bank: job.bank, wireframe: [], pose: camera(job.frame.frame), depth_recovery: false };
+      default: return { bank: job.bank, wireframe: [], pose: camera(job.frame.frame), depth_recovery: false,
+        continuity_core: [job.frame.frame, 0] };
     }
   };
 }
@@ -51,7 +54,7 @@ test("startup completion order cannot select a later seed or reorder orientation
   const stream = new BufferedPosePipeline(async job => {
     if (job.type === "prepare" && (job.frame as PipelineFrame).frame === 1) await delayed;
     const result = await execute(job);
-    if (job.type === "prepare" && (job.frame as PipelineFrame).frame === 0) return { source: null, anchor: false };
+    if (job.type === "prepare" && (job.frame as PipelineFrame).frame === 0) return { candidates: [] };
     return result;
   }, config);
   const pending = [0, 1, 2].map(index => stream.push(frame(index)));
@@ -60,6 +63,48 @@ test("startup completion order cannot select a later seed or reorder orientation
   release(); await stream.flush(); await Promise.all(pending);
   assert.equal(log.find(j => j.type === "initial")!.source.rvec[0], 1);
   assert.deepEqual(log.filter(j => j.type === "orient").map(j => j.frame.frame), [0, 1, 2]);
+});
+
+test("startup selection follows source order and waits for finalized reference cores", async () => {
+  const log: Record<string, any>[] = [], execute = executor(log);
+  let release!: () => void;
+  const delayed = new Promise<void>(resolve => { release = resolve; });
+  const stream = new BufferedPosePipeline(async job => {
+    const index = (job.frame as PipelineFrame | undefined)?.frame;
+    if (job.type === "prepare" && index === 0) await delayed;
+    const result = await execute(job);
+    if (job.type === "prepare" && index === 1) return { candidates: [] };
+    return result;
+  }, config);
+  const pending = [0, 1, 2].map(index => stream.push(frame(index)));
+  await tick();
+  assert.equal(log.some(j => j.type === "select_startup"), false);
+  release(); await stream.flush(); await Promise.all(pending);
+  const selections = log.filter(j => j.type === "select_startup");
+  assert.deepEqual(selections.map(j => j.frame.frame), [0, 1, 2]);
+  assert.deepEqual(selections.map(j => j.references), [[], [], [{frame:0,core:[0,0]}]]);
+  const targets = log.filter(j => j.type === "target");
+  assert.ok(targets.every(j => j.anchors.every((i: number) => j.frames[i].frame !== 1)));
+});
+
+test("flagged final poses cannot replace the reference, regardless of worker completion order", async () => {
+  const run = async (delayed: boolean) => {
+    const log: Record<string, any>[] = [], execute = executor(log);
+    const stream = new BufferedPosePipeline(async job => {
+      const index = (job.frame as PipelineFrame | undefined)?.frame;
+      if (delayed && job.type === "finalize" && index === 0) await tick();
+      const result = await execute(job);
+      if (job.type === "finalize" && index !== 1 && index !== 2) return { ...result, continuity_core: null };
+      return result;
+    }, { ...config, fps: 30 });
+    const pending = Array.from({length: 10}, (_,i)=>stream.push(frame(i)));
+    await stream.flush(); await Promise.all(pending);
+    return log.filter(j=>j.type === "select_startup").map(j=>j.references);
+  };
+  const one = [{frame:1,core:[1,0]}], two = [...one,{frame:2,core:[2,0]}];
+  const expected = [[],[],[],[],[],[],[],one,two,two];
+  assert.deepEqual(await run(false), expected);
+  assert.deepEqual(await run(true), expected);
 });
 
 test("cancelling rejects outstanding frames and a pending flush", async () => {

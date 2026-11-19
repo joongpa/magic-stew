@@ -32,6 +32,23 @@ pub struct Route {
 fn relative(a: [f64; 3]) -> [f64; 2] {
     [a[0] - a[1], a[2] - a[1]]
 }
+/// Physical turn travel, independent of the common rigid orientation.
+/// A middle turn changes both outer-to-middle angles in the same direction;
+/// those are two measurements of one turn, not two separate turns. Opposing
+/// outer turns still spend their combined travel. Rigid motion is gated
+/// separately by the camera/material motion checks.
+fn travel(delta: [f64; 2]) -> f64 {
+    delta[0].max(delta[1]).max(0.) - delta[0].min(delta[1]).min(0.)
+}
+fn slice_travel(delta: [f64; 2]) -> f64 {
+    // Common outer-to-middle motion is a slice in any rigid cube basis.
+    // Wide turns have one zero component; opposing outer turns have no slice.
+    if delta[0] * delta[1] > 0. {
+        delta[0].abs().min(delta[1].abs())
+    } else {
+        0.
+    }
+}
 fn offsets(start: [f64; 3], end: [f64; 3], budget: f64) -> Vec<[i32; 3]> {
     let a = relative(start);
     let b = relative(end);
@@ -130,6 +147,7 @@ fn add(
     phases: Vec<Phase>,
     budget: f64,
     double: f64,
+    slice_budget: f64,
 ) {
     let mut merged: Vec<Phase> = vec![];
     for mut p in phases {
@@ -143,7 +161,7 @@ fn add(
     }
     let (mut degrees, mut fraction) = (0., 0.);
     for p in merged {
-        degrees += p.delta.iter().map(|v| v.abs()).sum::<f64>();
+        degrees += travel(p.delta);
         let mut f: f64 = 0.;
         for i in 0..2 {
             let distance = p.delta[i].abs();
@@ -156,6 +174,8 @@ fn add(
                 f64::INFINITY
             });
         }
+        let slice = slice_travel(p.delta);
+        f = f.max(if slice_budget > 0. { slice / slice_budget } else if slice == 0. { 0. } else { f64::INFINITY });
         fraction += f;
     }
     fraction = fraction.max(if double > 0. {
@@ -182,6 +202,9 @@ fn add(
     }
 }
 pub fn between(before: &Shape, after: &Shape, budget: f64) -> Vec<Route> {
+    between_with_slice_limit(before, after, budget, budget)
+}
+pub fn between_with_slice_limit(before: &Shape, after: &Shape, budget: f64, slice_budget: f64) -> Vec<Route> {
     let double = budget;
     let mut unique = BTreeMap::new();
     if before.axis.is_none() || after.axis.is_none() || before.axis == after.axis {
@@ -199,6 +222,7 @@ pub fn between(before: &Shape, after: &Shape, budget: f64) -> Vec<Route> {
                     vec![phase(axis, before.angles, end)],
                     budget,
                     double,
+                    slice_budget,
                 );
             }
         }
@@ -221,7 +245,7 @@ pub fn between(before: &Shape, after: &Shape, budget: f64) -> Vec<Route> {
             }
             let mut groups = exit.clone();
             groups.extend(entry.clone());
-            add(&mut unique, groups, phases.clone(), budget, double);
+            add(&mut unique, groups, phases.clone(), budget, double, slice_budget);
             let limit = ((double - ec - ic + 1e-9) / 90.).floor().max(0.) as usize;
             for count in 1..=limit {
                 if phases.is_empty() && count as f64 * 90. > budget + 1e-9 {
@@ -241,7 +265,7 @@ pub fn between(before: &Shape, after: &Shape, budget: f64) -> Vec<Route> {
                     let mut gs = exit.clone();
                     gs.extend(middle.clone());
                     gs.extend(entry.clone());
-                    add(&mut unique, gs, ps, budget, double);
+                    add(&mut unique, gs, ps, budget, double, slice_budget);
                 }
             }
         }

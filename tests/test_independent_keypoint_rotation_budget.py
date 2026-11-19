@@ -15,7 +15,7 @@ def test_flat_to_flat_only_admits_one_whole_quarter():
     assert ((0, (0, 0, 2)),) not in routes
     assert ((0, (0, 0, 1)), (1, (0, 0, 1))) not in routes
     assert all(cost in (0., 90.) for cost in routes.values())
-    assert len(routes) == 25  # Face/wide turns; two relative slab turns exceed the shared cap.
+    assert len(routes) == 37  # Face/wide/slice quarters and equivalent same-direction outer motion.
 
 
 @pytest.mark.parametrize('angle', [30., 45.])
@@ -37,25 +37,24 @@ def test_both_outer_offsets_are_measured_from_the_middle():
     assert costs(before, after)[((2, (1, 0, 0)),)] == 120.
 
 
-def test_slice_turn_spends_both_relative_angles_from_shared_budget():
+def test_slice_turn_spends_one_quarter_from_shared_budget():
     whole_slice = ((0, (0, 1, 0)),)
     assert whole_slice not in costs(FLAT, FLAT, 89.999)
-    assert whole_slice not in costs(FLAT, FLAT, 179.999)
-    assert costs(FLAT, FLAT, 180.)[whole_slice] == 180.
+    assert costs(FLAT, FLAT, 90.)[whole_slice] == 90.
     partial = RotationGeometry.make(0, (0., 30., 0.))
-    assert costs(FLAT, partial, 60.)[()] == 60.
-    assert () not in costs(FLAT, partial, 59.999)
-    # A hidden slice spends travel for both relative angles even concurrently.
+    assert costs(FLAT, partial, 30.)[()] == 30.
+    assert () not in costs(FLAT, partial, 29.999)
+    # A hidden slice is one turn, with the outer residual travel added.
     before = RotationGeometry.make(2, (0., 0., 3.))
     after = RotationGeometry.make(2, (0., 0., 14.))
-    assert whole_slice not in costs(before, after, 196.999)
-    assert costs(before, after, 197.)[whole_slice] == 197.
+    assert whole_slice not in costs(before, after, 106.999)
+    assert costs(before, after, 107.)[whole_slice] == 107.
 
 
 def test_slice_residual_seam_counts_concurrent_relative_distance():
     before = RotationGeometry.make(0, (0., 40., 0.))
     after = RotationGeometry.make(0, (0., -40., 0.))
-    assert costs(before, after)[((0, (0, 1, 0)),)] == 20.
+    assert costs(before, after)[((0, (0, 1, 0)),)] == 10.
 
 
 def test_rigid_rotation_does_not_spend_turn_budget_or_add_orientation_rescue():
@@ -189,3 +188,24 @@ def test_preparation_never_gives_hidden_different_axis_singles_the_double_rate()
     prepared = routes_between(FLAT, FLAT, 150., 187.5, optimistic_doubles=True)
     assert all(r.groups != two_singles for r in prepared)
     assert any(r.groups == ((0, (0, 0, 2)),) for r in prepared)
+
+
+def test_slice_specific_limit_is_basis_independent_and_preserves_face_and_wide_rate():
+    for axis in range(3):
+        limited = routes_between(FLAT, FLAT, 90., slice_budget=90.*40./54.)
+        for offsets in ((0, -1, 0), (1, 0, 1)):
+            group = ((axis, offsets),)
+            assert not any(r.groups == group for r in limited)
+            assert any(r.groups == group and r.degrees == 90.
+                       for r in routes_between(FLAT, FLAT, 121.5, slice_budget=90.))
+        for offsets in ((1, 0, 0), (1, 1, 0)):
+            assert any(r.groups == ((axis, offsets),) for r in limited)
+
+
+def test_reviewed_slice_and_cross_axis_partial_offset_spends_one_slice():
+    before = RotationGeometry.make(2, (15.045883504893528, 0., 23.665434536185003))
+    after = RotationGeometry.make(0, (0., 0., 28.678335684368218))
+    budget = 90.*54.*2./(60000./1001.)
+    route = next(r for r in routes_between(before, after, budget, slice_budget=budget*40./54.)
+                 if r.groups == ((2, (0, -1, 0)),))
+    assert abs(route.degrees - 103.6324521794747) < 1e-10

@@ -1,3 +1,4 @@
+import {poseWorkerCount} from '../../../pose-fitter/runtime/reconstruction-policy.mjs';
 type Reply = Record<string, any>;
 interface Task { id: number; job: Record<string, unknown>; resolve(value: Reply): void; reject(error: Error): void }
 interface Slot { worker: Worker; ready: boolean; task?: Task }
@@ -8,7 +9,7 @@ export class PoseWorkerPool {
   private queue: Task[] = [];
   private nextId = 0;
   private closed = false;
-  constructor(baseUrl: string, count = Math.min(3, Math.max(1, (navigator.hardwareConcurrency || 4) - 1))) {
+  constructor(baseUrl: string, count = poseWorkerCount(navigator.hardwareConcurrency)) {
     for (let i = 0; i < count; i++) {
       const worker = new Worker(new URL("./pose.worker.ts", import.meta.url), { type: "module" });
       const slot: Slot = { worker, ready: false };

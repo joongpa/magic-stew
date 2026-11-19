@@ -2,6 +2,8 @@ import type { FrameResult } from "./detector";
 import type { FittedPose, PoseObservations } from "./pose-types";
 import { BufferedPosePipeline, type PipelineFrame } from "../../../pose-fitter/runtime/buffered-pipeline.mjs";
 import { PoseWorkerPool } from "./pose-worker-pool";
+import { centerColorsForScramble } from "./cube-colors";
+import {videoFrameIdentity} from '../../../pose-fitter/runtime/reconstruction-policy.mjs';
 
 export function poseObservations(frame: FrameResult): PoseObservations {
   const landmarks = frame.detections.filter(point => point.classId < 3);
@@ -13,11 +15,7 @@ export function poseObservations(frame: FrameResult): PoseObservations {
   };
 }
 const COLORS = ["corner", "corner-edge", "corner-edge-center", "white", "yellow", "orange", "red", "blue", "green"];
-const CENTERS = [
-  { axis: 2, side: 1, color: "white" }, { axis: 2, side: -1, color: "yellow" },
-  { axis: 1, side: -1, color: "green" }, { axis: 1, side: 1, color: "blue" },
-  { axis: 0, side: 1, color: "red" }, { axis: 0, side: -1, color: "orange" },
-];
+export interface PoseFittingOptions {scramble:string;turningStartFrame:number|null;originSeconds?:number;endSeconds?:number}
 export function pipelineFrame(frame: FrameResult, frameIndex: number): PipelineFrame {
   return { ...poseObservations(frame), frame: frameIndex,
     pixel_scale: Math.max(Math.max(frame.transform.cropWidth, frame.transform.cropHeight) / 400, 0.3),
@@ -34,19 +32,25 @@ export class PoseFitter {
   private dimensions = "";
   private fps = 0;
   private segment = 0;
+  private configKey = "";
+  private activeConfig = {turningStartFrame:null as number|null,centers:centerColorsForScramble("")};
   constructor(baseUrl: string) { this.pool = new PoseWorkerPool(baseUrl); }
-  fit(frame: FrameResult, reset: boolean, timestamp = 0, sourceFps = 30): Promise<FittedPose> {
+  fit(frame: FrameResult, reset: boolean, timestamp = 0, sourceFps = 30,
+      options:PoseFittingOptions={scramble:"",turningStartFrame:null}): Promise<FittedPose> {
     const fps = sourceFps > 0 ? sourceFps : 30;
     const dimensions = frame.transform.sourceWidth + "x" + frame.transform.sourceHeight;
-    if (reset || !this.stream || this.stream.ended || dimensions !== this.dimensions || Math.abs(fps - this.fps) > 0.001) {
+    const configKey=JSON.stringify(options);
+    if (reset || !this.stream || this.stream.ended || dimensions !== this.dimensions || Math.abs(fps - this.fps) > 0.001 || configKey!==this.configKey) {
       if (this.stream && !this.stream.ended) void this.stream.flush().catch(() => {});
-      this.stream = new BufferedPosePipeline(job => this.pool.execute(job), { fps, turningStartFrame: null, centers: CENTERS });
+      this.activeConfig={turningStartFrame:options.turningStartFrame,centers:centerColorsForScramble(options.scramble)};
+      this.configKey=configKey;
+      this.stream = new BufferedPosePipeline(job => this.pool.execute(job), { fps, ...this.activeConfig });
       this.segments.add(this.stream); this.dimensions = dimensions; this.fps = fps;
       this.segment++;
     }
-    const sourceFrame = Math.round(timestamp * fps), segment = this.segment;
+    const sourceFrame = videoFrameIdentity(timestamp,{fps}).sourceFrame, segment = this.segment, fittingConfig={segment,fps,...this.activeConfig};
     return this.stream.push(pipelineFrame(frame, sourceFrame)).then(value => ({ ...value, sourceFrame,
-      fittingConfig: { segment, fps, turningStartFrame: null, centers: CENTERS } }));
+      fittingConfig }));
   }
   async flush() {
     const segments = [...this.segments];

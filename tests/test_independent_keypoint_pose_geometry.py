@@ -125,11 +125,13 @@ def test_targeted_recovery_preserves_baseline_banks_and_neighbors(solved_window,
     records, fps = solved_window
     cache = [SimpleNamespace(**vars(r)) for r in records]
     originals = {}
+    recovered = {}
     original_recovery = geometry.apply_depth_fallback
 
     def recover(renderer, records, *args):
         originals.update({r.frame_index: r.pose_candidate for r in records})
         original_recovery(renderer, records, *args)
+        recovered.update({r.frame_index: r.pose_candidate for r in records})
 
     monkeypatch.setattr(geometry, 'apply_depth_fallback', recover)
     args = m.build_parser().parse_args(['--source', 'clip.mp4', '--initial-scramble', '',
@@ -138,7 +140,8 @@ def test_targeted_recovery_preserves_baseline_banks_and_neighbors(solved_window,
     changed = []
     for record in cache:
         before = originals[record.frame_index]
-        after = record.pose_candidate
+        # Compare this stage before the independent final-output alternatives.
+        after = recovered[record.frame_index]
         if after is before:
             continue
         changed.append(record.frame_index)
@@ -194,6 +197,54 @@ def test_assignment_bank_has_five_unique_rows_plus_unconditional_flat(observatio
                 for f in bank[:5]}) == 5
     assert bank[-1].flat_fallback and bank[-1].angles == (0., 0., 0.)
     assert bank[-1].score == 10.  # The fallback ignores the score cutoff.
+
+
+@pytest.mark.parametrize(('same_assignments', 'cost_delta', 'accepted'), [
+    (True, .2, True), (False, -.02, True), (False, 0., True), (False, .2, False),
+])
+def test_final_flat_variants_freeze_camera_and_supported_layer_with_or_qualification(
+        observation, monkeypatch, same_assignments, cost_delta, accepted):
+    base = geometry._materialize(m, observation[0], 0, np.r_[
+        observation[0].rvec.ravel(), observation[0].tvec.ravel(), -20., 15.])
+    option = dict(base.option, layer_support=(1, 8, 20),
+                  keypoint_error=.1*m.PNP_FINAL_ASSIGNMENT_ERROR_FRACTION,
+                  sticker_error=.1*m.PNP_TURN_CENTER_PENALTY_SCALE)
+    base = replace(base, nearest=np.array([0, 0]), valid=np.array([True, False]), option=option)
+    fallback = replace(base, angles=(0., 0., 0.), flat_fallback=True)
+    calls = []
+
+    def project(renderer, candidate, axis, parameters):
+        calls.append(parameters.copy())
+        angles = (parameters[6], 0., parameters[7])
+        variant_option = dict(option, keypoint_error=(.1+2*cost_delta)*m.PNP_FINAL_ASSIGNMENT_ERROR_FRACTION)
+        return replace(base, angles=angles, option=variant_option,
+                       nearest=np.array([0 if same_assignments else 1, 53]))
+
+    monkeypatch.setattr(geometry, '_materialize', project)
+    diagnostics = {}
+    bank = geometry.final_assignment_bank(m, [base, fallback], diagnostics=diagnostics)
+    assert len(calls) == 1
+    np.testing.assert_array_equal(calls[0][:6], np.r_[base.candidate.rvec.ravel(), base.candidate.tvec.ravel()])
+    np.testing.assert_array_equal(calls[0][6:], [0., 15.])
+    assert bank[0].angles == ((0., 0., 15.) if accepted else base.angles)
+    assert bank[-1] is fallback
+    assert diagnostics['attempted_materializations'] == 1
+    assert diagnostics['qualified_variants'] == int(accepted)
+
+
+def test_final_flat_variants_do_no_projection_for_supported_layers(observation, monkeypatch):
+    base = geometry._materialize(m, observation[0], 0, np.r_[
+        observation[0].rvec.ravel(), observation[0].tvec.ravel(), -20., 15.])
+    base = replace(base, option=dict(base.option, layer_support=(2, 8, 20)))
+
+    def unexpected_projection(*args):
+        pytest.fail('Supported layers must not incur another projection')
+
+    monkeypatch.setattr(geometry, '_materialize', unexpected_projection)
+    diagnostics = {}
+    bank = geometry.final_assignment_bank(m, [base], diagnostics=diagnostics)
+    assert bank[0] is base
+    assert diagnostics['attempted_materializations'] == 0
 
 
 def test_assignment_bank_collapses_symmetry_relabeling_but_keeps_validity_changes(observation):

@@ -497,6 +497,84 @@ def assignment_shortlist(renderer, fits, size=5):
     return selected
 
 
+def final_assignment_bank(renderer, fits, size=5, *, diagnostics=None):
+    """Try cheap weak-layer flattening only after temporal fitting is finished.
+
+    Camera and supported angles are fixed. Existing proximity support <=1
+    gates each nonzero outer angle. A variant must preserve valid sticker
+    assignments or have non-worse balanced reprojection cost. No solver runs.
+    The reserved whole-flat fallback never displaces regular candidates.
+    """
+    ordinary = [fit for fit in fits if not fit.flat_fallback][:size]
+    fallback = next((fit for fit in fits if fit.flat_fallback), None)
+    if not ordinary:
+        if diagnostics is not None:
+            diagnostics.update(attempted_materializations=0, qualified_variants=0,
+                               selected_replacements=0)
+        return list(fits)
+    reference = cv2.Rodrigues(ordinary[0].candidate.rvec)[0]
+
+    def cost(fit):
+        return float(renderer.balanced_geometry_cost(
+            fit.option['keypoint_error'], fit.option['sticker_error']))
+
+    def order(fit):
+        return (sum(angle != 0. for angle in fit.angles),
+                sum(abs(angle) for angle in fit.angles), cost(fit), fit.axis, fit.angles)
+
+    def same_assignments(first, second):
+        return (np.array_equal(first.valid, second.valid)
+                and np.array_equal(first.nearest[first.valid], second.nearest[second.valid]))
+
+    preferred, attempts, qualified = [], 0, 0
+    for original in ordinary:
+        support = original.option.get('layer_support', (math.inf,)*3)
+        weak = [layer for layer in (0, 2)
+                if original.angles[layer] != 0. and support[layer] <= 1]
+        selected = original
+        for mask in range(1, 1 << len(weak)):
+            angles = list(original.angles)
+            for bit, layer in enumerate(weak):
+                if mask & (1 << bit):
+                    angles[layer] = 0.
+            parameters = np.r_[original.candidate.rvec.ravel(), original.candidate.tvec.ravel(),
+                               angles[0], angles[2]]
+            attempts += 1
+            variant = _materialize(renderer, original.candidate, original.axis, parameters)
+            if variant is None or not (same_assignments(original, variant)
+                                       or cost(variant) <= cost(original)+1e-9):
+                continue
+            qualified += 1
+            variant.proposal_source = 'weak_layer_flat_output'
+            if order(variant) < order(selected):
+                selected = variant
+        preferred.append(selected)
+
+    selected, signatures = [], {}
+    for fit in [*preferred, *ordinary]:
+        signature = sticker_assignment_signature(renderer, fit, reference)
+        if signature in signatures:
+            index = signatures[signature]
+            if order(fit) < order(selected[index]):
+                selected[index] = fit
+        elif len(selected) < size:
+            signatures[signature] = len(selected)
+            selected.append(fit)
+    if fallback is not None:
+        selected.append(fallback)
+    if diagnostics is not None:
+        def original_geometry(fit):
+            return any(fit.axis == old.axis and fit.angles == old.angles
+                       and np.array_equal(fit.candidate.rvec, old.candidate.rvec)
+                       and np.array_equal(fit.candidate.tvec, old.candidate.tvec)
+                       for old in ordinary)
+
+        diagnostics.update(attempted_materializations=attempts, qualified_variants=qualified,
+                           selected_replacements=sum(not fit.flat_fallback and not original_geometry(fit)
+                                                     for fit in selected))
+    return selected
+
+
 def fit_frame(renderer, candidate, *, static=False, prior=None, neighbors=(), retained=(), sweep_device='cpu',
               refinement_device='cpu'):
     """Sweep/refine, retain five unique sticker assignments and a flat fallback.
@@ -564,6 +642,12 @@ def fit_frame(renderer, candidate, *, static=False, prior=None, neighbors=(), re
 def projection_option(renderer, fit):
     """Serializable, candidate-specific pose and projection cache for search."""
     result = renderer.turn_trial_log_payload(fit.option)
+    # Keep numerical fields alongside the renderer's human-readable aliases so
+    # final alternatives can also be consumed directly by the CPU scorer.
+    for name in ('combined_mean_error', 'keypoint_error', 'sticker_error',
+                 'robust_error', 'p90_error', 'sticker_match_count'):
+        if name in fit.option:
+            result[name] = fit.option[name]
     result.update(joint_pose_fit=True, pose_rvec=fit.candidate.rvec.tolist(),
         geometry_bank_policy='sticker_assignments_plus_flat', flat_fallback=fit.flat_fallback,
         pose_proposal_source=fit.proposal_source,
@@ -750,6 +834,7 @@ def process_pose_geometry(renderer, cache, args, colors, fps, progress=None):
         if progress:
             progress('orientation matching', index, len(cache))
         fits = orient_fits(renderer, fits, colors, tracker, record.frame_index, fps)
+        banks[index] = fits
         if not fits:
             record.pose_candidate = None
             record.pose_candidates = ()
@@ -766,6 +851,45 @@ def process_pose_geometry(renderer, cache, args, colors, fps, progress=None):
         tracker.observe(best.rvec, record.frame_index)
     if progress:
         progress('orientation matching', len(cache), len(cache))
+    before_recovery = [record.pose_candidate for record in cache]
     if getattr(args, 'joint_depth_fallback', True):
         apply_depth_fallback(renderer, cache, originals, args, depth_targets)
+    # Final alternatives never become initial, neighbor or orientation seeds.
+    for index, record in enumerate(cache):
+        if record.pose_candidate is None:
+            continue
+        fits = banks[index]
+        if record.pose_candidate is not before_recovery[index]:
+            # Recovery is uncommon. Materialize its returned candidates from
+            # this frame's observations, without another fitting/solver pass.
+            options = record.pose_candidate.joint_geometry_candidates
+            if not any(any(angle != 0. and option.get('layer_support', (math.inf,)*3)[layer] <= 1
+                           for layer, angle in enumerate(renderer.parallel_layer_angles(candidate.layer_rotations)))
+                       for candidate, option in zip(record.pose_candidates, options, strict=True)):
+                continue
+            fits = []
+            for candidate, option in zip(record.pose_candidates, options, strict=True):
+                rotations = candidate.layer_rotations
+                axis = rotations[0].axis if rotations else 0
+                angles = renderer.parallel_layer_angles(rotations)
+                fit = _materialize(renderer, candidate, axis, np.r_[
+                    candidate.rvec.ravel(), candidate.tvec.ravel(), angles[0], angles[2]])
+                if fit is not None:
+                    fit.score = option.get('recovery_score', fit.score)
+                    fit.flat_fallback = option.get('flat_fallback', False)
+                    fit.option.update({name: option[name] for name in
+                                       ('depth_fallback', 'recovery_source', 'recovery_score')
+                                       if name in option})
+                    fits.append(fit)
+        final = final_assignment_bank(renderer, fits)
+        if len(final) == len(fits) and all(a is b for a, b in zip(final, fits, strict=True)):
+            continue
+        options = tuple(projection_option(renderer, fit) for fit in final)
+        record.pose_candidate = replace(final[0].candidate,
+            joint_pose_diagnostics=record.pose_candidate.joint_pose_diagnostics,
+            joint_geometry_candidates=options,
+            turn_search_diagnostics=dict(status='joint_pose_geometry', geometry=dict(
+                joint_refined=True, scope='per_geometry_middle_pose', options=options)),
+            turn_state_moves=(), turn_candidate_diagnostics=(), turn_fit_evaluated=False)
+        record.pose_candidates = tuple(fit.candidate for fit in final)
 

@@ -6,6 +6,7 @@ import {buildColorTimeline,stateAtFrame} from "./cube-colors";
 import type {CubeStateSnapshot} from "./cube-colors";
 import oracle from "../../../pose-fitter/tests/fixtures/cube-projection.json";
 import turns from "../../../pose-fitter/tables/render-turns.json";
+import orientations from "../../../pose-fitter/tables/orientations.json";
 const initial=stateAtFrame(buildColorTimeline("",[]),0,true)!;
 const pose=(axis:number,angles:number[],state:CubeStateSnapshot=initial,rvec=[.2,-.3,.1])=>makeCubePose({axis,params:rvec,angles},state)!;
 const squared=(p:number[])=>p.reduce((sum,v)=>sum+v*v,0);
@@ -32,6 +33,18 @@ test("shared-layer projection preserves the fixed-camera OpenCV reference",()=>{
   assert.equal(faces.length,sample.expected.length);
   faces.forEach((face,i)=>{assert.equal(face.face,sample.expected[i].face);near(face.depth,sample.expected[i].depth);
    face.points.forEach((p,j)=>p.forEach((v,k)=>near(v,sample.expected[i].points[j][k])));});
+ }
+});
+test("search orientation alternatives preserve every physical sticker polygon and shared layer",()=>{
+ for(const axis of [0,1,2])for(const angles of [[0,0,0],[23,0,-37]]){
+  const fit={axis,angles,params:[.3,-.5,.2]},before=poseSurfaces(makeCubePose(fit,initial)!);
+  for(let symmetry=0;symmetry<orientations.matrices.length;symmetry++){
+   const after=poseSurfaces(makeCubePose(fit,initial,symmetry)!);
+   for(const face of before){
+    const target=after[orientations.face_permutations[symmetry][face.face]];
+    for(const point of face.points)assert.ok(target.points.some(p=>squared(point.map((v,i)=>v-p[i]))<1e-14));
+   }
+  }
  }
 });
 test("one global rotation takes the short arc, with exact endpoints",()=>{

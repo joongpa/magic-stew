@@ -32,6 +32,118 @@ pub struct Candidate {
     pub anchor_indices: Vec<usize>,
     pub sequence: Vec<usize>,
 }
+/// Compact current-frame hypotheses for ordered startup selection. These carry
+/// existing PnP results; selecting a root never runs another fit or solver.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Seed {
+    pub pose: Pose,
+    pub visual_score: f64,
+    pub fit_metric: f64,
+    pub core_uv: V2,
+    pub diameter: f64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct FinalizedCore {
+    pub frame: usize,
+    pub core: V2,
+}
+
+/// A lagged reference needs a conservative allowance for normal screen-plane
+/// motion. Two unflagged finalized cores establish it; one alone is insufficient.
+pub fn selection_context(history: &[FinalizedCore], frame: usize) -> (Option<V2>, f64) {
+    if history.len() < 2 {
+        return (None, 0.);
+    }
+    let a = &history[history.len() - 2];
+    let b = &history[history.len() - 1];
+    if a.frame >= b.frame || b.frame >= frame {
+        return (None, 0.);
+    }
+    let allowance =
+        distance(a.core, b.core) / (b.frame - a.frame) as f64 * (frame - b.frame) as f64;
+    (Some(b.core), allowance)
+}
+
+pub fn projected_core(camera: &Camera, pose: &Pose) -> V2 {
+    let core = mv(camera.k, pose.tvec);
+    [core[0] / core[2], core[1] / core[2]]
+}
+
+pub fn seeds(g: &Geometry, input: &Input) -> Vec<Seed> {
+    let camera = camera(input);
+    prepare(g, input)
+        .candidates
+        .into_iter()
+        .map(|c| {
+            let diameter = projection::cube_diameter(g, &camera, c.pose.rvec, c.pose.tvec);
+            Seed {
+                fit_metric: c.visual_score - 0.25 * c.anchor_error / diameter,
+                core_uv: projected_core(&camera, &c.pose),
+                diameter,
+                pose: c.pose,
+                visual_score: c.visual_score,
+            }
+        })
+        .collect()
+}
+
+/// The accepted 25% rule: change the visual winner only when its projected core
+/// jumps >25% of its cube diameter and the closest eligible root more than halves
+/// that 2D jump. The caller supplies the last eligible finalized, unflagged
+/// pose's projected core. No 3D translation enters the comparison.
+pub fn select_seed(seeds: &[Seed], previous_core: Option<V2>) -> Option<&Seed> {
+    select_seed_with_allowance(seeds, previous_core, 0.)
+}
+pub fn select_seed_with_allowance(
+    seeds: &[Seed],
+    previous_core: Option<V2>,
+    motion_allowance: f64,
+) -> Option<&Seed> {
+    let finite: Vec<_> = seeds.iter().filter(|s| s.fit_metric.is_finite()).collect();
+    let qualified: Vec<_> = finite
+        .iter()
+        .copied()
+        .filter(|s| s.fit_metric <= 0.1)
+        .collect();
+    let pool = if qualified.is_empty() {
+        &finite
+    } else {
+        &qualified
+    };
+    let visual = pool.iter().copied().reduce(|best, s| {
+        if s.visual_score.total_cmp(&best.visual_score).is_lt() {
+            s
+        } else {
+            best
+        }
+    })?;
+    let Some(previous) = previous_core else {
+        return Some(visual);
+    };
+    let closest = pool
+        .iter()
+        .copied()
+        .reduce(|best, s| {
+            if distance(s.core_uv, previous)
+                .total_cmp(&distance(best.core_uv, previous))
+                .then(s.visual_score.total_cmp(&best.visual_score))
+                .is_lt()
+            {
+                s
+            } else {
+                best
+            }
+        })
+        .unwrap();
+    let visual_jump = distance(visual.core_uv, previous);
+    if visual_jump > 0.25 * visual.diameter + motion_allowance
+        && distance(closest.core_uv, previous) < 0.5 * visual_jump
+    {
+        Some(closest)
+    } else {
+        Some(visual)
+    }
+}
 #[derive(Serialize)]
 pub struct Output {
     pub matches: Vec<Match>,

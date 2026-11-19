@@ -26,6 +26,7 @@ const scope = self as unknown as {
   postMessage: (message: WorkerResponse) => void;
 };
 interface Stage {
+  identity:{file:string;size:number;bytes:number;sha256:string};
   session: Ort.InferenceSession;
   variant: ModelVariant;
   canvas: OffscreenCanvas;
@@ -86,6 +87,7 @@ async function loadStage(
     variant.bytes,
     label,
   );
+  const digest=crypto.subtle.digest('SHA-256',bytes.buffer as ArrayBuffer);
   const session = await ort.InferenceSession.create(bytes, {
     executionProviders: [backend],
     graphOptimizationLevel: "all",
@@ -117,7 +119,9 @@ async function loadStage(
           await import("./gpu-preprocess")
         ).GpuPreprocessor.create(await ort.env.webgpu.device)
       : undefined;
-  return { session, variant, canvas, context, gpu };
+  const identity={file:variant.file,size:variant.size,bytes:bytes.length,
+    sha256:[...new Uint8Array(await digest)].map(v=>v.toString(16).padStart(2,'0')).join('')};
+  return { session, variant, canvas, context, gpu,identity };
 }
 
 async function runStage(
@@ -266,6 +270,7 @@ scope.onmessage = async ({ data }) => {
         threads: ort.env.wasm.numThreads ?? 1,
         isolated: self.crossOriginIsolated,
         preprocessing,
+        models:{pose:pose.identity,bbox:bbox.identity},
       });
       return;
     }
@@ -390,6 +395,7 @@ scope.onmessage = async ({ data }) => {
     send({
       type: "result",
       result: {
+        detectorHashes:{pose:pose.identity.sha256,bbox:bbox.identity.sha256},
         detections,
         transform,
         cube,

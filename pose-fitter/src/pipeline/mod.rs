@@ -43,6 +43,8 @@ pub struct Output {
 pub struct FrameOutput {
     pub frame: usize,
     pub startup: Option<Pose>,
+    pub startup_reference_core: Option<V2>,
+    pub startup_motion_allowance: f64,
     pub bank: Vec<Fit>,
     pub depth_recovery: bool,
 }
@@ -107,13 +109,18 @@ fn mean_prior(g: &Geometry, base: &Pose, neighbors: &[Pose]) -> Pose {
 
 pub mod assignment;
 pub mod depth;
-pub mod orientation;
 pub mod jobs;
+pub mod orientation;
+mod sequence;
 #[cfg(test)]
 mod tests;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct State {
+    #[serde(default)]
+    pub startup_reference_cores: Vec<Option<V2>>,
+    #[serde(default)]
+    pub startup_motion_allowances: Vec<f64>,
     #[serde(default)]
     pub startups: Vec<Option<Pose>>,
     #[serde(default)]
@@ -146,12 +153,18 @@ fn static_frame(input: &Input, f: &Frame) -> bool {
         .is_some_and(|start| f.frame <= start)
 }
 
-pub fn startup_pass(g: &Geometry, input: &Input) -> Vec<Option<Pose>> {
+pub fn startup_pass(
+    g: &Geometry,
+    input: &Input,
+    reference_cores: &[Option<V2>],
+    allowances: &[f64],
+) -> Vec<Option<Pose>> {
     input
         .frames
         .iter()
-        .map(|frame| {
-            startup::prepare(
+        .enumerate()
+        .map(|(i, frame)| {
+            let seeds = startup::seeds(
                 g,
                 &startup::Input {
                     width: frame.width,
@@ -159,10 +172,13 @@ pub fn startup_pass(g: &Geometry, input: &Input) -> Vec<Option<Pose>> {
                     observations: frame.observations.clone(),
                     landmark_presence: frame.landmark_presence.clone(),
                 },
+            );
+            startup::select_seed_with_allowance(
+                &seeds,
+                reference_cores[i],
+                allowances.get(i).copied().unwrap_or(0.),
             )
-            .candidates
-            .first()
-            .map(|c| c.pose.clone())
+            .map(|seed| seed.pose.clone())
         })
         .collect()
 }
@@ -230,20 +246,16 @@ pub fn orientation_pass(g: &Geometry, input: &Input, banks: &[Vec<Fit>]) -> Vec<
         if banks[i].is_empty() {
             continue;
         }
-        let p = pose(&banks[i][0]);
-        let w = work(frame, &p, None, vec![], vec![], false);
-        revised[i] = orientation::orient(
+        let bank = jobs::orient(
             g,
-            &w,
+            frame,
             banks[i].clone(),
             &input.expected_center_colors,
-            reference,
+            reference.as_ref(),
             input.fps,
-            &frame.colors,
         );
-        if let Some(f) = revised[i].first() {
-            reference = Some((rodrigues(pose(f).rvec).0, frame.frame));
-        }
+        revised[i]=bank;
+        reference=jobs::next_reference(frame,&revised[i],reference);
     }
     revised
 }
@@ -260,13 +272,7 @@ pub fn recovery_pass(g: &Geometry, input: &Input, state: &State) -> (Vec<Vec<Fit
     }
     (banks, recovered)
 }
-pub fn run_stage(g: &Geometry, request: StageRequest) -> Result<State, String> {
-    let StageRequest {
-        stage,
-        input,
-        mut state,
-    } = request;
-    let n = input.frames.len();
+fn validate_input(input: &Input) -> Result<(), String> {
     if !input.fps.is_finite() || input.fps <= 0. {
         return Err("fps must be positive".into());
     }
@@ -311,6 +317,33 @@ pub fn run_stage(g: &Geometry, request: StageRequest) -> Result<State, String> {
             return Err("Frame indices must increase strictly".into());
         }
     }
+    Ok(())
+}
+
+pub fn run_stage(g: &Geometry, request: StageRequest) -> Result<State, String> {
+    let StageRequest {
+        stage,
+        input,
+        mut state,
+    } = request;
+    validate_input(&input)?;
+    let n = input.frames.len();
+    if matches!(stage, Stage::Startup) && state.startup_reference_cores.len() != n {
+        return Err("Startup stage requires explicit reference cores; use pipeline_json for automatic finalized-unflagged references".into());
+    }
+    if matches!(stage, Stage::Startup)
+        && !state.startup_motion_allowances.is_empty()
+        && (state.startup_motion_allowances.len() != n
+            || state
+                .startup_motion_allowances
+                .iter()
+                .any(|v| !v.is_finite() || *v < 0.))
+    {
+        return Err(
+            "Startup motion allowances must be finite, nonnegative and match the frame sequence"
+                .into(),
+        );
+    }
     if matches!(
         stage,
         Stage::DepthTargets | Stage::Initial | Stage::Recovery
@@ -329,7 +362,14 @@ pub fn run_stage(g: &Geometry, request: StageRequest) -> Result<State, String> {
         return Err("Depth-target checkpoint does not match frame sequence".into());
     }
     match stage {
-        Stage::Startup => state.startups = startup_pass(g, &input),
+        Stage::Startup => {
+            state.startups = startup_pass(
+                g,
+                &input,
+                &state.startup_reference_cores,
+                &state.startup_motion_allowances,
+            )
+        }
         Stage::DepthTargets => {
             state.depth_targets = depth::depth_targets(g, &input.frames, &state.startups, input.fps)
         }
@@ -341,46 +381,6 @@ pub fn run_stage(g: &Geometry, request: StageRequest) -> Result<State, String> {
     Ok(state)
 }
 pub fn run(g: &Geometry, input: Input) -> Result<Output, String> {
-    let mut stages = std::collections::BTreeMap::new();
-    let mut state = State::default();
-    for (stage, label) in [
-        (Stage::Startup, "startup"),
-        (Stage::DepthTargets, "depth_targets"),
-        (Stage::Initial, "initial"),
-        (Stage::Neighbors, "neighbors"),
-        (Stage::Orientation, "orientation"),
-        (Stage::Recovery, "recovery"),
-    ] {
-        opencv::diagnostic(&format!("CPU pipeline: {label}"));
-        state = run_stage(
-            g,
-            StageRequest {
-                stage,
-                input: input.clone(),
-                state,
-            },
-        )?;
-        if input.capture_stages {
-            stages.insert(label.to_string(), state.clone());
-        }
-    }
-    let frames = input
-        .frames
-        .iter()
-        .enumerate()
-        .map(|(i, frame)| FrameOutput {
-            frame: frame.frame,
-            startup: state.startups[i].clone(),
-            bank: state.banks[i].clone(),
-            depth_recovery: state.recovered[i],
-        })
-        .collect();
-    Ok(Output {
-        frames,
-        stages: if input.capture_stages {
-            Some(stages)
-        } else {
-            None
-        },
-    })
+    validate_input(&input)?;
+    sequence::run(g, &input)
 }

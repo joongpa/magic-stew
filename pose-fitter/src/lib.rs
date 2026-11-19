@@ -1,4 +1,5 @@
 pub mod browser;
+pub mod final_bank;
 pub mod move_search;
 mod math;
 #[cfg(feature = "cpu-pipeline")]
@@ -82,11 +83,29 @@ pub struct Metrics {
     pub layer_support: [usize; 3],
 }
 #[derive(Clone, Serialize, Deserialize)]
+pub struct RecoveryScoreComponents {
+    /// Sum of capped landmark/sticker reprojection losses (not detector scores).
+    pub observation_loss: f64,
+    pub pose_prior_loss: f64,
+    pub active_layers: usize,
+    pub observation_count: usize,
+    pub reprojection_weight: f64,
+}
+impl RecoveryScoreComponents {
+    pub fn cost(&self) -> f64 {
+        (0.5 * (self.reprojection_weight * self.observation_loss + self.pose_prior_loss)
+            + self.active_layers as f64)
+            / self.observation_count.max(1) as f64
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Fit {
     pub axis: usize,
     pub params: [f64; 8],
     pub angles: [f64; 3],
     pub score: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_score_components: Option<RecoveryScoreComponents>,
     pub source: String,
     #[serde(default)]
     pub flat_fallback: bool,
