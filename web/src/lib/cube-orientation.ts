@@ -92,6 +92,19 @@ const rotationWords=(()=>{
 })();
 
 export interface ReorientedMoveStep { frame:number; moves:string[]; rotation:boolean }
+export interface DisplayMoveToken { frame:number;move:string;rotation:boolean }
+/** Frame batches carry timing, not visual grouping. Merge adjacent matching
+ * quarter turns token by token, including pairs inside or across batches. */
+export function displayMoveTokens(steps:readonly ReorientedMoveStep[]):DisplayMoveToken[] {
+ const tokens:DisplayMoveToken[]=[];
+ for(const step of steps)for(const raw of step.moves){
+  const move=clean(raw),last=tokens.at(-1);
+  if(last&&last.rotation===step.rotation&&last.move===move&&/^(?:[RLUDFB]w?|[MESxyzrludfb])'?$/.test(move)){
+   last.move=move.replace(/'$/,"")+"2";last.frame=step.frame;
+  }else tokens.push({frame:step.frame,move,rotation:step.rotation});
+ }
+ return tokens;
+}
 export interface RotationDisplayOptions { fps?:number;rotationThresholdDegrees?:number;minimumRotationSeconds?:number;nativeSlices?:boolean }
 /** Fold the observed coordinate-basis jump and simultaneous layer commits
  * into a native slice only when their exact same-axis effect is M/E/S. */

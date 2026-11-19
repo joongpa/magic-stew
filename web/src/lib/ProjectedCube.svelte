@@ -2,7 +2,7 @@
   import { onMount, untrack } from "svelte";
   import { layerTransition } from "./cube-motion";
   import type { CubePose, Quaternion } from "./cube-motion";
-  import { CAMERA_ORIENTATION, reorientedCubePose, reorientedMoveTimeline } from "./cube-orientation";
+  import { CAMERA_ORIENTATION, displayMoveTokens, reorientedCubePose, reorientedMoveTimeline } from "./cube-orientation";
   import { dragCubeView, nudgeCubeView } from "./cube-drag";
   import type { CubeDragKind, DragPoint } from "./cube-drag";
   import type { MoveStep } from "./move-search-types";
@@ -18,6 +18,7 @@
   const effectiveOrientation=$derived(mode==="adjustable"?orientation:CAMERA_ORIENTATION);
   const viewPose=$derived(rendered?reorientedCubePose(rendered,effectiveOrientation):rendered);
   const reorientedMoves=$derived(reorientedMoveTimeline(timeline,steps,effectiveOrientation,{fps:sourceFps}));
+  const moveTokens=$derived(displayMoveTokens(reorientedMoves));
   let surface:HTMLDivElement,orbitRadius=$state(0),hoverRoll=$state(false);
   let drag=$state.raw<{pointer:number;kind:CubeDragKind;start:DragPoint;view:Quaternion;cx:number;cy:number;radius:number}>();
   let dragAnimation=0,pendingOrientation:Quaternion|undefined;
@@ -61,7 +62,7 @@
     const next=nudgeCubeView(orientation,event.key,event.shiftKey);
     if(next){finishDrag(false);orientation=next;event.preventDefault();event.stopPropagation();}
   }
-  const activeMoveFrame=$derived(reorientedMoves.filter(step=>step.frame<=sourceFrame).at(-1)?.frame);
+  const activeMoveFrame=$derived(moveTokens.filter(token=>token.frame<=sourceFrame).at(-1)?.frame);
   let canvas:HTMLCanvasElement,renderer=$state.raw<CubeRenderer>(),renderError=$state("");
   onMount(()=>{
     try {renderer=new CubeRenderer(canvas);} catch(error){renderError=String(error);return;}
@@ -127,10 +128,10 @@
     <div class="cube-orientation-moves" aria-label="Moves and rotations">
       <strong>Moves and rotations</strong>
       <span class="cube-notation-standard" aria-label="Move notation axes: U up, F down-left, R down-right">Notation axes: U ↑ · F ↙ · R ↘</span>
-      {#each reorientedMoves as step}
-        <span class:current={step.frame===activeMoveFrame} class:future={step.frame>sourceFrame}
-          title={step.rotation?"Cube rotation from tracked orientation":undefined}
-          aria-current={step.frame===activeMoveFrame?"step":undefined}>{step.moves.join(" ")}</span>
+      {#each moveTokens as token}
+        <span class:current={token.frame===activeMoveFrame} class:future={token.frame>sourceFrame}
+          title={token.rotation?"Cube rotation from tracked orientation":undefined}
+          aria-current={token.frame===activeMoveFrame?"step":undefined}>{token.move}</span>
       {:else}<span>Hold</span>{/each}
     </div>
   {:else}
