@@ -75,20 +75,20 @@ works without custom hosting headers.
 
 ## Validate and build
 
-For GitHub Pages in the main `auto-stew` repository, run from the repository root:
+For GitHub Pages in the main `magic-stew` repository, run from the repository root:
 
 ```sh
 npm --prefix web run build:pages
 ```
 
-This rebuilds the generated top-level `docs/` folder for `/auto-stew/`, including
+This rebuilds the generated top-level `docs/` folder for `/magic-stew/`, including
 both required models, WASM, `.nojekyll`, and a direct `/timer/` entry page. Commit
 `docs/` with source changes, then select **main → /docs** in GitHub Pages settings.
 The hosting repository must be public on GitHub Free; private repositories
 require an eligible paid plan. No separate deployment repository is needed.
 
 To preview that exact build locally, run `npm --prefix web run preview:pages`
-and open `http://localhost:4173/auto-stew/`. The Pages build replaces all of
+and open `http://localhost:4173/magic-stew/`. The Pages build replaces all of
 `docs/`; keep source files in `web/`. A normal `build` still uses `web/dist/`.
 
 From `web/`:

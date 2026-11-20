@@ -1,10 +1,10 @@
 {
-  "version": "0ea672babb8ff0fd7a9c",
+  "version": "56a6fa5a1f0e16ec7f59",
   "assets": [
     {
-      "path": "assets/big-puzzle-orientation-KJL4OFV2-BiUzZvqa.js",
-      "revision": "934c2a204fd25a764344d2081f9382a51c5871fc332771d9b6d909cd939de2c7",
-      "integrity": "sha256-k0wqIE/SWnZDRNIIH5OCpRxYcfwzJ3HZttkJzZOd4sc=",
+      "path": "assets/big-puzzle-orientation-KJL4OFV2-ZweInijD.js",
+      "revision": "c4722c19e8d3ac47146146ee29122693f6abfe9485d7ddcad330ee1a5dd6732c",
+      "integrity": "sha256-xHIsGejTrEcUYUbuKRImk/ar/pSF193K0zDuGl3Wcyw=",
       "precache": true
     },
     {
@@ -14,21 +14,21 @@
       "precache": true
     },
     {
-      "path": "assets/chunk-6R47S6MP-DPxs1U5G.js",
-      "revision": "2599b8931e11cdb22e0bc19a6e63734a4874e54bff7e97d0ed0943f896420e93",
-      "integrity": "sha256-JZm4kx4RzbIuC8GabmNzSkh05Uv/fpfQ7QlD+JZCDpM=",
+      "path": "assets/chunk-6R47S6MP-CDfn7jM_.js",
+      "revision": "221034f27a5c95128c8f4e4d5feecea9597c6ae411d065bcf27e3fad00771e6a",
+      "integrity": "sha256-IhA08npclRKMj05NX+7OqVl8auQR0GW88n4/rQB3Hmo=",
       "precache": true
     },
     {
-      "path": "assets/chunk-7LEVC3YR-BRSuS2GG.js",
-      "revision": "8fbf16607b9fcaac7a6b6402dfa2399a009d207b14e7e885ad66b70c2bd670cc",
-      "integrity": "sha256-j78WYHufyqx6a2QC36I5mgCdIHsU5+iFrWa3DCvWcMw=",
+      "path": "assets/chunk-7LEVC3YR-1Hjyqq9J.js",
+      "revision": "784ff38aaf5c3c7441a68e8a61cfec892c588717a584ef986795a2468b102482",
+      "integrity": "sha256-eE/ziq9cPHRBpo6KYc/siSxYhxelhO+YZ5WiRosQJII=",
       "precache": true
     },
     {
-      "path": "assets/chunk-UKAXYOG2-CW47qCgC.js",
-      "revision": "458cf3499b69d4a8c47e060db5cded9ccf873e1d334f882f547a48736cbbfc69",
-      "integrity": "sha256-RYzzSZtp1KjEfgYNtc3tnM+HPh0zT4gvVHpIc2y7/Gk=",
+      "path": "assets/chunk-UKAXYOG2-CAL05h19.js",
+      "revision": "2ca52e77a3ece7466c6b8dabf179cb999cdbc4d2a757827a0d2d1da6bbb1e216",
+      "integrity": "sha256-LKUud6Ps50Zsa42r8XnLmZzbxNKnV4J6DS0dprux4hY=",
       "precache": true
     },
     {
@@ -44,27 +44,27 @@
       "precache": true
     },
     {
+      "path": "assets/index--PpYa6NY.js",
+      "revision": "e84e30a479aecad9bbeae3a7064e1c52789896cf05d5ce7968a6ded83f9f7513",
+      "integrity": "sha256-6E4wpHmuytm76uOnBk4cUniYls8F1c55aKbe2D+fdRM=",
+      "precache": true
+    },
+    {
       "path": "assets/index-BAbXWyfK.css",
       "revision": "69b8e8d1bcc2bd6cfa2dc9eb8a8bb5c960ab47a99dbbe97eb030133cdabcf50a",
       "integrity": "sha256-abjo0bzCvWz6Lcnriou1yWCrR6mdu+l+sDATPNq89Qo=",
       "precache": true
     },
     {
-      "path": "assets/index-BG1lO2DU.js",
-      "revision": "d6a099b5f8237f7253c8506811c68c7f4e71c8adc43bfc0f68d6eb2bf9b1d900",
-      "integrity": "sha256-1qCZtfgjf3JTyFBoEcaMf05xyK3EO/wPaNbrK/mx2QA=",
+      "path": "assets/index-DTA3g5cW.js",
+      "revision": "6d91b1691fb6007be4fcaa1fdc9a8b09b9728ac937574346f780c6bea3ae9347",
+      "integrity": "sha256-bZGxaR+2AHvk/Kof3JqLCblyisk3V0NG94DGvqOuk0c=",
       "precache": true
     },
     {
-      "path": "assets/index-D-FWAaBA.js",
-      "revision": "458d6e9e86f97622163badec5c4b139ee4f1314c286615dc786397d174dca9fa",
-      "integrity": "sha256-RY1unob5diIWO63sXEsTnuTxMUwoZhXceGOX0XTcqfo=",
-      "precache": true
-    },
-    {
-      "path": "assets/index-fcHhvoLh.js",
-      "revision": "4bee5b50aaa05e5697cbccd5797a118fd94e412985714f6d01fcbeaf8e8db232",
-      "integrity": "sha256-S+5bUKqgXlaXy8zVeXoRj9lOQSmFcU9tAfy+r46NsjI=",
+      "path": "assets/index-vNKoOfz6.js",
+      "revision": "b0d04b2623c822e6da098d9d95dd3be6b3d18320b9ff38682ee2109f9101d577",
+      "integrity": "sha256-sNBLJiPIIubaCY2dld075rPRgyC5/zhoLuIQn5EB1Xc=",
       "precache": true
     },
     {
@@ -74,9 +74,9 @@
       "precache": true
     },
     {
-      "path": "assets/inside-UWSZBO4Y-ci-EHsFu.js",
-      "revision": "fbeb89c278cf124430d56d1823fa4bfd6ed1811e246262dd18e47ac5a6db44d8",
-      "integrity": "sha256-++uJwnjPEkQw1W0YI/pL/W7RgR4kYmLdGOR6xabbRNg=",
+      "path": "assets/inside-UWSZBO4Y-CCycdazP.js",
+      "revision": "d88e01a788dd89ffeb715c4625742ec979adecb7f935aa8ede301892464784b7",
+      "integrity": "sha256-2I4Bp4jdif/rcVxGJXQuyXmt7Lf5NaqO3jAYkkZHhLc=",
       "precache": true
     },
     {
@@ -110,15 +110,15 @@
       "precache": true
     },
     {
-      "path": "assets/preload-helper-CbmDsLn6.js",
-      "revision": "7ca89d0727f4d61d23d3e1eab5db578a281c2ccfacfeb7c272167dce13dde223",
-      "integrity": "sha256-fKidByf01h0j0+HqtdtXiigcLM+s/rfCchZ9zhPd4iM=",
+      "path": "assets/preload-helper-CLU8W8Ez.js",
+      "revision": "0a3c1a26548513f518641fd4c1950a08c816dd845ab16c17980838640974ce32",
+      "integrity": "sha256-CjwaJlSFE/UYZB/UwZUKCMgW3YRasWwXmAg4ZAl0zjI=",
       "precache": true
     },
     {
-      "path": "assets/puzzle-geometry-CBw8YBQa.js",
-      "revision": "1f192bb3399bf70f7e00869134239eea5f6ae577f6409543b50d364cf2f16c47",
-      "integrity": "sha256-Hxkrszmb9w9+AIaRNCOe6l9q5Xf2QJVDtQ02TPLxbEc=",
+      "path": "assets/puzzle-geometry-CkML_3Pq.js",
+      "revision": "e718b33fa05202f07691f0698e3f9e51f4040faea1edd209d4c7e099f9ee9b0b",
+      "integrity": "sha256-5xizP6BSAvB2kfBpjj+eUfQED66h7dIJ1Mfgmfnumws=",
       "precache": true
     },
     {
@@ -152,15 +152,15 @@
       "precache": true
     },
     {
-      "path": "assets/search-dynamic-sgs-side-events-5GQDHSJR-_qdNB-TR.js",
-      "revision": "e273017accabd7b0ea05ea6d837bc685da565fa8853dc48dfccea243fbfd4b71",
-      "integrity": "sha256-4nMBesyr17DqBeptg3vGhdpWX6iFPcSN/M6iQ/v9S3E=",
+      "path": "assets/search-dynamic-sgs-side-events-5GQDHSJR-5cfU9Dac.js",
+      "revision": "e1b3826041991f17fcee5a384d77a159cefeef46f326a93c435e18d5739496ca",
+      "integrity": "sha256-4bOCYEGZHxf87lo4TXehWc7+70bzJqk8Q14Y1XOUlso=",
       "precache": true
     },
     {
-      "path": "assets/search-dynamic-sgs-unofficial-YM23KVCN-BE93E3aj.js",
-      "revision": "e922ac0130fb348e8e050c97f15ae8721583ce3c64659d1b153dce1aaf96bb06",
-      "integrity": "sha256-6SKsATD7NI6OBQyX8VrochWDzjxkZZ0bFT3OGq+WuwY=",
+      "path": "assets/search-dynamic-sgs-unofficial-YM23KVCN-D6KsaOgr.js",
+      "revision": "a1e34411c4b040e0937da3330fbad930f549d51acd38d8a65581211d14446864",
+      "integrity": "sha256-oeNEEcSwQOCTfaMzD7rZMPVJ1RrNONimVYEhHRREaGQ=",
       "precache": true
     },
     {
@@ -170,33 +170,33 @@
       "precache": true
     },
     {
-      "path": "assets/search-dynamic-solve-4x4x4-KNSBAM7Q-Bs-IgIvp.js",
-      "revision": "9a70fa6943345e8b4473ffcdf16993707bcc5e0e149be21493136cddbf4f5810",
-      "integrity": "sha256-mnD6aUM0XotEc//N8WmTcHvMXg4Um+IUkxNs3b9PWBA=",
+      "path": "assets/search-dynamic-solve-4x4x4-KNSBAM7Q-CIdQ4_H-.js",
+      "revision": "c29accd20b037e78b0d6341ffd31ea063dbf1840377417342cbc45ed03ce47de",
+      "integrity": "sha256-wprM0gsDfniw1jQf/THqBj2/GEA3dBc0LLxF7QPOR94=",
       "precache": true
     },
     {
-      "path": "assets/search-dynamic-solve-fto-CSXJYISF-DWlie2aK.js",
-      "revision": "72cd38f3f3c994248d1daa70a30d2fca399d024b65ced889de3a6ae3507a8d25",
-      "integrity": "sha256-cs048/PJlCSNHapwow0vyjmdAktlztiJ3jpq41B6jSU=",
+      "path": "assets/search-dynamic-solve-fto-CSXJYISF-WbkFoawG.js",
+      "revision": "a86b30e88f919c97f34e66295794c997adb7dbd6502ee412213bb544c0b6725e",
+      "integrity": "sha256-qGsw6I+RnJfzTmYpV5TJl62329ZQLuQSITu1RMC2cl4=",
       "precache": true
     },
     {
-      "path": "assets/search-dynamic-solve-kilominx-EHAUQJXS-DatrHB5Y.js",
-      "revision": "519110252c242c90fe219e09223d2961e1ea570700a1da073f49c99611868642",
-      "integrity": "sha256-UZEQJSwkLJD+IZ4JIj0pYeHqVwcAodoHP0nJlhGGhkI=",
+      "path": "assets/search-dynamic-solve-kilominx-EHAUQJXS-C1vPbLib.js",
+      "revision": "38555a2ac2a63a2230e8eb885ca02951070bfb693d6e273a3399b9f73211a2ee",
+      "integrity": "sha256-OFVaKsKmOiIw6OuIXKApUQcL+2k9bic6M5m59zIRou4=",
       "precache": true
     },
     {
-      "path": "assets/search-dynamic-solve-master_tetraminx-ZQ25QK7E-3d4CjAYH.js",
-      "revision": "06f16202a1f4d37fbcdb2a297dbae4f42ae7564233203b690b19a858abdb25af",
-      "integrity": "sha256-BvFiAqH003+82yopfbrk9CrnVkIzIDtpCxmoWKvbJa8=",
+      "path": "assets/search-dynamic-solve-master_tetraminx-ZQ25QK7E-BdHzBn-y.js",
+      "revision": "94c7e5438365c47c482cc3c9925af9730f0c5fce79c60d612af6a4a215cfec2c",
+      "integrity": "sha256-lMflQ4NlxHxILMPJklr5cw8MX855xg1hKvakohXP7Cw=",
       "precache": true
     },
     {
-      "path": "assets/search-worker-entry-DRkbDh1u.js",
-      "revision": "392f03f0f3d8b04c5612f1882af77cb14f03338689fafd9e5ef0d36afdd3704f",
-      "integrity": "sha256-OS8D8PPYsExWEvGIKvd8sU8DM4aJ+v2eXvDTav3TcE8=",
+      "path": "assets/search-worker-entry-CeRSAAei.js",
+      "revision": "3c2e4e34cb81c7cdfb0770c67f9b6d82b8f83d19eb5bb15ce95a74cb61a4f901",
+      "integrity": "sha256-PC5ONMuBx837B3DGf5ttgrj4PRnrW7Fc6Vp0y2Gk+QE=",
       "precache": true
     },
     {
@@ -206,9 +206,9 @@
       "precache": true
     },
     {
-      "path": "assets/twips-IMF5RNH5-BzMOl0oS.js",
-      "revision": "0a5f5eb48ffcb823168c4bcd62b6e616f91989e6f4a7bdbc689b4d596d1ecc66",
-      "integrity": "sha256-Cl9etI/8uCMWjEvNYrbmFvkZieb0p728aJtNWW0ezGY=",
+      "path": "assets/twips-IMF5RNH5-CXzOTcsr.js",
+      "revision": "84018df1a5c92ed5f6e67aeee649dc84038fa11d4b004d2380b374790cab0ae7",
+      "integrity": "sha256-hAGN8aXJLtX25nru5knchAOPoR1LAE0jgLN0eQyrCuc=",
       "precache": true
     },
     {
@@ -218,15 +218,15 @@
       "precache": true
     },
     {
-      "path": "assets/twisty-dynamic-3d-HSYJR5CM-CPLQtPyn.js",
-      "revision": "4a91fab47878e5922e51a94fb9212b14e236ab93a0650277ff140fdde253178e",
-      "integrity": "sha256-SpH6tHh45ZIuUalPuSErFOI2q5OgZQJ3/xQP3eJTF44=",
+      "path": "assets/twisty-dynamic-3d-HSYJR5CM-BsORPOl4.js",
+      "revision": "241b011cf020c66c197e3454eb255de389caa44c37105f1095655f122ae5fdd9",
+      "integrity": "sha256-JBsBHPAgxmwZfjRU6yVd44nKpEw3EF8QlWVfEirl/dk=",
       "precache": true
     },
     {
       "path": "index.html",
-      "revision": "1e9a339583c1c488337e5b7292fe19ccb4106426c0287dd605ffd44526b24ba3",
-      "integrity": "sha256-HpozlYPBxIgzfltykv4ZzLQQZCbAKH3WBf/URSayS6M=",
+      "revision": "910ac4f4b3dd3bdba8684c7a2162b7d75882248bcdb29fe9b0eb2bc198760117",
+      "integrity": "sha256-kQrE9LPdO9uoaEx6IWK311iCJIvNsp/psOsrwZh2ARc=",
       "precache": true
     },
     {
