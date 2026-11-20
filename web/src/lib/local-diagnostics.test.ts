@@ -21,6 +21,8 @@ test('automatic local captures save exact run data and cannot overwrite a newer 
  assert.equal((await send(payload)).status,200);
  assert.equal((await send({...payload,revision:1})).status,202);
  assert.deepEqual(JSON.parse(await readFile(join(directory,'protocol-capture-test.json'),'utf8')),payload);
+ assert.deepEqual(await (await fetch(url+'?id='+payload.id)).json(),payload);
+ assert.equal((await fetch(url+'?id=../../private')).status,400);
  const latest=JSON.parse(await readFile(join(directory,'latest.json'),'utf8'));
  assert.equal(latest.revision,2);assert.equal(latest.path,join(directory,'protocol-capture-test.json'));
 });

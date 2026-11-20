@@ -10,10 +10,12 @@
   import {timecode} from './solve-range';
   import ProjectedCube from './ProjectedCube.svelte';
 
-  let {clip,reconstruction,disabled=false}:{clip:TimerReplay;reconstruction:TimerReconstructionResult;disabled?:boolean}=$props();
-  let canvas:HTMLCanvasElement,surface:HTMLElement;
-  let position=$state(0),playing=$state(false),speed=$state<PlaybackSpeed>(1),showPose=$state(true);
+  let {clip,reconstruction,disabled=false,showRecording=true,seekRequest,onpositionchange}:{clip:TimerReplay;reconstruction:TimerReconstructionResult;disabled?:boolean;showRecording?:boolean;
+    seekRequest?:{timestamp:number;revision:number};onpositionchange?:(timestamp:number)=>void}=$props();
+  let canvas=$state<HTMLCanvasElement>(),surface:HTMLElement;
+  let position=$state(0),playing=$state(false),speed=$state<PlaybackSpeed>(1);
   let drawError=$state('');
+  const hasRecording=$derived(showRecording&&clip.frames.some(frame=>!!frame.image));
   const steps=$derived(reconstruction.result?.steps??[]);
   const solved=$derived(reconstruction.result?.status==='solved'||reconstruction.result?.status==='already_solved');
   const start=$derived(clip.frames[0]?.timestamp??clip.start);
@@ -29,6 +31,8 @@
   const pose=$derived(solved||frame<=(steps.at(-1)?.frame_index??-Infinity)?projectedCubeAtFrame(timeline,frame):undefined);
   $effect(()=>{const initial=start;untrack(()=>{playing=false;position=initial;});});
   $effect(()=>{if(disabled)playing=false;});
+  $effect(()=>{const request=seekRequest;if(request)untrack(()=>seek(request.timestamp));});
+  $effect(()=>{onpositionchange?.(position);});
   $effect(()=>{
     if(!playing)return;
     const origin=untrack(()=>position),wall=performance.now(),rate=speed,limit=end;
@@ -40,8 +44,8 @@
     animation=requestAnimationFrame(tick);return()=>cancelAnimationFrame(animation);
   });
   $effect(()=>{
-    const row=current,target=canvas,enabled=showPose,choice=step;
-    if(!target||!row)return;
+    const row=current,target=canvas,choice=step;
+    if(!target||!row||!hasRecording)return;
     let stale=false;
     void (async()=>{
       if(!row.image){drawError='Camera image unavailable for this frame';target.getContext('2d')?.clearRect(0,0,target.width,target.height);return;}
@@ -52,7 +56,7 @@
           target.width=image.width;target.height=image.height;
           const context=target.getContext('2d')!;context.drawImage(image,0,0);drawError='';
           const fitted=row.result.fittedPose;
-          if(enabled&&fitted?.pose&&!poseIsFlagged(fitted,choice?.pose_flagged)){
+          if(fitted?.pose&&!poseIsFlagged(fitted,choice?.pose_flagged)){
             context.strokeStyle='#64f6dd';context.lineWidth=Math.max(1.5,image.width/650);context.lineJoin='round';
             for(const polygon of projectedWireframe(fitted,choice?.geometry_option_index)){
               if(!polygon.length)continue;context.beginPath();context.moveTo(...polygon[0]);
@@ -74,17 +78,10 @@
 
 <svelte:window onkeydown={keydown} />
 <section bind:this={surface} class="timer-replay" aria-label="Solve replay">
-  <div class="timer-section-heading"><h3>Solve replay</h3><span>{clip.frames.length} processed frames{clip.complete?'':' · Finishing capture'}</span></div>
-  <div class="reconstruction-pair with-projection">
-    <div class="stage video-view"><canvas bind:this={canvas} aria-label="Timer replay camera frame"></canvas></div>
-    <ProjectedCube {pose} sourceTimestamp={current?.timestamp??position} timestamp={timecode(position-clip.start)} {solved}
-      {timeline} {steps} sourceFrame={frame} sourceFps={clip.clockFps} playbackSpeed={playing?speed:1} />
-  </div>
   <div class="transport"><div class="transport-actions">
     <button class="small" disabled={disabled||clip.frames.length<2} onclick={toggle}>{playing?'Pause':'Play'}</button>
     <label class="playback-speed">Speed <select aria-label="Timer replay speed" bind:value={speed} disabled={disabled}>
       {#each PLAYBACK_SPEEDS as value}<option value={value}>{value}×</option>{/each}</select></label>
-    <label class="toggle"><input type="checkbox" bind:checked={showPose} />Pose overlay</label>
   </div></div>
   <div class="scrubber"><span>{timecode(position-clip.start)}</span>
     <input type="range" aria-label="Timer replay position" min={start} max={end} step="0.001" value={position}
@@ -95,6 +92,11 @@
     <span>Frame {Math.max(0,index+1)} / {clip.frames.length}</span>
     <button class="small" aria-label="Next timer frame" disabled={disabled||index>=clip.frames.length-1} onclick={()=>advance(1)}>→</button>
     <span class="frame-key-hint">← / → to step frames</span>
+  </div>
+  <div class="reconstruction-pair" class:with-projection={hasRecording}>
+    {#if hasRecording}<div class="stage video-view"><canvas bind:this={canvas} aria-label="Timer replay camera frame"></canvas></div>{/if}
+    <ProjectedCube {pose} sourceTimestamp={current?.timestamp??position} timestamp={timecode(position-clip.start)} {solved}
+      {timeline} {steps} sourceFrame={frame} sourceFps={clip.clockFps} playbackSpeed={playing?speed:1} />
   </div>
   {#if drawError}<p class="timer-error" role="status">{drawError}</p>{/if}
 </section>

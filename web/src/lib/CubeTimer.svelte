@@ -1,14 +1,18 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { CubeTimerClock, TIMER_HOLD_MS, formatTimer, solveTime, timerAverage, readTimerSolves, compactTimerReconstruction } from './cube-timer';
+  import { CubeTimerClock, TIMER_HOLD_MS, formatTimer, solveTime, timerAverage, readTimerSolves, compactTimerReconstruction,timerReconstructionStatus,timerSessionRows } from './cube-timer';
   import type { Penalty, TimerSolve, TimerReconstructionResult } from './cube-timer';
   import ScrambleNet from './ScrambleNet.svelte';
+  import TpsGraph from './TpsGraph.svelte';
   import TimerReplay from './TimerReplay.svelte';
   import type {TimerReplay as ReplayClip} from './timer-replay';
 
-  let { active, cameraReady, reconstructions, replays={}, ondelete, onstart, onstop, onbusychange, ondownloaddiagnostics, storageKey = 'live-recognition.timer.v1' }: {
+  let { active, cameraReady, reconstructions,latestReplayPosition,onlatestseek,replays={}, replayLoading=false,replayError='',onreplayselect,ondelete,onclearsession, onstart, onstop, onbusychange, ondownloaddiagnostics, storageKey = 'live-recognition.timer.v1' }: {
     active: boolean; cameraReady: boolean; reconstructions: Record<string, TimerReconstructionResult>;
+    latestReplayPosition?:number;onlatestseek?:(id:string,timestamp:number)=>boolean;
     replays?:Record<string,ReplayClip>;ondelete?:(id:string)=>void;
+    replayLoading?:boolean;replayError?:string;onreplayselect?:(id?:string)=>void;
+    onclearsession?:(ids:string[])=>void;
     onstart: (id: string, scramble: string, clockMs: number) => void;
     onstop: (id: string, clockMs: number) => void;
     onbusychange: (busy: boolean) => void;
@@ -20,15 +24,37 @@
   let now = $state(0), elapsed = $state(0), scramble = $state('');
   let loadingScramble = $state(false), scrambleError = $state(''), storageError = $state('');
   let history = $state<TimerSolve[]>([]), mounted = $state(false), initialized = false;
-  let attempt: { id: string; scramble: string; startedAt: string } | undefined;
-  let selectedId = $state('');
+  let attempt=$state<{ id: string; scramble: string; startedAt: string }>();
+  let selectedId = $state(''), modalOpen=$state(false);
+  let solveDialog=$state<HTMLDialogElement>();
+  let replayPosition=$state<number>(),replaySeek=$state<{timestamp:number;revision:number}>();
+  let replaySeekRevision=0;
   let savedSession = '';
   const ready = $derived(phase === 'holding' && now - clock.heldAt >= TIMER_HOLD_MS);
   const locked = $derived(phase !== 'idle');
-  const canStart = $derived(cameraReady && !!scramble && !loadingScramble && active);
+  const canStart = $derived(cameraReady && !!scramble && !loadingScramble && active && !modalOpen);
   const last = $derived(history.at(-1));
-  const selected = $derived(history.find(solve => solve.id === selectedId) ?? last);
+  const selected = $derived(history.find(solve => solve.id === selectedId));
   const reconstruction = $derived(selected ? reconstructions[selected.id] ?? selected.reconstruction : undefined);
+  const latestReconstruction=$derived(attempt?reconstructions[attempt.id]:last?(reconstructions[last.id]??last.reconstruction):undefined);
+  const reconstructionState=$derived(timerReconstructionStatus(latestReconstruction));
+  const sessionRows=$derived(timerSessionRows(history));
+  const lastReconstruction=$derived(last?(reconstructions[last.id]??last.reconstruction):undefined);
+  const selectedReconstruction=$derived(reconstruction?.result?reconstruction:selected?replays[selected.id]?.reconstruction??reconstruction:undefined);
+  const selectedStart=$derived(selectedReconstruction?.config?.requested_start_seconds??(selected?replays[selected.id]?.start:undefined)??0);
+  const lastStart=$derived(lastReconstruction?.config?.requested_start_seconds??0);
+  const selectedRow=$derived(sessionRows.find(row=>row.solve.id===selectedId));
+  $effect(()=>{onreplayselect?.(active&&modalOpen?selected?.id:undefined);});
+  $effect(()=>{
+    if(!solveDialog)return;
+    if(active&&modalOpen&&selected){if(!solveDialog.open)solveDialog.showModal();}
+    else if(solveDialog.open)solveDialog.close();
+  });
+  function openSolve(id:string){if(!locked){selectedId=id;replayPosition=undefined;replaySeek=undefined;modalOpen=true;}}
+  function seekReplay(timestamp:number){replaySeek={timestamp,revision:++replaySeekRevision};}
+  function deleteSolve(id:string){
+    ondelete?.(id);history=history.filter(solve=>solve.id!==id);modalOpen=false;selectedId='';
+  }
   const best = $derived(history.length ? Math.min(...history.map(solveTime)) : undefined);
   const currentAverage5 = $derived(timerAverage(history, 5));
   const currentAverage12 = $derived(timerAverage(history, 12));
@@ -88,8 +114,8 @@
     phase = clock.phase; now = time;
   }
   function keydown(event: KeyboardEvent) {
-    if (!active) return;
-    const editable = event.target instanceof Element && !!event.target.closest('input, textarea, select, button, a, [contenteditable="true"]');
+    if (!active || modalOpen) return;
+    const editable = event.target instanceof Element && !!event.target.closest('input, textarea, select, button, a, [contenteditable="true"], [role="application"], [role="slider"], .timer-replay');
     if (clock.phase === 'running' || event.code === 'Space' && !editable && canStart) event.preventDefault();
     press(event.code, performance.now(), editable, event.repeat);
   }
@@ -98,6 +124,11 @@
   }
   function setPenalty(id: string, penalty: Penalty) {
     history = history.map(solve => solve.id === id ? { ...solve, penalty } : solve);
+  }
+  function clearSession(){
+    if(locked)return;
+    onclearsession?.(history.map(solve=>solve.id));
+    history=[];selectedId='';modalOpen=false;elapsed=0;
   }
   function downloadSession() {
     const url = URL.createObjectURL(new Blob([JSON.stringify({ version: 1, event: '333', generator: 'cubing.js',
@@ -126,67 +157,109 @@
 <svelte:window onkeydown={keydown} onkeyup={keyup} onblur={() => { clock.cancelHold(); phase = clock.phase; }} />
 
 <section class="cube-timer" aria-label="Cube timer">
-  <div class="timer-scramble">
-    <div class="timer-section-heading"><strong>3×3×3 · Random-state scramble</strong>
-      <button class="small" onclick={nextScramble} disabled={locked || loadingScramble}>{loadingScramble ? 'Generating…' : 'New scramble'}</button></div>
-    <p aria-label="Timer scramble">{scramble || (loadingScramble ? 'Generating scramble…' : 'No scramble loaded')}</p>
-    {#if scramble}<ScrambleNet {scramble} />{/if}
-    {#if scrambleError}<p class="timer-error" role="alert">{scrambleError}</p>{/if}
+  <div class="timer-primary">
+    <div class="timer-reconstruction-status" data-state={reconstructionState.kind} role="status" aria-live="polite">
+      <strong>{reconstructionState.label}</strong>
+      {#if latestReconstruction?.status === 'failed'}<span>{latestReconstruction.message} · Partial reconstruction{latestReconstruction.moves?.length ? ' retained' : ' · No moves recovered'}</span>{/if}
+    </div>
+    <div class="timer-scramble">
+      <div class="timer-scramble-text">
+        <div class="timer-section-heading"><strong>Scramble</strong>
+          <button class="small" onclick={nextScramble} disabled={locked || loadingScramble}>{loadingScramble ? 'Generating…' : 'New scramble'}</button></div>
+        <p aria-label="Timer scramble">{scramble || (loadingScramble ? 'Generating scramble…' : 'No scramble loaded')}</p>
+        {#if scrambleError}<p class="timer-error" role="alert">{scrambleError}</p>{/if}
+      </div>
+      {#if scramble}<ScrambleNet {scramble} />{/if}
+    </div>
+    <div class="timer-performance">
+    <div class="timer-face" class:timer-ready={ready} class:timer-holding={phase === 'holding' && !ready}>
+      <div>
+        <output class="timer-digits" aria-label="Solve time">{formatTimer(elapsed)}</output>
+        <p>{phase === 'running' ? 'Press any key to stop' : ready ? 'Release to start' : phase === 'holding' ? 'Keep holding…' : !cameraReady ? 'Connect a camera to begin' : 'Hold space, then release to start'}</p>
+      </div>
+      <button class="timer-touch" aria-label="Hold to start or tap to stop timer"
+        disabled={!canStart && phase !== 'running'}
+        onpointerdown={event => { if (event.button !== 0) return; event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); press('Space', performance.now()); }}
+        onpointerup={event => { event.preventDefault(); release(performance.now()); }}
+        onpointercancel={() => { clock.cancelHold(); phase = clock.phase; }}
+        onkeydown={event => { if (event.code === 'Space' || event.code === 'Enter') { event.preventDefault(); press('Space', performance.now(), false, event.repeat); } }}
+        onkeyup={event => { if (event.code === 'Space' || event.code === 'Enter') { event.preventDefault(); release(performance.now()); } }}
+      >{phase === 'running' ? 'Stop' : ready ? 'Release to start' : 'Hold to start'}</button>
+    </div>
+    <TpsGraph compact steps={lastReconstruction?.result?.steps??[]} turns={lastReconstruction?.turnEvents} moves={lastReconstruction?.moves}
+      fps={lastReconstruction?.config?.fps??1000} start={lastStart} end={lastStart+(last?.elapsedMs??0)/1000} solveSeconds={last?last.elapsedMs/1000:undefined}
+      complete={lastReconstruction?.status==='solved'} cursor={latestReplayPosition} label="Latest solve TPS"
+      onseek={timestamp=>{if(last&&!onlatestseek?.(last.id,timestamp)){openSolve(last.id);seekReplay(timestamp);}}} />
+    </div>
   </div>
-  <div class="timer-face" class:timer-ready={ready} class:timer-holding={phase === 'holding' && !ready}>
-    <p class="timer-mode">{phase === 'running' ? 'SOLVING' : ready ? 'READY' : phase === 'holding' ? 'HOLD' : 'CUBE TIMER'}</p>
-    <output class="timer-digits" aria-label="Solve time">{formatTimer(elapsed)}</output>
-    <p>{phase === 'running' ? 'Press any key to stop' : ready ? 'Release to start' : phase === 'holding' ? 'Keep holding…' : !cameraReady ? 'Connect the camera below to begin' : 'Hold space, then release to start · Any key to stop'}</p>
-    <button class="timer-touch" aria-label="Hold to start or tap to stop timer"
-      disabled={!canStart && phase !== 'running'}
-      onpointerdown={event => { if (event.button !== 0) return; event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); press('Space', performance.now()); }}
-      onpointerup={event => { event.preventDefault(); release(performance.now()); }}
-      onpointercancel={() => { clock.cancelHold(); phase = clock.phase; }}
-      onkeydown={event => { if (event.code === 'Space' || event.code === 'Enter') { event.preventDefault(); press('Space', performance.now(), false, event.repeat); } }}
-      onkeyup={event => { if (event.code === 'Space' || event.code === 'Enter') { event.preventDefault(); release(performance.now()); } }}
-    >{phase === 'running' ? 'Stop' : ready ? 'Release to start' : 'Hold to start'}</button>
-    <p class="timer-note">Automatic reconstruction · Timer start to stop + 0.3s · 10s search limit after capture</p>
-  </div>
-  <div class="timer-statistics" aria-label="Session statistics">
-    <div><span>Solves</span><strong>{history.length}</strong></div>
-    <div><span>Best</span><strong>{formatTimer(best)}</strong></div>
-    <div><span>ao5</span><strong>{formatTimer(currentAverage5)}</strong></div>
-    <div><span>ao12</span><strong>{formatTimer(currentAverage12)}</strong></div>
-  </div>
-  <div class="timer-history">
-    <div class="timer-section-heading"><h2>Session</h2><button class="small" onclick={downloadSession} disabled={!history.length || locked}>Download session</button></div>
-    {#if storageError}<p class="timer-error" role="status">{storageError}</p>{/if}
-    {#if history.length}
-      <div class="timer-history-scroll"><table><thead><tr><th>Solve</th><th>Time</th><th>Penalty</th><th>Reconstruction</th><th></th></tr></thead>
-        <tbody>{#each [...history].reverse() as solve, index (solve.id)}
-          {@const rec = reconstructions[solve.id] ?? solve.reconstruction}
-          <tr class:selected={selected?.id === solve.id}>
-            <td><button class="text-button" disabled={locked} onclick={() => selectedId = solve.id}>#{history.length - index}</button></td>
-            <td class="timer-history-time">{formatTimer(solveTime(solve))}{solve.penalty === '+2' ? '+' : ''}</td>
-            <td><select aria-label={`Penalty for solve ${history.length - index}`} value={solve.penalty} disabled={locked} onchange={event => setPenalty(solve.id, event.currentTarget.value as Penalty)}>
-              <option value="none">OK</option><option value="+2">+2</option><option value="DNF">DNF</option></select></td>
-            <td>{rec?.status ?? 'Pending'}{rec?.status === 'solved' ? ` · ${rec.moves?.length ?? 0} moves` : ''}</td>
-            <td><button class="small subtle" aria-label={`Delete solve ${history.length - index}`} disabled={locked} onclick={() => {ondelete?.(solve.id);history = history.filter(row => row.id !== solve.id);}}>Delete</button></td>
+
+  <aside class="timer-session" aria-label="Timer session">
+    <div class="timer-session-heading"><h2>Session</h2><span>{history.length} solves</span></div>
+    <div class="timer-statistics" aria-label="Session statistics">
+      <div><span>Best</span><strong>{formatTimer(best)}</strong></div>
+      <div><span>ao5</span><strong>{formatTimer(currentAverage5)}</strong></div>
+      <div><span>ao12</span><strong>{formatTimer(currentAverage12)}</strong></div>
+    </div>
+    <div class="timer-history-scroll">
+      <table aria-label="Session solves"><thead><tr><th scope="col">#</th><th scope="col">Time</th><th scope="col">ao5</th><th scope="col">ao12</th><th scope="col" aria-label="Reconstruction">✓</th></tr></thead>
+        <tbody>{#each [...sessionRows].reverse() as row (row.solve.id)}
+          {@const rec = reconstructions[row.solve.id] ?? row.solve.reconstruction}
+          <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions (The first cell has a native keyboard-accessible button that also opens this row.) -->
+          <tr class:selected={modalOpen && selectedId===row.solve.id} class:locked onclick={()=>openSolve(row.solve.id)}>
+            <td><button class="timer-row-select" disabled={locked} aria-label={`View solve ${row.number}: ${formatTimer(solveTime(row.solve))}`} onclick={event=>{event.stopPropagation();openSolve(row.solve.id);}}>{row.number}</button></td>
+            <td class="timer-history-time">{formatTimer(solveTime(row.solve))}{row.solve.penalty === '+2' ? '+' : ''}</td>
+            <td>{formatTimer(row.ao5)}</td><td>{formatTimer(row.ao12)}</td>
+            <td class="timer-reconstruction-check" title={rec?timerReconstructionStatus(rec).label:'Pending'}>
+              {#if rec?.status==='solved'}<span class="success" aria-label="Reconstruction successful">✓</span>
+              {:else if rec && !['failed','solved'].includes(rec.status)}<span aria-label="Reconstruction in progress">…</span>
+              {:else}<span aria-label={rec?'Reconstruction failed':'No reconstruction'}>—</span>{/if}
+            </td>
           </tr>
-        {/each}</tbody></table></div>
-      {#if selected}<details open class="timer-solve-details"><summary>Solve details · {formatTimer(solveTime(selected))}</summary>
-        <p><strong>Scramble</strong> {selected.scramble}</p>
-        <ScrambleNet scramble={selected.scramble} />
-        <p role="status"><strong>Reconstruction</strong> {reconstruction?.message ?? reconstruction?.status ?? 'Pending'}{reconstruction?.frames ? ` · ${reconstruction.frames} frames` : ''}</p>
-        {#if reconstruction?.result}<p class="timer-note" aria-label="Timer search progress">
-          {reconstruction.result.frames_prepared} frames prepared · {reconstruction.result.stats.furthest_frames} frames searched · {reconstruction.result.stats.evaluated_states.toLocaleString()} states
-        </p>{/if}
-        {#if reconstructions[selected.id]?.diagnosticRunId && ondownloaddiagnostics}<button class="small" disabled={locked}
-          onclick={() => ondownloaddiagnostics?.(selected.id)}>Download diagnostics</button>{/if}
-        {#if reconstruction?.moves?.length}<p><strong>{reconstruction.status === 'solved' ? 'Solution' : 'Current candidate'}</strong> {reconstruction.moves.join(' ')}</p>{/if}
-        {#if reconstruction?.config}<p class="timer-note">Source range {reconstruction.config.requested_start_seconds.toFixed(3)}–{reconstruction.config.source_end_seconds.toFixed(3)}s (includes 0.3s after stop)</p>{/if}
-        {#if replays[selected.id]&&reconstruction}
-          {#if !['solved','failed'].includes(reconstruction.status)}<p class="timer-note">Pose replay is available while reconstruction searches.</p>{/if}
-          {#key selected.id}<TimerReplay clip={replays[selected.id]} {reconstruction} disabled={locked||!active} />{/key}
-        {:else if reconstruction&&['solved','failed'].includes(reconstruction.status)}
-          <p class="timer-note">Replay is kept for solves captured in this page session.</p>
-        {/if}
-      </details>{/if}
-    {:else}<p class="muted">Your solve times, scrambles, and reconstructions will appear here.</p>{/if}
-  </div>
+        {:else}<tr><td colspan="5" class="timer-session-empty">Your solves will appear here.</td></tr>{/each}</tbody>
+      </table>
+    </div>
+    {#if storageError}<p class="timer-error" role="status">{storageError}</p>{/if}
+    <div class="timer-session-actions">
+      <button class="small" onclick={downloadSession} disabled={!history.length || locked}>Download session</button>
+      <button class="small subtle" onclick={clearSession} disabled={!history.length || locked}>Clear session</button>
+    </div>
+  </aside>
 </section>
+
+<dialog class="timer-solve-modal" bind:this={solveDialog} onclose={()=>modalOpen=false}
+  aria-labelledby="timer-solve-title" onpointerdown={event=>{
+    if(event.target!==solveDialog)return;
+    const rect=solveDialog!.getBoundingClientRect();
+    if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)solveDialog!.close();
+  }}>
+  {#if selected && modalOpen}
+    <div class="timer-modal-heading"><div><h2 id="timer-solve-title">Solve #{selectedRow?.number} · {formatTimer(solveTime(selected))}</h2>
+      <p>ao5 {formatTimer(selectedRow?.ao5)} · ao12 {formatTimer(selectedRow?.ao12)}</p></div>
+      <button class="small" onclick={()=>solveDialog?.close()}>Close</button></div>
+    <div class="timer-modal-content">
+      <div class="timer-modal-summary">
+      <div class="timer-modal-scramble"><div><h3>Scramble</h3><p>{selected.scramble}</p></div><ScrambleNet scramble={selected.scramble} /></div>
+      <div class="timer-modal-result" role="status"><strong>{reconstruction?timerReconstructionStatus(reconstruction).label:'Pending'}</strong>
+        {#if reconstruction?.message}<span>{reconstruction.message}</span>{/if}
+      </div>
+      {#if reconstruction?.moves?.length && !replays[selected.id]}<p class="timer-modal-moves"><strong>{reconstruction.status==='solved'?'Full reconstruction':'Partial reconstruction'}</strong> {reconstruction.moves.join(' ')}</p>{/if}
+      <TpsGraph compact steps={selectedReconstruction?.result?.steps??[]} turns={selectedReconstruction?.turnEvents} moves={selectedReconstruction?.moves}
+        fps={selectedReconstruction?.config?.fps??replays[selected.id]?.clockFps??1000}
+        start={selectedStart} end={selectedStart+selected.elapsedMs/1000} solveSeconds={selected.elapsedMs/1000} cursor={replayPosition}
+        complete={selectedReconstruction?.status==='solved'} label="Selected solve TPS" onseek={seekReplay} />
+      </div>
+      {#if replays[selected.id] && reconstruction}
+        {#key selected.id}<TimerReplay clip={replays[selected.id]}
+          reconstruction={selectedReconstruction??reconstruction} disabled={!active} seekRequest={replaySeek} onpositionchange={timestamp=>replayPosition=timestamp} />{/key}
+      {:else if replayLoading}<p class="timer-note">Loading projected-cube replay…</p>
+      {:else}<p class="timer-note">No projected-cube replay is available for this solve.</p>{/if}
+      {#if replayError}<p class="timer-error" role="status">{replayError}</p>{/if}
+    </div>
+    <div class="timer-modal-actions">
+      <label>Penalty <select aria-label="Solve penalty" value={selected.penalty} onchange={event=>setPenalty(selected.id,event.currentTarget.value as Penalty)}>
+        <option value="none">OK</option><option value="+2">+2</option><option value="DNF">DNF</option></select></label>
+      {#if reconstructions[selected.id]?.diagnosticRunId && ondownloaddiagnostics}<button class="small" onclick={()=>ondownloaddiagnostics?.(selected.id)}>Download diagnostics</button>{/if}
+      <button class="small subtle" onclick={()=>deleteSolve(selected.id)}>Delete solve</button>
+    </div>
+  {/if}
+</dialog>

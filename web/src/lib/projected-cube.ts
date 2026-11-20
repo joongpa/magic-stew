@@ -4,7 +4,7 @@ import { layerTransition, makeCubePose } from "./cube-motion";
 import type { CubePose } from "./cube-motion";
 import type { MoveStep } from "./move-search-types";
 import { poseIsFlagged, projectedGeometryIndex } from "./reconstruction-view";
-import type { SavedVideoResult } from "./video-result-cache";
+import type {FrameResult} from './detector';
 import turns from "../../../pose-fitter/tables/render-turns.json";
 import type { V3 } from "./cube-motion";
 import {displaySliceCommits} from './cube-display-slices';
@@ -61,7 +61,7 @@ export function projectedCubeAtFrame(rows:readonly ProjectedCubeFrame[],frame:nu
 
 /** Rejected fits never become render anchors. Bridge them using accepted
  * orientations and legal layer transitions, including commits in pose gaps. */
-export function buildProjectedCubeTimeline(rows:readonly SavedVideoResult[],colors:ColorTimeline,
+export function buildProjectedCubeTimeline(rows:readonly {timestamp:number;result:Pick<FrameResult,'fittedPose'>}[],colors:ColorTimeline,
  options:{fps:number;solved:boolean;steps:readonly MoveStep[];turningStartFrame?:number|null}):ProjectedCubeFrame[] {
  const steps=new Map(options.steps.map(step=>[step.frame_index,step]));
  const accepted:ProjectedCubeFrame[]=[];

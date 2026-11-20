@@ -1,3 +1,5 @@
+import {CAMERA_CLOCK_HZ} from '../../../pose-fitter/runtime/reconstruction-policy.mjs';
+
 /** A bounded source-time window measures delivered capture frames, independently
  * of the camera's advertised setting and delayed processing completions. */
 export class CameraFrameRate {
@@ -15,7 +17,19 @@ export interface CameraCaptureMetrics {captureFps:number;skippedFrames:number;br
 /** Saturation limits admission, never stops the consumer or evicts queued work. */
 export class CameraFrameBuffer {
   pending=0;skipped=0;
+  private lastTick=-Infinity;
   constructor(readonly capacity=60) {}
-  admit(){if(this.pending>=this.capacity){this.skipped++;return false;}this.pending++;return true;}
+  admit(timestamp?:number){
+    // Camera drivers can deliver distinct images less than one clock tick
+    // apart, or repeat/regress a timestamp. Reject them before inference;
+    // never manufacture extra elapsed time to satisfy pose/search ordering.
+    const tick=timestamp===undefined?undefined:Math.round(timestamp*CAMERA_CLOCK_HZ);
+    if(tick!==undefined&&(!Number.isFinite(tick)||tick<=this.lastTick)){
+      this.skipped++;return false;
+    }
+    if(this.pending>=this.capacity){this.skipped++;return false;}
+    if(tick!==undefined)this.lastTick=tick;
+    this.pending++;return true;
+  }
   acknowledge(){this.pending=Math.max(0,this.pending-1);}
 }

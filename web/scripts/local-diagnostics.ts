@@ -1,5 +1,5 @@
 import type {Plugin,Connect} from 'vite';
-import {mkdir,writeFile,rename} from 'node:fs/promises';
+import {mkdir,writeFile,rename,readFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {join} from 'node:path';
 /** Local dev/preview only. Save actual app inputs locally so diagnostics never need
@@ -10,8 +10,14 @@ export function localDiagnostics(directory=fileURLToPath(new URL('../../pose-fit
   function install(middlewares:Connect.Server) {
     middlewares.use('/__diagnostics/run',async(req,res)=>{
       try {
-        if(req.method!=='POST'){res.statusCode=405;res.end('POST required');return;}
         if(req.headers.origin&&new URL(req.headers.origin).host!==req.headers.host){res.statusCode=403;res.end('Same origin required');return;}
+        if(req.method==='GET'){
+          const id=new URL(req.url??'','http://localhost').searchParams.get('id');
+          if(!id||!/^[-A-Za-z0-9_:.]{10,150}$/.test(id)){res.statusCode=400;res.end('Invalid run ID');return;}
+          try{const data=await readFile(join(directory,id.replaceAll(':','_')+'.json'));res.setHeader('Content-Type','application/json');res.end(data);}
+          catch{res.statusCode=404;res.end('Saved diagnostic capture is unavailable');}return;
+        }
+        if(req.method!=='POST'){res.statusCode=405;res.end('GET or POST required');return;}
         const chunks:Buffer[]=[];let count=0;
         for await(const chunk of req){const bytes=Buffer.from(chunk);count+=bytes.length;
           if(count>64*1024*1024){res.statusCode=413;res.end('Diagnostic capture too large');return;}chunks.push(bytes);}

@@ -13,12 +13,12 @@
     pose?:CubePose;sourceTimestamp?:number;timestamp?:string;solved?:boolean;
     steps?:readonly MoveStep[];timeline?:readonly ProjectedCubeFrame[];sourceFrame?:number;sourceFps?:number;playbackSpeed?:number
   } = $props();
-  let smooth=$state(true),rendered=$state.raw<CubePose>();
-  let mode=$state<"camera"|"adjustable">("camera");
+  let rendered=$state.raw<CubePose>();
   let orientation=$state.raw<Quaternion>(CAMERA_ORIENTATION);
-  const effectiveOrientation=$derived(mode==="adjustable"?orientation:CAMERA_ORIENTATION);
-  const viewPose=$derived(rendered?reorientedCubePose(rendered,effectiveOrientation):rendered);
-  const reorientedMoves=$derived(reorientedMoveTimeline(timeline,steps,effectiveOrientation,{fps:sourceFps}));
+  const viewPose=$derived(rendered?reorientedCubePose(rendered,orientation):rendered);
+  const reorientedMoves=$derived(timeline.length
+    ? reorientedMoveTimeline(timeline,steps,orientation,{fps:sourceFps})
+    : steps.map(step=>({frame:step.frame_index,moves:step.state_moves,rotation:false})));
   const moveTokens=$derived(displayMoveTokens(reorientedMoves));
   let surface:HTMLDivElement,orbitRadius=$state(0),hoverRoll=$state(false);
   let drag=$state.raw<{pointer:number;kind:CubeDragKind;start:DragPoint;view:Quaternion;cx:number;cy:number;radius:number}>();
@@ -30,11 +30,8 @@
     const pointer=drag?.pointer;drag=undefined;hoverRoll=false;
     if(pointer!=null&&surface?.hasPointerCapture(pointer))surface.releasePointerCapture(pointer);
   }
-  function changeMode(next:"camera"|"adjustable"){
-    finishDrag();mode=next;
-  }
   function pointerDown(event:PointerEvent){
-    if(mode!=="adjustable"||!rendered||drag||event.button!==0||!event.isPrimary)return;
+    if(!rendered||drag||event.button!==0||!event.isPrimary)return;
     const rect=surface.getBoundingClientRect(),radius=Math.min(rect.width,rect.height)*.42;
     if(radius<=0)return;
     const cx=rect.left+rect.width/2,cy=rect.top+rect.height/2;
@@ -43,7 +40,6 @@
     surface.setPointerCapture(event.pointerId);surface.focus({preventScroll:true});event.preventDefault();
   }
   function pointerMove(event:PointerEvent){
-    if(mode!=="adjustable")return;
     if(!drag){
       const rect=surface.getBoundingClientRect(),radius=Math.min(rect.width,rect.height)*.42;
       hoverRoll=radius>0&&Math.hypot(event.clientX-rect.left-rect.width/2,event.clientY-rect.top-rect.height/2)>=radius*.85;
@@ -59,7 +55,7 @@
   }
   function pointerEnd(event:PointerEvent){if(event.pointerId===drag?.pointer)finishDrag();}
   function orientationKeydown(event:KeyboardEvent){
-    if(mode!=="adjustable"||!rendered||event.altKey||event.ctrlKey||event.metaKey)return;
+    if(!rendered||event.altKey||event.ctrlKey||event.metaKey)return;
     const next=nudgeCubeView(orientation,event.key,event.shiftKey);
     if(next){finishDrag(false);orientation=next;event.preventDefault();event.stopPropagation();}
   }
@@ -69,7 +65,7 @@
     try {renderer=new CubeRenderer(canvas);} catch(error){renderError=String(error);return;}
     const resize=new ResizeObserver(()=>{
       renderer?.resize();renderer?.draw(viewPose);orbitRadius=Math.min(canvas.clientWidth,canvas.clientHeight)*.42;
-    });resize.observe(canvas);
+    });resize.observe(surface);
     return ()=>{finishDrag(false);resize.disconnect();renderer?.dispose();};
   });
   $effect(()=>renderer?.draw(viewPose));
@@ -77,10 +73,10 @@
   $effect(()=>{
     // Animate in the original basis, then reorient each sampled mesh. This
     // preserves signed half-turn paths and in-flight motion when the view changes.
-    const target=pose,stamp=sourceTimestamp,enabled=smooth,duration=playbackTiming(sourceFps,playbackSpeed).transitionMs;
+    const target=pose,stamp=sourceTimestamp,duration=playbackTiming(sourceFps,playbackSpeed).transitionMs;
     const previous=untrack(()=>rendered),adjacent=lastTimestamp!=null&&Math.abs(stamp-lastTimestamp)<=0.15;
     lastTimestamp=stamp;
-    if(!enabled||!adjacent||!previous||!target){rendered=target;return;}
+    if(!adjacent||!previous||!target){rendered=target;return;}
     const transition=layerTransition(previous,target),start=performance.now();let animation=0;
     const tick=(now:number)=>{
       const progress=Math.min(1,(now-start)/duration);rendered=transition.sample(progress);
@@ -94,48 +90,41 @@
 </script>
 
 <section class="projected-cube-panel" aria-label="Projected cube">
-  <div class="projected-cube-heading"><strong>Projected cube</strong><span>{timestamp}</span></div>
-  <label class="cube-smoothing"><input type="checkbox" bind:checked={smooth} /> Smooth cube motion</label>
+  <div class="projected-cube-heading"><strong>Reconstruction</strong><span>{timestamp}</span></div>
   <div class="cube-orientation-controls">
-    <div class="cube-orientation-modes" role="group" aria-label="Cube orientation mode">
-      <button type="button" aria-pressed={mode==="camera"} onclick={()=>changeMode("camera")}>Camera orientation</button>
-      <button type="button" aria-pressed={mode==="adjustable"} onclick={()=>changeMode("adjustable")}>Adjustable</button>
+    <p id="cube-drag-help">Drag the cube to turn &amp; tilt. Drag the ring to roll.</p>
+    <div class="cube-drag-actions">
+      <span id="cube-keyboard-help">Arrow keys: turn/tilt · Q/E: roll · Shift: fine</span>
+      <button type="button" onclick={()=>{finishDrag(false);orientation=CAMERA_ORIENTATION;}}>Reset view</button>
     </div>
-    {#if mode==="adjustable"}
-      <p id="cube-drag-help">Drag the cube to turn &amp; tilt. Drag the ring to roll.</p>
-      <div class="cube-drag-actions">
-        <span id="cube-keyboard-help">Arrow keys: turn/tilt · Q/E: roll · Shift: fine</span>
-        <button type="button" onclick={()=>{finishDrag(false);orientation=CAMERA_ORIENTATION;}}>Reset to camera orientation</button>
-      </div>
-    {:else}<p>Follows the camera. Choose Adjustable to change the view.</p>{/if}
   </div>
   <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions (The 3D application surface provides keyboard controls for all three axes.) -->
-  <div bind:this={surface} class="cube-viewport" class:adjustable={mode==="adjustable"} class:dragging={!!drag}
+  <div bind:this={surface} class="cube-viewport adjustable" class:dragging={!!drag}
     class:roll-active={hoverRoll||drag?.kind==="roll"} class:empty-cube={!pose||!!renderError}
-    role="application" tabindex={mode==="adjustable"?0:-1} aria-disabled={mode!=="adjustable"||!rendered}
-    aria-label={mode==="adjustable"?"Adjust cube orientation":"Camera-oriented cube"}
-    aria-keyshortcuts={mode==="adjustable"?"ArrowUp ArrowDown ArrowLeft ArrowRight Q E":undefined}
-    aria-describedby={mode==="adjustable"?"cube-drag-help cube-keyboard-help":undefined}
+    role="application" tabindex="0" aria-disabled={!rendered}
+    aria-label="Adjust cube orientation"
+    aria-keyshortcuts="ArrowUp ArrowDown ArrowLeft ArrowRight Q E"
+    aria-describedby="cube-drag-help cube-keyboard-help"
     onpointerdown={pointerDown} onpointermove={pointerMove} onpointerup={pointerEnd} onpointercancel={pointerEnd}
     onlostpointercapture={pointerEnd} onpointerleave={()=>{if(!drag)hoverRoll=false;}} onkeydown={orientationKeydown}>
     <canvas bind:this={canvas} class="projected-cube-model" aria-label="Colored reconstructed cube"></canvas>
-    {#if mode==="adjustable"&&pose&&!renderError}
+    {#if !pose||renderError}
+      <div class="projected-cube-empty">{renderError||"No reconstructed cube state for this frame"}</div>
+    {/if}
+    {#if pose&&!renderError}
       <svg class="cube-roll-ring" aria-hidden="true"><circle cx="50%" cy="50%" r={orbitRadius} /></svg>
       <span class="cube-roll-label" style:top={`calc(50% + ${orbitRadius}px - 9px)`} aria-hidden="true">↻ Roll</span>
     {/if}
   </div>
-  {#if pose&&!renderError}
-    <p class="projected-cube-caption">{solved ? "Reconstructed sticker colors" : "Candidate sticker colors"}</p>
+  {#if steps.length || pose&&!renderError}
     <div class="cube-orientation-moves" aria-label="Moves and rotations">
-      <strong>Moves and rotations</strong>
-      <span class="cube-notation-standard" aria-label="Move notation axes: U up, F down-left, R down-right">Notation axes: U ↑ · F ↙ · R ↘</span>
+      <strong>{solved ? "Full reconstruction" : "Partial reconstruction"}</strong>
+      {#if timeline.length}<span class="cube-notation-standard" aria-label="Move notation axes: U up, F down-left, R down-right">Notation axes: U ↑ · F ↙ · R ↘</span>{/if}
       {#each moveTokens as token}
         <span class:current={token.frame===activeMoveFrame} class:future={token.frame>sourceFrame}
           title={token.rotation?"Cube rotation from tracked orientation":undefined}
           aria-current={token.frame===activeMoveFrame?"step":undefined}>{token.move}</span>
       {:else}<span>Hold</span>{/each}
     </div>
-  {:else}
-    <div class="projected-cube-empty">{renderError||"No reconstructed cube state for this frame"}</div>
   {/if}
 </section>

@@ -28,7 +28,8 @@ interface Window {
 export class TimerReconstruction {
   private windows=new Map<string,Window>();
   private cameraBackpressure=false;
-  constructor(private factory:TimerSearchFactory,private update:(id:string,value:TimerReconstructionResult)=>void) {}
+  constructor(private factory:TimerSearchFactory,private update:(id:string,value:TimerReconstructionResult)=>void,
+    private finished:(id:string)=>void=()=>{}) {}
   start(id:string,scramble:string,start:number,fps:number,diagnostics=true) {
     const config=createSearchConfig({scramble,fps,camera:true,originSeconds:start,startSeconds:start,diagnostics,bidirectional:false});
     this.windows.set(id,{id,start,config,frames:0,submitted:new Set(),closed:false,disposed:false,paused:false});
@@ -45,7 +46,7 @@ export class TimerReconstruction {
       window.deadline??=setTimeout(()=>{
         window.deadline=undefined;
         if(!window.disposed&&!window.failure&&!this.terminal(window.result))
-          this.fail(window,'Reconstruction timed out after 10 seconds');
+          this.fail(window,'Reconstruction timed out after 30 seconds');
       },TIMER_TAIL_SECONDS*1000+TIMER_SEARCH_LIMIT_MS);
     }
   }
@@ -103,6 +104,10 @@ export class TimerReconstruction {
       window.closed=true;this.fail(window,message);this.remove(window);
     }
   }
+  cancelSolve(id:string,message='Solve deleted'){
+    const window=this.windows.get(id);if(!window)return;
+    window.closed=true;this.fail(window,message);this.remove(window);this.prioritize();
+  }
   private terminal(result:MoveSearchResult|undefined){return !!result&&['solved','already_solved','exhausted','state_limit'].includes(result.status);}
   private register(window:Window,timestamp:number){
     if(window.submitted.has(timestamp))return false;
@@ -145,8 +150,10 @@ export class TimerReconstruction {
     if(window.closed){this.remove(window);this.prioritize();}
   }
   private remove(window:Window) {
+    if(window.disposed)return;
     this.clearDeadline(window);
     window.disposed=true;window.search?.dispose();this.windows.delete(window.id);
+    this.finished(window.id);
   }
   private clearDeadline(window:Window){clearTimeout(window.deadline);window.deadline=undefined;}
   private prioritize() {

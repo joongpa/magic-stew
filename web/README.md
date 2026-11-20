@@ -1,11 +1,11 @@
-# Live Recognition web detector
+# Magic Stew web detector
 
 Svelte 5 + TypeScript + Vite with both ONNX models running in a worker through
-WebGPU or WASM (CPU). This follows the native renderer's two-part flow:
+WebGPU (required by the app). This follows the native renderer's two-part flow:
 
 **640px full-frame cube detection → padded square ROI → 256px pose inference →
 pose-point ROI tracking.** The cube detector runs again after tracking loses its
-usable points. The pose input defaults to 256px, matching the search scripts; 160px and 288px are also available.
+usable points. The app fixes pose input at 256px, matching the search scripts. Other sizes and WASM inference remain available to developer benchmarks.
 
 ## Run
 
@@ -17,16 +17,17 @@ npm ci
 npm run dev
 ```
 
-Open the printed localhost URL. Choose **WebGPU (GPU)** or **WASM (CPU)** under
-**Inference backend**. Click **Try a sample
-image**, **Start camera**, or **Open file**. You can also drop an image/video on
-the viewer. Camera access requires browser permission. Use HTTPS when serving
-anywhere other than localhost. Camera, images and videos stay on the device;
-there is no server-side inference. WASM uses the dedicated CPU runtime with SIMD and up to four threads in the
-worker and does not require WebGPU. The viewer reports the actual CPU thread
-count. Threading requires cross-origin isolation; without it, CPU mode runs
-single-threaded and the viewer reports that limitation. Changing backend finishes the current
-frame, retains queued source frames, and restarts both model sessions.
+Open the printed localhost URL. The **Detector** tab accepts image/video uploads
+only, using **Upload file** or drag and drop. Camera capture is available in the
+**Cube timer** tab and requires browser permission. WebGPU and HTTPS (or localhost)
+are required. All inference runs on the device. A persistent banner on both tabs
+identifies this as a barely functional early beta.
+
+The interface keeps fitted pose overlays and smooth cube motion enabled. The
+cleanup color-error tolerance defaults to **0.08** for video and timer runs.
+The status bar shows FPS and a detection-data download. Reconstructed moves wrap
+without a scrollable inner panel. The remaining model and search controls are fixed
+internally rather than exposed as user settings.
 
 ## Cube timer (testing)
 
@@ -73,7 +74,7 @@ continue to be prepared immediately, and neither mechanism resets the frontier.
 Finding a solution leaves the camera connected; detection pauses after the tail drains. Disconnecting the camera preserves
 searches whose complete input window has already been received. Incomplete capture or failed fitting
 is reported explicitly. Keep the scrambled/solved cube visible around timer input.
-Reconstruction has a 10-second wall-clock deadline starting after the 0.3-second
+Reconstruction has a 30-second wall-clock deadline starting after the 0.3-second
 capture tail. The main thread terminates the search worker at that deadline,
 including a worker blocked inside WASM or still waiting for fits. The solve time,
 last candidate, diagnostics and pose replay remain available after a timeout.
@@ -82,11 +83,9 @@ Detection records are retained only within timed solve windows, including the
 
 During capture and tail draining, the timer displays the furthest fully processed
 camera frame, with the fitted pose drawn on that same frame by default. Once the
-tail drains, it returns to the live idle preview. **Show fitted pose** remains
-available in the timer tab; disabling overlays still shows processed frames during
-a solve.
-Its throughput row separates measured capture FPS from processing
-FPS, processing delay and skipped frames. A full buffer keeps draining at the rate
+tail drains, it returns to the live idle preview. Fitted pose overlays remain on.
+The status bar shows processing FPS, or capture FPS while the detector is idle.
+A full buffer keeps draining at the rate
 the processor can sustain: queued frames are preserved, and newly arriving frames
 are skipped until a slot is available. Capture does not stop, and no Resume action
 is needed. Browser-discarded frames are counted as well; real timestamp gaps remain
@@ -103,25 +102,38 @@ detections, model/settings and source clock, original per-frame `fittingError`,
 and the search journal if search ran. **Download diagnostics** in the solve details
 exports the same run while that page session remains open. The visible failure
 message includes the first underlying fitting error and its source timestamp.
-The Detector tab's **Record search diagnostics** setting also controls timer logs.
+Diagnostic recording is enabled internally for both tabs.
 Large diagnostic JSON is serialized in a separate worker, with one snapshot in
 flight and repeated queued saves coalesced. Ongoing search progress updates memory
 without repeatedly rewriting the full detection capture or browser-local session.
 
-The session includes +2/DNF edits, deletion, best time, ao5/ao12 (dropping best and
-worst), scramble/reconstruction details and JSON export. Times and compact results
-are retained in browser local storage; raw camera images are not stored there.
-New solves also retain compressed processed-frame snapshots in page-session memory
-for replay. Already processed frames become available immediately when the timer
-stops, with remaining solve/tail frames appended as they finish. Replay does not
-wait for reconstruction to finish or succeed. Solve details show the same `ProjectedCube` viewer used by uploads,
-including reconstructed colors, moves/rotations, smooth motion and adjustable view,
-beside the matching processed camera frame and selected pose overlay. Play/pause,
-0.25×/0.5×/1× speed, scrubbing, and frame buttons/arrow keys use the original irregular
-source timestamps. Deleting a solve releases its replay. Reloading preserves times
-and compact results but releases replay images; historical solves from before this
-feature have no camera images to replay. Snapshots are encoded asynchronously only
-inside solve windows, without waiting before search submission.
+The timer workspace keeps the scramble, clock, camera controls and session panel
+inside the desktop viewport. The fixed side panel shows a grid of solve time,
+ao5 and ao12 **as of each solve**, with a checkmark for successful reconstruction.
+Long histories scroll inside that panel. The camera panel also shows the latest projected-cube replay beside the live feed, with playback, speed, scrubbing and frame-step controls. This panel can extend below the viewport; the session panel stays sticky while scrolling.
+Selecting any row opens a native modal dialog with that solve's scramble,
+reconstruction status/moves, projected-cube replay, penalty and deletion controls.
+The modal traps focus, closes with Escape, and prevents timer shortcuts while open.
+
+Times and compact reconstruction summaries remain in local storage. Completed
+projected-cube replays are saved in IndexedDB with compact geometry and original
+source timestamps. Camera images are **never saved** in IndexedDB: only the latest
+solve keeps its processed camera snapshots in memory until the next solve starts
+or the page closes. Old image-bearing replays are migrated to geometry-only
+records without losing their projected replay. Late image encodes from an earlier
+solve cannot restore its footage. Historical solves predating replay storage have
+no projected replay available.
+
+Processed frames become available as soon as the timer stops, with tail frames
+appended as they finish; replay does not wait for successful reconstruction.
+Older solves replay the projected cube alone. The latest solve can show the cube
+beside its matching camera frame. Play/pause, speed, scrubbing, frame stepping and
+adjustable view/reset stay in the modal. No new camera input is needed to replay a
+solve. Selecting another solve loads only that saved geometry on demand.
+Diagnostic captures are saved before working detection records and pose banks are
+released. Deleting a solve removes its saved replay; **Clear session** cancels
+outstanding searches and removes history and replays. Local diagnostic files
+remain in the results directory.
 
 This initial version has no inspection countdown or hardware timer input.
 The existing Detector tab retains file reconstruction.
@@ -138,7 +150,8 @@ clock; the 30fps selector establishes its origin at the first included frame.
 The first pass has no pause/resume button or playback scrubber. Those controls
 appear after the selected frames have finished and move search reaches a terminal
 status. Clear/replacing the source still cancels the run. When complete, the
-projected cube appears automatically in an enlarged panel beside the video.
+projected cube appears automatically in an enlarged panel beside the video,
+and playback returns paused to the first frame of the selected range.
 The panel renders full reconstructed sticker colors from the applied scramble
 and recovered moves. It stays synchronized during cached playback and scrubbing.
 Its camera, cube origin and scale are fixed: only the selected fit's rotation,
@@ -148,7 +161,7 @@ The frame counter shows the saved-frame ordinal and the zero-based source frame.
 After reconstruction, Left/Right or the previous/next buttons pause playback and
 step one saved result (two source frames for a 60fps source sampled at 30fps).
 Keyboard shortcuts leave text fields and other editing controls alone.
-**Smooth cube motion** eases rotations and turns over 100ms at the screen's refresh
+Cube motion always eases rotations and turns over 100ms at the screen's refresh
 rate with `requestAnimationFrame`, independently of detector/video frame cadence.
 When a new target arrives, the previous ease curve is cut off immediately and
 the new curve starts from the currently displayed pose; curves never queue up.
@@ -157,7 +170,7 @@ center and solid body on a slab uses the same transform. Committed moves rebase
 the shared angles, preserving continuity through quarter-turn resets and reverse
 scrubbing. Perpendicular turns meet at an aligned cube before the next axis moves;
 there are no per-sticker motion paths. Distant seeks snap to their frame; adjacent steps ease to
-the exact saved state. Disable smoothing for immediate frame inspection. The video
+the exact saved state. The video
 and its wireframe always show the exact selected frame without this easing.
 The video retains its separate wireframe overlay. Its mesh uses the geometry selected by
 search for that frame, including the reserved sixth flat fit; all six meshes
@@ -186,7 +199,7 @@ engine preserves the CPU scorer used by
 54-byte cube states, directional 26m color-confusion costs, unique-sticker duplicate
 semantics, balanced geometry/color ranks, geometry contexts, eight-frame mismatch
 history, dominance, sibling ties, sparse branching and deferred widening. There
-is one shared **40 TPS** move limit; cube rotation remains at **20 TPS**.
+is a **54 TPS** move limit for Detector uploads and **40 TPS** for the timer; cube rotation remains at **20 TPS**.
 No double-turn witness/classification is used. Saved runs retain their recorded
 TPS setting for diagnostic replay.
 The browser defaults to width 3, sparse threshold 3 and a 1,000,000-state budget.
@@ -212,11 +225,11 @@ frames wake the frontier. Waiting does not count as exhaustion or consume search
 expansions. End-of-input is explicit. Search has no dependency on Svelte, video
 pixels or OpenCV. Shared cube/permutation conventions are embedded in the module.
 
-Progress displays prepared/searched frames and expanded states. Unfinished paths
-are labeled **Current candidate**, and only a verified solved state is labeled
-**Solution**. Downloads include `moveSearches`, its configuration/source range,
-chosen geometry indices, moves, state/queue scores and computation timings.
-State-limit/exhausted results are explicit, not presented as solved.
+A buffering indicator covers the video during reconstruction. Uploaded-video
+search has a 30-second deadline after input finishes. Full reconstructions are
+labeled **Full reconstruction**. Timeouts, exhausted searches and state limits
+show **Reconstruction failed** while retaining the **Partial reconstruction**
+and its moves for review.
 
 The standalone checks in [the fitter/search documentation](../pose-fitter/README.md)
 compare both native Rust and WASM with Python on identical saved banks. A streaming
@@ -470,6 +483,29 @@ bitmaps, decoders and camera tracks. Pausing retains at most one prepared video
 frame and stops camera admission; resuming drains admitted camera frames first. No
 CPU-only session is automatically substituted when WebGPU is unavailable.
 
+## TPS graphs
+
+The Detector shows an interactive TPS graph below the completed video panel.
+The timer shows the last solve's graph beside the clock and a graph in each solve
+modal. Hover or use arrow keys to inspect source time/TPS; click or press Enter
+to seek the matching replay frame. On the timer workspace, the latest graph seeks the replay beside the camera; historical graphs seek their modal replay. TPS values, curves and summary statistics appear only for full successful reconstructions; pending, failed and partial results show a placeholder.
+
+The curve sums normalized Gaussian impulses with a fixed **0.2-second standard
+deviation**, matching the earlier solve plots. Counting uses HTM: half turns count
+once; consecutive identical quarter-turn commits merge into a half turn at their
+midpoint. Inverses remain separate, wide/slice turns count once, and cube rotations
+are excluded. Raw source timestamps remain unchanged by playback speed or view.
+
+Under each graph, **Solve time**, **Total moves**, and **Avg. TPS** summarize the
+solve rather than the clip. Uploaded solve time runs from the first original
+move commit to the last, excluding lead-in/hold footage and the clip tail; it is
+unavailable when the recording has only one distinct move timestamp. Timer graphs
+use actual unpenalized timer duration, excluding the 0.3-second capture tail.
+Average TPS is counted HTM moves divided by that duration. New compact session
+summaries retain the small timed-turn list so curves survive reloads without
+retaining camera images or fit banks. Legacy summaries lacking timestamps show
+known totals with a clear unavailable-curve message.
+
 ## Detection records
 
 All processed camera/video source frames and evaluated still images retain their
@@ -479,22 +515,25 @@ state and worker timings. Records include source identity, source timestamp, see
 segment, inference backend and the settings actually applied to that frame.
 Switching or clearing the media does not discard earlier records in the tab.
 
-Use **Download detection data** to save `cube-detections.json`. The export includes the model manifest/class mapping and labels
-the pose object score, keypoint-presence score and separate cube bbox score
-explicitly. Results are retained by reference without per-frame JSON serialization
-or point copying; JSON is produced only when downloading. Records are held in
-memory for this tab and do not survive a reload unless downloaded.
+Use **Download detection data** to save `cube-detections.json`. Both this download
+and the timer's diagnostic download use the compact `replay-inputs` format. They
+include raw coordinates, separate pose object/class and keypoint-presence scores,
+the separate cube bbox score, source timestamps/segments, ROI/transform data,
+detector settings, model hashes/manifest, runtime asset identities, fitting
+configuration, complete run settings, errors, a small result summary, and the
+operation journal needed to reproduce frame-admission and expansion order.
+Fitted geometry banks, meshes, search frontiers and redundant state paths are
+omitted; fresh fitting and deterministic search regenerate them. Export waits
+for source/runtime fingerprints to finish. Local automatic captures retain their
+existing detailed format for development. Camera records are retained only for
+solve windows; after a solve is released from working memory, its diagnostic
+download reads the saved local capture.
 
-The app implements detection and ROI tracking. It does not yet port the native
-renderer’s geometry recovery, orientation, move search or solve reconstruction.
 The explicit area/linear kernels agree with the OpenCV pixel fixtures within one
-8-bit level. Native-tensor fixtures match displayed detections and ROI updates
-at both 160px and 256px. Browser video decoding and floating-point execution can
-still produce small differences near thresholds; these are not bit-exact
-end-to-end guarantees. To compare with the independent search command using only
-`--roi-padding 0.4`, select **256 × 256 · Search script** and keep default thresholds.
-The app starts at 256px; 160px remains available as the faster option. Camera capture now requests
-640×480 at up to 30fps, matching the renderer defaults.
+8-bit level. Browser video decoding and floating-point execution can still
+produce small differences near thresholds; these are not bit-exact end-to-end
+guarantees. The app uses 256px pose input and requests camera capture at 640×480
+and up to 30fps.
 
 ## Scores
 
@@ -768,3 +807,8 @@ Normal Svelte app playback of the same clip finished with displayed rates of
 both runs. Last-frame worker times were 24.6ms and 33.1ms respectively. These UI
 runs include pacing and Svelte/overlay/rendering work that the uncapped developer
 benchmark does not reproduce exactly; 256px is improved but not locked to 30fps.
+
+`/tests/timer-session.html` is an isolated development fixture with a 40-solve
+history, per-solve averages, success checkmarks, historical cube-only replay and
+latest-solve camera replay. It uses a separate storage key and sample images;
+it never requests camera permission or changes the normal timer session.

@@ -1,6 +1,6 @@
 import type { FrameResult } from "./detector";
 import type { FittedPose } from "./pose-types";
-import type { MoveSearchConfig,MoveSearchResult } from "./move-search-types";
+import { RECONSTRUCTION_TIMEOUT_MS, type MoveSearchConfig, type MoveSearchResult } from "./move-search-types";
 import {videoFrameIdentity} from '../../../pose-fitter/runtime/reconstruction-policy.mjs';
 import type {SearchAction} from '../../../pose-fitter/runtime/incremental-search.mjs';
 import {ParallelMoveSearch} from './parallel-move-search';
@@ -13,6 +13,8 @@ export class MoveSearch {
   private worker:Worker|ParallelMoveSearch;private sequence=0;private seen=new Set<number>();private lastSequence=-1;
   private pending=new Set<Promise<void>>();private closed=false;private ended=false;private endRequested=false;
   private solutionFound=false;
+  private deadline:ReturnType<typeof setTimeout>|undefined;
+  private terminal=false;
   get solved(){return this.solutionFound;}
   constructor(baseUrl:string,readonly config:MoveSearchConfig,onResult:(value:MoveSearchResult,ended:boolean)=>void,onError:(message:string)=>void,private video=false){
     this.onError=onError;
@@ -20,6 +22,9 @@ export class MoveSearch {
     this.worker.onmessage=({data})=>{
       if(this.closed)return;
       if(data.type==="result"){
+        if(["solved","already_solved","exhausted","state_limit"].includes(data.result.status)){
+          this.terminal=true;clearTimeout(this.deadline);this.deadline=undefined;
+        }
         if(data.result.status==="solved"||data.result.status==="already_solved")this.solutionFound=true;
         if(this.config.diagnostics!==false)this.actions.push(...(data.actions??[]));onResult(data.result,!!data.ended);
       }
@@ -51,7 +56,15 @@ export class MoveSearch {
   }
   async end(){
     if(this.closed||this.ended)return;this.endRequested=true;
+    this.startDeadline();
     if(!this.solutionFound)await Promise.all([...this.pending]);this.maybeEnd();
+  }
+  startDeadline(){
+    // Keep the deadline on the UI thread so a blocked worker or fitting promise
+    // cannot prevent termination. Repeated closure attempts keep the same limit.
+    if(this.video&&!this.closed&&!this.terminal&&this.deadline===undefined)this.deadline=setTimeout(()=>{
+      this.dispose();this.onError("Reconstruction timed out after 30 seconds");
+    },RECONSTRUCTION_TIMEOUT_MS);
   }
   private maybeEnd(){
     if(!this.closed&&!this.ended&&this.endRequested&&
@@ -59,7 +72,7 @@ export class MoveSearch {
       this.ended=true;this.worker.postMessage({type:"end"});
     }
   }
-  dispose(){this.closed=true;this.worker.terminate();}
+  dispose(){clearTimeout(this.deadline);this.deadline=undefined;this.closed=true;this.worker.terminate();}
   pause(){if(!this.closed)this.worker.postMessage({type:'pause'});}
   resume(){if(!this.closed)this.worker.postMessage({type:'resume'});}
   setPacing(delayMs:number){if(!this.closed)this.worker.postMessage({type:'pace',delayMs});}

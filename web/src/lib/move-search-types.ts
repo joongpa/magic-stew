@@ -1,3 +1,4 @@
+export const RECONSTRUCTION_TIMEOUT_MS = 30_000;
 export type {SearchConfig as MoveSearchConfig} from '../../../pose-fitter/runtime/reconstruction-policy.mjs';
 export interface MoveStep {
   postprocessed?:boolean;

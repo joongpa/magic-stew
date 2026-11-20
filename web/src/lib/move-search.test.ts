@@ -31,10 +31,10 @@ test('timer deadline terminates the worker directly without waiting for a stuck 
  const pipeline=new TimerReconstruction((config,onResult,onError)=>new MoveSearch('http://localhost/',config,onResult,onError),(_id,value)=>updates.push(value));
  pipeline.start('a','R',0,30);pipeline.submit(0,frame,new Promise<FittedPose>(()=>{}));
  const worker=WorkerStub.instances.at(-1)!;
- pipeline.stop('a',1);clock.tick(10_300);
+ pipeline.stop('a',1);clock.tick(30_300);
  assert.equal(worker.terminated,true);
  assert.equal(worker.messages.some(message=>message.type==='end'),false,'termination works without an input-close acknowledgement');
- assert.equal(updates.at(-1).message,'Reconstruction timed out after 10 seconds');pipeline.cancel();
+ assert.equal(updates.at(-1).message,'Reconstruction timed out after 30 seconds');pipeline.cancel();
 });
 function gate(){let resolve!:(pose:FittedPose)=>void;const promise=new Promise<FittedPose>(r=>{resolve=r;});return{promise,resolve};}
 test("completed future poses are prepared immediately with their original sequence",async t=>{
@@ -191,4 +191,39 @@ test('timer forward search prepares fitting promises immediately, independently 
  assert.equal(worker.messages.some(m=>m.type==='end'),false);
  pipeline.accept(11.299,{...frame,fittedPose:pose});pipeline.accept(11.3,{...frame,fittedPose:pose});
  await tick();assert.equal(worker.messages.at(-1).type,'end');
+});
+
+test('uploaded video times out after 30 seconds, retaining the last partial result and ignoring late replies', async t=>{
+ setup(t);const clock=fakeTimers(t),received:any[]=[],errors:string[]=[];
+ const search=new MoveSearch('http://localhost/',config,value=>received.push(value),message=>errors.push(message),true);
+ const worker=WorkerStub.instances.at(-1)!;
+ const partial={status:'running',steps:[{frame_index:0,state_moves:['R']}]};
+ search.submit(0,frame,Promise.resolve(pose));await search.end();
+ worker.onmessage({data:{type:'result',result:partial}});
+ clock.tick(29_999);assert.equal(worker.terminated,false);
+ await search.end(); // Repeated input closure must not extend the deadline.
+ clock.tick(1);assert.equal(worker.terminated,true);
+ assert.deepEqual(errors,['Reconstruction timed out after 30 seconds']);
+ assert.deepEqual(received,[partial]);
+ worker.onmessage({data:{type:'result',result:{status:'solved',steps:[]}}});
+ assert.deepEqual(received,[partial]);
+});
+
+test('video deadline also terminates a search blocked by an unresolved fitting promise',t=>{
+ const {search,worker,errors}=setup(t),clock=fakeTimers(t);
+ search.submit(0,frame,new Promise<FittedPose>(()=>{}));void search.end();
+ clock.tick(30_000);
+ assert.equal(worker.terminated,true);assert.equal(errors.length,1);
+ assert.equal(worker.messages.some(message=>message.type==='end'),false);
+});
+
+test('terminal video results and source replacement clear the deadline',async t=>{
+ setup(t);const clock=fakeTimers(t),errors:string[]=[];
+ for(const status of ['solved','already_solved','exhausted','state_limit','replaced']){
+  const search=new MoveSearch('http://localhost/',config,()=>{},message=>errors.push(message),true);
+  const worker=WorkerStub.instances.at(-1)!;await search.end();
+  if(status==='replaced')search.dispose();
+  else worker.onmessage({data:{type:'result',result:{status,steps:[]}}});
+  clock.tick(30_001);assert.deepEqual(errors,[]);search.dispose();
+ }
 });

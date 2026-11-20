@@ -19,11 +19,13 @@ export interface RecordingContext {
 export class DetectionRecording {
   private readonly startedAt = new Date().toISOString();
   private revision=0;
+  private nextFrame=0;
+  private nextRun=0;
   private readonly sources = new Map<
     number,
     { id: number; name: string; kind: string; fps: number }
   >();
-  private readonly frames: {
+  private readonly frames = new Map<number,{
     sequence: number;
     sourceId: number;
     segment: number;
@@ -32,7 +34,7 @@ export class DetectionRecording {
     settings: Settings;
     result: FrameResult;
     runId?:string;
-  }[] = [];
+  }>();
   private readonly searches = new Map<number,{sourceId:number;config:MoveSearchConfig;result:MoveSearchResult}>();
   private readonly runs=new Map<string,{id:string;sourceId:number;config:MoveSearchConfig;metadata:RunMetadata;
     result?:MoveSearchResult;error?:string;actions:SearchAction[];frameSequences:number[]}>();
@@ -45,34 +47,42 @@ export class DetectionRecording {
     this.files.set(sourceId,pending);void pending.catch(()=>{});
   }
   startRun(sourceId:number,config:MoveSearchConfig,metadata:RunMetadata) {
-    const id=`${this.startedAt}-${sourceId}-${this.runs.size}`;
+    const id=`${this.startedAt}-${sourceId}-${this.nextRun++}`;
     this.runs.set(id,{id,sourceId,config:structuredClone(config),metadata:structuredClone(metadata),actions:[],frameSequences:[]});return id;
   }
   updateRunConfig(id:string,config:MoveSearchConfig) {
     const run=this.runs.get(id);if(run){run.config=structuredClone(config);this.revision++;}
   }
   linkFrame(id:string,sequence:number) {
-    const run=this.runs.get(id),frame=this.frames[sequence];
+    const run=this.runs.get(id),frame=this.frames.get(sequence);
     if(!run)return;
     if(!frame||frame.sourceId!==run.sourceId)throw Error('Run references an absent/different source frame');
     if(!run.frameSequences.includes(sequence)){run.frameSequences.push(sequence);this.revision++;}
   }
   linkCachedFrame(id:string,timestamp:number,result:FrameResult) {
     const run=this.runs.get(id);if(!run)return;
-    const sequence=this.frames.findIndex(row=>row.sourceId===run.sourceId&&row.result===result&&Math.abs(row.timestampSeconds-timestamp)<0.00001);
-    if(sequence<0)throw Error('Cached reconstruction frame lacks its original raw detection record');
-    this.linkFrame(id,sequence);
+    const frame=[...this.frames.values()].find(row=>row.sourceId===run.sourceId&&row.result===result&&Math.abs(row.timestampSeconds-timestamp)<0.00001);
+    if(!frame)throw Error('Cached reconstruction frame lacks its original raw detection record');
+    this.linkFrame(id,frame.sequence);
   }
   setFingerprints(id:string,fingerprints:Promise<NonNullable<RunMetadata['fingerprints']>>) {
     const pending=(async()=>{const run=this.runs.get(id);
       if(run){run.metadata.fingerprints=await fingerprints;run.metadata.source=await this.files.get(run.sourceId);}
     })();this.readiness.set(id,pending);return pending;
   }
+  readyAll(){return Promise.all([...this.readiness.values()]);}
   ready(id:string){return this.readiness.get(id)??Promise.resolve();}
   diagnosticsEnabled(id:string){return this.runs.get(id)?.config.diagnostics!==false;}
+  frameForRun(id:string|undefined,sourceFrame:number){
+    const run=id?this.runs.get(id):undefined;if(!run)return;
+    for(const sequence of run.frameSequences){
+      const row=this.frames.get(sequence);
+      if(row?.result.fittedPose?.sourceFrame===sourceFrame)return {timestamp:row.timestampSeconds,result:row.result};
+    }
+  }
   exportRun(id:string) {
     const run=this.runs.get(id);if(!run)throw Error('Unknown reconstruction run');
-    const all=this.toJSON(),frames=run.frameSequences.map(sequence=>all.frames[sequence]);
+    const all=this.toJSON(),frames=run.frameSequences.map(sequence=>this.frames.get(sequence)!);
     return {...all,sources:all.sources.filter(source=>source.id===run.sourceId),frames,
       runs:[{...run,frameSequences:frames.map((_,index)=>index)}],
       moveSearches:run.result?[{sourceId:run.sourceId,config:run.config,result:run.result}]:[]};
@@ -87,7 +97,20 @@ export class DetectionRecording {
   }
 
   get length() {
-    return this.frames.length;
+    return this.frames.size;
+  }
+
+  /** Call only after the complete diagnostic capture has been saved. Stable
+   * sequence IDs keep other in-flight solves and shared video frames valid. */
+  releaseRun(id:string){
+    const run=this.runs.get(id);if(!run)return;
+    this.runs.delete(id);this.readiness.delete(id);
+    const shared=new Set([...this.runs.values()].flatMap(value=>value.frameSequences));
+    for(const sequence of run.frameSequences)if(!shared.has(sequence))this.frames.delete(sequence);
+    if(this.searches.get(run.sourceId)?.result===run.result)this.searches.delete(run.sourceId);
+    if(![...this.frames.values()].some(frame=>frame.sourceId===run.sourceId)&&
+      ![...this.runs.values()].some(value=>value.sourceId===run.sourceId))this.sources.delete(run.sourceId);
+    this.revision++;
   }
 
   append(result: FrameResult, context: RecordingContext) {
@@ -99,8 +122,9 @@ export class DetectionRecording {
         kind: context.sourceKind,
         fps: context.sourceFps,
       });
-    this.frames.push({
-      sequence: this.frames.length,
+    const sequence=this.nextFrame++;
+    this.frames.set(sequence,{
+      sequence,
       sourceId: context.sourceId,
       segment: context.segment,
       timestampSeconds: context.timestampSeconds,
@@ -109,11 +133,12 @@ export class DetectionRecording {
       result,
       runId:context.runId,
     });
-    if(context.runId)this.runs.get(context.runId)?.frameSequences.push(this.frames.length-1);
-    return this.frames.length-1;
+    if(context.runId)this.runs.get(context.runId)?.frameSequences.push(sequence);
+    return sequence;
   }
 
   toJSON() {
+    const frames=[...this.frames.values()],indices=new Map(frames.map((frame,index)=>[frame.sequence,index]));
     return {
       version: 2,
       revision:this.revision,
@@ -159,9 +184,9 @@ export class DetectionRecording {
         "result.fittedPose.bank[].flat_fallback": "Reserved zero-angle option outside the five assignment-distinct slots",
       },
       sources: [...this.sources.values()],
-      frames: this.frames,
+      frames,
       moveSearches: [...this.searches.values()],
-      runs:[...this.runs.values()],
+      runs:[...this.runs.values()].map(run=>({...run,frameSequences:run.frameSequences.map(sequence=>indices.get(sequence)!)})),
     };
   }
 }

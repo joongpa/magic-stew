@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { CubeTimerClock, formatTimer, timerAverage, readTimerSolves, solveTime, compactTimerReconstruction } from './cube-timer';
+import { CubeTimerClock, formatTimer, timerAverage, readTimerSolves, solveTime, compactTimerReconstruction, timerSessionRows } from './cube-timer';
 import type { TimerSolve } from './cube-timer';
 const solve = (elapsedMs: number, penalty: TimerSolve['penalty'] = 'none'): TimerSolve =>
   ({ id: String(elapsedMs), scramble: 'R U', elapsedMs, penalty, startedAt: '2026-11-19' });
@@ -46,4 +46,18 @@ test('search progress does not change the persisted session until a lifecycle or
  const later=compactTimerReconstruction({status:'searching',frames:100,moves:['R','U','R']});
  assert.equal(JSON.stringify(first),JSON.stringify(later));
  assert.deepEqual(compactTimerReconstruction({status:'solved',moves:['R','U']})?.moves,['R','U']);
+});
+
+test('session grid averages use only solves up to that row and follow penalty edits',()=>{
+ const history=Array.from({length:14},(_,i)=>({...solve((i+1)*1000),id:String(i)}));
+ const rows=timerSessionRows(history);
+ assert.equal(rows[3].ao5,undefined);assert.equal(rows[4].ao5,3000);
+ assert.equal(rows[4].ao12,undefined);assert.equal(rows[11].ao12,6500);
+ assert.equal(rows[12].ao5,11000);assert.equal(rows[12].ao12,7500);
+ assert.equal(rows[13].number,14);assert.equal(rows[13].solve,history[13]);
+ const changed=timerSessionRows(history.map((row,i)=>i===2?{...row,penalty:'+2' as const}:row));
+ assert.equal(changed[4].ao5,11000/3);
+ assert.equal(changed[13].ao5,rows[13].ao5,'old penalties do not affect later windows');
+ const dnfs=timerSessionRows(history.map((row,i)=>i===3||i===4?{...row,penalty:'DNF' as const}:row));
+ assert.equal(dnfs[4].ao5,Infinity);assert.equal(dnfs[13].ao5,rows[13].ao5);
 });

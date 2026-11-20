@@ -75,7 +75,7 @@ scope.onmessage = async ({ data }) => {
             skippedFrames:buffer.skipped,browserSkippedFrames:processor?.discardedFrames??0}});}
           continue;
         }
-        if(!buffer.admit()){
+        if(!buffer.admit(timestamp)){
           if(timestamp-lastStats>=.5){lastStats=timestamp;scope.postMessage({type:'stats',metrics:{captureFps,
             skippedFrames:buffer.skipped,browserSkippedFrames:processor?.discardedFrames??0}});}
           continue;

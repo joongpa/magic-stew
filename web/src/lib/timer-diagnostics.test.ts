@@ -104,3 +104,21 @@ test('input-end acknowledgements on ongoing search reports do not rewrite the fu
  diagnostics.update('first',{status:'failed',message:'Search state limit'});
  assert.equal(saved.length,before+1);
 });
+test('final diagnostics finish saving before captured detection and pose records are released',async()=>{
+ const recording=new DetectionRecording();let final=false,release!:()=>void;
+ const diagnostics=new TimerDiagnostics(recording,async()=>{if(final)await new Promise<void>(resolve=>{release=resolve;});});
+ const config={scramble:'R U',fps:1000,max_tps:54} as any;
+ diagnostics.start('a',4,config,metadata);diagnostics.frame('a',recording.append(fitted,context));
+ final=true;const done=diagnostics.finish('a');assert.equal(recording.length,1);assert.equal(diagnostics.released('a'),false);
+ release();await done;assert.equal(recording.length,0);assert.equal(diagnostics.released('a'),true);
+ await diagnostics.finish('a');assert.equal(recording.length,0);
+});
+test('a failed final save reports the failure and still releases working frames',async()=>{
+ const recording=new DetectionRecording();let fail=false;
+ const diagnostics=new TimerDiagnostics(recording,async()=>!fail);
+ diagnostics.start('a',4,{scramble:'R U',fps:1000,max_tps:54} as any,metadata);
+ diagnostics.frame('a',recording.append(fitted,context));fail=true;
+ await assert.rejects(diagnostics.finish('a'),/working frames were released/);
+ assert.equal(recording.length,0);assert.equal(diagnostics.released('a'),true);
+ await diagnostics.forget('a');assert.equal(diagnostics.runId('a'),undefined);
+});

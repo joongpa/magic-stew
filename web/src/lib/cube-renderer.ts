@@ -64,11 +64,16 @@ export class CubeRenderer {
   this.resize();
  }
  resize(){
-  const width=Math.max(1,Math.round(this.canvas.clientWidth*(window.devicePixelRatio||1))),height=Math.max(1,Math.round(this.canvas.clientHeight*(window.devicePixelRatio||1)));
+  const cssWidth=this.canvas.clientWidth,cssHeight=this.canvas.clientHeight;
+  // Hidden panels have no layout size. Keep their last valid buffer rather
+  // than replacing it with a square that can distort the first visible draw.
+  if(cssWidth<=0||cssHeight<=0)return;
+  const width=Math.max(1,Math.round(cssWidth*(window.devicePixelRatio||1))),height=Math.max(1,Math.round(cssHeight*(window.devicePixelRatio||1)));
   if(this.canvas.width!==width||this.canvas.height!==height){this.canvas.width=width;this.canvas.height=height;}
   this.gl.viewport(0,0,width,height);
  }
  draw(pose?:CubePose){
+  this.resize();
   const gl=this.gl;gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);if(!pose)return;
   const values:number[]=[];
   for(const quad of cubeMesh(pose))for(const index of [0,1,2,0,2,3])values.push(...quad.points[index],...quad.color);

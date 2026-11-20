@@ -118,3 +118,27 @@ test('run exports isolate sources and preserve cached raw-frame links without ca
  assert.equal(saved.runs[0].id,restarted);
  assert.equal(saved.frames[0].result.detections[0].score,.9);
 });
+
+test('releasing a saved run frees its frames and search data while preserving stable IDs for active runs',()=>{
+ const recording=new DetectionRecording(),config=createSearchConfig({scramble:'R U'});
+ const metadata={policyVersion:1,appOrigin:'http://localhost',poseWorkers:1,admissionCapacity:12,
+  detector:{poseSize:256,backend:'webgpu',preprocessing:'gpu',settings:context.settings}};
+ const first=recording.startRun(1,config,metadata),second=recording.startRun(1,config,metadata);
+ const a=recording.append(frame(.9),context),b=recording.append(frame(.8),context);
+ recording.linkFrame(first,a);recording.linkFrame(second,b);recording.releaseRun(first);
+ assert.equal(recording.length,1);assert.equal(recording.exportRun(second).frames[0].sequence,b);
+ const c=recording.append(frame(.7),context);recording.linkFrame(second,c);
+ assert.equal(c,2,'released IDs are never reused');
+ assert.deepEqual(recording.exportRun(second).frames.map(row=>row.sequence),[b,c]);
+ assert.deepEqual(recording.toJSON().runs[0].frameSequences,[0,1]);
+ recording.releaseRun(second);assert.equal(recording.length,0);
+ assert.deepEqual(recording.toJSON().runs,[]);assert.deepEqual(recording.toJSON().sources,[]);
+ assert.notEqual(recording.startRun(1,config,metadata),first);
+});
+test('releasing one run preserves raw frames shared by another run',()=>{
+ const recording=new DetectionRecording(),config=createSearchConfig({scramble:'R U'}),metadata={} as any;
+ const first=recording.startRun(1,config,metadata),second=recording.startRun(1,config,metadata);
+ const sequence=recording.append(frame(.9),context);recording.linkFrame(first,sequence);recording.linkFrame(second,sequence);
+ recording.releaseRun(first);assert.equal(recording.length,1);assert.equal(recording.exportRun(second).frames.length,1);
+ recording.releaseRun(second);assert.equal(recording.length,0);
+});

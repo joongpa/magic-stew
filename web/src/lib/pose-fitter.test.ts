@@ -3,6 +3,8 @@ import test from "node:test";
 import { PoseFitter, pipelineFrame, poseObservations } from "./pose-fitter";
 import type { FrameResult } from "./detector";
 import cameraTiming from './fixtures/camera-timer-timestamps.json';
+import cameraCollision from './fixtures/camera-clock-collision.json';
+import {CameraFrameBuffer} from './camera-metrics';
 
 test("pose fitting receives source coordinates and already-filtered object classes", () => {
   const frame = {
@@ -57,4 +59,32 @@ test("CPU pipeline gets ROI pixel scale, source frame number, colors and presenc
   assert.deepEqual(input.landmark_presence, [0.98]);
   assert.deepEqual(input.colors, ["orange"]);
   assert.deepEqual(input.observations.stickers, [[40, 50]]);
+});
+
+test('the 203-frame failed camera solve fits through the end after source admission filters the clock collision',async()=>{
+  const admitted:number[]=[],buffer=new CameraFrameBuffer();
+  const pool={dispose(){},async execute(job:Record<string,any>){
+    if(job.type==='prepare'){admitted.push(job.frame.frame);return {candidates:[]};}
+    if(job.type==='select_startup')return {source:null,anchor:false};
+    if(job.type==='orient')return {bank:[],reference:null};
+    return {bank:[],wireframe:[],pose:null};
+  }};
+  const fitter=new PoseFitter('http://localhost/',pool);
+  const frame={transform:{sourceWidth:640,sourceHeight:480,cropWidth:200,cropHeight:200},detections:[]} as unknown as FrameResult;
+  const pending:ReturnType<PoseFitter['fit']>[]=[],times:number[]=[];
+  for(const timestamp of cameraCollision.timestamps){
+    if(!buffer.admit(timestamp))continue;
+    times.push(timestamp);pending.push(fitter.fit(frame,pending.length===0,timestamp,cameraCollision.sourceFps,
+      {scramble:'',turningStartFrame:null,camera:true}));
+    buffer.acknowledge();
+  }
+  await fitter.flush();const poses=await Promise.all(pending);
+  assert.equal(cameraCollision.timestamps.length,203);assert.equal(buffer.skipped,1);
+  assert.equal(poses.length,202);assert.equal(admitted.length,202);
+  assert.ok(admitted.every((value,index)=>!index||value>admitted[index-1]));
+  assert.ok(!times.includes(640.007205));
+  assert.deepEqual(poses.map(pose=>pose.sourceFrame),times.map(timestamp=>Math.round(timestamp*1000)));
+  assert.equal(poses.at(-1)?.sourceFrame,Math.round(cameraCollision.timestamps.at(-1)!*1000));
+  assert.deepEqual([...new Set(poses.map(pose=>pose.fittingConfig?.segment))],[1]);
+  fitter.dispose();
 });

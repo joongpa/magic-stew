@@ -35,7 +35,16 @@ test('idle capture keeps the source clock moving and resumes bitmap delivery wit
     assert.equal(frames.length,11);assert.equal(copies,11);
     assert.ok(Math.abs(frames[1].timestamp-31/30)<1e-6,'resumed frames retain elapsed idle source time');
     assert.ok(frames.every(message=>message.clockOriginMs===frames[0].clockOriginMs));
-    assert.equal(closed,41,'native frames are released during both idle and active capture');
+    // Reproduce the driver burst from the failed solve, then duplicates and a
+    // regressed source timestamp. The native frames must still be released.
+    for(const timestamp of [640006740,640007205,640011442,640006000,640011442,640057699])
+      controller.enqueue({...frame(0),timestamp});
+    await tick();
+    const afterBurst=messages.filter(message=>message.type==='frame');
+    assert.deepEqual(afterBurst.slice(-3).map(message=>message.timestamp),[640.006740,640.011442,640.057699]);
+    assert.equal(afterBurst.length,14);assert.equal(copies,14,'collisions are skipped before allocating/copying bitmaps');
+    assert.equal(afterBurst.at(-1).metrics.skippedFrames,3);
+    assert.equal(closed,47,'native frames are released during idle, active capture and timestamp rejection');
     assert.equal(messages.some(message=>message.type==='stopped'),false);
   }finally{
     controller.close();await running;

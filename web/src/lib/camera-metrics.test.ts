@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {CameraFrameRate,CameraFrameBuffer} from './camera-metrics';
+test('sub-millisecond camera bursts, duplicate timestamps and regressions cannot reach pose fitting',()=>{
+ const buffer=new CameraFrameBuffer(),timestamps=[640.006740,640.007205,640.011442,640.006000,640.011442,640.057699];
+ const admitted=timestamps.filter(timestamp=>buffer.admit(timestamp));
+ assert.deepEqual(admitted,[640.006740,640.011442,640.057699]);
+ assert.equal(buffer.pending,3);assert.equal(buffer.skipped,3);
+ assert.deepEqual(admitted.map(timestamp=>Math.round(timestamp*1000)),[640007,640011,640058]);
+});
 test('measured capture FPS follows source timestamps independently of processing delays or nominal FPS',()=>{
  const rate=new CameraFrameRate();let measured=0;
  for(let i=0;i<240;i++)measured=rate.observe(i/24);

@@ -23,6 +23,19 @@ function setup() {
   return { pipeline, updates, searches };
 }
 const result = (status: MoveSearchResult['status']): MoveSearchResult => ({ status, steps: [{ frame_index: 1, geometry_option_index: 0, state_moves: ['R'] }] }) as MoveSearchResult;
+test('working-data cleanup runs once after final input and search completion, including timeouts and early failures',()=>{
+ const finished:string[]=[],callbacks:Parameters<TimerSearchFactory>[1][]=[];
+ const timer=new TimerReconstruction((_config,onResult)=>{
+   callbacks.push(onResult);return {submit(){},async end(){},dispose(){}};
+ },()=>{},id=>finished.push(id));
+ timer.start('solved','R',0,30);timer.accept(0,frame);timer.stop('solved',1);
+ callbacks[0](result('solved'),false);assert.deepEqual(finished,[],'retain diagnostic inputs until the tail drains');
+ timer.finishThrough(1.3);callbacks[0](result('solved'),true);assert.deepEqual(finished,['solved']);
+ timer.start('timeout','R',2,30);timer.accept(2,frame);timer.stop('timeout',3);timer.finishThrough(3.3);
+ clock.tick(30_300);assert.deepEqual(finished,['solved','timeout']);
+ timer.start('failed','R',4,30);timer.stop('failed',5);timer.accept(4,{detections:[]} as unknown as FrameResult);
+ timer.finishThrough(5.3);timer.cancel();assert.deepEqual(finished,['solved','timeout','failed']);
+});
 test('the post-stop deadline terminates a stalled search even before fitting and input closure finish',t=>{
   const {pipeline,searches,updates}=setup();
   pipeline.start('a','R',10,30);pipeline.accept(10,frame);
@@ -32,7 +45,7 @@ test('the post-stop deadline terminates a stalled search even before fitting and
   assert.equal(searches[0].disposed,false);
   clock.tick(1);assert.equal(searches[0].disposed,true);
   assert.equal(updates.get('a')?.status,'failed');
-  assert.equal(updates.get('a')?.message,'Reconstruction timed out after 10 seconds');
+  assert.equal(updates.get('a')?.message,'Reconstruction timed out after 30 seconds');
   assert.deepEqual(updates.get('a')?.moves,['R'],'last candidate remains available for inspection');
   searches[0].result(result('solved'),true);assert.equal(updates.get('a')?.status,'failed','late worker results cannot overwrite a timeout');
   assert.equal(pipeline.includes(10),true,'remaining processed solve frames still belong to diagnostics/replay');

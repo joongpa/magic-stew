@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import { FramePresenter } from "./lib/frame-presenter";
+  import { compactDetectionCapture } from "./lib/diagnostic-capture";
   import { DetectionRecording } from "./lib/detection-recording";
   import type { RecordingContext } from "./lib/detection-recording";
-  import { COLORS, LABELS } from "./lib/detector";
   import type {
     FrameResult,
     ModelManifest,
@@ -29,16 +29,19 @@
   import { reviewIndex, steppedTimestamp, frameArrow } from "./lib/frame-review";
   import { PLAYBACK_SPEEDS, playbackTiming } from "./lib/playback-timing";
   import type { PlaybackSpeed } from "./lib/playback-timing";
+  import TpsGraph from "./lib/TpsGraph.svelte";
   import ProjectedCube from "./lib/ProjectedCube.svelte";
-  import {createSearchConfig,ADMISSION_CAPACITY,poseWorkerCount,POLICY_VERSION,CAMERA_CLOCK_HZ,MOVE_TPS_LIMIT} from "../../pose-fitter/runtime/reconstruction-policy.mjs";
+  import {createSearchConfig,ADMISSION_CAPACITY,poseWorkerCount,POLICY_VERSION,CAMERA_CLOCK_HZ} from "../../pose-fitter/runtime/reconstruction-policy.mjs";
   import {runtimeFingerprints} from './lib/capture-provenance';
   import CubeTimer from './lib/CubeTimer.svelte';
+  import LatestTimerReplay from './lib/LatestTimerReplay.svelte';
   import { TimerReconstruction } from './lib/timer-reconstruction';
   import type { TimerReconstructionResult } from './lib/cube-timer';
   import { TimerDiagnostics } from './lib/timer-diagnostics';
   import { DiagnosticWriter } from './lib/diagnostic-writer';
   import type {CameraCaptureMetrics} from './lib/camera-metrics';
-  import {TimerReplayStore,type TimerReplay} from './lib/timer-replay';
+  import {TimerReplayStore,replayReconstruction,type TimerReplay} from './lib/timer-replay';
+  import {LocalReplayStorage,TimerReplayCache} from './lib/timer-replay-cache';
   import {TimerCaptureGate} from './lib/timer-capture';
   import {workspacePath,workspaceFromPath,type WorkspaceTab} from './lib/workspace-route';
 
@@ -48,8 +51,23 @@
   let timerCamera = $state(false);
   let cameraClockOriginMs = $state<number>();
   let timerReconstructions = $state<Record<string, TimerReconstructionResult>>({});
-  let timerReplays=$state<Record<string,TimerReplay>>({});
-  const timerReplayStore=new TimerReplayStore(clip=>{timerReplays={...timerReplays,[clip.id]:clip};});
+  let timerReplays=$state.raw<Record<string,TimerReplay>>({});
+  let latestTimerSolveId=$state<string>(),latestReplayPosition=$state<number>();
+  let latestTimerReplay=$state.raw<TimerReplay>();
+  let latestReplaySeek=$state<{timestamp:number;revision:number}>(),latestReplaySeekRevision=0;
+  const latestReplayReconstruction=$derived(latestTimerSolveId?timerReconstructions[latestTimerSolveId]??latestTimerReplay?.reconstruction:undefined);
+  function seekLatestTimerReplay(id:string,timestamp:number){
+    if(id!==latestTimerSolveId||!latestTimerReplay)return false;
+    latestReplaySeek={timestamp,revision:++latestReplaySeekRevision};return true;
+  }
+  let replayLoading=$state(false),replayStorageError=$state('');
+  const timerReplayCache=new TimerReplayCache(new LocalReplayStorage(),(clip,loading=false,error='')=>{
+    timerReplays=clip?{[clip.id]:clip}:{};replayLoading=loading;replayStorageError=error;
+  });
+  const timerReplayStore=new TimerReplayStore(clip=>{
+    timerReplayCache.publish(clip);
+    if(clip.id===latestTimerSolveId)latestTimerReplay=clip;
+  });
   const timerCaptureGate=new TimerCaptureGate();
   let timerCapturePhase=$state<'idle'|'capturing'|'draining'>('idle');
   const timerReconstruction = new TimerReconstruction(
@@ -60,7 +78,12 @@
       }, onError);
       return search;
     },
-    (id, value) => { timerReconstructions = { ...timerReconstructions, [id]: timerDiagnostics.update(id, value) }; });
+    (id, value) => { timerReconstructions = { ...timerReconstructions, [id]: timerDiagnostics.update(id, value) }; },
+    id=>{
+      const playback=replayReconstruction($state.snapshot(timerReconstructions[id]));
+      timerReplayCache.finish(id,playback);timerReconstructions={...timerReconstructions,[id]:playback};
+      void timerDiagnostics.finish(id).then(()=>{savedFrames=recording.length;}).catch(error=>{mediaError=String(error);});
+    });
   function selectTab(tab:WorkspaceTab,pushHistory=true) {
     if (timerBusy || tab === activeTab) return;
     if (tab === 'timer') {
@@ -69,6 +92,7 @@
       activeRunId = undefined;
       if (sourceKind === 'camera') timerCamera = true;
     }
+    if (tab === 'detector' && sourceKind === 'camera') stopSource();
     activeTab = tab;
     if(pushHistory)history.pushState(null,'',workspacePath(tab,workspaceBase));
     document.getElementById('workspace-panel')?.focus({ preventScroll: true });
@@ -85,6 +109,8 @@
   function startTimerSolve(id: string, scramble: string, clockMs: number) {
     if (cameraClockOriginMs === undefined) return;
     const config = timerReconstruction.start(id, scramble, (clockMs - cameraClockOriginMs) / 1000, sourceFps || 30, searchDiagnostics);
+    latestTimerSolveId=id;latestTimerReplay=undefined;latestReplayPosition=undefined;latestReplaySeek=undefined;
+    timerReplayCache.begin(id);
     timerReplayStore.start(id,config.requested_start_seconds!,config.fps);
     timerCaptureGate.start(id,config.requested_start_seconds!);timerCapturePhase='capturing';capture?.resume();
     const runId = timerDiagnostics.start(id, generation, config, {
@@ -103,13 +129,22 @@
       timerCaptureGate.stop(id,timestamp);
     }
   }
-  function deleteTimerSolve(id:string){timerReplayStore.remove(id);delete timerReplays[id];}
+  function deleteTimerSolve(id:string){
+    if(latestTimerSolveId===id){latestTimerSolveId=undefined;latestTimerReplay=undefined;latestReplayPosition=undefined;latestReplaySeek=undefined;}
+    timerReconstruction.cancelSolve(id);timerReplayStore.remove(id);timerReplayCache.remove(id);
+    void timerDiagnostics.forget(id).catch(error=>{mediaError=String(error);});
+    const remaining={...timerReconstructions};delete remaining[id];timerReconstructions=remaining;
+  }
+  function clearTimerSession(ids:string[]){
+    latestTimerSolveId=undefined;latestTimerReplay=undefined;latestReplayPosition=undefined;latestReplaySeek=undefined;
+    timerReconstruction.cancel('Session cleared');timerReplayStore.clear();timerReplayCache.clear();
+    for(const id of ids){timerReplayCache.remove(id);void timerDiagnostics.forget(id).catch(error=>{mediaError=String(error);});}
+    timerReconstructions={};
+  }
 
   let manifest = $state<ModelManifest>();
-  let size = $state(256);
-  let backend = $state<"webgpu" | "wasm">("webgpu");
-  let runtimeThreads = $state(1);
-  let runtimeIsolated = $state(false);
+  const size = 256;
+  const backend = "webgpu";
   let detectorIdentity:Extract<WorkerResponse,{type:'ready'}>['models'],detectorPreprocessing='gpu';
   let activeRunId:string|undefined;
   let status = $state<"loading" | "ready" | "error">("loading");
@@ -129,13 +164,13 @@
   let bboxThreshold = $state(0.25),
     roiPadding = $state(0.4);
   let showRoi = $state(false);
-  let showPose = $state(true);
+  const showPose = true;
   let searchEnabled = $state(true), initialScramble = $state("");
   let openingHoldSeconds = $state(0);
   let searchDiagnostics = $state(true);
   let searchBidirectional = $state(true);
   let searchCleanup = $state(true);
-  let searchCleanupTolerance = $state(0.02);
+  let searchCleanupTolerance = $state(0.08);
   let searchResult = $state<MoveSearchResult>(), searchError = $state("");
   let moveSearch: MoveSearch | undefined;
   let poseFitting = $state(false);
@@ -151,7 +186,7 @@
   let trimming = $state(false), solveStart = $state(0), solveEnd = $state(0);
   let thumbnails = $state<string[]>([]);
   let previewVersion = 0, searchOriginTimestamp = 0;
-  let projectedAfterPass = $state(false);
+  let reviewInitialized = $state(false);
   const reconstructionChoices = $derived(new Map(searchResult?.steps.map(step => [step.frame_index, step.geometry_option_index] as const) ?? []));
   const reconstructionFlags = $derived(new Map(searchResult?.steps.map(step => [step.frame_index,step.pose_flagged === true] as const) ?? []));
   const reconstructionComplete = $derived(videoInputComplete && (!searchEnabled || !!searchError ||
@@ -163,6 +198,9 @@
   const diagnosticWriter=new DiagnosticWriter(id=>({id,...recording.exportRun(id),model:$state.snapshot(manifest)}),sendDiagnostics);
   let captureFps=$state(0),cameraDelayMs=$state(0),skippedCameraFrames=$state(0);
   let savedFrames = $state(0);
+  const latestTimerReconstruction=$derived(Object.values(timerReconstructions).at(-1));
+  const timerBuffering=$derived(timerCamera && timerCapturePhase !== 'capturing' &&
+    !!latestTimerReconstruction && ['waiting','queued','searching'].includes(latestTimerReconstruction.status));
   let thresholds = $state([0.25, 0.4, 0.25, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]);
   let presenceThreshold = $state(0.05);
   let result = $state<FrameResult>();
@@ -279,11 +317,6 @@
     });
   const idleWaiters: (() => void)[] = [];
   const baseUrl = new URL(import.meta.env.BASE_URL, location.origin).href;
-  const counts = $derived(
-    manifest?.classes.map(
-      (_, id) => result?.detections.filter((d) => d.classId === id).length ?? 0,
-    ) ?? [],
-  );
   const settings = (): Settings => ({
     thresholds: thresholds.map((value, id) =>
       Number.isFinite(value)
@@ -304,8 +337,11 @@
   const inferenceAllowed = () => (timerCamera || !moveSearch?.solved) && !(sourceKind === "video" && videoInputComplete);
   const displayPose = () => showPose && (sourceKind !== "video" || !trimming);
   $effect(() => {
-    if (!projectedAfterPass && sourceKind === "video" && reconstructionComplete && !trimming && result?.fittedPose) {
-      projectedAfterPass = true; showPose = true; untrack(redrawOverlay);
+    if (!reviewInitialized && sourceKind === "video" && reconstructionComplete && !trimming) {
+      reviewInitialized = true;
+      // Enter review paused at the first saved frame, once per reconstruction.
+      // Later result updates and playback reaching the end must not rewind it.
+      untrack(() => { void requestReview(reviewRows[0]?.timestamp ?? solveStart); });
     }
   });
   const poseFittingOptions = () => timerCamera ? {scramble:'',turningStartFrame:null,originSeconds:0,camera:true} : ({scramble:moveSearch?.config.scramble ?? initialScramble.trim(),
@@ -330,7 +366,7 @@
     const token = generation;
     const config = createSearchConfig({scramble:initialScramble,fps:sourceFps||30,camera:sourceKind==='camera',
       openingHoldSeconds,diagnostics:searchDiagnostics,bidirectional:searchBidirectional&&sourceKind==="video",originSeconds:sourceKind==="video"?searchOriginTimestamp:0,
-      postprocessIdentityLoops:searchCleanup,postprocessColorTolerance:searchCleanup?searchCleanupTolerance:0.02,
+      postprocessIdentityLoops:searchCleanup,postprocessColorTolerance:searchCleanup?searchCleanupTolerance:0.08,
       startSeconds:sourceKind==="video"?solveStart:undefined,endSeconds:sourceKind==="video"?solveEnd:undefined});
     const runId=recording.startRun(token,config,{policyVersion:POLICY_VERSION,appOrigin:location.origin,
       poseWorkers:poseWorkerCount(navigator.hardwareConcurrency),admissionCapacity:ADMISSION_CAPACITY,
@@ -356,11 +392,16 @@
       if(videoInputComplete&&((ended&&!endCaptured)||['solved','already_solved','state_limit','exhausted'].includes(value.status)))void persistDiagnostics(runId);
       if(ended)endCaptured = true;
     }, message => { if (token === generation) {
-      searchError = message;recording.saveError(runId,message,moveSearch?.actions??[]);void persistDiagnostics(runId);
+      searchError = message;
+      if(sourceKind === 'video'){
+        running=false;seekResume=false;videoInputComplete=true;fileEnded=true;cancelScheduled();
+      }
+      recording.saveError(runId,message,moveSearch?.actions??[]);void persistDiagnostics(runId);
     } }, sourceKind === "video");
   }
   async function finishMoveSearch() {
     const token = generation, activeSearch = moveSearch;
+    activeSearch?.startDeadline();
     await waitForPipelineIdle();
     if (token !== generation || disposed || activeSearch !== moveSearch) return;
     if (timerCamera && captureStopped) {timerReplayStore.closeInput();timerReconstruction.closeInput();}
@@ -369,11 +410,12 @@
     try { await activeSearch?.end(); } catch (cause) { if (token === generation) searchError = cause instanceof Error ? cause.message : String(cause); }
   }
   async function persistDiagnostics(runId:string) {
-    if((!import.meta.env.DEV&&!['localhost','127.0.0.1','[::1]'].includes(location.hostname))||!recording.diagnosticsEnabled(runId))return;
+    if((!import.meta.env.DEV&&!['localhost','127.0.0.1','[::1]'].includes(location.hostname))||!recording.diagnosticsEnabled(runId))return true;
     try {
       await recording.ready(runId);
       await diagnosticWriter.write(runId);
-    }catch(cause){console.error('Local diagnostic capture failed',cause);}
+      return true;
+    }catch(cause){console.error('Local diagnostic capture failed',cause);return false;}
   }
   function sendDiagnostics(capture:unknown):Promise<void> {
     if(disposed)return Promise.resolve();
@@ -403,30 +445,6 @@
       moveSearch?.submit(row.timestamp, row.result, Promise.resolve(row.result.fittedPose)); count++; last = row;
     }
     return { last, complete: count >= Math.ceil((solveEnd - origin) * target - 0.00001) };
-  }
-  async function changeMoveSearch() {
-    if (timerCamera || activeTab === 'timer') return;
-    if (!searchEnabled) { moveSearch?.dispose(); moveSearch = undefined; if (!showPose) void flushPose(); return; }
-    if (trimming) return;
-    if (!initialScramble.trim()) { searchEnabled = false; searchError = "Enter the initial scramble to start move search."; return; }
-    const wasRunning = running;
-    if (sourceKind === "video") videoInputComplete = false;
-    running = false; cancelScheduled();
-    await waitForPipelineIdle(); startMoveSearch();
-    if (!moveSearch) { running = wasRunning; scheduleNext(); return; }
-    if (sourceKind === "video" && fileSource) {
-      const {last,complete} = seedCachedSearch();
-      if (last && complete) {
-        await moveSearch.end(); videoInputComplete = true; running = wasRunning&&!moveSearch.solved; scheduleNext(); return;
-      }
-      // Newly requested fitting starts at the first missing frame, never at an
-      // arbitrary mid-solve state carrying the opening scramble.
-      const next = last ? last.timestamp + 1 / Math.min(30, sourceFps || 30) : solveStart;
-      seeking = false; running = true; await seekFile(next); scheduleNext();
-    } else {
-      running = wasRunning; resetPose = true;
-      if (sourceKind === "image") void inferFrame(); else scheduleNext();
-    }
   }
   async function previewTrim(timestamp: number) {
     const request = ++previewVersion, token = generation, source = fileSource;
@@ -476,7 +494,7 @@
       // viewer has not yet presented those cached frames again.
       const cached = seedCachedSearch();
       trimming = false; videoInputComplete = false; fileEnded = false; running = true;
-      projectedAfterPass = false;
+      reviewInitialized = false;
       resetTracking = true; resetPose = true; seekVersion++; processedFrames = 0; fps = 0;
       lastResultTime = 0; previousFrameStart = 0; lastStarted = performance.now(); acquireMs = 0; pacingMs = 0;
       const firstSaved = findSavedResult(frame.timestamp);
@@ -645,7 +663,7 @@
     }
     if (backend === "webgpu" && !("gpu" in navigator)) {
       error =
-        "WebGPU is unavailable in this browser. Select WASM (CPU), or open this app in a WebGPU-enabled browser.";
+        "WebGPU is required. Open this app in a browser that supports WebGPU.";
       status = "error";
       return;
     }
@@ -673,7 +691,6 @@
           throw new Error(
             "Incompatible detector manifest. Re-export the checkpoint.",
           );
-        size = manifest.defaultSize;
         thresholds = [...manifest.classThresholds];
         presenceThreshold = manifest.presenceThreshold;
         bboxThreshold = manifest.bbox.threshold;
@@ -695,8 +712,6 @@
               : `${data.stage} · preparing ${backend === "webgpu" ? "GPU" : "CPU"}…`;
         if (data.type === "ready") {
           detectorIdentity=data.models;detectorPreprocessing=data.preprocessing;
-          runtimeThreads = data.threads;
-          runtimeIsolated = data.isolated;
           status = "ready";
           lastResultTime = 0;
           if (sourceKind === "image") void inferFrame();
@@ -795,7 +810,7 @@
     videoResults.clear(); cachedVideoFrames = 0; viewingSavedResult = false;
     presentedTimestamp=0;requestedReviewTimestamp=undefined;reviewInProgress=false;
     videoInputComplete = false;
-    projectedAfterPass = false;
+    reviewInitialized = false;
     trimming = false; solveStart = 0; solveEnd = 0; previewVersion++; searchOriginTimestamp = 0;
     thumbnails.forEach(url => URL.revokeObjectURL(url)); thumbnails = [];
     cameraQueue.clear();
@@ -945,24 +960,6 @@
       if (token === generation)
         mediaError =
           cause instanceof Error ? cause.message : "Unable to read this file.";
-    }
-  }
-
-  async function sample() {
-    stopSource();
-    mediaError = "";
-    const token = generation;
-    try {
-      const image = new Image();
-      image.src = new URL("sample.jpg", baseUrl).href;
-      await image.decode();
-      if (token !== generation || disposed) return;
-      still = image;
-      sourceKind = "image";
-      sourceName = "Sample cube";
-      await inferFrame();
-    } catch {
-      mediaError = "The sample image could not be loaded.";
     }
   }
 
@@ -1223,26 +1220,14 @@
   function redrawOverlay() {
     if (result) presenter.redraw(stage, showRoi || displayPose() ? drawOverlay : undefined);
   }
-  function changePoseDisplay() {
-    poseError = "";
-    cachedVideoFrames = savedFrameCount();
-    if (!needsPose()) void flushPose();
-    const saved = sourceKind === "video" ? findSavedResult(position) : undefined;
-    if (saved) { result = saved.result; viewingSavedResult = true; }
-    redrawOverlay();
-    if (showPose && !result?.fittedPose) {
-      resetPose = true;
-      if (busy || completionQueue.size) refreshPending = true;
-      else void inferFrame();
-      continuePipeline();
-    }
-  }
-  function downloadDetections() {
+  async function downloadDetections() {
     if (!recording.length) return;
+    try { await recording.readyAll(); }
+    catch (cause) { mediaError = `Unable to prepare diagnostic metadata: ${String(cause)}`; return; }
     const blob = new Blob(
       [
         JSON.stringify({
-          ...recording.toJSON(),
+          ...compactDetectionCapture(recording.toJSON()),
           model: $state.snapshot(manifest),
         }),
       ],
@@ -1257,34 +1242,22 @@
     link.click();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
-  function downloadTimerDiagnostics(id: string) {
-    const data = { ...timerDiagnostics.export(id), model: $state.snapshot(manifest) };
-    const url = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' }));
+  async function downloadTimerDiagnostics(id: string) {
+    let data:unknown;
+    try{
+      if(timerDiagnostics.released(id)){
+        const url=new URL('__diagnostics/run',baseUrl);url.searchParams.set('id',timerDiagnostics.runId(id)!);
+        const response=await fetch(url);if(!response.ok)throw Error('Saved diagnostic capture is unavailable');data=await response.json();
+      }else {
+        await recording.ready(timerDiagnostics.runId(id)!);
+        data=timerDiagnostics.export(id);
+      }
+    }catch(error){mediaError=error instanceof Error?error.message:String(error);return;}
+    const capture=compactDetectionCapture(data as ReturnType<DetectionRecording["toJSON"]>);
+    const url = URL.createObjectURL(new Blob([JSON.stringify({...capture,model:$state.snapshot(manifest)})], { type: 'application/json' }));
     const link = document.createElement('a'); link.href = url; link.download = `cube-timer-diagnostics-${id}.json`; link.click();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
-  function refresh() {
-    if (moveSearch) { moveSearch.dispose(); moveSearch = undefined; searchError = "Detection settings changed. Restart move search to use the new results."; }
-    resetTracking = true;
-    resetPose = true;
-    cachedVideoFrames = savedFrameCount();
-    if (busy || completionQueue.size) refreshPending = true;
-    else void inferFrame();
-    continuePipeline();
-  }
-  function reacquire() {
-    refresh();
-  }
-  function resetThresholds() {
-    if (manifest) {
-      thresholds = [...manifest.classThresholds];
-      presenceThreshold = manifest.presenceThreshold;
-      bboxThreshold = manifest.bbox.threshold;
-      roiPadding = manifest.tracking.roiPadding;
-    }
-    refresh();
-  }
-
   async function requestReview(timestamp:number) {
     if(!reconstructionComplete||trimming)return;
     requestedReviewTimestamp=timestamp;
@@ -1398,7 +1371,7 @@
   }
   function cleanup() {
     timerReconstruction.cancel('Page closed before reconstruction finished');
-    timerReplayStore.clear();timerReplays={};
+    timerReplayStore.clear();timerReplayCache.clear();latestTimerReplay=undefined;
     timerCaptureGate.clear();
     disposed = true;
     generation++;
@@ -1421,60 +1394,52 @@
   });
 </script>
 
-<svelte:head><title>Live Recognition · {activeTab === 'timer' ? 'Cube timer' : 'Detector'}</title></svelte:head>
+<svelte:head><title>Magic Stew · {activeTab === 'timer' ? 'Cube timer' : 'Detector'}</title></svelte:head>
 <svelte:window onpagehide={cleanup} onkeydown={reviewKeydown} onpopstate={followHistory} />
 
-<div class="shell">
+<div class="shell" class:timer-shell={activeTab === 'timer'}>
+  <div class="beta-banner" role="note"><strong>Early beta — barely functional.</strong> Cube detection and reconstruction will likely fail in many cases.</div>
   <header class="topbar">
-    <a class="brand" href={workspacePath('detector',workspaceBase)} aria-label="Live Recognition home"
-      ><span class="cube-mark" aria-hidden="true"
-        ><i></i><i></i><i></i><i></i></span
-      >live<span>recognition</span></a
-    >
+    <a class="brand" href={workspacePath('detector',workspaceBase)} aria-label="Magic Stew home">
+      <span class="brand-logo-frame"><img class="brand-logo" src={new URL('magic-stew-logo.png',baseUrl).href} alt="" width="64" height="64" /></span>
+      <span class="brand-label">Magic Stew</span>
+    </a>
     <div class="app-tabs" role="tablist" aria-label="Workspace">
       <a id="detector-tab" role="tab" aria-selected={activeTab === 'detector'} aria-controls="workspace-panel" aria-disabled={timerBusy} href={workspacePath('detector',workspaceBase)} onclick={event=>navigateTab(event,'detector')}>Detector</a>
       <a id="timer-tab" role="tab" aria-selected={activeTab === 'timer'} aria-controls="workspace-panel" aria-disabled={timerBusy} href={workspacePath('timer',workspaceBase)} onclick={event=>navigateTab(event,'timer')}>Cube timer</a>
-    </div>
-    <div class="device-badge">
-      <span class="status-dot" class:ready={status === "ready"}
-      ></span>{status === "ready"
-        ? backend === "webgpu"
-          ? "WebGPU ready"
-          : "WASM CPU ready"
-        : status === "loading"
-          ? "Loading detector"
-          : "Detector unavailable"}
     </div>
   </header>
 
   <main>
   <div id="workspace-panel" role="tabpanel" tabindex="0" aria-labelledby={activeTab === 'timer' ? 'timer-tab' : 'detector-tab'}>
-    <div class="page-heading">
-      <div>
-        <p class="eyebrow">CUBE VISION / LOCAL INFERENCE</p>
-        <h1>{activeTab === 'timer' ? 'Time it. Reconstruct it.' : 'See every point.'}</h1>
-        <p class="subtitle">
-          {activeTab === 'timer' ? 'A simple 3×3 timer with automatic camera reconstruction.' : 'Landmarks and sticker colors, straight from your camera.'}
-        </p>
-      </div>
-      <span class="privacy"
-        ><span aria-hidden="true">◈</span> Your media stays on this device</span
-      >
-    </div>
-    <div hidden={activeTab !== 'timer'}>
+    <div class:timer-layout={activeTab === 'timer'} class:with-inline-replay={activeTab === 'timer' && !!latestTimerReplay}>
+    <div class="timer-controls" hidden={activeTab !== 'timer'}>
       <CubeTimer active={activeTab === 'timer'} cameraReady={sourceKind === 'camera' && running && !captureStopped && status === 'ready' && cameraClockOriginMs !== undefined}
-        reconstructions={timerReconstructions} replays={timerReplays} ondelete={deleteTimerSolve} onstart={startTimerSolve} onstop={stopTimerSolve} onbusychange={value => timerBusy = value}
+        reconstructions={timerReconstructions} replays={timerReplays} {replayLoading} replayError={replayStorageError}
+        latestReplayPosition={latestTimerReplay?latestReplayPosition:undefined} onlatestseek={seekLatestTimerReplay}
+        onreplayselect={id=>{void timerReplayCache.select(id);}}
+        ondelete={deleteTimerSolve} onclearsession={clearTimerSession} onstart={startTimerSolve} onstop={stopTimerSolve} onbusychange={value => timerBusy = value}
         ondownloaddiagnostics={downloadTimerDiagnostics} />
     </div>
     <div class="workspace" class:timer-workspace={activeTab === 'timer'}>
+      {#if activeTab === 'detector'}<p class="local-processing-note">Everything runs locally on your device.</p>{/if}
       <section class="viewer" aria-label="Detection viewer">
+        {#if sourceKind === 'video' && !trimming}
+          <div class="reconstruction-status" class:failed={!!searchError || searchResult?.status === 'exhausted' || searchResult?.status === 'state_limit'} role="status" aria-live="polite">
+            {#if searchError || searchResult?.status === 'exhausted' || searchResult?.status === 'state_limit'}
+              <strong>Reconstruction failed</strong>
+              <span>{searchError || (searchResult?.status === 'state_limit' ? 'Search limit reached.' : 'No full reconstruction found.')}</span>
+              <span>Partial reconstruction{searchResult?.steps.length ? ' retained.' : ' · No moves recovered.'}</span>
+            {:else if cubeSolved}<strong>Full reconstruction</strong>{/if}
+          </div>
+        {/if}
         <div class="viewer-toolbar">
           <span class="source-label"
             ><span class="status-dot" class:ready={sourceKind !== "none"}
             ></span>{sourceName}</span
-          ><span class="input-badge">POSE {size} × {size}</span>
+          >
         </div>
-        <div class="reconstruction-pair" class:with-projection={sourceKind === "video" && reconstructionComplete && !trimming}>
+        <div class="reconstruction-pair" class:with-timer-replay={activeTab === 'timer'} class:with-projection={sourceKind === "video" && reconstructionComplete && !trimming}>
         <div
           class="stage"
           class:video-view={sourceKind === "video"}
@@ -1499,66 +1464,48 @@
           {/if}
           {#if sourceKind === "none"}
             <div class="empty-state">
-              <div class="viewfinder" aria-hidden="true"><span>＋</span></div>
-              <p class="eyebrow">READY WHEN YOU ARE</p>
-              <h2>Bring your cube into view.</h2>
-              <p>{activeTab === 'timer' ? 'Connect the camera, then start a solve to begin processing.' : 'Start your camera or drop an image or video here.'}</p>
-              <div class="source-actions">
-                <button
-                  class="primary"
-                  onclick={camera}
-                  disabled={status !== "ready"}
-                  >Start camera <span aria-hidden="true">↗</span></button
-                >{#if activeTab !== 'timer'}<button onclick={() => fileInput.click()}>Open file</button>{/if}
-              </div>
-              {#if activeTab !== 'timer'}<button class="text-button" onclick={sample}
-                >Try a sample image <span aria-hidden="true">→</span></button
-              >{/if}
+              {#if activeTab === 'timer'}
+                <button class="primary" onclick={camera} disabled={status !== "ready"}>Connect camera</button>
+              {:else}
+                <p>Drop an image or video here</p>
+                <button class="primary" onclick={() => fileInput.click()}>Upload file</button>
+              {/if}
             </div>
           {/if}
           {#if status === "loading"}<div class="loading-badge" role="status">
               <span class="spinner"></span>{loadingText}
             </div>{/if}
+          {#if sourceKind === 'video' && !trimming && !reconstructionComplete || timerBuffering}
+            <div class="buffering-overlay" role="status" aria-label="Reconstructing">
+              <span class="spinner"></span><span>Allowing up to 30 seconds to find a solution…</span>
+            </div>
+          {/if}
         </div>
+        {#if activeTab === 'timer'}
+          <LatestTimerReplay clip={latestTimerReplay} reconstruction={latestReplayReconstruction}
+            disabled={timerBusy} seekRequest={latestReplaySeek} onpositionchange={timestamp=>latestReplayPosition=timestamp} />
+        {/if}
         {#if sourceKind === "video" && reconstructionComplete && !trimming}
           <ProjectedCube pose={coloredProjection} sourceTimestamp={presentedTimestamp} timestamp={timecode(presentedTimestamp)} solved={cubeSolved}
             timeline={projectedTimeline} steps={searchResult?.steps??[]} {sourceFps} playbackSpeed={running?playbackSpeed:1}
             sourceFrame={result?.fittedPose?.sourceFrame??Math.round(presentedTimestamp*sourceFps)} />
         {/if}
         </div>
-        <div class="transport">
+        {#if sourceKind !== "none"}<div class="transport">
           <div class="transport-actions">
-            {#if sourceKind !== "none"}{#if activeTab !== 'timer'}<button
-                class="small"
-                onclick={() => fileInput.click()}>Open file</button
-              >{/if}<button
-                class="small"
-                onclick={camera}
-                disabled={status !== "ready" || timerBusy}>Camera</button
-              >{#if sourceKind === "camera" && !timerCamera || sourceKind === "video" && reconstructionComplete && !trimming}<button
-                  class="small"
-                  onclick={togglePlayback}
-                  >{running ? "Pause" : "Resume"}</button
-                >{/if}
-              {#if sourceKind==="video"&&reconstructionComplete&&!trimming}
-                <label class="playback-speed">Speed
-                  <select aria-label="Playback speed" bind:value={playbackSpeed} onchange={changePlaybackSpeed}>
-                    {#each PLAYBACK_SPEEDS as speed}<option value={speed}>{speed}×</option>{/each}
-                  </select>
-                </label>
-              {/if}<button class="small subtle" onclick={stopSource} disabled={timerBusy}
-                >{timerCamera ? 'Disconnect camera' : 'Clear'}</button
-              >{:else}<span class="muted">Images, videos, or a live camera</span
-              >{/if}
+            {#if activeTab === 'detector'}<button class="small" onclick={() => fileInput.click()}>Upload file</button>{/if}
+            {#if sourceKind === "video" && reconstructionComplete && !trimming}
+              <button class="small" onclick={togglePlayback}>{running ? "Pause" : "Play"}</button>
+              <label class="playback-speed">Speed
+                <select aria-label="Playback speed" bind:value={playbackSpeed} onchange={changePlaybackSpeed}>
+                  {#each PLAYBACK_SPEEDS as speed}<option value={speed}>{speed}×</option>{/each}
+                </select>
+              </label>
+              <button class="small" onclick={editSolveRange}>Adjust range</button>
+            {/if}
+            <button class="small subtle" onclick={stopSource} disabled={timerBusy}>{timerCamera ? 'Disconnect camera' : 'Clear'}</button>
           </div>
-          <span class="local-label"
-            >ON DEVICE <span aria-hidden="true">↗</span></span
-          >
-              {#if sourceKind === "video" && reconstructionComplete && !trimming}<button class="small" onclick={editSolveRange}>Adjust range</button>{/if}
-        </div>
-        {#if sourceKind==='camera'&&timerCamera&&timerCapturePhase==='idle'}
-          <p class="hint" role="status" aria-label="Camera idle status">Camera preview · Detection starts when you start a solve.</p>
-        {/if}
+        </div>{/if}
         {#if sourceKind === "video" && duration > 0 && reconstructionComplete && !trimming}<div class="scrubber">
             <span>{position.toFixed(1)}s</span><input
               aria-label="Video position"
@@ -1597,334 +1544,28 @@
           <div class="trim-actions"><p class="hint">Include a clear cube before the first move.</p>
             <button class="primary" disabled={status !== "ready" || searchEnabled && !initialScramble.trim()} onclick={beginReconstruction}>Reconstruct selected range</button></div>
         </section>{/if}
-        {#if sourceKind === "video" && !trimming && !reconstructionComplete}<p class="hint" role="status" aria-label="Reconstruction progress">
-          Reconstructing first pass… Playback and scrubbing will be available when it finishes.
-        </p>{/if}
-        {#if sourceKind === "video" || sourceKind === "camera"}
-          <div class="frame-policy" aria-label="Frame processing status">
-            <span
-              >{sourceFps.toFixed(2)} fps {sourceKind==='camera'?'configured':'source'} → {Math.min(
-                30,
-                sourceFps || 30,
-              ).toFixed(2)} fps target</span
-            ><span
-              >{processedFrames} frames processed{sourceKind === "camera"
-                ? ` · ${queuedFrames} queued`
-                : ""}{fitBufferedFrames ? ` · ${fitBufferedFrames} fitting/presentation buffered` : ""}</span
-            >
-            {#if sourceKind === "video"}<span>{cachedVideoFrames} saved frames{viewingSavedResult ? " · Showing saved result" : ""}</span>{/if}
-            {#if sourceKind==='camera'}<span aria-label="Camera throughput">
-              {#if timerCamera&&timerCapturePhase==='idle'}Preview {captureFps?captureFps.toFixed(1):'—'} fps · Detector idle
-              {:else}Capture {captureFps?captureFps.toFixed(1):'—'} fps · Processing {fps?fps.toFixed(1):'—'} fps · Processing delay {(cameraDelayMs/1000).toFixed(2)}s · {skippedCameraFrames} frames skipped{/if}
-            </span>{/if}
-          </div>
-        {/if}
-        {#if sourceKind==='camera'&&captureStopped}<p class="hint" role="status" aria-label="Camera stopped status">
-          Camera stream ended. {queuedFrames||fitBufferedFrames||running?'Finishing buffered frames.':''}
-          Completed solve windows continue searching.
-        </p>{/if}
-        <div class="pipeline-status" role="status">
-          <span class="status-dot" class:ready={!!result?.roi}></span><span
-            >{!result
-              ? sourceKind==="video"&&videoInputComplete?"Reviewing video · no saved detections for this frame":"Cube acquisition → pose tracking"
-              : result.roiSource === "none"
-                ? "Searching for cube · pose skipped"
-                : result.trackingLost
-                  ? "Tracking lost · reacquiring next frame"
-                  : result.roiSource === "detector"
-                    ? "Cube acquired → pose tracking"
-                    : "Tracking cube from pose points"}</span
-          >{#if result?.cube}<span class="acquisition-score"
-              >Last cube acquisition: {result.cube.score.toFixed(2)}</span
-            >{/if}
-        </div>
-        <div class="metrics">
-          <div>
-            <span class="metric-label"
-              >{result?.profile.pose?.preprocessing === "gpu"
-                ? "POSE + GPU PREPROCESS"
-                : "POSE INFERENCE"}</span
-            ><strong
-              >{result?.poseMs != null ? result.poseMs.toFixed(1) : "—"}<small
-                >ms</small
-              ></strong
-            >
-          </div>
-          <div>
-            <span class="metric-label">DETECTOR WORKER</span><strong
-              >{result ? result.totalMs.toFixed(1) : "—"}<small>ms</small
-              ></strong
-            >
-          </div>
-          <div>
-            <span class="metric-label">PROCESSED FPS</span><strong
-              >{fps ? fps.toFixed(1) : "—"}<small>fps</small></strong
-            >
-          </div>
-          <div>
-            <span class="metric-label">POINTS</span><strong
-              >{result?.detections.length ?? "—"}<small>detected</small></strong
-            >
+        <div class="viewer-statusbar">
+          <span class="fps" aria-label="Frames per second">{(sourceKind === 'camera' && timerCapturePhase === 'idle' ? captureFps : fps)?.toFixed(1) || '0.0'} FPS</span>
+          <div class="detection-data" aria-label="Detection data">
+            <span>{savedFrames} frames</span>
+            <button class="small" onclick={downloadDetections} disabled={!savedFrames || timerBusy}>Download detection data</button>
           </div>
         </div>
-        {#if frameTiming}
-          <details
-            class="frame-policy frame-timing"
-            aria-label="Frame timing details"
-          >
-            <summary>Frame timing</summary>
-            <div>
-              Frame interval: {frameTiming.intervalMs.toFixed(1)}ms · Source
-              wait: {frameTiming.acquireMs.toFixed(1)}ms · Source drawing: {frameTiming.drawMs.toFixed(
-                1,
-              )}ms · Worker round trip: {frameTiming.roundTripMs.toFixed(1)}ms ·
-              Presentation: {frameTiming.overlayMs.toFixed(1)}ms · Pacing wait: {frameTiming.pacingMs.toFixed(
-                1,
-              )}ms
-            </div>
-            {#if result?.profile.pose?.preprocessing === "gpu" || result?.profile.bbox?.preprocessing === "gpu"}
-              <div>
-                GPU preprocessing submission: {(
-                  (result?.profile.pose?.gpuSubmitMs ?? 0) +
-                  (result?.profile.bbox?.gpuSubmitMs ?? 0)
-                ).toFixed(1)}ms. GPU execution is included in the model session
-                times.
-              </div>
-            {:else}
-              <div>
-                Worker resize: {(
-                  (result?.profile.pose?.resizeMs ?? 0) +
-                  (result?.profile.bbox?.resizeMs ?? 0)
-                ).toFixed(1)}ms · Pixel read: {(
-                  (result?.profile.pose?.pixelReadMs ?? 0) +
-                  (result?.profile.bbox?.pixelReadMs ?? 0)
-                ).toFixed(1)}ms{result?.bboxMs != null
-                  ? ` · Cube acquisition: ${result.bboxMs.toFixed(1)}ms`
-                  : ""}
-              </div>
-            {/if}
-          </details>
-        {/if}
         {#if mediaError}<div class="error" role="alert">{mediaError}</div>{/if}
         {#if status === "error"}<div class="error" role="alert">
             <p>{error}</p>
             <button class="small" onclick={loadModel}>Reload detector</button>
           </div>{/if}
       </section>
+      {#if activeTab === 'detector' && sourceKind === 'video' && reconstructionComplete && !trimming}
+        <TpsGraph steps={searchResult?.steps??[]} fps={sourceFps} start={solveStart} end={solveEnd}
+          cursor={presentedTimestamp} complete={cubeSolved} onseek={timestamp=>{void requestReview(timestamp);}} />
+      {/if}
 
-      <aside class="controls" inert={timerBusy}>
-        <section class="control-section">
-          <div class="section-heading">
-            <h2>Detector</h2>
-            <span class="tag">YOLO26m</span>
-          </div>
-          <p class="hint flow-description">
-            {manifest?.bbox.size ?? 640}px cube acquisition → {size}px pose
-            tracking
-          </p>
-          <label class="field-label" for="backend">Inference backend</label>
-          <select
-            id="backend"
-            bind:value={backend}
-            disabled={status === "loading"}
-            onchange={loadModel}
-          >
-            <option value="webgpu">WebGPU (GPU)</option><option value="wasm"
-              >WASM (CPU)</option
-            >
-          </select>
-          {#if backend === "wasm" && status === "ready"}<p
-              class="hint"
-              aria-label="CPU runtime configuration"
-            >
-              SIMD · {runtimeThreads} CPU {runtimeThreads === 1
-                ? "thread"
-                : "threads"}{runtimeIsolated
-                ? ""
-                : " · threading unavailable on this host"}
-            </p>{/if}
-          <label class="field-label" for="resolution"
-            >Pose input resolution</label
-          ><select
-            id="resolution"
-            bind:value={size}
-            disabled={status === "loading" || !manifest}
-            onchange={loadModel}
-            >{#each manifest?.variants ?? [{ size: 160 }, { size: 256 }, { size: 288 }] as item}<option
-                value={item.size}
-                >{item.size} × {item.size}{item.size === 160
-                  ? " · Fast"
-                  : item.size === 256
-                    ? " · Search script"
-                    : " · More detail"}</option
-              >{/each}</select
-          >
-          <p class="hint">
-            Pose points track the crop between frames. The cube detector runs
-            again after a tracking miss.
-          </p>
-          <button
-            class="small"
-            onclick={reacquire}
-            disabled={sourceKind === "none"}>Reacquire cube</button
-          >
-        </section>
-        <section class="control-section">
-          <h2>Fitted pose</h2>
-          <label class="toggle">
-            <input type="checkbox" bind:checked={showPose} onchange={changePoseDisplay} />
-            <span>Show fitted pose</span>
-          </label>
-          <p class="hint">{sourceKind === "video" ? "Show the fitted wireframe on each processed frame, including the first pass. The colored cube appears when reconstruction finishes." : activeTab==='timer' ? "Draw the fitted pose on its matching camera frame. The camera display always shows the latest fully processed frame." : "Fit and display a cube wireframe. Points remain hidden."}</p>
-          {#if showPose}
-            <p class="hint" role="status" aria-label="Pose fitting status">
-              {poseError || (displayedPoseFlagged ? "Flagged pose hidden" : result?.fittedPose?.message) || (poseFitting ? "Fitting pose…" : "Waiting for a cube")}
-              {#if result?.fittedPose}
-                · Fit {result.fittedPose.elapsedMs.toFixed(1)}ms
-                · Draw {(result.pipeline?.presentationMs ?? 0).toFixed(1)}ms
-                · {result.fittedPose.bank.length} options
-              {/if}
-            </p>
-          {/if}
-        </section>
-        <section class="control-section" hidden={activeTab === 'timer' || timerCamera}>
-          <h2>Move search</h2>
-          {#if !trimming}<label class="field-label" for="initial-scramble">Initial scramble</label>
-          <input id="initial-scramble" aria-label="Search scramble" bind:value={initialScramble} placeholder="R U R' U'…" />{/if}
-          <label class="field-label" for="opening-hold">Opening hold (seconds)</label>
-          <input id="opening-hold" aria-label="Opening hold (seconds)" type="number" min="0" step="0.01" bind:value={openingHoldSeconds} />
-          <label class="toggle"><input type="checkbox" bind:checked={searchEnabled} onchange={changeMoveSearch} />
-            <span>Reconstruct moves</span></label>
-          <label class="toggle"><input type="checkbox" bind:checked={searchBidirectional} onchange={changeMoveSearch} />
-            <span>Bidirectional video search</span></label>
-          <label class="toggle"><input type="checkbox" bind:checked={searchCleanup} onchange={changeMoveSearch} />
-            <span>Remove move/undo artifacts</span></label>
-          <label class="field-label" for="cleanup-tolerance">Cleanup color tolerance</label>
-          <input id="cleanup-tolerance" aria-label="Cleanup color tolerance" type="number" min="0" max="1" step="0.005"
-            disabled={!searchCleanup} bind:value={searchCleanupTolerance} />
-          <p class="hint">After solving, remove state-return sections when holding raises the segment's average color error by at most this amount. Applies to the next run.</p>
-          <label class="toggle"><input type="checkbox" bind:checked={searchDiagnostics} />
-            <span>Record search diagnostics</span></label>
-          <p class="hint">Turn off for faster search. Applies to the next run.</p>
-          <p class="hint">{searchBidirectional ? "Video search starts after all poses are fitted and searches from both ends. Camera search stays forward." : "Forward search starts as poses arrive."} Shared {MOVE_TPS_LIMIT} TPS limit · five fits plus flat.</p>
-          <button class="small" disabled={!searchEnabled || sourceKind === "none" || trimming} onclick={changeMoveSearch}>Restart move search</button>
-          <p class="hint" role="status" aria-label="Move search status">
-            {searchError || (searchResult ? ({running:"Searching",waiting_for_frames:"Waiting for fitted frames",solved:"Solved",already_solved:"Already solved",exhausted:"Search exhausted",state_limit:"Search state limit reached"}[searchResult.status]) : searchEnabled ? "Waiting for a source" : "Move search is off")}
-            {#if searchResult?.bidirectional_fallback}<span> · {searchResult.bidirectional_fallback}</span>{/if}
-            {#if searchResult} · {searchResult.frames_prepared} prepared
-              {#if searchResult.search_direction === "bidirectional"} · {(searchResult.stats.forward_expanded ?? 0).toLocaleString()} forward · {(searchResult.stats.backward_expanded ?? 0).toLocaleString()} backward
-              {:else} · {searchResult.stats.furthest_frames} searched{/if}
-              · {searchResult.stats.evaluated_states.toLocaleString()} states
-            {/if}
-          </p>
-          {#if searchResult?.steps.length}<p class="hint" aria-label="Move search path">
-            {searchResult.status === "solved" ? "Solution" : "Current candidate"}: {searchResult.steps.flatMap(step => step.state_moves).join(" ") || "Hold"}
-          </p>{/if}
-          {#if searchResult?.postprocess}<p class="hint" role="status" aria-label="Solution cleanup">
-            {#if searchResult.postprocess.error}Cleanup skipped: {searchResult.postprocess.error}
-            {:else if searchResult.postprocess.removed_moves}
-              {#if searchResult.postprocess.removed_sections}Removed {searchResult.postprocess.removed_sections} move/undo {searchResult.postprocess.removed_sections===1?"section":"sections"}.{/if}
-              {#if searchResult.postprocess.simplified_frames}Simplified moves in {searchResult.postprocess.simplified_frames} {searchResult.postprocess.simplified_frames===1?"frame":"frames"}.{/if}
-            {:else}No removable move/undo sections found.{/if}
-          </p>{/if}
-          {#if searchResult?.unprocessed_steps?.length}<details>
-            <summary>Original move list</summary>
-            <p class="hint">{searchResult.unprocessed_steps.flatMap(step=>step.state_moves).join(" ")}</p>
-          </details>{/if}
-        </section>
-        <section class="control-section">
-          <div class="section-heading">
-            <h2>Detected points</h2>
-            <span class="muted">{result?.detections.length ?? 0} total</span>
-          </div>
-          <div class="class-list">
-            {#each LABELS as label, id}<div class="class-row">
-                <span class="class-name"
-                  ><span class="color-dot" style={`--dot: ${COLORS[id]}`}
-                  ></span>{label}</span
-                ><span class="count">{counts[id] ?? 0}</span>
-              </div>{/each}
-          </div>
-        </section>
-        <section class="control-section">
-          <h2>Detection data</h2>
-          <p class="hint">
-            {savedFrames} frame records retained in this tab. Coordinates and scores
-            are recorded without drawing points.
-          </p>
-          {#if timerCamera || activeTab === 'timer'}<p class="hint">Only timed solve windows (including stop + 0.3s) are recorded. Detection and pose fitting are idle between solves.</p>{/if}
-          <button
-            class="small"
-            onclick={downloadDetections}
-            disabled={!savedFrames}>Download detection data</button
-          >
-          <label class="toggle">
-            <input
-              type="checkbox"
-              bind:checked={showRoi}
-              onchange={redrawOverlay}
-            /><span>Tracked ROI outline</span>
-          </label>
-        </section>
-        <details class="control-section">
-          <summary>Detection thresholds</summary><label class="threshold"
-            ><span>Cube bbox score</span><input
-              aria-label="Cube bbox score threshold"
-              type="number"
-              min="0"
-              max="1"
-              step="0.05"
-              bind:value={bboxThreshold}
-              onchange={reacquire}
-            /></label
-          ><label class="threshold"
-            ><span>Initial ROI padding</span><input
-              type="number"
-              min="0"
-              max="2"
-              step="0.05"
-              bind:value={roiPadding}
-              onchange={reacquire}
-            /></label
-          >
-          <p class="hint">
-            These filter pose object/class scores. Each object has one keypoint.
-          </p>
-          {#each LABELS as label, id}<label class="threshold"
-              ><span>{label}</span><input
-                aria-label={`${label} object score threshold`}
-                type="number"
-                min="0"
-                max="1"
-                step="0.05"
-                bind:value={thresholds[id]}
-                onchange={refresh}
-              /></label
-            >{/each}<label class="threshold presence-field"
-            ><span>Keypoint presence</span><input
-              type="number"
-              min="0"
-              max="1"
-              step="0.05"
-              bind:value={presenceThreshold}
-              onchange={refresh}
-            /></label
-          >
-          <p class="hint">
-            Presence is separate from the object score. Sticker presence has a
-            0.25 minimum.
-          </p>
-          <button class="small" onclick={resetThresholds}>Reset defaults</button
-          >
-        </details>
-      </aside>
+    </div>
     </div>
   </div>
-    <footer>
-      <span>LIVE RECOGNITION</span>
-      <p>Two models. One continuous view of the cube.</p>
-      <span>DETECTOR / 01</span>
-    </footer>
+
   </main>
 </div>
 <input

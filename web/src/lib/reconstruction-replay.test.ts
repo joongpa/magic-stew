@@ -39,7 +39,8 @@ test('camera diagnostics validate irregular millisecond ticks separately from no
 test('new runs record motion cost explicitly while retaining source clocks and TPS limits',()=>{
  const config=createSearchConfig({scramble:'R U',fps:60});
  assert.equal(config.motion_cost_weight,.025);
- assert.equal(config.max_tps,40);assert.equal(config.max_rotation_tps,20);
+ assert.equal(config.max_tps,54);assert.equal(config.max_rotation_tps,20);
+ assert.equal(createSearchConfig({scramble:'R U',bidirectional:true}).max_tps,54);
  assert.equal(createSearchConfig({scramble:'R U',camera:true}).max_tps,40);
  assert.equal(createSearchConfig({scramble:'R U',motionCostWeight:0}).motion_cost_weight,0);
  for(const motionCostWeight of [-1,Infinity,NaN])assert.throws(()=>createSearchConfig({scramble:'R U',motionCostWeight}));
@@ -47,7 +48,8 @@ test('new runs record motion cost explicitly while retaining source clocks and T
 test('new runs enable post-solve identity cleanup with a configurable segment mean color tolerance',()=>{
  const config=createSearchConfig({scramble:'R U'});
  assert.equal(config.postprocess_identity_loops,true);
- assert.equal(config.postprocess_color_tolerance,.02);
+ assert.equal(config.postprocess_color_tolerance,.08);
+ assert.equal(createSearchConfig({scramble:'R U',camera:true}).postprocess_color_tolerance,.08);
  assert.equal(config.postprocess_pose_cleanup,true);
  assert.equal(createSearchConfig({scramble:'R U',postprocessIdentityLoops:false}).postprocess_identity_loops,false);
  assert.equal(createSearchConfig({scramble:'R U',postprocessIdentityLoops:false}).postprocess_pose_cleanup,false);

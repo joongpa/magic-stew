@@ -2,7 +2,8 @@ export const ADMISSION_CAPACITY:12;
 export const SEARCH_CHUNK:128;
 export const POLICY_VERSION:1;
 export const CAMERA_CLOCK_HZ:1000;
-export const MOVE_TPS_LIMIT:40;
+export const MOVE_TPS_LIMIT:54;
+export const TIMER_MOVE_TPS_LIMIT:40;
 export function poseWorkerCount(cores?:number):number;
 export interface SearchConfig {
   scramble:string;fps:number;max_tps:number;turning_start_frame:number|null;
