@@ -9,6 +9,7 @@ application uses Svelte, TypeScript, ONNX Runtime Web, and a Rust/WASM pose fitt
 - [`pose-fitter/`](pose-fitter/README.md): Rust/WASM pose fitting and move search.
 - [`model-support/`](model-support/README.md): nine-class YOLO pose training,
   the matching Blender dataset generator, and synthetic scene assets.
+- `docs/`: generated GitHub Pages site, including its model and WASM files.
 
 **Everything in [`experiment-records/`](experiment-records/README.md) is unused
 historical material.** Its Python pipelines, alternative trainers, notebooks,
@@ -28,6 +29,9 @@ npm run dev
 See [`web/README.md`](web/README.md) for required detector models, WASM artifacts,
 and browser requirements.
 
+For GitHub Pages, run `npm --prefix web run build:pages`, commit the rebuilt
+`docs/` folder, and select **main → /docs** in Pages settings.
+
 ## Checks
 
 ```sh
@@ -36,5 +40,5 @@ npm --prefix web test
 cargo test --manifest-path pose-fitter/Cargo.toml
 ```
 
-Training data, checkpoints, local environments, and generated runtime files are
-ignored by Git.
+Training data, checkpoints, local environments, and local runtime inputs are
+ignored by Git. The generated `docs/` deployment is committed.

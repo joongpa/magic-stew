@@ -46,6 +46,9 @@
   import {workspacePath,workspaceFromPath,type WorkspaceTab} from './lib/workspace-route';
   import {offlineCacheReady} from './lib/offline-cache';
   import {hasWebGpuAdapter} from './lib/runtime-config';
+  import SourceCropper from './lib/SourceCropper.svelte';
+  import {cropPixels} from './lib/source-crop';
+  import type {SourceCrop, PixelCrop} from './lib/source-crop';
 
   const workspaceBase=new URL(import.meta.env.BASE_URL,location.origin).pathname;
   let activeTab = $state<WorkspaceTab>(workspaceFromPath(location.pathname,workspaceBase));
@@ -186,6 +189,10 @@
   let requestedReviewTimestamp:number|undefined,reviewInProgress=false;
   let videoInputComplete = $state(false);
   let trimming = $state(false), solveStart = $state(0), solveEnd = $state(0);
+  let uploadedFile = $state.raw<File>();
+  let sourceCrop = $state<SourceCrop>();
+  let cropLocked = $state(false), cropLoading = $state(false);
+  let cropPreview = $state<{url: string; width: number; height: number; kind: 'image' | 'video'}>();
   let thumbnails = $state<string[]>([]);
   let previewVersion = 0, searchOriginTimestamp = 0;
   let reviewInitialized = $state(false);
@@ -448,6 +455,48 @@
     }
     return { last, complete: count >= Math.ceil((solveEnd - origin) * target - 0.00001) };
   }
+  function inputCrop(source: HTMLImageElement | ImageBitmap | OffscreenCanvas) {
+    if (sourceKind === 'camera') return;
+    return cropPixels(sourceCrop, source instanceof HTMLImageElement ? source.naturalWidth : source.width,
+      source instanceof HTMLImageElement ? source.naturalHeight : source.height);
+  }
+  function closeCrop() {
+    if (cropPreview) URL.revokeObjectURL(cropPreview.url);
+    cropPreview = undefined;
+  }
+  async function editCrop() {
+    if (!uploadedFile || cropLocked || cropLoading || (sourceKind === 'video' && !trimming)) return;
+    const token = generation;
+    running = false; seekResume = false; cancelScheduled(); cropLoading = true;
+    let frame: SourceFrame | null | undefined;
+    try {
+      await waitForPipelineIdle();
+      if (token !== generation || disposed) return;
+      const kind = sourceKind;
+      if (kind !== 'image' && kind !== 'video') return;
+      const source = kind === 'image' ? still : (frame = await fileSource?.preview(position))?.bitmap;
+      if (!source) throw new Error('A source frame could not be loaded for cropping.');
+      const width = source instanceof HTMLImageElement ? source.naturalWidth : source.width;
+      const height = source instanceof HTMLImageElement ? source.naturalHeight : source.height;
+      const scale = Math.min(1, 1280 / Math.max(width, height));
+      const canvas = new OffscreenCanvas(Math.max(1, Math.round(width * scale)), Math.max(1, Math.round(height * scale)));
+      canvas.getContext('2d')!.drawImage(source, 0, 0, canvas.width, canvas.height);
+      const blob = await canvas.convertToBlob({type: 'image/png'});
+      if (token !== generation || disposed) return;
+      closeCrop(); cropPreview = {url: URL.createObjectURL(blob), width, height, kind};
+    } catch (cause) {
+      if (token === generation) mediaError = cause instanceof Error ? cause.message : String(cause);
+    } finally {frame?.bitmap.close(); if (token === generation) cropLoading = false;}
+  }
+  async function applyCrop(crop: SourceCrop | undefined) {
+    if (!uploadedFile || cropLocked) return;
+    const file = uploadedFile;
+    const range = sourceKind === 'video' ? {start: solveStart, end: solveEnd} : undefined;
+    closeCrop();
+    // Reopen as a new input generation: discard tracking, fitting and cached
+    // results from the old crop before any new cropped frame can be admitted.
+    await openFile(file, crop, range);
+  }
   async function previewTrim(timestamp: number) {
     const request = ++previewVersion, token = generation, source = fileSource;
     if (!source || !trimming) return;
@@ -456,7 +505,7 @@
       if (!frame) return;
       try {
         if (request !== previewVersion || token !== generation || !trimming) return;
-        presenter.presentFrame(stage, presenter.captureFrame(frame.bitmap));
+        presenter.presentFrame(stage, presenter.captureFrame(frame.bitmap, inputCrop(frame.bitmap)));
         position = frame.timestamp; result = undefined;
       } finally { frame.bitmap.close(); }
     } catch (cause) { if (token === generation) mediaError = cause instanceof Error ? cause.message : String(cause); }
@@ -483,8 +532,9 @@
     }
   }
   async function beginReconstruction() {
-    if (!fileSource || !trimming || status !== "ready") return;
+    if (!fileSource || !trimming || status !== "ready" || cropPreview || cropLoading) return;
     if (searchEnabled && !initialScramble.trim()) { searchError = "Enter the initial scramble."; return; }
+    cropLocked = true;
     const token = generation; mediaError = ""; previewVersion++; busy = true;
     try {
       fileSource.seek(solveStart); const frame = await fileSource.next();
@@ -792,6 +842,7 @@
   }
 
   function stopSource() {
+    closeCrop(); uploadedFile = undefined; sourceCrop = undefined; cropLocked = false; cropLoading = false;
     timerCaptureGate.clear();timerCapturePhase='idle';
     timerReplayStore.closeInput();
     timerReconstruction.closeInput('Camera disconnected before the complete solve window was processed');
@@ -931,9 +982,10 @@
     }
   }
 
-  async function openFile(file?: File) {
+  async function openFile(file?: File, crop?: SourceCrop, range?: {start: number; end: number}) {
     if (!file) return;
     stopSource();
+    uploadedFile = file; sourceCrop = crop;
     mediaError = "";
     const token = generation;
     recording.setSourceFile(token,file);
@@ -951,6 +1003,7 @@
         still = image;
         sourceKind = "image";
         sourceName = file.name;
+        presenter.presentFrame(stage, presenter.captureFrame(image, inputCrop(image)));
         startMoveSearch();
         await inferFrame();
       } else if (file.type.startsWith("video/")) {
@@ -964,8 +1017,9 @@
         sourceFps = decoded.sourceFps;
         sourceKind = "video";
         sourceName = file.name;
-        solveStart = 0; solveEnd = duration; trimming = true;
-        await previewTrim(0); void makeThumbnails(token);
+        solveStart = Math.max(0, Math.min(range?.start ?? 0, duration));
+        solveEnd = Math.max(solveStart, Math.min(range?.end ?? duration, duration)); trimming = true;
+        await previewTrim(solveStart); void makeThumbnails(token);
       } else throw new Error("Choose an image or a video file.");
     } catch (cause) {
       if (token === generation)
@@ -974,14 +1028,14 @@
     }
   }
 
-  function dispatch(bitmap: ImageBitmap, timestamp: number, counted: boolean,captureMetrics?:CameraCaptureMetrics) {
+  function dispatch(bitmap: ImageBitmap, timestamp: number, counted: boolean,captureMetrics?:CameraCaptureMetrics, crop?:PixelCrop) {
     // Recheck after asynchronous decoding/bitmap creation: search can finish
     // while a frame is being acquired, before it reaches the neural worker.
     if(!inferenceAllowed()){
       bitmap.close();markIdle();continuePipeline();return;
     }
     const drawStart = performance.now();
-    const snapshot = presenter.captureFrame(bitmap);
+    const snapshot = presenter.captureFrame(bitmap, crop);
     const sentAt = performance.now();
     const appliedSettings = settings();
     currentFrame = {
@@ -1016,6 +1070,7 @@
       {
         type: "frame",
         bitmap,
+        crop,
         settings: appliedSettings,
         resetTracking: resetTracking || sourceKind === "image",
         preserveAlpha: sourceKind === "image",
@@ -1049,7 +1104,7 @@
         bitmap.close();
         return;
       }
-      dispatch(bitmap, position, false);
+      dispatch(bitmap, position, false, undefined, sourceKind === 'image' ? inputCrop(bitmap) : undefined);
     } catch (cause) {
       if (token !== generation) return;
       markIdle();
@@ -1112,13 +1167,14 @@
     }
   }
   function admitFrame(frame: SourceFrame) {
+      const crop = inputCrop(frame.bitmap);
       const saved = sourceKind === "video" ? findSavedResult(frame.timestamp) : undefined;
       if (saved) {
         if (saved.result.fittedPose) moveSearch?.submit(saved.timestamp, saved.result, Promise.resolve(saved.result.fittedPose));
         // A cached island closes the preceding numerical segment. Present it
         // through the same queue so it cannot overtake an earlier pending fit.
         void flushPose(); resetTracking = true; resetPose = true;
-        const snapshot = presenter.captureFrame(frame.bitmap);
+        const snapshot = presenter.captureFrame(frame.bitmap, crop);
         frame.bitmap.close();
         completionQueue.enqueue({ saved, context: { snapshot, generation, timestamp: frame.timestamp } });
         markIdle();
@@ -1127,17 +1183,17 @@
         // Completed-video playback is decoding only. An uncached frame (for
         // example after an early solution) must never restart neural inference.
         try {
-          presenter.presentFrame(stage,presenter.captureFrame(frame.bitmap));
+          presenter.presentFrame(stage,presenter.captureFrame(frame.bitmap, crop));
           result=undefined;position=frame.timestamp;presentedTimestamp=frame.timestamp;
           viewingSavedResult=false;frameTiming=undefined;
         } finally {frame.bitmap.close();markIdle();}
         continuePipeline();
-      } else dispatch(frame.bitmap, frame.timestamp, true,frame.captureMetrics);
+      } else dispatch(frame.bitmap, frame.timestamp, true,frame.captureMetrics, crop);
   }
 
   function presentSavedFrame(bitmap: ImageBitmap, saved: SavedVideoResult) {
     try {
-      const snapshot = presenter.captureFrame(bitmap);
+      const snapshot = presenter.captureFrame(bitmap, inputCrop(bitmap));
       presentSavedSnapshot(snapshot, saved);
     } finally { bitmap.close(); }
   }
@@ -1381,6 +1437,7 @@
     void openFile(event.dataTransfer?.files[0]);
   }
   function cleanup() {
+    closeCrop();
     timerReconstruction.cancel('Page closed before reconstruction finished');
     timerReplayStore.clear();timerReplayCache.clear();latestTimerReplay=undefined;
     timerCaptureGate.clear();
@@ -1505,6 +1562,12 @@
         {#if sourceKind !== "none"}<div class="transport">
           <div class="transport-actions">
             {#if activeTab === 'detector'}<button class="small" onclick={() => fileInput.click()}>Upload file</button>{/if}
+            {#if activeTab === 'detector' && (sourceKind === 'image' || sourceKind === 'video')}
+              <button class="small" onclick={editCrop} disabled={cropLocked || cropLoading}
+                title={cropLocked ? 'The crop is locked once reconstruction starts.' : 'Select the area sent to the detector'}>
+                {cropLoading ? 'Loading crop…' : cropLocked ? 'Crop locked' : `Crop ${sourceKind}`}
+              </button>
+            {/if}
             {#if sourceKind === "video" && reconstructionComplete && !trimming}
               <button class="small" onclick={togglePlayback}>{running ? "Pause" : "Play"}</button>
               <label class="playback-speed">Speed
@@ -1553,7 +1616,7 @@
           <label class="field-label" for="solve-scramble">Initial scramble</label>
           <input id="solve-scramble" aria-label="Initial scramble" bind:value={initialScramble} placeholder="R U R' U'…" />
           <div class="trim-actions"><p class="hint">Include a clear cube before the first move.</p>
-            <button class="primary" disabled={status !== "ready" || searchEnabled && !initialScramble.trim()} onclick={beginReconstruction}>Reconstruct selected range</button></div>
+            <button class="primary" disabled={status !== "ready" || cropLoading || !!cropPreview || searchEnabled && !initialScramble.trim()} onclick={beginReconstruction}>Reconstruct selected range</button></div>
         </section>{/if}
         <div class="viewer-statusbar">
           <span class="fps" aria-label="Frames per second">{(sourceKind === 'camera' && timerCapturePhase === 'idle' ? captureFps : fps)?.toFixed(1) || '0.0'} FPS</span>
@@ -1579,6 +1642,9 @@
 
   </main>
 </div>
+{#if cropPreview}
+  <SourceCropper {...cropPreview} initial={sourceCrop} onapply={crop => {void applyCrop(crop);}} oncancel={closeCrop} />
+{/if}
 <input
   class="hidden"
   bind:this={fileInput}

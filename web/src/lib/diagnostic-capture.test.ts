@@ -21,6 +21,7 @@ function setup(){
   const frame={detections:[{classId:0,x:40,y:50,score:.65,presence:.99,box:[30,40,50,60]},
       {classId:3,x:45,y:55,score:.94,presence:.98,box:[35,45,55,65]}],
     transform:letterbox(640,480,256,false),detectorHashes:{pose:'pose',bbox:'bbox'},
+    inputCrop:{x:320,y:120,width:640,height:480,sourceWidth:1920,sourceHeight:1080},
     cube:{box:[0,0,100,100],score:.85},roi:[0,0,100,100],roiSource:'tracker',trackingLost:false,
     profile:{pose:{preprocessing:'gpu'}},pipeline:{presentedAtMs:100},
     fittedPose:{sourceFrame:0,pipelineVersion:runtime,pipelineAssets:{rust:runtime,geometry:'geometry',opencvModule:'cv.mjs',opencvWasm:'cv.wasm'},
@@ -43,6 +44,7 @@ test('compact downloads retain identical fitting inputs, clocks, scores, provena
   assert.equal(capture.format,'replay-inputs');assert.equal(capture.reconstructionTimeoutMs,30_000);
   assert.deepEqual(pipelineFrame(capture.frames[0].result,0),pipelineFrame(frame,0));
   assert.deepEqual(capture.frames[0].result.detections,frame.detections);
+  assert.deepEqual(capture.frames[0].result.inputCrop,frame.inputCrop);
   assert.equal(capture.frames[0].result.cube.score,.85);
   assert.match(capture.confidenceFields['result.detections[].score'],/per-object/);
   assert.match(capture.confidenceFields['result.detections[].presence'],/presence/);

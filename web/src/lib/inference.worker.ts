@@ -275,6 +275,12 @@ scope.onmessage = async ({ data }) => {
       return;
     }
     if (!pose || !bbox) throw new Error("The detectors are still loading.");
+    const inputCrop = data.crop ? {...data.crop, sourceWidth: data.bitmap.width, sourceHeight: data.bitmap.height} : undefined;
+    if (data.crop) {
+      const original = data.bitmap;
+      data.bitmap = await createImageBitmap(original, data.crop.x, data.crop.y, data.crop.width, data.crop.height);
+      original.close();
+    }
     const start = performance.now();
     const profile: FrameProfile = {
       bbox: null,
@@ -395,6 +401,7 @@ scope.onmessage = async ({ data }) => {
     send({
       type: "result",
       result: {
+        inputCrop,
         detectorHashes:{pose:pose.identity.sha256,bbox:bbox.identity.sha256},
         detections,
         transform,

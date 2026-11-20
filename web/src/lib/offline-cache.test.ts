@@ -172,6 +172,9 @@ test('production build fingerprints actual model bytes independently of UI relea
   assert.equal(await readFile(join(directory, 'new/models', detector.variants[0].file), 'utf8'), 'pose weights');
   assert.equal((await readdir(join(directory, 'new/models'))).length, 3, 'no duplicate unversioned model files');
   assert.match(await readFile(join(directory, 'new/index.html'), 'utf8'), new RegExp(next.version));
+  assert.equal(await readFile(join(directory, 'new/timer/index.html'), 'utf8'),
+    await readFile(join(directory, 'new/index.html'), 'utf8'));
+  assert.equal(await readFile(join(directory, 'new/.nojekyll'), 'utf8'), '');
   const source = await readFile(join(directory, 'new/service-worker.js'), 'utf8');
   assert.doesNotThrow(() => new Function(source), 'worker output is standalone JavaScript');
 });

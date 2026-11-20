@@ -41,6 +41,7 @@ export function compactDetectionCapture(capture: Capture) {
         settings: row.settings, runId: row.runId,
         result: {
           detections: frame.detections, transform: frame.transform,
+          inputCrop: frame.inputCrop,
           detectorHashes: frame.detectorHashes,
           cube: frame.cube, roi: frame.roi, roiSource: frame.roiSource,
           trackingLost: frame.trackingLost, fittingError: frame.fittingError,

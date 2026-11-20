@@ -2,6 +2,26 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { FramePresenter } from "./frame-presenter";
 
+test('cropped presentation copies the selected original pixels without stretching', t => {
+  const draws: unknown[][] = [];
+  class Canvas {
+    constructor(public width: number, public height: number) {}
+    getContext() { return {clearRect() {}, drawImage(...args: unknown[]) {draws.push(args);}}; }
+  }
+  const globals = globalThis as unknown as Record<string, unknown>;
+  const oldCanvas = globals.OffscreenCanvas, oldImage = globals.HTMLImageElement;
+  globals.OffscreenCanvas = Canvas; globals.HTMLImageElement = class {};
+  t.after(() => {globals.OffscreenCanvas = oldCanvas; globals.HTMLImageElement = oldImage;});
+  const source = new Canvas(3840, 2160), presenter = new FramePresenter();
+  const frame = presenter.captureFrame(source as unknown as OffscreenCanvas, {x: 960, y: 270, width: 1920, height: 1620});
+  assert.equal(frame.width, 1920); assert.equal(frame.height, 1620);
+  assert.deepEqual(draws[0], [source, 960, 270, 1920, 1620, 0, 0, 1920, 1620]);
+  presenter.releaseFrame(frame);
+  const full = presenter.captureFrame(source as unknown as OffscreenCanvas);
+  assert.equal(full.width, 3840); assert.equal(full.height, 2160);
+  assert.deepEqual(draws[1], [source, 0, 0]);
+});
+
 test("buffered raw frames stay separate and each overlay is composed with its own frame", (t) => {
   class Canvas {
     pixel = 0;

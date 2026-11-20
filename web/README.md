@@ -19,6 +19,9 @@ npm run dev
 
 Open the printed localhost URL in a browser with WebGPU support. Image and video
 uploads use the detector at `/`; camera solves use the cube timer at `/timer`.
+Use **Crop image** or **Crop video** to select the area sent to the detector.
+A video's crop locks when reconstruction starts and stays locked during review
+and range adjustments. Upload a new file or clear the source to reset it.
 Camera access requires browser permission and HTTPS or localhost. Hold space
 for 0.3 seconds and release to start a solve; any newly pressed key stops it.
 
@@ -71,6 +74,22 @@ adds HTTP cache/isolation headers on hosts that support it; offline caching also
 works without custom hosting headers.
 
 ## Validate and build
+
+For GitHub Pages in the main `auto-stew` repository, run from the repository root:
+
+```sh
+npm --prefix web run build:pages
+```
+
+This rebuilds the generated top-level `docs/` folder for `/auto-stew/`, including
+both required models, WASM, `.nojekyll`, and a direct `/timer/` entry page. Commit
+`docs/` with source changes, then select **main → /docs** in GitHub Pages settings.
+The hosting repository must be public on GitHub Free; private repositories
+require an eligible paid plan. No separate deployment repository is needed.
+
+To preview that exact build locally, run `npm --prefix web run preview:pages`
+and open `http://localhost:4173/auto-stew/`. The Pages build replaces all of
+`docs/`; keep source files in `web/`. A normal `build` still uses `web/dist/`.
 
 From `web/`:
 

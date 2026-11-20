@@ -61,7 +61,7 @@ export async function buildOfflineRelease(output: string): Promise<OfflineReleas
 
   const assets: CachedAsset[] = [];
   for (const path of await files(output)) {
-    if (['_headers', '_redirects', 'service-worker.js', 'offline-release.json', '404.html'].includes(path)) continue;
+    if (['_headers', '_redirects', '.nojekyll', 'timer/index.html', 'service-worker.js', 'offline-release.json', '404.html'].includes(path)) continue;
     const bytes = await readFile(join(output, path));
     const revision = sha256(bytes);
     assets.push({path, revision, integrity: `sha256-${Buffer.from(revision, 'hex').toString('base64')}`,
@@ -74,6 +74,10 @@ export async function buildOfflineRelease(output: string): Promise<OfflineReleas
   const html = (await readFile(indexPath, 'utf8')).replace('</head>',
     `  <meta name="app-release" content="${version}" />\n  </head>`);
   await writeFile(indexPath, html);
+  // Static hosts can open the timer directly without an SPA rewrite rule.
+  await mkdir(join(output, 'timer'), {recursive: true});
+  await writeFile(join(output, 'timer/index.html'), html);
+  await writeFile(join(output, '.nojekyll'), '');
   const index = assets.find(asset => asset.path === 'index.html')!;
   index.revision = sha256(html);
   index.integrity = `sha256-${Buffer.from(index.revision, 'hex').toString('base64')}`;

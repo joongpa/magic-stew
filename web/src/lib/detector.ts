@@ -94,6 +94,7 @@ export interface FrameProfile {
   otherMs: number;
 }
 export interface FrameResult {
+  inputCrop?: import('./source-crop').InputCrop;
   detectorHashes?:{pose:string;bbox:string};
   fittedPose?: FittedPose;
   fittingError?: string;
@@ -132,6 +133,7 @@ export type WorkerRequest =
   | {
       type: "frame";
       bitmap: ImageBitmap;
+      crop?: import('./source-crop').PixelCrop;
       settings: Settings;
       resetTracking: boolean;
       /** Preserve the existing canvas alpha conversion for still images. */

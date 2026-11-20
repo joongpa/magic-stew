@@ -1,3 +1,5 @@
+import type {PixelCrop} from './source-crop';
+
 export type OverlayPainter = (
   context: OffscreenCanvasRenderingContext2D,
   width: number,
@@ -21,17 +23,16 @@ export class FramePresenter {
   }
 
   /** Detached raw frame: its pixels cannot be overwritten by later admissions. */
-  captureFrame(source: HTMLImageElement | ImageBitmap | OffscreenCanvas) {
-    const width =
-      source instanceof HTMLImageElement ? source.naturalWidth : source.width;
-    const height =
-      source instanceof HTMLImageElement ? source.naturalHeight : source.height;
+  captureFrame(source: HTMLImageElement | ImageBitmap | OffscreenCanvas, crop?: PixelCrop) {
+    const width = crop?.width ?? (source instanceof HTMLImageElement ? source.naturalWidth : source.width);
+    const height = crop?.height ?? (source instanceof HTMLImageElement ? source.naturalHeight : source.height);
     const frame = this.reusable.pop() ?? new OffscreenCanvas(width, height);
     if (frame.width !== width) frame.width = width;
     if (frame.height !== height) frame.height = height;
     const context = frame.getContext("2d")!;
     context.clearRect(0, 0, width, height);
-    context.drawImage(source, 0, 0);
+    if (crop) context.drawImage(source, crop.x, crop.y, width, height, 0, 0, width, height);
+    else context.drawImage(source, 0, 0);
     return frame;
   }
 
