@@ -54,7 +54,7 @@ async function download(
   const response = await fetch(url);
   if (!response.ok)
     throw new Error(
-      `Model download failed (${response.status}). Run scripts/export_web_detector.py first.`,
+      `Model download failed (${response.status}). Add the detector files described in web/README.md.`,
     );
   if (!response.body) return new Uint8Array(await response.arrayBuffer());
   const reader = response.body.getReader();

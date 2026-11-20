@@ -439,7 +439,7 @@ export function squareRoi(
   return [x, y, x + pixels, y + pixels];
 }
 
-/** Port of src/live_recognition/roi_tracking.py: bbox acquisition, then pose-point tracking. */
+/** Port of experiment-records/src/live_recognition/roi_tracking.py: bbox acquisition, then pose-point tracking. */
 export class RoiTracker {
   roi: Box | null = null;
   cube: CubeBox | null = null;
