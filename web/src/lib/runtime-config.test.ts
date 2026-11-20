@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { wasmThreadCount } from "./runtime-config";
+import { hasWebGpuAdapter, wasmThreadCount } from "./runtime-config";
+
+test("WebGPU requires an available adapter, not just an exposed API", async () => {
+  assert.equal(await hasWebGpuAdapter(undefined), false);
+  assert.equal(await hasWebGpuAdapter({requestAdapter: async () => null}), false);
+  assert.equal(await hasWebGpuAdapter({requestAdapter: async () => ({} as GPUAdapter)}), true);
+  assert.equal(await hasWebGpuAdapter({requestAdapter: async () => { throw new Error('GPU blocked'); }}), false);
+});
 
 test("CPU uses up to four threads only when isolated", () => {
   assert.equal(wasmThreadCount("wasm", true, 8), 4);

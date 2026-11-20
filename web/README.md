@@ -26,16 +26,19 @@ for 0.3 seconds and release to start a solve; any newly pressed key stops it.
 
 Model weights are not committed. Place the ONNX files described by
 `public/models/detector.json` under `public/models/` before running inference.
-The default application uses these two models:
+The application uses only these two models:
 
 | Stage | File | Contract |
 | --- | --- | --- |
 | Cube bounding box | `cube-bbox-640.onnx` | One cube class; dynamic rectangular input; output `[1, 5, N]` |
 | Pose | `cube-pose-256.onnx` | Fixed 256 × 256 input; nine classes; one keypoint per object; output `[1, 16, 1344]` |
 
-The manifest also lists optional 160px and 288px pose models for developer
-comparisons. Use FP32, batch-one models with embedded NMS disabled. The retained
-pose training and Blender generator live in [`../model-support/`](../model-support/README.md).
+Production builds include only the 256px pose model and the cube detector,
+even if other model resolutions exist locally. Use FP32, batch-one models with
+embedded NMS disabled. The retained pose training and Blender generator live in
+[`../model-support/`](../model-support/README.md).
+Keep the source filenames in `public/models/`; production builds fingerprint
+the model filenames in `dist/` and update the deployed manifest automatically.
 
 Pose class scores use thresholds of 0.25/0.40/0.25 for the three landmarks and
 0.90 for the six sticker colors. Keypoint-presence scores are separate channels;
@@ -50,6 +53,22 @@ Build the Rust and OpenCV camera kernels using
 `npm run sync:runtime` copies the generated artifacts and ONNX Runtime bootstrap
 into `public/pose/` and `public/runtime/`. It runs automatically before `dev`
 and `build`. These generated directories are ignored by Git.
+
+## Browser caching
+
+Production builds cache the app shell and current WASM runtime for offline use.
+Model weights download only after a WebGPU adapter is available, then enter the
+browser cache on first use. App/runtime files can still cache on unsupported
+browsers. Content-based versions let UI updates reuse unchanged weights.
+Old generated WASM files are omitted from the deployment.
+
+Updates install in the background and apply after all app tabs close. The app
+and previously loaded model versions can reopen offline while their files remain
+cached. New model versions, cleared site data, browser eviction, or private
+browsing can require another download. Caching is disabled in the Vite dev server;
+use `npm run build` and `npm run preview` to test it. The supplied `_headers` file
+adds HTTP cache/isolation headers on hosts that support it; offline caching also
+works without custom hosting headers.
 
 ## Validate and build
 

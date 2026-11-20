@@ -25,28 +25,12 @@
   "layout": "NCHW-xywh-classes-keypoint",
   "variants": [
     {
-      "size": 160,
-      "file": "cube-pose-160.onnx",
-      "bytes": 84984614,
-      "inputName": "images",
-      "outputName": "output0",
-      "outputShape": [1, 16, 525]
-    },
-    {
       "size": 256,
       "file": "cube-pose-256.onnx",
       "bytes": 85012985,
       "inputName": "images",
       "outputName": "output0",
       "outputShape": [1, 16, 1344]
-    },
-    {
-      "size": 288,
-      "file": "cube-pose-288.onnx",
-      "bytes": 85024409,
-      "inputName": "images",
-      "outputName": "output0",
-      "outputShape": [1, 16, 1701]
     }
   ],
   "bbox": {

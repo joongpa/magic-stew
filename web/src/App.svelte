@@ -44,6 +44,8 @@
   import {LocalReplayStorage,TimerReplayCache} from './lib/timer-replay-cache';
   import {TimerCaptureGate} from './lib/timer-capture';
   import {workspacePath,workspaceFromPath,type WorkspaceTab} from './lib/workspace-route';
+  import {offlineCacheReady} from './lib/offline-cache';
+  import {hasWebGpuAdapter} from './lib/runtime-config';
 
   const workspaceBase=new URL(import.meta.env.BASE_URL,location.origin).pathname;
   let activeTab = $state<WorkspaceTab>(workspaceFromPath(location.pathname,workspaceBase));
@@ -667,8 +669,17 @@
       status = "error";
       return;
     }
-    loadingText = "Reading detector configuration…";
+    loadingText = backend === "webgpu" ? "Checking WebGPU…" : "Preparing app files…";
     try {
+      if (backend === "webgpu") {
+        const available = await hasWebGpuAdapter(navigator.gpu);
+        if (disposed || request !== modelGeneration) return;
+        if (!available) throw new Error("WebGPU is unavailable on this device or browser.");
+      }
+      loadingText = "Preparing app files…";
+      await offlineCacheReady();
+      if (disposed || request !== modelGeneration) return;
+      loadingText = "Reading detector configuration…";
       if (!manifest) {
         const response = await fetch(new URL("models/detector.json", baseUrl));
         if (
@@ -676,7 +687,7 @@
           !response.headers.get("content-type")?.includes("json")
         )
           throw new Error(
-            "Detector files are missing. Run the ONNX export command in web/README.md.",
+            "Detector files are missing. Add the files described in web/README.md.",
           );
         manifest = await response.json();
         if (
