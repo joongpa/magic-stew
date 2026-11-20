@@ -29,8 +29,8 @@ npm run dev
 See [`web/README.md`](web/README.md) for required detector models, WASM artifacts,
 and browser requirements.
 
-For GitHub Pages, run `npm --prefix web run build:pages`, commit the rebuilt
-`docs/` folder, and select **main → /docs** in Pages settings.
+## Model Weights
+https://huggingface.co/joongpa/you-only-cube-once
 
 ## Checks
 
